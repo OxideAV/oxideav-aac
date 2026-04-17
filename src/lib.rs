@@ -49,6 +49,7 @@ pub mod sfband;
 pub mod syntax;
 pub mod synth;
 pub mod tns;
+pub mod tns_analyse;
 pub mod window;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};

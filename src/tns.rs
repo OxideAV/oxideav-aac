@@ -257,6 +257,19 @@ fn apply_tns_filter_range(
     }
 }
 
+/// Test/internal-use re-export so sibling modules (`tns_analyse`) can call
+/// the decoder's filter directly to verify encoder/decoder inversion.
+#[doc(hidden)]
+pub fn _apply_tns_filter_range_for_test(
+    spec: &mut [f32; SPEC_LEN],
+    start: usize,
+    length: usize,
+    lpc: &[f32],
+    direction: u8,
+) {
+    apply_tns_filter_range(spec, start, length, lpc, direction);
+}
+
 /// Resolve the TNS start band for a window. ISO §4.6.9.1 — the span begins at
 /// `tns_max_sfb` (see Table 4.139) scaled downward by the filter's `length`,
 /// but most impls simply cap `tns_max_sfb` to `max_sfb` and run the filter

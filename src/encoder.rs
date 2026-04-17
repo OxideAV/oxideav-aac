@@ -25,8 +25,14 @@
 //! reporting a Goertzel ratio >= 50× at the source tone frequency on a
 //! 1-second synthesised sine.
 //!
-//! Not implemented (deferred): TNS synthesis, PNS, intensity stereo,
-//! pulse data, short-block/transient detection, gain control.
+//! Partially implemented:
+//!   - TNS analysis + filter emission for SCE (mono) long windows. See
+//!     `tns_analyse.rs`. CPE (stereo) leaves TNS off for now because the
+//!     M/S per-band decision would need to take the TNS-flattened spectrum
+//!     into account, which isn't wired yet.
+//!
+//! Not implemented (deferred): PNS (encoder side), intensity stereo, pulse
+//! data, short-block/transient detection, gain control.
 
 use std::collections::VecDeque;
 
@@ -43,9 +49,11 @@ use crate::huffman_tables::{
     BOOK6_BITS, BOOK6_CODES, BOOK7_BITS, BOOK7_CODES, BOOK8_BITS, BOOK8_CODES, BOOK9_BITS,
     BOOK9_CODES, SCALEFACTOR_BITS, SCALEFACTOR_CODES,
 };
+use crate::ics::SPEC_LEN;
 use crate::mdct::mdct_long;
 use crate::sfband::SWB_LONG;
 use crate::syntax::{ElementType, AOT_AAC_LC, SAMPLE_RATES};
+use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
 use crate::window::sine_long;
 
 /// MDCT length (long block).
@@ -419,6 +427,9 @@ struct Ics {
     q_bands: Vec<Vec<i32>>,
     /// Global gain value (first non-ZERO band's scalefactor, 8-bit).
     global_gain: u8,
+    /// TNS filter parameters (at most one filter per window for the
+    /// current encoder). `None` => `tns_data_present = 0`.
+    tns: Option<TnsEncFilter>,
 }
 
 #[derive(Clone, Debug)]
@@ -428,6 +439,10 @@ struct IcsInfoEnc {
 }
 
 fn analyse_and_quantise(spec: &[f32], sf_index: u8) -> Result<Ics> {
+    analyse_and_quantise_opts(spec, sf_index, true)
+}
+
+fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Result<Ics> {
     let swb = SWB_LONG[sf_index as usize];
     let total_sfb = swb.len() - 1;
 
@@ -447,6 +462,21 @@ fn analyse_and_quantise(spec: &[f32], sf_index: u8) -> Result<Ics> {
         }
     }
     let max_sfb = max_band_active.max(1).min(total_sfb);
+
+    // Copy the spectrum into a fixed-size array so the TNS analyser can
+    // apply its forward filter in place. If TNS is gated off, `spec_tns`
+    // is identical to the input.
+    let mut spec_tns = [0.0f32; SPEC_LEN];
+    let copy_len = spec.len().min(SPEC_LEN);
+    spec_tns[..copy_len].copy_from_slice(&spec[..copy_len]);
+    let tns = if use_tns {
+        tns_analyse_long(&mut spec_tns, sf_index, max_sfb as u8)
+    } else {
+        None
+    };
+    // Work with the TNS-flattened spectrum from this point on. If TNS was
+    // not applied, spec_tns == spec.
+    let spec: &[f32] = &spec_tns[..];
 
     // Pick per-band scalefactor so the largest quantised magnitude lands
     // in a useful range. We aim for `target_max ≈ 7` so smaller bands
@@ -535,6 +565,7 @@ fn analyse_and_quantise(spec: &[f32], sf_index: u8) -> Result<Ics> {
         cbs,
         q_bands,
         global_gain: gg_clamped,
+        tns,
     })
 }
 
@@ -732,10 +763,37 @@ fn write_ics_body_no_global_gain(bw: &mut BitWriter, ics: &Ics) -> Result<()> {
     write_section_data(bw, ics);
     write_scalefactors(bw, ics)?;
     bw.write_bit(false); // pulse_data_present
-    bw.write_bit(false); // tns_data_present
+    let tns_present = ics.tns.is_some();
+    bw.write_bit(tns_present);
+    if let Some(ref f) = ics.tns {
+        write_tns_data_long(bw, f);
+    }
     bw.write_bit(false); // gain_control_data_present
     write_spectral_data(bw, ics);
     Ok(())
+}
+
+/// Serialise `tns_data()` for a single long window with one filter. Matches
+/// the bit layout consumed by `tns::parse_tns_data` — see `src/tns.rs`.
+fn write_tns_data_long(bw: &mut BitWriter, filt: &TnsEncFilter) {
+    // Long window: n_filt is 2 bits.
+    bw.write_u32(1, 2); // n_filt = 1
+    bw.write_u32(crate::tns_analyse::TNS_ENC_COEF_RES as u32, 1); // coef_res
+                                                                  // length (6 bits) + order (5 bits).
+    bw.write_u32(filt.length_sfb as u32, 6);
+    bw.write_u32(filt.order as u32, 5);
+    if filt.order > 0 {
+        bw.write_u32(filt.direction as u32, 1);
+        bw.write_u32(filt.coef_compress as u32, 1);
+        let coef_bits: u32 =
+            3 + crate::tns_analyse::TNS_ENC_COEF_RES as u32 - filt.coef_compress as u32;
+        for o in 0..filt.order as usize {
+            bw.write_u32(
+                filt.coef_raw[o] as u32 & ((1u32 << coef_bits) - 1),
+                coef_bits,
+            );
+        }
+    }
 }
 
 fn write_section_data(bw: &mut BitWriter, ics: &Ics) {
@@ -811,16 +869,22 @@ fn write_spectral_data(bw: &mut BitWriter, ics: &Ics) {
 /// ICS structures to a single unified max_sfb after analysis.
 fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ics)> {
     // Quantise L/R and M/S independently; pick the cheaper one per band.
-    let ics_l_alone = analyse_and_quantise(l, sf_index)?;
-    let ics_r_alone = analyse_and_quantise(r, sf_index)?;
+    // NOTE: TNS is disabled for CPE in this first-cut encoder because a
+    // single TNS filter must span the whole spectrum, while per-band M/S
+    // decisions can take quantised coefficients from multiple source ICSs.
+    // Re-enabling TNS here requires running analysis on L/R directly, then
+    // computing M/S from the flattened coefficients and picking per-band —
+    // left as future work.
+    let ics_l_alone = analyse_and_quantise_opts(l, sf_index, false)?;
+    let ics_r_alone = analyse_and_quantise_opts(r, sf_index, false)?;
     let mut m = vec![0.0f32; l.len()];
     let mut s = vec![0.0f32; l.len()];
     for i in 0..l.len() {
         m[i] = (l[i] + r[i]) * 0.5;
         s[i] = (l[i] - r[i]) * 0.5;
     }
-    let ics_m = analyse_and_quantise(&m, sf_index)?;
-    let ics_s = analyse_and_quantise(&s, sf_index)?;
+    let ics_m = analyse_and_quantise_opts(&m, sf_index, false)?;
+    let ics_s = analyse_and_quantise_opts(&s, sf_index, false)?;
 
     let max_sfb_lr = ics_l_alone.info.max_sfb.max(ics_r_alone.info.max_sfb);
     let max_sfb_ms = ics_m.info.max_sfb.max(ics_s.info.max_sfb);
@@ -883,6 +947,7 @@ fn empty_ics(max_sfb: usize, sf_index: u8) -> Ics {
         cbs: vec![0; max_sfb],
         q_bands,
         global_gain: 100,
+        tns: None,
     }
 }
 
