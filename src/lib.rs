@@ -10,12 +10,14 @@
 //! - M/S stereo (§4.6.13)
 //! - IMDCT 2048/256 with sine + KBD windows + overlap-add (§4.6.18 / §4.6.11)
 //! - LongStart / LongStop / EightShort window sequences
-//! - TNS bit-skip (no synthesis), pulse data flag check, fill / DSE elements
+//! - TNS synthesis for long windows (§4.6.9); short-window TNS parses but is
+//!   skipped (documented limitation)
+//! - PNS / perceptual noise substitution (§4.6.13)
+//! - Pulse data flag check, fill / DSE elements
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
-//! - Pulse data (§4.6.5), TNS synthesis (§4.6.9), gain control (§4.6.12)
+//! - Pulse data (§4.6.5), gain control (§4.6.12)
 //! - Intensity stereo (§4.6.14) — bands marked IS leave zeros
-//! - PNS / perceptual noise substitution (§4.6.10) — ditto
 //! - LFE / CCE / PCE elements
 //! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
@@ -42,9 +44,11 @@ pub mod huffman_tables;
 pub mod ics;
 pub mod imdct;
 pub mod mdct;
+pub mod pns;
 pub mod sfband;
 pub mod syntax;
 pub mod synth;
+pub mod tns;
 pub mod window;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};

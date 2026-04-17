@@ -17,9 +17,11 @@ use crate::ics::{
     parse_section_data, IcsInfo, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, SPEC_LEN,
     ZERO_HCB,
 };
+use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
+use crate::tns::{apply_tns_long, parse_tns_data, TnsData};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     // Figure out the stream config. Two paths:
@@ -57,6 +59,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         object_type,
         chans: vec![ChannelState::new(); 2],
         configured: !params.extradata.is_empty(),
+        pns_rng: PnsRng::new(),
     }))
 }
 
@@ -75,6 +78,7 @@ struct AacDecoder {
     object_type: u8,
     chans: Vec<ChannelState>,
     configured: bool,
+    pns_rng: PnsRng,
 }
 
 impl Decoder for AacDecoder {
@@ -165,8 +169,23 @@ impl AacDecoder {
                 ElementType::Sce => {
                     let _instance_tag = br.read_u32(4)?;
                     let mut spec = [0.0f32; SPEC_LEN];
-                    let (info, sf, sec) = decode_ics(&mut br, self.sf_index, false)?;
+                    let (info, sf, sec, tns) = decode_ics(&mut br, self.sf_index, false)?;
                     fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
+                    // PNS first: fill NOISE_HCB bands with shaped noise.
+                    if info.window_sequence == WindowSequence::EightShort {
+                        apply_pns_short(&mut spec, &info, &sec, &sf, &mut self.pns_rng);
+                    } else {
+                        apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
+                    }
+                    // TNS after PNS/IS but before IMDCT (§4.6.9.2).
+                    if let Some(tns) = tns.as_ref() {
+                        if info.window_sequence != WindowSequence::EightShort {
+                            let swb = SWB_LONG[self.sf_index as usize];
+                            apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
+                        }
+                        // Short-window TNS is parsed but not applied — see
+                        // `tns::apply_tns_short` doc.
+                    }
                     let mut channel_pcm = [0.0f32; FRAME_LEN];
                     imdct_and_overlap(
                         &spec,
@@ -206,6 +225,7 @@ impl AacDecoder {
                         let mut secs: [SectionData; 2] = Default::default();
                         let mut sfs: [Vec<i32>; 2] = Default::default();
                         let infos: [IcsInfo; 2] = [info.clone(), info.clone()];
+                        let mut tns_all: [Option<TnsData>; 2] = [None, None];
                         for ch in 0..2 {
                             let gg = br.read_u32(8)? as u8;
                             let sec = parse_section_data(&mut br, &infos[ch])?;
@@ -217,9 +237,18 @@ impl AacDecoder {
                                     "AAC: pulse_data_present not implemented",
                                 ));
                             }
-                            let _tns = br.read_bit()?;
-                            if _tns {
-                                skip_tns_data(&mut br, &infos[ch])?;
+                            let tns_present = br.read_bit()?;
+                            if tns_present {
+                                let n_windows = if infos[ch].window_sequence.is_eight_short() {
+                                    8
+                                } else {
+                                    1
+                                };
+                                tns_all[ch] = Some(parse_tns_data(
+                                    &mut br,
+                                    infos[ch].window_sequence,
+                                    n_windows,
+                                )?);
                             }
                             let _gain_control = br.read_bit()?;
                             if _gain_control {
@@ -231,11 +260,67 @@ impl AacDecoder {
                             sfs[ch] = sf;
                             fill_spectrum(&mut br, &infos[ch], &secs[ch], &sfs[ch], &mut spec[ch])?;
                         }
+                        // PNS: fill NOISE_HCB bands. For correlated-noise bands
+                        // (ms_used set on a noise sfb) both channels share the
+                        // same random sequence.
+                        if infos[0].window_sequence == WindowSequence::EightShort {
+                            apply_pns_short(
+                                &mut spec[0],
+                                &infos[0],
+                                &secs[0],
+                                &sfs[0],
+                                &mut self.pns_rng,
+                            );
+                            apply_pns_short(
+                                &mut spec[1],
+                                &infos[1],
+                                &secs[1],
+                                &sfs[1],
+                                &mut self.pns_rng,
+                            );
+                        } else {
+                            // Apply channel 0 + optionally mirror to channel 1.
+                            let (s0, s1) = spec.split_at_mut(1);
+                            apply_pns_long(
+                                &mut s0[0],
+                                &infos[0],
+                                &secs[0],
+                                &sfs[0],
+                                &mut self.pns_rng,
+                                Some(&mut s1[0]),
+                                Some(&ms_used),
+                            );
+                            // Fill any NOISE_HCB bands channel 1 has that
+                            // channel 0 did not (rare, but spec-legal).
+                            apply_pns_long_ch1_leftover(
+                                &mut s1[0],
+                                &infos[1],
+                                &secs[0],
+                                &secs[1],
+                                &sfs[1],
+                                &mut self.pns_rng,
+                            );
+                        }
                         // M/S stereo: replace L,R with (L+R)/sqrt(2), (L-R)/sqrt(2)?
                         // Per spec §4.6.13.3:
                         //   L = M + S; R = M - S  (no sqrt scaling — IS-only normalisation
                         //   uses sqrt(2), but MS as defined in 14496-3 is L=M+S, R=M-S).
                         apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
+                        // TNS after PNS + M/S, before IMDCT.
+                        for ch in 0..2 {
+                            if let Some(tns) = tns_all[ch].as_ref() {
+                                if infos[ch].window_sequence != WindowSequence::EightShort {
+                                    let swb = SWB_LONG[self.sf_index as usize];
+                                    apply_tns_long(
+                                        &mut spec[ch],
+                                        tns,
+                                        self.sf_index,
+                                        infos[ch].max_sfb,
+                                        swb,
+                                    );
+                                }
+                            }
+                        }
                         for ch in 0..2 {
                             let mut channel_pcm = [0.0f32; FRAME_LEN];
                             imdct_and_overlap(
@@ -252,12 +337,41 @@ impl AacDecoder {
                         // Independent ICS for each channel.
                         let mut spec = [[0.0f32; SPEC_LEN]; 2];
                         let mut infos: [IcsInfo; 2] = Default::default();
+                        let mut tns_all: [Option<TnsData>; 2] = [None, None];
                         for ch in 0..2 {
-                            let (info, sf, sec) = decode_ics(&mut br, self.sf_index, true)?;
+                            let (info, sf, sec, tns) = decode_ics(&mut br, self.sf_index, true)?;
                             fill_spectrum(&mut br, &info, &sec, &sf, &mut spec[ch])?;
+                            // PNS per channel, independent (no CPE common_window
+                            // => no shared ms flags).
+                            if info.window_sequence == WindowSequence::EightShort {
+                                apply_pns_short(&mut spec[ch], &info, &sec, &sf, &mut self.pns_rng);
+                            } else {
+                                apply_pns_long(
+                                    &mut spec[ch],
+                                    &info,
+                                    &sec,
+                                    &sf,
+                                    &mut self.pns_rng,
+                                    None,
+                                    None,
+                                );
+                            }
                             infos[ch] = info;
+                            tns_all[ch] = tns;
                         }
                         for ch in 0..2 {
+                            if let Some(tns) = tns_all[ch].as_ref() {
+                                if infos[ch].window_sequence != WindowSequence::EightShort {
+                                    let swb = SWB_LONG[self.sf_index as usize];
+                                    apply_tns_long(
+                                        &mut spec[ch],
+                                        tns,
+                                        self.sf_index,
+                                        infos[ch].max_sfb,
+                                        swb,
+                                    );
+                                }
+                            }
                             let mut channel_pcm = [0.0f32; FRAME_LEN];
                             imdct_and_overlap(
                                 &spec[ch],
@@ -349,14 +463,14 @@ impl AacDecoder {
     }
 }
 
-/// Decode a single-channel ICS into (info, scalefactors, section_data).
+/// Decode a single-channel ICS into (info, scalefactors, section_data, tns_data).
 /// Reads global_gain, ics_info, section_data, scalefactors, then advances
 /// past pulse/TNS/gain-control flags. Spectrum decoding is left to caller.
 fn decode_ics(
     br: &mut BitReader<'_>,
     sf_index: u8,
     is_in_cpe: bool,
-) -> Result<(IcsInfo, Vec<i32>, SectionData)> {
+) -> Result<(IcsInfo, Vec<i32>, SectionData, Option<TnsData>)> {
     let global_gain = br.read_u32(8)? as u8;
     let info = parse_ics_info(br, sf_index)?;
     let sec = parse_section_data(br, &info)?;
@@ -367,16 +481,24 @@ fn decode_ics(
             "AAC: pulse_data_present not implemented",
         ));
     }
-    let _tns = br.read_bit()?;
-    if _tns {
-        skip_tns_data(br, &info)?;
-    }
+    let tns_present = br.read_bit()?;
+    let tns = if tns_present {
+        // Per §4.6.9.1, tns_data has n_windows == num_windows (8 for short, 1 otherwise).
+        let n_windows = if info.window_sequence.is_eight_short() {
+            8
+        } else {
+            1
+        };
+        Some(parse_tns_data(br, info.window_sequence, n_windows)?)
+    } else {
+        None
+    };
     let _gain_control = br.read_bit()?;
     if _gain_control {
         return Err(Error::unsupported("AAC: gain_control in LC stream"));
     }
     let _ = is_in_cpe;
-    Ok((info, sf, sec))
+    Ok((info, sf, sec, tns))
 }
 
 fn fill_spectrum(
@@ -393,44 +515,31 @@ fn fill_spectrum(
     }
 }
 
-/// Skip over the `tns_data` syntax element. We don't apply TNS yet but we
-/// must consume the right number of bits to keep the stream aligned.
-fn skip_tns_data(br: &mut BitReader<'_>, info: &IcsInfo) -> Result<()> {
-    let n_filt_bits = if info.window_sequence == WindowSequence::EightShort {
-        1
-    } else {
-        2
-    };
-    let length_bits = if info.window_sequence == WindowSequence::EightShort {
-        4
-    } else {
-        6
-    };
-    let order_bits = if info.window_sequence == WindowSequence::EightShort {
-        3
-    } else {
-        5
-    };
-    let n_windows = info.num_window_groups as usize;
-    for _ in 0..n_windows {
-        let n_filt = br.read_u32(n_filt_bits)? as usize;
-        if n_filt > 0 {
-            let coef_res = br.read_u32(1)? as u32;
-            for _ in 0..n_filt {
-                let _length = br.read_u32(length_bits)?;
-                let order = br.read_u32(order_bits)? as usize;
-                if order > 0 {
-                    let _direction = br.read_bit()?;
-                    let coef_compress = br.read_u32(1)? as u32;
-                    let coef_bits = (3 + coef_res) - coef_compress;
-                    for _ in 0..order {
-                        br.read_u32(coef_bits)?;
-                    }
-                }
+/// Fill any NOISE_HCB bands in channel 1 that were not handled by the shared
+/// channel-0 PNS pass — only relevant when the two channels have diverging
+/// NOISE_HCB band sets, which is rare but spec-legal for CPE common_window.
+fn apply_pns_long_ch1_leftover(
+    spec1: &mut [f32; SPEC_LEN],
+    info: &IcsInfo,
+    sec0: &SectionData,
+    sec1: &SectionData,
+    sf1: &[i32],
+    rng: &mut PnsRng,
+) {
+    let swb = SWB_LONG[info.sf_index as usize];
+    let max_sfb = info.max_sfb as usize;
+    for sfb in 0..max_sfb {
+        let cb1 = sec1.sfb_cb.get(sfb).copied().unwrap_or(0);
+        let cb0 = sec0.sfb_cb.get(sfb).copied().unwrap_or(0);
+        if cb1 == NOISE_HCB && cb0 != NOISE_HCB {
+            let start = swb[sfb] as usize;
+            let end = swb[sfb + 1] as usize;
+            let gain = crate::pns::pns_gain(sf1[sfb]);
+            for s in start..end {
+                spec1[s] = rng.next_float() * gain;
             }
         }
     }
-    Ok(())
 }
 
 /// Apply M/S stereo decoding in-place. Spec §4.6.13.
