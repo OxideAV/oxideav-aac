@@ -1,18 +1,18 @@
 [package]
 name = "oxideav-aac"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-aac"
+authors = ["Mark Karpeles"]
 description = "Pure-Rust AAC (AAC-LC) codec scaffold for oxideav — ADTS parser, AudioSpecificConfig, Huffman tables, decoder stub"
 
 readme = "README.md"
-homepage.workspace = true
+homepage = "https://github.com/OxideAV/oxideav-aac"
 keywords = ["multimedia", "audio", "aac", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
+oxideav-core = "0.0"
+oxideav-codec = "0.0"
