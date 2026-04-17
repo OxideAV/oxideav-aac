@@ -239,6 +239,48 @@ fn encode_mono_48k_ffmpeg() {
     assert!(ratio >= 50.0, "ffmpeg mono 48k ratio {ratio} < 50");
 }
 
+fn pcm_silence(sr: u32, channels: u16, secs: f32) -> Vec<u8> {
+    let total = (sr as f32 * secs) as usize;
+    vec![0u8; total * channels as usize * 2]
+}
+
+fn rms_f32(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut acc = 0.0f64;
+    for &s in samples {
+        let v = s as f64 / 32768.0;
+        acc += v * v;
+    }
+    (acc / samples.len() as f64).sqrt() as f32
+}
+
+#[test]
+fn encode_silence_mono_self_decoder() {
+    let sr = 44_100u32;
+    let pcm = pcm_silence(sr, 1, 0.5);
+    let aac = encode(pcm, sr, 1, 64_000);
+    let decoded = decode_self(&aac);
+    assert!(!decoded.is_empty(), "no samples decoded from silence");
+    // Silence must decode to ~zero. Allow a tiny quantisation floor.
+    let rms = rms_f32(&decoded);
+    eprintln!("mono silence rms={rms}");
+    assert!(rms < 1e-3, "silence decoded with audible noise rms={rms}");
+}
+
+#[test]
+fn encode_silence_stereo_self_decoder() {
+    let sr = 44_100u32;
+    let pcm = pcm_silence(sr, 2, 0.5);
+    let aac = encode(pcm, sr, 2, 96_000);
+    let decoded = decode_self(&aac);
+    assert!(!decoded.is_empty(), "no samples decoded from silence");
+    let rms = rms_f32(&decoded);
+    eprintln!("stereo silence rms={rms}");
+    assert!(rms < 1e-3, "stereo silence decoded with audible noise rms={rms}");
+}
+
 #[test]
 fn encode_stereo_roundtrip_ffmpeg() {
     let sr = 44_100u32;

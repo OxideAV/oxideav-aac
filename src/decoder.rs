@@ -18,6 +18,7 @@ use crate::ics::{
     ZERO_HCB,
 };
 use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
+use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
@@ -169,8 +170,16 @@ impl AacDecoder {
                 ElementType::Sce => {
                     let _instance_tag = br.read_u32(4)?;
                     let mut spec = [0.0f32; SPEC_LEN];
-                    let (info, sf, sec, tns) = decode_ics(&mut br, self.sf_index, false)?;
+                    let (info, sf, sec, tns, pulse) =
+                        decode_ics(&mut br, self.sf_index, false)?;
                     fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
+                    // Pulse data: §4.6.5 — applied to long-window spectrum
+                    // before PNS / TNS.
+                    if let Some(pd) = pulse.as_ref() {
+                        if info.window_sequence != WindowSequence::EightShort {
+                            apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
+                        }
+                    }
                     // PNS first: fill NOISE_HCB bands with shaped noise.
                     if info.window_sequence == WindowSequence::EightShort {
                         apply_pns_short(&mut spec, &info, &sec, &sf, &mut self.pns_rng);
@@ -226,16 +235,14 @@ impl AacDecoder {
                         let mut sfs: [Vec<i32>; 2] = Default::default();
                         let infos: [IcsInfo; 2] = [info.clone(), info.clone()];
                         let mut tns_all: [Option<TnsData>; 2] = [None, None];
+                        let mut pulse_all: [Option<PulseData>; 2] = [None, None];
                         for ch in 0..2 {
                             let gg = br.read_u32(8)? as u8;
                             let sec = parse_section_data(&mut br, &infos[ch])?;
                             let sf = parse_scalefactors(&mut br, &infos[ch], &sec, gg)?;
-                            // Pulse, TNS, gain control all "absent" in AAC-LC mainstream.
-                            let _pulse = br.read_bit()?;
-                            if _pulse {
-                                return Err(Error::unsupported(
-                                    "AAC: pulse_data_present not implemented",
-                                ));
+                            let pulse_present = br.read_bit()?;
+                            if pulse_present {
+                                pulse_all[ch] = Some(parse_pulse_data(&mut br)?);
                             }
                             let tns_present = br.read_bit()?;
                             if tns_present {
@@ -259,6 +266,17 @@ impl AacDecoder {
                             secs[ch] = sec;
                             sfs[ch] = sf;
                             fill_spectrum(&mut br, &infos[ch], &secs[ch], &sfs[ch], &mut spec[ch])?;
+                            if let Some(pd) = pulse_all[ch].as_ref() {
+                                if infos[ch].window_sequence != WindowSequence::EightShort {
+                                    apply_pulse_long(
+                                        &mut spec[ch],
+                                        pd,
+                                        self.sf_index,
+                                        infos[ch].max_sfb,
+                                        &sfs[ch],
+                                    )?;
+                                }
+                            }
                         }
                         // PNS: fill NOISE_HCB bands. For correlated-noise bands
                         // (ms_used set on a noise sfb) both channels share the
@@ -339,8 +357,20 @@ impl AacDecoder {
                         let mut infos: [IcsInfo; 2] = Default::default();
                         let mut tns_all: [Option<TnsData>; 2] = [None, None];
                         for ch in 0..2 {
-                            let (info, sf, sec, tns) = decode_ics(&mut br, self.sf_index, true)?;
+                            let (info, sf, sec, tns, pulse) =
+                                decode_ics(&mut br, self.sf_index, true)?;
                             fill_spectrum(&mut br, &info, &sec, &sf, &mut spec[ch])?;
+                            if let Some(pd) = pulse.as_ref() {
+                                if info.window_sequence != WindowSequence::EightShort {
+                                    apply_pulse_long(
+                                        &mut spec[ch],
+                                        pd,
+                                        self.sf_index,
+                                        info.max_sfb,
+                                        &sf,
+                                    )?;
+                                }
+                            }
                             // PNS per channel, independent (no CPE common_window
                             // => no shared ms flags).
                             if info.window_sequence == WindowSequence::EightShort {
@@ -463,24 +493,30 @@ impl AacDecoder {
     }
 }
 
-/// Decode a single-channel ICS into (info, scalefactors, section_data, tns_data).
-/// Reads global_gain, ics_info, section_data, scalefactors, then advances
-/// past pulse/TNS/gain-control flags. Spectrum decoding is left to caller.
+/// Decode a single-channel ICS into (info, scalefactors, section_data, tns_data, pulse_data).
+/// Reads global_gain, ics_info, section_data, scalefactors, pulse / TNS / gain-control
+/// fields. Spectrum decoding is left to caller.
 fn decode_ics(
     br: &mut BitReader<'_>,
     sf_index: u8,
     is_in_cpe: bool,
-) -> Result<(IcsInfo, Vec<i32>, SectionData, Option<TnsData>)> {
+) -> Result<(
+    IcsInfo,
+    Vec<i32>,
+    SectionData,
+    Option<TnsData>,
+    Option<PulseData>,
+)> {
     let global_gain = br.read_u32(8)? as u8;
     let info = parse_ics_info(br, sf_index)?;
     let sec = parse_section_data(br, &info)?;
     let sf = parse_scalefactors(br, &info, &sec, global_gain)?;
-    let _pulse = br.read_bit()?;
-    if _pulse {
-        return Err(Error::unsupported(
-            "AAC: pulse_data_present not implemented",
-        ));
-    }
+    let pulse_present = br.read_bit()?;
+    let pulse = if pulse_present {
+        Some(parse_pulse_data(br)?)
+    } else {
+        None
+    };
     let tns_present = br.read_bit()?;
     let tns = if tns_present {
         // Per §4.6.9.1, tns_data has n_windows == num_windows (8 for short, 1 otherwise).
@@ -498,7 +534,7 @@ fn decode_ics(
         return Err(Error::unsupported("AAC: gain_control in LC stream"));
     }
     let _ = is_in_cpe;
-    Ok((info, sf, sec, tns))
+    Ok((info, sf, sec, tns, pulse))
 }
 
 fn fill_spectrum(

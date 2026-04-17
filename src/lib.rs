@@ -13,10 +13,11 @@
 //! - TNS synthesis for long windows (§4.6.9); short-window TNS parses but is
 //!   skipped (documented limitation)
 //! - PNS / perceptual noise substitution (§4.6.13)
-//! - Pulse data flag check, fill / DSE elements
+//! - Pulse data (§4.6.5) — applied to long-window dequantised spectrum
+//! - Fill / DSE elements
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
-//! - Pulse data (§4.6.5), gain control (§4.6.12)
+//! - Gain control (§4.6.12)
 //! - Intensity stereo (§4.6.14) — bands marked IS leave zeros
 //! - LFE / CCE / PCE elements
 //! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
@@ -45,6 +46,7 @@ pub mod ics;
 pub mod imdct;
 pub mod mdct;
 pub mod pns;
+pub mod pulse;
 pub mod sfband;
 pub mod syntax;
 pub mod synth;
