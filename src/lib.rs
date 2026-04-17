@@ -1,6 +1,6 @@
-//! AAC-LC decoder — ISO/IEC 14496-3 / ISO 13818-7.
+//! AAC-LC decoder and encoder — ISO/IEC 14496-3 / ISO 13818-7.
 //!
-//! Implemented:
+//! Decoder implements:
 //! - ADTS frame header parser (§1.A.2 / 13818-7 §6.2)
 //! - AudioSpecificConfig parser (§1.6.2.1)
 //! - Huffman codebooks 1-11 + scalefactor (§4.A.1)

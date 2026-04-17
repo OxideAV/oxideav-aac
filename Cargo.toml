@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-aac"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust AAC (AAC-LC) codec scaffold for oxideav — ADTS parser, AudioSpecificConfig, Huffman tables, decoder stub"
+description = "Pure-Rust AAC-LC decoder and encoder for oxideav — ADTS framing, Huffman books 1-11, IMDCT, M/S stereo, TNS, PNS"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-aac"
