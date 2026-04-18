@@ -302,60 +302,81 @@ impl AacEncoder {
     }
 
     fn encode_raw_data_block(&self, specs: &[Vec<f32>]) -> Result<Vec<u8>> {
+        let all_long = vec![WindowSequence::OnlyLong; specs.len()];
+        self.encode_raw_data_block_seq(specs, &all_long)
+    }
+
+    /// Build one raw_data_block with per-channel [`WindowSequence`]. When
+    /// `seqs[ch]` is `EightShort`, that channel's spectrum is emitted via
+    /// the short-window writer (`write_single_ics_short`) and CPE pairs
+    /// fall back to `common_window = 0` — each channel carries its own
+    /// `ics_info`, M/S is off. Non-EightShort sequences (OnlyLong /
+    /// LongStart / LongStop) go through the existing long writers with
+    /// common-window M/S intact.
+    fn encode_raw_data_block_seq(
+        &self,
+        specs: &[Vec<f32>],
+        seqs: &[WindowSequence],
+    ) -> Result<Vec<u8>> {
         let mut bw = BitWriter::with_capacity(1024);
-        let seq = element_sequence(self.channel_configuration);
-        if seq.is_empty() {
+        let element_seq = element_sequence(self.channel_configuration);
+        if element_seq.is_empty() {
             return Err(Error::unsupported(format!(
                 "AAC encoder: channel_configuration={} unsupported",
                 self.channel_configuration
             )));
         }
         let mut ch_idx: usize = 0;
-        // Per-element-type instance tag counters. First SCE gets tag 0,
-        // second SCE gets tag 1, etc. Same for CPE and LFE.
         let mut sce_tag: u8 = 0;
         let mut cpe_tag: u8 = 0;
         let mut lfe_tag: u8 = 0;
-        for &el in seq {
+        for &el in element_seq {
             match el {
                 AacElement::Sce => {
                     bw.write_u32(ElementType::Sce as u32, 3);
                     bw.write_u32(sce_tag as u32, 4);
-                    write_single_ics(
-                        &mut bw,
-                        &specs[ch_idx],
-                        self.sf_index,
-                        WindowSequence::OnlyLong,
-                        false,
-                    )?;
+                    write_single_ics_any(&mut bw, &specs[ch_idx], self.sf_index, seqs[ch_idx])?;
                     ch_idx += 1;
                     sce_tag += 1;
                 }
                 AacElement::Cpe => {
                     bw.write_u32(ElementType::Cpe as u32, 3);
                     bw.write_u32(cpe_tag as u32, 4);
-                    write_cpe(
-                        &mut bw,
-                        &specs[ch_idx],
-                        &specs[ch_idx + 1],
-                        self.sf_index,
-                        WindowSequence::OnlyLong,
-                    )?;
+                    // Short-window CPE: drop common_window so each channel
+                    // carries its own ics_info; long-window CPE keeps the
+                    // existing common_window=1 + per-band M/S path.
+                    let l_seq = seqs[ch_idx];
+                    let r_seq = seqs[ch_idx + 1];
+                    debug_assert_eq!(l_seq, r_seq, "CPE channels must share seq");
+                    if l_seq == WindowSequence::EightShort {
+                        bw.write_bit(false); // common_window = 0
+                        write_single_ics_any(&mut bw, &specs[ch_idx], self.sf_index, l_seq)?;
+                        write_single_ics_any(
+                            &mut bw,
+                            &specs[ch_idx + 1],
+                            self.sf_index,
+                            r_seq,
+                        )?;
+                    } else {
+                        write_cpe(
+                            &mut bw,
+                            &specs[ch_idx],
+                            &specs[ch_idx + 1],
+                            self.sf_index,
+                            l_seq,
+                        )?;
+                    }
                     ch_idx += 2;
                     cpe_tag += 1;
                 }
                 AacElement::Lfe => {
                     bw.write_u32(ElementType::Lfe as u32, 3);
                     bw.write_u32(lfe_tag as u32, 4);
-                    // Syntactically identical to SCE; the decoder distinguishes
-                    // via the leading id_syn_ele = 3 we just wrote.
-                    write_single_ics(
-                        &mut bw,
-                        &specs[ch_idx],
-                        self.sf_index,
-                        WindowSequence::OnlyLong,
-                        false,
-                    )?;
+                    debug_assert!(
+                        !matches!(seqs[ch_idx], WindowSequence::EightShort),
+                        "LFE is long-only per §4.6.10",
+                    );
+                    write_single_ics_any(&mut bw, &specs[ch_idx], self.sf_index, seqs[ch_idx])?;
                     ch_idx += 1;
                     lfe_tag += 1;
                 }
@@ -365,6 +386,27 @@ impl AacEncoder {
         bw.write_u32(ElementType::End as u32, 3);
         bw.align_to_byte();
         Ok(bw.finish())
+    }
+}
+
+/// SCE / LFE writer that dispatches between long (`write_single_ics`) and
+/// short (`write_single_ics_short`) based on `seq`. For short sequences
+/// the spectrum is expected to be laid out as 8 × 128 coefficients in
+/// sub-window-major order (what [`mdct::mdct_short_eightshort`] produces).
+fn write_single_ics_any(
+    bw: &mut BitWriter,
+    spec: &[f32],
+    sf_index: u8,
+    seq: WindowSequence,
+) -> Result<()> {
+    if seq == WindowSequence::EightShort {
+        let spec_arr: &[f32; 1024] = spec
+            .try_into()
+            .map_err(|_| Error::invalid("AAC encoder: EightShort spec must be 1024 coeffs"))?;
+        let ics = analyse_and_quantise_short(spec_arr, sf_index)?;
+        write_single_ics_short(bw, &ics)
+    } else {
+        write_single_ics(bw, spec, sf_index, seq, false)
     }
 }
 
