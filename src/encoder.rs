@@ -53,7 +53,7 @@ use crate::huffman_tables::{
 use crate::ics::SPEC_LEN;
 use crate::mdct::mdct_long;
 use crate::sfband::{SWB_LONG, SWB_SHORT};
-use crate::syntax::{ElementType, AOT_AAC_LC, SAMPLE_RATES};
+use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC, SAMPLE_RATES};
 use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
 use crate::window::sine_long;
 
@@ -321,7 +321,13 @@ impl AacEncoder {
                 AacElement::Sce => {
                     bw.write_u32(ElementType::Sce as u32, 3);
                     bw.write_u32(sce_tag as u32, 4);
-                    write_single_ics(&mut bw, &specs[ch_idx], self.sf_index, false)?;
+                    write_single_ics(
+                        &mut bw,
+                        &specs[ch_idx],
+                        self.sf_index,
+                        WindowSequence::OnlyLong,
+                        false,
+                    )?;
                     ch_idx += 1;
                     sce_tag += 1;
                 }
@@ -333,6 +339,7 @@ impl AacEncoder {
                         &specs[ch_idx],
                         &specs[ch_idx + 1],
                         self.sf_index,
+                        WindowSequence::OnlyLong,
                     )?;
                     ch_idx += 2;
                     cpe_tag += 1;
@@ -342,7 +349,13 @@ impl AacEncoder {
                     bw.write_u32(lfe_tag as u32, 4);
                     // Syntactically identical to SCE; the decoder distinguishes
                     // via the leading id_syn_ele = 3 we just wrote.
-                    write_single_ics(&mut bw, &specs[ch_idx], self.sf_index, false)?;
+                    write_single_ics(
+                        &mut bw,
+                        &specs[ch_idx],
+                        self.sf_index,
+                        WindowSequence::OnlyLong,
+                        false,
+                    )?;
                     ch_idx += 1;
                     lfe_tag += 1;
                 }
@@ -463,17 +476,29 @@ fn build_adts_frame(sf_index: u8, channel_configuration: u8, payload_len: usize)
 
 // ==================== SCE / CPE writers ====================
 
-fn write_single_ics(bw: &mut BitWriter, spec: &[f32], sf_index: u8, _in_cpe: bool) -> Result<()> {
+fn write_single_ics(
+    bw: &mut BitWriter,
+    spec: &[f32],
+    sf_index: u8,
+    seq: WindowSequence,
+    _in_cpe: bool,
+) -> Result<()> {
     // global_gain (8 bits) — set later. For now write a placeholder.
     // Design: we need to pick scalefactors first so we know the gain, then
     // write the full ICS in one pass. We encode everything into a temp
     // structure and emit at the end.
     let ics = analyse_and_quantise(spec, sf_index)?;
-    write_ics(bw, &ics, false)?;
+    write_ics(bw, &ics, seq, false)?;
     Ok(())
 }
 
-fn write_cpe(bw: &mut BitWriter, spec_l: &[f32], spec_r: &[f32], sf_index: u8) -> Result<()> {
+fn write_cpe(
+    bw: &mut BitWriter,
+    spec_l: &[f32],
+    spec_r: &[f32],
+    sf_index: u8,
+    seq: WindowSequence,
+) -> Result<()> {
     // Decide M/S stereo per band. We build M/S spectra, then try both
     // representations and pick whichever needs fewer bits overall.
     let (ms_used, ics_l, ics_r) = analyse_cpe(spec_l, spec_r, sf_index)?;
@@ -481,7 +506,7 @@ fn write_cpe(bw: &mut BitWriter, spec_l: &[f32], spec_r: &[f32], sf_index: u8) -
     bw.write_bit(true); // common_window — share ics_info between the channels
                         // The shared ics_info uses ch0's max_sfb (which equals ch1's after the
                         // pad-to-max-sfb done in analyse_cpe).
-    write_ics_info(bw, &ics_l.info);
+    write_ics_info(bw, &ics_l.info, seq);
     let any_ms = ms_used.iter().any(|&b| b);
     if any_ms {
         bw.write_u32(1, 2); // ms_mask_present = 1 (explicit per-band mask)
@@ -1080,9 +1105,13 @@ fn write_escape_amp(bw: &mut BitWriter, a: u32) {
 
 // ==================== ICS bitstream writers ====================
 
-fn write_ics_info(bw: &mut BitWriter, info: &IcsInfoEnc) {
+/// Write ics_info for any long-style window sequence (OnlyLong, LongStart,
+/// LongStop). EightShort uses [`write_ics_info_short`] which has a
+/// different layout (4-bit max_sfb + 7-bit scale_factor_grouping).
+fn write_ics_info(bw: &mut BitWriter, info: &IcsInfoEnc, seq: WindowSequence) {
+    debug_assert!(!matches!(seq, WindowSequence::EightShort));
     bw.write_bit(false); // ics_reserved_bit
-    bw.write_u32(0, 2); // window_sequence = ONLY_LONG_SEQUENCE
+    bw.write_u32(seq as u32, 2); // window_sequence
     bw.write_u32(0, 1); // window_shape = sine
     bw.write_u32(info.max_sfb as u32, 6);
     bw.write_bit(false); // predictor_data_present
@@ -1091,9 +1120,9 @@ fn write_ics_info(bw: &mut BitWriter, info: &IcsInfoEnc) {
 /// Write the full SCE individual_channel_stream payload. The SCE caller
 /// has already emitted element_instance_tag (4 bits). Layout:
 ///   global_gain (8) | ics_info | body
-fn write_ics(bw: &mut BitWriter, ics: &Ics, _in_cpe: bool) -> Result<()> {
+fn write_ics(bw: &mut BitWriter, ics: &Ics, seq: WindowSequence, _in_cpe: bool) -> Result<()> {
     bw.write_u32(ics.global_gain as u32, 8);
-    write_ics_info(bw, &ics.info);
+    write_ics_info(bw, &ics.info, seq);
     write_ics_body_no_global_gain(bw, ics)
 }
 
