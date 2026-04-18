@@ -22,7 +22,7 @@ use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
-use crate::tns::{apply_tns_long, parse_tns_data, TnsData};
+use crate::tns::{apply_tns_long, apply_tns_short, parse_tns_data, TnsData};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     // Figure out the stream config. Two paths:
@@ -188,12 +188,12 @@ impl AacDecoder {
                     }
                     // TNS after PNS/IS but before IMDCT (§4.6.9.2).
                     if let Some(tns) = tns.as_ref() {
-                        if info.window_sequence != WindowSequence::EightShort {
+                        if info.window_sequence == WindowSequence::EightShort {
+                            apply_tns_short(&mut spec, tns, self.sf_index, info.max_sfb, &info);
+                        } else {
                             let swb = SWB_LONG[self.sf_index as usize];
                             apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
                         }
-                        // Short-window TNS is parsed but not applied — see
-                        // `tns::apply_tns_short` doc.
                     }
                     let mut channel_pcm = [0.0f32; FRAME_LEN];
                     imdct_and_overlap(
@@ -340,7 +340,15 @@ impl AacDecoder {
                         // TNS after PNS + M/S, before IMDCT.
                         for ch in 0..2 {
                             if let Some(tns) = tns_all[ch].as_ref() {
-                                if infos[ch].window_sequence != WindowSequence::EightShort {
+                                if infos[ch].window_sequence == WindowSequence::EightShort {
+                                    apply_tns_short(
+                                        &mut spec[ch],
+                                        tns,
+                                        self.sf_index,
+                                        infos[ch].max_sfb,
+                                        &infos[ch],
+                                    );
+                                } else {
                                     let swb = SWB_LONG[self.sf_index as usize];
                                     apply_tns_long(
                                         &mut spec[ch],
@@ -404,7 +412,15 @@ impl AacDecoder {
                         }
                         for ch in 0..2 {
                             if let Some(tns) = tns_all[ch].as_ref() {
-                                if infos[ch].window_sequence != WindowSequence::EightShort {
+                                if infos[ch].window_sequence == WindowSequence::EightShort {
+                                    apply_tns_short(
+                                        &mut spec[ch],
+                                        tns,
+                                        self.sf_index,
+                                        infos[ch].max_sfb,
+                                        &infos[ch],
+                                    );
+                                } else {
                                     let swb = SWB_LONG[self.sf_index as usize];
                                     apply_tns_long(
                                         &mut spec[ch],

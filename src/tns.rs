@@ -33,7 +33,8 @@
 use oxideav_core::{Error, Result};
 
 use crate::bitreader::BitReader;
-use crate::ics::SPEC_LEN;
+use crate::ics::{group_starts, IcsInfo, SPEC_LEN};
+use crate::sfband::SWB_SHORT;
 use crate::syntax::WindowSequence;
 
 /// Max TNS filter order for AAC-LC (§4.6.9, Table 4.136): 12 long / 7 short.
@@ -343,18 +344,71 @@ pub fn apply_tns_long(
     }
 }
 
-/// Same as `apply_tns_long` but iterates per sub-window in an eight-short ICS.
-/// `group_starts` gives window offsets per group; `group_lengths` is window
-/// count per group; the spectrum is laid out as interleaved per-sfb sub-windows
-/// per group — for TNS we need to address each sub-window as a contiguous
-/// 128-sample chunk, so eight-short blocks are handled pre-grouping. Since our
-/// decoder stores coefs in grouped layout (per-sfb interleave), we skip TNS for
-/// short blocks here: this is a documented limitation and extremely rare in
-/// AAC-LC content which mostly uses long windows for TNS.
-pub fn apply_tns_short(_spec: &mut [f32; SPEC_LEN], _tns: &TnsData, _sf_index: u8, _max_sfb: u8) {
-    // Left as a no-op deliberately. Real-world AAC-LC usage of TNS in short
-    // blocks is rare; wiring the grouped-layout address arithmetic is non-
-    // trivial and the bit parser already consumes the right number of bits.
+/// Apply TNS filtering to an eight-short-window spectrum.
+///
+/// Layout: `decode_spectrum_short` writes samples de-interleaved back to
+/// per-sub-window order so the output array has 8 contiguous 128-sample
+/// sub-windows at offsets `0, 128, 256, ..., 896`. TNS is specified
+/// per sub-window (not per group) with `num_windows == 8`, and each
+/// sub-window's filters run on its own 128-sample chunk using
+/// `SWB_SHORT` band offsets.
+///
+/// Filters are ordered top-down within a sub-window — same semantics as
+/// the long-block case but bounded by `TNS_MAX_BANDS_SHORT = 14`.
+pub fn apply_tns_short(
+    spec: &mut [f32; SPEC_LEN],
+    tns: &TnsData,
+    sf_index: u8,
+    max_sfb: u8,
+    info: &IcsInfo,
+) {
+    let swb = SWB_SHORT[sf_index as usize];
+    let bottom_cap = tns_max_bands(WindowSequence::EightShort, sf_index).min(max_sfb) as usize;
+    let starts = group_starts(info);
+    for g in 0..info.num_window_groups as usize {
+        let group_len = info.window_group_length[g] as usize;
+        let win_start_offset = starts[g] * 128;
+        for w in 0..group_len {
+            let subwin = starts[g] + w;
+            if (subwin as u8) >= tns.num_windows {
+                break;
+            }
+            let tns_win = &tns.windows[subwin];
+            if tns_win.n_filt == 0 {
+                continue;
+            }
+            let sub_base = win_start_offset + w * 128;
+            let mut top = bottom_cap;
+            for f in 0..tns_win.n_filt as usize {
+                let filt = &tns_win.filters[f];
+                if filt.order == 0 || filt.length == 0 {
+                    top = top.saturating_sub(filt.length as usize);
+                    continue;
+                }
+                let length = filt.length as usize;
+                let bottom = top.saturating_sub(length);
+                if bottom >= swb.len() || top >= swb.len() {
+                    break;
+                }
+                let start = sub_base + swb[bottom] as usize;
+                let end = sub_base + swb[top] as usize;
+                if end <= start {
+                    top = bottom;
+                    continue;
+                }
+                let order = filt.order as usize;
+                let mut parcor = [0.0f32; TNS_MAX_ORDER_LONG as usize];
+                for o in 0..order {
+                    parcor[o] =
+                        dequant_tns_coef(filt.coef_raw[o], tns_win.coef_res, filt.coef_compress);
+                }
+                let mut lpc = [0.0f32; TNS_MAX_ORDER_LONG as usize];
+                parcor_to_lpc(&parcor[..order], &mut lpc[..order]);
+                apply_tns_filter_range(spec, start, end - start, &lpc[..order], filt.direction);
+                top = bottom;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -438,5 +492,71 @@ mod tests {
         // swb_offsets for 44.1 kHz long.
         let swb: Vec<u16> = (0..=49).map(|i| (i * 20) as u16).collect();
         apply_tns_long(&mut spec, &tns, 4, 49, &swb);
+    }
+
+    #[test]
+    fn apply_tns_short_filters_only_target_subwindow() {
+        // Build an 8-short ICS with the default "8 groups of 1 window each"
+        // grouping. Put a constant signal in sub-windows 0 and 3; attach a
+        // TNS filter only to sub-window 0; verify sub-window 0 is IIR-
+        // filtered and sub-window 3 is untouched.
+        let mut info = IcsInfo::default();
+        info.sf_index = 4;
+        info.window_sequence = WindowSequence::EightShort;
+        info.max_sfb = 14;
+        info.num_window_groups = 8;
+        for g in 0..8 {
+            info.window_group_length[g] = 1;
+        }
+        let mut spec = [0.0f32; SPEC_LEN];
+        for k in 0..128 {
+            spec[k] = 1.0; // sub-window 0
+            spec[3 * 128 + k] = 1.0; // sub-window 3
+        }
+
+        // Build TNS data: one filter on sub-window 0, order=1, direction=1
+        // (low→high), coef_res=1, coef_compress=0, coef_raw[0] encodes ≈0.5
+        // after dequant. For 4-bit coef, dequant = sin(raw * π/17). We pick
+        // raw=3 → sin(3π/17) ≈ 0.508.
+        let mut tns = TnsData::default();
+        tns.num_windows = 8;
+        tns.windows[0].n_filt = 1;
+        tns.windows[0].coef_res = 1;
+        tns.windows[0].filters[0] = TnsFilter {
+            length: 14,
+            order: 1,
+            direction: 1,
+            coef_compress: 0,
+            coef_raw: {
+                let mut c = [0u8; TNS_MAX_ORDER_LONG as usize];
+                c[0] = 3;
+                c
+            },
+        };
+
+        apply_tns_short(&mut spec, &tns, info.sf_index, info.max_sfb, &info);
+
+        // Sub-window 3 must still be the constant input.
+        for k in 0..128 {
+            assert_eq!(
+                spec[3 * 128 + k], 1.0,
+                "sub-window 3 was modified at k={k}"
+            );
+        }
+        // Sub-window 0 must show the first-order IIR response: first sample
+        // stays 1.0, subsequent samples decay toward 1/(1+a).
+        // The filter runs over bands [0..14) which for 44.1 kHz short covers
+        // the first chunk of sub-window 0.
+        let swb = SWB_SHORT[info.sf_index as usize];
+        let filter_end = swb[14] as usize;
+        assert!((spec[0] - 1.0).abs() < 1e-6);
+        // Past the filter range, samples remain untouched.
+        if filter_end < 128 {
+            assert_eq!(spec[filter_end], 1.0);
+        }
+        // Within the filter range, sample 1 should have decayed.
+        if filter_end > 1 {
+            assert!(spec[1] < 1.0, "sub-window 0 sample 1 was not filtered");
+        }
     }
 }
