@@ -67,6 +67,7 @@ pub mod syntax;
 pub mod synth;
 pub mod tns;
 pub mod tns_analyse;
+pub mod transient;
 pub mod window;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
