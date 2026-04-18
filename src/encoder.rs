@@ -53,9 +53,10 @@ use crate::huffman_tables::{
 use crate::ics::SPEC_LEN;
 use crate::mdct::mdct_long;
 use crate::sfband::{SWB_LONG, SWB_SHORT};
-use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC, SAMPLE_RATES};
+use crate::syntax::{ElementType, WindowSequence, WindowShape, AOT_AAC_LC, SAMPLE_RATES};
 use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
-use crate::window::sine_long;
+use crate::transient::TransientDetector;
+use crate::window::{build_long_window_full, sine_long};
 
 /// MDCT length (long block).
 const FRAME_LEN: usize = 1024;
@@ -118,6 +119,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     out_params.sample_format = Some(SampleFormat::S16);
     out_params.bit_rate = Some(bitrate);
 
+    let n_ch = channels as usize;
     Ok(Box::new(AacEncoder {
         codec_id: CodecId::new(crate::CODEC_ID_STR),
         out_params,
@@ -127,15 +129,39 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         sample_rate,
         sf_index,
         bitrate,
-        input_buf: vec![Vec::with_capacity(BLOCK_LEN * 2); channels as usize],
-        overlap: vec![vec![0.0f32; FRAME_LEN]; channels as usize],
+        input_buf: vec![Vec::with_capacity(BLOCK_LEN * 2); n_ch],
+        overlap: vec![vec![0.0f32; FRAME_LEN]; n_ch],
         output_queue: VecDeque::new(),
         pts: 0,
         flushed: false,
+        enable_short_blocks: false,
+        short_state: (0..n_ch).map(|_| ChannelShortState::default()).collect(),
     }))
 }
 
-struct AacEncoder {
+/// Per-channel state for the short-block encoder state machine. One
+/// instance per input channel, carried across frames.
+#[derive(Clone, Debug, Default)]
+struct ChannelShortState {
+    /// Per-channel transient detector. Consumes the raw (unwindowed) new
+    /// samples of each frame.
+    transient: TransientDetector,
+    /// 1-frame lookahead buffer: the spectrum and WindowSequence decided
+    /// in the previous `emit_block` call, awaiting emission on the next
+    /// call. `None` before the first frame has been processed or after a
+    /// [`drain_held`]-style flush.
+    held: Option<HeldBlock>,
+}
+
+#[derive(Clone, Debug)]
+struct HeldBlock {
+    /// 1024 forward-MDCT coefficients (either long-block or 8 × 128
+    /// short-block layout, depending on `seq`).
+    spec: Vec<f32>,
+    seq: WindowSequence,
+}
+
+pub struct AacEncoder {
     codec_id: CodecId,
     out_params: CodecParameters,
     time_base: TimeBase,
@@ -154,9 +180,39 @@ struct AacEncoder {
     output_queue: VecDeque<Packet>,
     pts: i64,
     flushed: bool,
+    /// When true, `emit_block` runs the 1-frame-lookahead state machine
+    /// and may emit OnlyLong / LongStart / EightShort / LongStop frames
+    /// driven by transient detection. When false (default) every frame is
+    /// emitted as OnlyLong via the long-only path.
+    enable_short_blocks: bool,
+    /// Per-channel short-block state; only populated when
+    /// `enable_short_blocks` is true.
+    short_state: Vec<ChannelShortState>,
 }
 
 impl AacEncoder {
+    /// Enable (or disable) the short-block encoder state machine. Off by
+    /// default — every frame is emitted as `OnlyLong`. When on, the
+    /// encoder runs a per-channel [`TransientDetector`] against each new
+    /// frame and may transition through
+    /// `OnlyLong → LongStart → EightShort → LongStop → OnlyLong` in
+    /// response to attacks, localising them with 128-sample sub-windows
+    /// and suppressing long-window pre-echo.
+    ///
+    /// Enabling adds one frame of encoder latency (the lookahead buffer).
+    /// If turned on mid-stream after frames have already been emitted,
+    /// the per-channel held spectrum is cleared so the state machine
+    /// starts fresh.
+    pub fn set_enable_short_blocks(&mut self, on: bool) {
+        self.enable_short_blocks = on;
+        if !on {
+            // Drop any held state so the long-only path resumes cleanly.
+            for s in self.short_state.iter_mut() {
+                s.held = None;
+            }
+        }
+    }
+
     fn push_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
         if frame.channels != self.channels {
             return Err(Error::invalid(format!(
