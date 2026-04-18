@@ -85,6 +85,48 @@ pub fn mdct_short(time: &[f32], spec: &mut [f32]) {
     mdct_direct(time, spec, short_cos(), SHORT_INPUT);
 }
 
+/// Compute the 1024-coefficient spectrum for an EightShort block.
+///
+/// `block` is a 2*LONG_LEN (= 2048) sample time-domain region = previous
+/// frame's overlap (length LONG_LEN, unwindowed) concatenated with the
+/// current frame's 1024 new samples (unwindowed).
+///
+/// The 8 overlapping short sub-windows sit at offsets
+/// `{448 + w*128}` for `w = 0..8`, each consuming 256 samples. Each
+/// sub-window is multiplied by a 256-sample window whose first half is
+/// `prev_short` for w==0 (to TDAC against the preceding long block)
+/// and `cur_short` for w >= 1, and whose second half is always
+/// `cur_short` (mirrored to form the falling slope). The 128-coefficient
+/// MDCT outputs are concatenated in natural (non-grouped) per-sub-window
+/// order — `spec[w*128 .. (w+1)*128]`.
+pub fn mdct_short_eightshort(
+    block: &[f32],
+    cur_shape: crate::syntax::WindowShape,
+    prev_shape: crate::syntax::WindowShape,
+    spec: &mut [f32; 1024],
+) {
+    assert!(block.len() >= 2 * crate::window::LONG_LEN);
+    let cur_short = crate::window::short_window_for_shape(cur_shape);
+    let prev_short = crate::window::short_window_for_shape(prev_shape);
+    const SUB_LEN: usize = crate::window::SHORT_LEN; // 128
+    const SUB_INPUT: usize = 2 * SUB_LEN;            // 256
+    let mut sub_time = [0.0f32; SUB_INPUT];
+    for w in 0..8 {
+        let base = 448 + w * SUB_LEN;
+        let rising = if w == 0 { prev_short } else { cur_short };
+        for i in 0..SUB_LEN {
+            sub_time[i] = block[base + i] * rising[i];
+        }
+        for i in 0..SUB_LEN {
+            sub_time[SUB_LEN + i] = block[base + SUB_LEN + i] * cur_short[SUB_LEN - 1 - i];
+        }
+        let mut sub_spec = [0.0f32; SUB_LEN];
+        mdct_short(&sub_time, &mut sub_spec);
+        let dst_base = w * SUB_LEN;
+        spec[dst_base..dst_base + SUB_LEN].copy_from_slice(&sub_spec);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +206,82 @@ mod tests {
             }
         }
         assert!(max_err < 1e-3, "round-trip max err {max_err}");
+    }
+
+    /// Encoder-side EightShort MDCT followed by the decoder-side synth
+    /// path must reconstruct the overlap region of a known input signal.
+    /// This verifies mdct_short_eightshort is TDAC-correct against the
+    /// existing short-window synthesis in synth.rs.
+    #[test]
+    fn eightshort_round_trip_overlap_region() {
+        use crate::imdct::imdct_short;
+        use crate::syntax::WindowShape;
+        use crate::window::{short_window_for_shape, SHORT_LEN};
+
+        let n = LONG_LEN;
+        // Input signal: known sine spanning 3 frames.
+        let total = 3 * n;
+        let mut x = vec![0.0f32; total];
+        for i in 0..total {
+            x[i] = (2.0 * PI * 7.0 * i as f64 / n as f64).sin() as f32;
+        }
+
+        // Build a 2N-sample block = samples [0, 2N). Run the encoder-side
+        // EightShort MDCT on it.
+        let mut block = vec![0.0f32; 2 * n];
+        block[..2 * n].copy_from_slice(&x[..2 * n]);
+        let mut spec = [0.0f32; 1024];
+        mdct_short_eightshort(&block, WindowShape::Sine, WindowShape::Sine, &mut spec);
+
+        // Now run 8 × 128-sample IMDCTs, apply the short windows, and
+        // overlap-add per the EightShort layout documented in synth.rs.
+        // The overlap-add reconstructs samples in [448, 1600) of the
+        // 2N-sample block, corresponding to input samples [448, 1600).
+        let mut shorts = [[0.0f32; 2 * SHORT_LEN]; 8];
+        for w in 0..8 {
+            let chunk = &spec[w * SHORT_LEN..(w + 1) * SHORT_LEN];
+            imdct_short(chunk, &mut shorts[w]);
+        }
+        let cur_short = short_window_for_shape(WindowShape::Sine);
+        let prev_short = short_window_for_shape(WindowShape::Sine);
+        for n_ in 0..SHORT_LEN {
+            shorts[0][n_] *= prev_short[n_];
+            shorts[0][SHORT_LEN + n_] *= cur_short[SHORT_LEN - 1 - n_];
+        }
+        for w in 1..8 {
+            for n_ in 0..SHORT_LEN {
+                shorts[w][n_] *= cur_short[n_];
+                shorts[w][SHORT_LEN + n_] *= cur_short[SHORT_LEN - 1 - n_];
+            }
+        }
+        // Reconstruct samples [576, 1472) by overlapping adjacent sub-windows.
+        let mut recon = vec![0.0f32; 2 * n];
+        for i in 0..SHORT_LEN {
+            recon[448 + i] += shorts[0][i];
+            recon[576 + i] += shorts[0][SHORT_LEN + i] + shorts[1][i];
+            recon[704 + i] += shorts[1][SHORT_LEN + i] + shorts[2][i];
+            recon[832 + i] += shorts[2][SHORT_LEN + i] + shorts[3][i];
+            recon[960 + i] += shorts[3][SHORT_LEN + i] + shorts[4][i];
+            recon[1088 + i] += shorts[4][SHORT_LEN + i] + shorts[5][i];
+            recon[1216 + i] += shorts[5][SHORT_LEN + i] + shorts[6][i];
+            recon[1344 + i] += shorts[6][SHORT_LEN + i] + shorts[7][i];
+            recon[1472 + i] += shorts[7][SHORT_LEN + i];
+        }
+        // The stable overlap region where two sub-windows sum (TDAC valid)
+        // is [576, 1472). Check reconstruction there. MDCT/IMDCT round-trip
+        // under the sine-window OLA scheme gives back the input directly
+        // (no scaling) because windowed analysis + windowed synthesis +
+        // sin²+cos² overlap cancels the factor-of-2 IMDCT amplification.
+        let mut max_err = 0.0f32;
+        for i in 576..1472 {
+            let got = recon[i];
+            let want = x[i];
+            let err = (got - want).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(max_err < 5e-3, "eight-short OLA max err {max_err}");
     }
 
     #[test]
