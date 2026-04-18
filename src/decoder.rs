@@ -477,7 +477,11 @@ impl AacDecoder {
                     }
                 }
                 ElementType::Pce => {
-                    return Err(Error::unsupported("AAC: PCE element not implemented"));
+                    // Parse the PCE so we stay aligned on the bitstream even
+                    // if we don't yet route the described channel layout to
+                    // the output. Multi-channel support is a separate wiring
+                    // step tracked alongside LFE element handling.
+                    let _pce = crate::pce::parse_program_config_element(&mut br)?;
                 }
                 ElementType::Fil => {
                     let mut count = br.read_u32(4)?;

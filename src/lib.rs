@@ -45,6 +45,7 @@ pub mod huffman_tables;
 pub mod ics;
 pub mod imdct;
 pub mod mdct;
+pub mod pce;
 pub mod pns;
 pub mod pulse;
 pub mod sfband;
