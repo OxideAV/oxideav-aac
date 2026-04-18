@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "oxideav-aac"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "oxideav-codec",
  "oxideav-core",
