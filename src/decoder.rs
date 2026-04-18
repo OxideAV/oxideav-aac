@@ -319,6 +319,19 @@ impl AacDecoder {
                                 &mut self.pns_rng,
                             );
                         }
+                        // Intensity stereo (§4.6.8.2.3): for each band whose
+                        // channel-1 codebook is INTENSITY_HCB / INTENSITY_HCB2,
+                        // synthesise spec[1] from spec[0] scaled by
+                        // sign * 2^(-is_position/4). apply_ms_stereo below
+                        // already skips IS bands, so IS must run first.
+                        apply_intensity_stereo(
+                            &infos[0],
+                            &secs,
+                            &sfs,
+                            &ms_used,
+                            ms_mask_present,
+                            &mut spec,
+                        );
                         // M/S stereo: replace L,R with (L+R)/sqrt(2), (L-R)/sqrt(2)?
                         // Per spec §4.6.13.3:
                         //   L = M + S; R = M - S  (no sqrt scaling — IS-only normalisation
@@ -578,6 +591,80 @@ fn apply_pns_long_ch1_leftover(
     }
 }
 
+/// Apply Intensity Stereo (IS) decoding in-place. Spec §4.6.8.2.3.
+///
+/// For each scalefactor band where channel 1's codebook is `INTENSITY_HCB`
+/// (15) or `INTENSITY_HCB2` (14), synthesise channel-1 coefficients from
+/// channel-0 coefficients:
+/// ```text
+/// spec[1][k] = sign · 2^(-is_position/4) · spec[0][k]
+/// ```
+/// where:
+/// * `sign = +1` for codebook 15, `-1` for codebook 14.
+/// * `is_position` is the accumulated scalefactor value stored in
+///   `sfs[1][g·max_sfb + sfb]` (the IS-specific accumulator tracked by
+///   [`parse_scalefactors`]).
+/// * `ms_used[g·max_sfb + sfb]` on an IS band is repurposed as the sign
+///   toggle (per §4.6.8.2.3); when it's set, the sign flips.
+///
+/// Must run BEFORE [`apply_ms_stereo`] — the M/S pass explicitly skips IS
+/// bands and depends on them already carrying the IS-synthesised channel-1
+/// values.
+fn apply_intensity_stereo(
+    info: &IcsInfo,
+    secs: &[SectionData; 2],
+    sfs: &[Vec<i32>; 2],
+    ms_used: &[bool],
+    ms_mask_present: u8,
+    spec: &mut [[f32; SPEC_LEN]; 2],
+) {
+    let max_sfb = info.max_sfb as usize;
+    let groups = info.num_window_groups as usize;
+    let starts = crate::ics::group_starts(info);
+    let is_short = info.window_sequence.is_eight_short();
+    let swb = if is_short {
+        SWB_SHORT[info.sf_index as usize]
+    } else {
+        SWB_LONG[info.sf_index as usize]
+    };
+
+    for g in 0..groups {
+        let group_len = info.window_group_length[g] as usize;
+        for sfb in 0..max_sfb {
+            let cb = secs[1].sfb_cb[g * max_sfb + sfb];
+            if cb != INTENSITY_HCB && cb != INTENSITY_HCB2 {
+                continue;
+            }
+            // cb 15 → sign +1, cb 14 → sign -1.
+            let mut sign: f32 = if cb == INTENSITY_HCB { 1.0 } else { -1.0 };
+            // ms_mask_present != 0 makes ms_used[] meaningful. On IS bands
+            // it's the sign-toggle bit rather than an MS flag (the MS pass
+            // already skips IS bands).
+            if ms_mask_present != 0 && ms_used[g * max_sfb + sfb] {
+                sign = -sign;
+            }
+            let is_position = sfs[1][g * max_sfb + sfb];
+            let scale = (2.0f32).powf(-(is_position as f32) * 0.25);
+            let coef = sign * scale;
+            let band_start = swb[sfb] as usize;
+            let band_end = swb[sfb + 1] as usize;
+            if is_short {
+                let win_start_offset = starts[g] * 128;
+                for w in 0..group_len {
+                    for j in band_start..band_end {
+                        let idx = win_start_offset + w * 128 + j;
+                        spec[1][idx] = coef * spec[0][idx];
+                    }
+                }
+            } else {
+                for j in band_start..band_end {
+                    spec[1][j] = coef * spec[0][j];
+                }
+            }
+        }
+    }
+}
+
 /// Apply M/S stereo decoding in-place. Spec §4.6.13.
 fn apply_ms_stereo(
     info: &IcsInfo,
@@ -627,6 +714,135 @@ fn apply_ms_stereo(
                     spec[1][j] = m - s;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal long-window IcsInfo for unit-testing the stereo passes.
+    fn long_info(sf_index: u8, max_sfb: u8) -> IcsInfo {
+        let mut info = IcsInfo::default();
+        info.sf_index = sf_index;
+        info.window_sequence = WindowSequence::OnlyLong;
+        info.max_sfb = max_sfb;
+        info.num_window_groups = 1;
+        info.window_group_length[0] = 1;
+        info
+    }
+
+    fn section_with_cb(max_sfb: usize, overrides: &[(usize, u8)]) -> SectionData {
+        let mut sfb_cb = vec![1u8; max_sfb]; // default to codebook 1 (scaled)
+        for (sfb, cb) in overrides.iter() {
+            sfb_cb[*sfb] = *cb;
+        }
+        SectionData { sfb_cb }
+    }
+
+    #[test]
+    fn intensity_stereo_cb15_positive_sign() {
+        // IS band at sfb=2 with cb=15 (positive sign) and is_position=8 →
+        // scale = 2^(-8/4) = 0.25, sign = +1.
+        let max_sfb = 5u8;
+        let info = long_info(4, max_sfb); // sf_index=4 → 44.1 kHz
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        let band_start = swb[2] as usize;
+        let band_end = swb[3] as usize;
+        for k in band_start..band_end {
+            spec[0][k] = (k as f32) * 0.1;
+        }
+        let secs = [
+            section_with_cb(max_sfb as usize, &[]),
+            section_with_cb(max_sfb as usize, &[(2, INTENSITY_HCB)]),
+        ];
+        let mut sfs: [Vec<i32>; 2] = [vec![0; max_sfb as usize], vec![0; max_sfb as usize]];
+        sfs[1][2] = 8; // is_position
+        let ms_used = vec![false; max_sfb as usize];
+        apply_intensity_stereo(&info, &secs, &sfs, &ms_used, 0, &mut spec);
+        for k in band_start..band_end {
+            let expected = 0.25 * spec[0][k];
+            assert!(
+                (spec[1][k] - expected).abs() < 1e-6,
+                "k={k}: got {} want {}",
+                spec[1][k],
+                expected
+            );
+        }
+        // Neighbouring bands must remain zero in channel 1.
+        let pre = swb[1] as usize;
+        assert_eq!(spec[1][pre], 0.0);
+    }
+
+    #[test]
+    fn intensity_stereo_cb14_negative_sign() {
+        let max_sfb = 3u8;
+        let info = long_info(4, max_sfb);
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        for k in swb[0] as usize..swb[1] as usize {
+            spec[0][k] = 2.0;
+        }
+        let secs = [
+            section_with_cb(max_sfb as usize, &[]),
+            section_with_cb(max_sfb as usize, &[(0, INTENSITY_HCB2)]),
+        ];
+        let mut sfs: [Vec<i32>; 2] = [vec![0; max_sfb as usize], vec![0; max_sfb as usize]];
+        sfs[1][0] = 0; // is_position=0 → scale = 1.0
+        let ms_used = vec![false; max_sfb as usize];
+        apply_intensity_stereo(&info, &secs, &sfs, &ms_used, 0, &mut spec);
+        for k in swb[0] as usize..swb[1] as usize {
+            assert!((spec[1][k] - (-2.0)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn intensity_stereo_ms_mask_flips_sign() {
+        // cb 15 (sign=+1) with ms_mask_present=1 and ms_used=true on that band
+        // should flip the sign to -1.
+        let max_sfb = 2u8;
+        let info = long_info(4, max_sfb);
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        for k in swb[0] as usize..swb[1] as usize {
+            spec[0][k] = 1.0;
+        }
+        let secs = [
+            section_with_cb(max_sfb as usize, &[]),
+            section_with_cb(max_sfb as usize, &[(0, INTENSITY_HCB)]),
+        ];
+        let mut sfs: [Vec<i32>; 2] = [vec![0; max_sfb as usize], vec![0; max_sfb as usize]];
+        sfs[1][0] = 4; // scale = 2^(-1) = 0.5
+        let mut ms_used = vec![false; max_sfb as usize];
+        ms_used[0] = true;
+        apply_intensity_stereo(&info, &secs, &sfs, &ms_used, 1, &mut spec);
+        for k in swb[0] as usize..swb[1] as usize {
+            assert!((spec[1][k] - (-0.5)).abs() < 1e-6, "got {}", spec[1][k]);
+        }
+    }
+
+    #[test]
+    fn intensity_stereo_non_is_bands_untouched() {
+        // A band coded with a regular codebook (cb=1) must not be modified.
+        let max_sfb = 2u8;
+        let info = long_info(4, max_sfb);
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        for k in swb[0] as usize..swb[1] as usize {
+            spec[0][k] = 5.0;
+            spec[1][k] = 3.0; // pre-existing ch-1 content from normal decode
+        }
+        let secs = [
+            section_with_cb(max_sfb as usize, &[]),
+            section_with_cb(max_sfb as usize, &[]),
+        ];
+        let sfs: [Vec<i32>; 2] = [vec![0; max_sfb as usize], vec![0; max_sfb as usize]];
+        let ms_used = vec![false; max_sfb as usize];
+        apply_intensity_stereo(&info, &secs, &sfs, &ms_used, 0, &mut spec);
+        for k in swb[0] as usize..swb[1] as usize {
+            assert_eq!(spec[1][k], 3.0);
         }
     }
 }
