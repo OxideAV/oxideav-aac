@@ -159,6 +159,23 @@ fn ffmpeg_decode(bytes: &[u8], out_wav: &Path) -> Option<Vec<i16>> {
     )
 }
 
+/// Synthesise N-channel interleaved S16 PCM where each channel carries a
+/// distinct sine tone; used by the multi-channel round-trip tests.
+fn pcm_multichannel_sines(freqs: &[f32], sr: u32, secs: f32, amp: f32) -> Vec<u8> {
+    let channels = freqs.len();
+    let total = (sr as f32 * secs) as usize;
+    let mut out = Vec::with_capacity(total * channels * 2);
+    for i in 0..total {
+        let t = i as f32 / sr as f32;
+        for &f in freqs {
+            let v = (2.0 * std::f32::consts::PI * f * t).sin() * amp;
+            let s = (v * 32767.0) as i16;
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+    out
+}
+
 fn check_goertzel(samples: &[i16], sr: u32, channels: u16, target: f32, ch_idx: usize) -> f32 {
     let warm = 4 * 1024 * channels as usize;
     let analysis: Vec<f32> = samples[warm..]
@@ -296,4 +313,46 @@ fn encode_stereo_roundtrip_ffmpeg() {
     let r1 = check_goertzel(&decoded, sr, 2, 880.0, 1);
     assert!(r0 >= 50.0, "ffmpeg stereo L Goertzel ratio {r0} < 50");
     assert!(r1 >= 50.0, "ffmpeg stereo R Goertzel ratio {r1} < 50");
+}
+
+#[test]
+fn encode_51_roundtrip_self_decoder() {
+    // 5.1 (channel_configuration = 6): SCE + CPE + CPE + LFE. Each
+    // input channel carries a distinct sine; after encode + decode each
+    // channel must recover its own tone above the Goertzel floor.
+    // Frequencies chosen to avoid the hardcoded off-freq probe list in
+    // `check_goertzel` (220 / 660 / 1000 / 100 / 50).
+    let sr = 44_100u32;
+    let freqs = [440.0, 550.0, 880.0, 1320.0, 1760.0, 330.0];
+    let pcm = pcm_multichannel_sines(&freqs, sr, 1.0, 0.5);
+    let aac = encode(pcm, sr, 6, 256_000);
+    eprintln!("5.1 encoded size: {} bytes", aac.len());
+    let decoded = decode_self(&aac);
+    assert!(!decoded.is_empty(), "no samples decoded");
+    for (ch, &f) in freqs.iter().enumerate() {
+        let ratio = check_goertzel(&decoded, sr, 6, f, ch);
+        assert!(
+            ratio >= 20.0,
+            "ch {ch} tone {f} Hz Goertzel ratio {ratio} < 20 (5.1 round-trip)",
+        );
+    }
+}
+
+#[test]
+fn encode_71_roundtrip_self_decoder() {
+    // 7.1 (channel_configuration = 7, 8 input channels): SCE + 3×CPE + LFE.
+    let sr = 44_100u32;
+    let freqs = [440.0, 550.0, 880.0, 770.0, 990.0, 1320.0, 1760.0, 330.0];
+    let pcm = pcm_multichannel_sines(&freqs, sr, 1.0, 0.5);
+    let aac = encode(pcm, sr, 8, 320_000);
+    eprintln!("7.1 encoded size: {} bytes", aac.len());
+    let decoded = decode_self(&aac);
+    assert!(!decoded.is_empty(), "no samples decoded");
+    for (ch, &f) in freqs.iter().enumerate() {
+        let ratio = check_goertzel(&decoded, sr, 8, f, ch);
+        assert!(
+            ratio >= 20.0,
+            "ch {ch} tone {f} Hz Goertzel ratio {ratio} < 20 (7.1 round-trip)",
+        );
+    }
 }

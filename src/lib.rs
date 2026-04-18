@@ -84,7 +84,10 @@ pub fn register(reg: &mut CodecRegistry) {
     let enc_caps = CodecCapabilities::audio("aac_sw")
         .with_lossy(true)
         .with_intra_only(true)
-        .with_max_channels(2)
+        // Encoder now orchestrates SCE / CPE / LFE elements for channel
+        // configurations 1..=7 (1, 2, 3, 4, 5, 6, 8 channels). 7-channel
+        // layouts have no standard configuration and are rejected.
+        .with_max_channels(8)
         .with_max_sample_rate(48_000);
     reg.register_encoder_impl(cid, enc_caps, make_encoder);
 }

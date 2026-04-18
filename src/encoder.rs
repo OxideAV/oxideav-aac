@@ -80,11 +80,23 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("AAC encoder: channels required"))?;
-    if !(1..=2).contains(&channels) {
-        return Err(Error::unsupported(format!(
-            "AAC encoder: {channels}-channel encode not supported (mono/stereo only)"
-        )));
-    }
+    // Map input channel count → AAC channel_configuration (§1.6.3).
+    // Supported: 1, 2, 3, 4, 5, 6, 8 (configs 1..=7). 7 channels has no
+    // standard config so it's rejected.
+    let channel_configuration: u8 = match channels {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 5,
+        6 => 6,
+        8 => 7,
+        _ => {
+            return Err(Error::unsupported(format!(
+                "AAC encoder: {channels}-channel layout has no standard channel_configuration",
+            )));
+        }
+    };
     let sample_rate = params
         .sample_rate
         .ok_or_else(|| Error::invalid("AAC encoder: sample_rate required"))?;
@@ -111,6 +123,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         out_params,
         time_base: TimeBase::new(1, sample_rate as i64),
         channels,
+        channel_configuration,
         sample_rate,
         sf_index,
         bitrate,
@@ -127,6 +140,10 @@ struct AacEncoder {
     out_params: CodecParameters,
     time_base: TimeBase,
     channels: u16,
+    /// AAC `channel_configuration` (§1.6.3) matching `channels`. Written to
+    /// every ADTS header and used to look up the SCE/CPE/LFE element
+    /// sequence.
+    channel_configuration: u8,
     sample_rate: u32,
     sf_index: u8,
     bitrate: u64,
@@ -274,7 +291,8 @@ impl AacEncoder {
 
         // Wrap in ADTS.
         let samples_per_frame = FRAME_LEN as u32;
-        let mut adts_frame = build_adts_frame(self.sf_index, self.channels as u8, payload.len());
+        let mut adts_frame =
+            build_adts_frame(self.sf_index, self.channel_configuration, payload.len());
         adts_frame.extend_from_slice(&payload);
 
         let pkt = Packet::new(0, self.time_base, adts_frame).with_pts(self.pts);
@@ -285,20 +303,90 @@ impl AacEncoder {
 
     fn encode_raw_data_block(&self, specs: &[Vec<f32>]) -> Result<Vec<u8>> {
         let mut bw = BitWriter::with_capacity(1024);
-        if self.channels == 1 {
-            bw.write_u32(ElementType::Sce as u32, 3);
-            bw.write_u32(0, 4); // element_instance_tag
-            write_single_ics(&mut bw, &specs[0], self.sf_index, false)?;
-        } else {
-            // Channel Pair Element.
-            bw.write_u32(ElementType::Cpe as u32, 3);
-            bw.write_u32(0, 4); // element_instance_tag
-            write_cpe(&mut bw, &specs[0], &specs[1], self.sf_index)?;
+        let seq = element_sequence(self.channel_configuration);
+        if seq.is_empty() {
+            return Err(Error::unsupported(format!(
+                "AAC encoder: channel_configuration={} unsupported",
+                self.channel_configuration
+            )));
+        }
+        let mut ch_idx: usize = 0;
+        // Per-element-type instance tag counters. First SCE gets tag 0,
+        // second SCE gets tag 1, etc. Same for CPE and LFE.
+        let mut sce_tag: u8 = 0;
+        let mut cpe_tag: u8 = 0;
+        let mut lfe_tag: u8 = 0;
+        for &el in seq {
+            match el {
+                AacElement::Sce => {
+                    bw.write_u32(ElementType::Sce as u32, 3);
+                    bw.write_u32(sce_tag as u32, 4);
+                    write_single_ics(&mut bw, &specs[ch_idx], self.sf_index, false)?;
+                    ch_idx += 1;
+                    sce_tag += 1;
+                }
+                AacElement::Cpe => {
+                    bw.write_u32(ElementType::Cpe as u32, 3);
+                    bw.write_u32(cpe_tag as u32, 4);
+                    write_cpe(
+                        &mut bw,
+                        &specs[ch_idx],
+                        &specs[ch_idx + 1],
+                        self.sf_index,
+                    )?;
+                    ch_idx += 2;
+                    cpe_tag += 1;
+                }
+                AacElement::Lfe => {
+                    bw.write_u32(ElementType::Lfe as u32, 3);
+                    bw.write_u32(lfe_tag as u32, 4);
+                    // Syntactically identical to SCE; the decoder distinguishes
+                    // via the leading id_syn_ele = 3 we just wrote.
+                    write_single_ics(&mut bw, &specs[ch_idx], self.sf_index, false)?;
+                    ch_idx += 1;
+                    lfe_tag += 1;
+                }
+            }
         }
         // ID_END
         bw.write_u32(ElementType::End as u32, 3);
         bw.align_to_byte();
         Ok(bw.finish())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AacElement {
+    Sce,
+    Cpe,
+    Lfe,
+}
+
+/// Element sequence for each AAC `channel_configuration` (§1.6.3). Listed
+/// in the exact order they must appear in the raw_data_block — the
+/// encoder's channel vector is sliced by these positions: SCE / LFE
+/// take one channel, CPE takes two.
+fn element_sequence(channel_configuration: u8) -> &'static [AacElement] {
+    match channel_configuration {
+        1 => &[AacElement::Sce],
+        2 => &[AacElement::Cpe],
+        3 => &[AacElement::Sce, AacElement::Cpe],
+        4 => &[AacElement::Sce, AacElement::Cpe, AacElement::Sce],
+        5 => &[AacElement::Sce, AacElement::Cpe, AacElement::Cpe],
+        6 => &[
+            AacElement::Sce,
+            AacElement::Cpe,
+            AacElement::Cpe,
+            AacElement::Lfe,
+        ],
+        7 => &[
+            AacElement::Sce,
+            AacElement::Cpe,
+            AacElement::Cpe,
+            AacElement::Cpe,
+            AacElement::Lfe,
+        ],
+        _ => &[],
     }
 }
 
