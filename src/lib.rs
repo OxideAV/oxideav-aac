@@ -32,8 +32,12 @@
 //!   * [`transient::TransientDetector`] — per-channel attack classifier
 //!   * [`window::build_long_window_full`] — LongStart / LongStop shapes
 //!   * [`mdct::mdct_short_eightshort`] — 8 × 256 short MDCTs
-//!   The state-machine integration that consumes these into an
-//!   EightShort raw_data_block is still pending — the encoder still
+//!   * Internal `analyse_and_quantise_short` + `write_single_ics_short`
+//!     (see `encoder.rs`): full IcsShort → ADTS round-trip validated
+//!     against the decoder.
+//!   What's still missing is the `emit_block` state machine (1-frame
+//!   lookahead + LongStart → EightShort → LongStop transitions driven
+//!   by the transient detector) — the default encoder path still
 //!   always emits OnlyLong windows.
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
