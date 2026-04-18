@@ -78,65 +78,7 @@ const MDCT_FORWARD_SCALE: f32 = 32768.0;
 const ESC_LAV: i32 = 16;
 
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    let channels = params
-        .channels
-        .ok_or_else(|| Error::invalid("AAC encoder: channels required"))?;
-    // Map input channel count → AAC channel_configuration (§1.6.3).
-    // Supported: 1, 2, 3, 4, 5, 6, 8 (configs 1..=7). 7 channels has no
-    // standard config so it's rejected.
-    let channel_configuration: u8 = match channels {
-        1 => 1,
-        2 => 2,
-        3 => 3,
-        4 => 4,
-        5 => 5,
-        6 => 6,
-        8 => 7,
-        _ => {
-            return Err(Error::unsupported(format!(
-                "AAC encoder: {channels}-channel layout has no standard channel_configuration",
-            )));
-        }
-    };
-    let sample_rate = params
-        .sample_rate
-        .ok_or_else(|| Error::invalid("AAC encoder: sample_rate required"))?;
-    let sf_index = SAMPLE_RATES
-        .iter()
-        .position(|&r| r == sample_rate)
-        .ok_or_else(|| {
-            Error::unsupported(format!(
-                "AAC encoder: sample rate {sample_rate} not supported"
-            ))
-        })? as u8;
-
-    let bitrate = params.bit_rate.unwrap_or(128_000).max(16_000);
-
-    let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
-    out_params.media_type = MediaType::Audio;
-    out_params.channels = Some(channels);
-    out_params.sample_rate = Some(sample_rate);
-    out_params.sample_format = Some(SampleFormat::S16);
-    out_params.bit_rate = Some(bitrate);
-
-    let n_ch = channels as usize;
-    Ok(Box::new(AacEncoder {
-        codec_id: CodecId::new(crate::CODEC_ID_STR),
-        out_params,
-        time_base: TimeBase::new(1, sample_rate as i64),
-        channels,
-        channel_configuration,
-        sample_rate,
-        sf_index,
-        bitrate,
-        input_buf: vec![Vec::with_capacity(BLOCK_LEN * 2); n_ch],
-        overlap: vec![vec![0.0f32; FRAME_LEN]; n_ch],
-        output_queue: VecDeque::new(),
-        pts: 0,
-        flushed: false,
-        enable_short_blocks: false,
-        short_state: (0..n_ch).map(|_| ChannelShortState::default()).collect(),
-    }))
+    Ok(Box::new(AacEncoder::new(params)?))
 }
 
 /// Per-channel state for the short-block encoder state machine. One
@@ -191,6 +133,73 @@ pub struct AacEncoder {
 }
 
 impl AacEncoder {
+    /// Construct an unboxed AAC-LC encoder from a set of
+    /// [`CodecParameters`]. Used by [`make_encoder`] (which boxes the
+    /// result into a `dyn Encoder`); callers that need to reach
+    /// through-type extensions like [`Self::set_enable_short_blocks`]
+    /// can instantiate directly.
+    pub fn new(params: &CodecParameters) -> Result<Self> {
+        let channels = params
+            .channels
+            .ok_or_else(|| Error::invalid("AAC encoder: channels required"))?;
+        // Map input channel count → AAC channel_configuration (§1.6.3).
+        // Supported: 1, 2, 3, 4, 5, 6, 8 (configs 1..=7). 7 channels
+        // has no standard config so it's rejected.
+        let channel_configuration: u8 = match channels {
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 5,
+            6 => 6,
+            8 => 7,
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "AAC encoder: {channels}-channel layout has no standard channel_configuration",
+                )));
+            }
+        };
+        let sample_rate = params
+            .sample_rate
+            .ok_or_else(|| Error::invalid("AAC encoder: sample_rate required"))?;
+        let sf_index = SAMPLE_RATES
+            .iter()
+            .position(|&r| r == sample_rate)
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "AAC encoder: sample rate {sample_rate} not supported"
+                ))
+            })? as u8;
+
+        let bitrate = params.bit_rate.unwrap_or(128_000).max(16_000);
+
+        let mut out_params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        out_params.media_type = MediaType::Audio;
+        out_params.channels = Some(channels);
+        out_params.sample_rate = Some(sample_rate);
+        out_params.sample_format = Some(SampleFormat::S16);
+        out_params.bit_rate = Some(bitrate);
+
+        let n_ch = channels as usize;
+        Ok(AacEncoder {
+            codec_id: CodecId::new(crate::CODEC_ID_STR),
+            out_params,
+            time_base: TimeBase::new(1, sample_rate as i64),
+            channels,
+            channel_configuration,
+            sample_rate,
+            sf_index,
+            bitrate,
+            input_buf: vec![Vec::with_capacity(BLOCK_LEN * 2); n_ch],
+            overlap: vec![vec![0.0f32; FRAME_LEN]; n_ch],
+            output_queue: VecDeque::new(),
+            pts: 0,
+            flushed: false,
+            enable_short_blocks: false,
+            short_state: (0..n_ch).map(|_| ChannelShortState::default()).collect(),
+        })
+    }
+
     /// Enable (or disable) the short-block encoder state machine. Off by
     /// default — every frame is emitted as `OnlyLong`. When on, the
     /// encoder runs a per-channel [`TransientDetector`] against each new
@@ -2227,6 +2236,235 @@ mod tests {
             let v = decode_spectral(&mut br, &BOOK11).unwrap();
             assert_eq!(v[0] as i32, want_a, "book11 A mismatch");
             assert_eq!(v[1] as i32, want_b, "book11 B mismatch");
+        }
+    }
+
+    #[test]
+    fn next_window_seq_transitions() {
+        // Validate the 6 entries of the state table.
+        assert_eq!(
+            next_window_seq(WindowSequence::OnlyLong, true),
+            WindowSequence::LongStart,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::OnlyLong, false),
+            WindowSequence::OnlyLong,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::LongStart, false),
+            WindowSequence::EightShort,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::LongStart, true),
+            WindowSequence::EightShort,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::EightShort, true),
+            WindowSequence::EightShort,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::EightShort, false),
+            WindowSequence::LongStop,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::LongStop, true),
+            WindowSequence::OnlyLong,
+        );
+        assert_eq!(
+            next_window_seq(WindowSequence::LongStop, false),
+            WindowSequence::OnlyLong,
+        );
+    }
+
+    /// Percussive-signal round-trip: a click train drives the encoder's
+    /// lookahead + transient detector through the full
+    /// `OnlyLong → LongStart → EightShort → LongStop → OnlyLong`
+    /// cycle. Verify that (a) every emitted packet parses through the
+    /// decoder end-to-end, (b) at least one transition actually
+    /// happened (we see LongStart AND EightShort AND LongStop in the
+    /// emitted window-sequence history), and (c) the decoded output
+    /// stays bounded — no catastrophic pre-echo spikes in the pre-attack
+    /// samples.
+    #[test]
+    fn short_block_percussive_round_trip() {
+        use crate::bitreader::BitReader;
+        #[allow(unused_imports)]
+        use oxideav_codec::Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+
+        let sr = 44_100u32;
+        // Build a 10-frame (10 * 1024 = 10 240 samples) click train:
+        // low-level white-ish jitter with sharp attacks at samples 4096
+        // and 8192 (≈ start of frames 4 and 8).
+        let total_samples = 10 * FRAME_LEN;
+        let mut pcm_f32 = vec![0.0f32; total_samples];
+        for (i, s) in pcm_f32.iter_mut().enumerate() {
+            // Deterministic pseudo-noise — a handful of dB below attacks.
+            let n = ((i as u32).wrapping_mul(1103515245).wrapping_add(12345)) >> 16;
+            *s = ((n as f32 / 65536.0) - 0.5) * 0.01;
+        }
+        // Attacks: 16 full-amplitude samples per attack.
+        for &pos in &[4096usize, 8192usize] {
+            for k in 0..16 {
+                pcm_f32[pos + k] = 0.9 * if k & 1 == 0 { 1.0 } else { -1.0 };
+            }
+        }
+        // Convert to interleaved S16 LE.
+        let mut pcm_s16: Vec<u8> = Vec::with_capacity(total_samples * 2);
+        for &x in &pcm_f32 {
+            let s = (x * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            pcm_s16.extend_from_slice(&s.to_le_bytes());
+        }
+
+        // Construct the encoder directly so we can flip the short-block
+        // feature flag (not exposed via the Encoder trait).
+        let mut params = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        params.sample_rate = Some(sr);
+        params.channels = Some(1);
+        let mut enc = AacEncoder::new(&params).expect("make encoder");
+        enc.set_enable_short_blocks(true);
+
+        let frame = Frame::Audio(AudioFrame {
+            format: SampleFormat::S16,
+            channels: 1,
+            sample_rate: sr,
+            samples: total_samples as u32,
+            pts: None,
+            time_base: TimeBase::new(1, sr as i64),
+            data: vec![pcm_s16],
+        });
+        enc.send_frame(&frame).unwrap();
+        enc.flush().unwrap();
+
+        // Drain emitted packets.
+        let mut pkts: Vec<Packet> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(oxideav_core::Error::Eof) => break,
+                Err(oxideav_core::Error::NeedMore) => break,
+                Err(e) => panic!("encoder: {e}"),
+            }
+        }
+        // With 10 input frames + 1 long-path silence tail + 1 short-path
+        // held drain, we expect at least 10 packets; upper bound ≈ 12.
+        assert!(
+            pkts.len() >= 10,
+            "emitted {} packets, expected >= 10",
+            pkts.len()
+        );
+
+        // Inspect each packet's window_sequence by parsing the first
+        // SCE element's ics_info. The ADTS header is 7 bytes; the
+        // raw_data_block then reads:
+        //   id_syn_ele (3) | elem_instance_tag (4)
+        //   SCE: global_gain (8) | ics_info: reserved (1) | window_sequence (2) | ...
+        // We only need to read the first 3 + 4 + 8 + 1 + 2 = 18 bits.
+        // Counters indexed by `seq as u8` (OnlyLong=0 .. LongStop=3).
+        let mut seen = [0usize; 4];
+        let mut seq_history: Vec<WindowSequence> = Vec::new();
+        for pkt in &pkts {
+            assert!(pkt.data.len() > 7, "ADTS frame too short");
+            let payload = &pkt.data[7..];
+            let mut br = BitReader::new(payload);
+            let syn_ele = br.read_u32(3).unwrap();
+            assert_eq!(
+                syn_ele,
+                ElementType::Sce as u32,
+                "expected SCE element, got id={syn_ele}"
+            );
+            let _tag = br.read_u32(4).unwrap();
+            let _global_gain = br.read_u32(8).unwrap();
+            let _reserved = br.read_bit().unwrap();
+            let ws = WindowSequence::from_u32(br.read_u32(2).unwrap());
+            seen[ws as usize] += 1;
+            seq_history.push(ws);
+        }
+
+        // The state machine must have traversed the short-block cycle
+        // at least once. Every transient path goes through all four
+        // sequences.
+        assert!(
+            seen[WindowSequence::LongStart as usize] > 0,
+            "never saw LongStart. history = {seq_history:?}",
+        );
+        assert!(
+            seen[WindowSequence::EightShort as usize] > 0,
+            "never saw EightShort. history = {seq_history:?}",
+        );
+        assert!(
+            seen[WindowSequence::LongStop as usize] > 0,
+            "never saw LongStop. history = {seq_history:?}",
+        );
+        assert!(
+            seen[WindowSequence::OnlyLong as usize] > 0,
+            "never saw OnlyLong. history = {seq_history:?}",
+        );
+
+        // Decoder round-trip: all packets must parse without error.
+        let mut dec = crate::decoder::make_decoder(&params).expect("decoder");
+        let tb = TimeBase::new(1, sr as i64);
+        let mut decoded = Vec::new();
+        for pkt in pkts.iter() {
+            let p2 = Packet::new(0, tb, pkt.data.clone());
+            dec.send_packet(&p2).unwrap_or_else(|e| {
+                panic!("decoder rejected a short-block packet: {e}")
+            });
+            loop {
+                match dec.receive_frame() {
+                    Ok(oxideav_core::Frame::Audio(af)) => {
+                        assert_eq!(af.channels, 1);
+                        assert_eq!(af.samples, 1024);
+                        // Grab the first plane (S16 interleaved — 1 ch
+                        // so 2 bytes per sample). Append to decoded.
+                        let plane = &af.data[0];
+                        for k in 0..af.samples as usize {
+                            let s = i16::from_le_bytes([plane[k * 2], plane[k * 2 + 1]]);
+                            decoded.push(s as f32 / 32768.0);
+                        }
+                    }
+                    Ok(other) => panic!("unexpected frame variant: {other:?}"),
+                    Err(oxideav_core::Error::NeedMore) => break,
+                    Err(e) => panic!("decoder receive_frame: {e}"),
+                }
+            }
+        }
+        // Flush the decoder in case it has one frame of residual delay.
+        let _ = dec.flush();
+        loop {
+            match dec.receive_frame() {
+                Ok(oxideav_core::Frame::Audio(af)) => {
+                    let plane = &af.data[0];
+                    for k in 0..af.samples as usize {
+                        let s = i16::from_le_bytes([plane[k * 2], plane[k * 2 + 1]]);
+                        decoded.push(s as f32 / 32768.0);
+                    }
+                }
+                Ok(_) => break,
+                Err(_) => break,
+            }
+        }
+
+        // Sanity: decoded is non-empty and at least as long as the
+        // original input (encoder + decoder each add ≈ 1 frame of
+        // latency; we fed 10 frames, should see ≥ 10 frames out).
+        assert!(
+            decoded.len() >= 10 * FRAME_LEN,
+            "decoded only {} samples, expected ≥ {}",
+            decoded.len(),
+            10 * FRAME_LEN,
+        );
+
+        // Bounded pre-echo check: the decoder is lossy, so we can't
+        // expect bit-exact output. We just verify nothing exploded —
+        // every decoded sample fits in [-1.5, 1.5]. This catches NaNs,
+        // infs, and runaway quantisation errors that would happen if
+        // the window transitions produced inconsistent overlap.
+        for (i, &s) in decoded.iter().enumerate() {
+            assert!(
+                s.is_finite() && s.abs() < 1.5,
+                "decoded sample {i} out of range: {s}",
+            );
         }
     }
 

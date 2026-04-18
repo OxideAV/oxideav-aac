@@ -28,25 +28,27 @@
 //! - PNS + IS emission plumbing (scalefactor + spectral-data paths); both
 //!   detector heuristics are gated off pending a psy-acoustic
 //!   bit-allocation model
-//! - Short-block encoder building blocks:
-//!   * [`transient::TransientDetector`] — per-channel attack classifier
-//!   * [`window::build_long_window_full`] — LongStart / LongStop shapes
-//!   * [`mdct::mdct_short_eightshort`] — 8 × 256 short MDCTs
-//!   * Internal `analyse_and_quantise_short` + `write_single_ics_short`
-//!     (see `encoder.rs`): full IcsShort → ADTS round-trip validated
-//!     against the decoder.
-//!   What's still missing is the `emit_block` state machine (1-frame
-//!   lookahead + LongStart → EightShort → LongStop transitions driven
-//!   by the transient detector) — the default encoder path still
-//!   always emits OnlyLong windows.
+//! - Short-block encoder — opt-in via
+//!   [`encoder::AacEncoder::set_enable_short_blocks`]. Runs a
+//!   per-channel [`transient::TransientDetector`] with a 1-frame
+//!   lookahead; transitions through
+//!   `OnlyLong → LongStart → EightShort → LongStop → OnlyLong` based on
+//!   attack detection. CPE pairs unify their transient flag so both
+//!   channels share a window sequence; short CPE drops common_window
+//!   (per-channel ics_info, no M/S). LFE is long-only per §4.6.10.
+//!   The default encoder path still emits only OnlyLong windows — the
+//!   short-block mode is off until the caller opts in, because the
+//!   transient-driven path has higher bitrate on tonal content.
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
 //! - Gain control (§4.6.12)
 //! - CCE elements (parsed / emitted as unsupported)
 //! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
-//! - Encoder short-block / transient detection (long-only output)
 //! - Encoder pulse data, VBR rate control
+//! - Encoder short-window TNS / PNS / IS (short-block path emits them
+//!   gated off — decode round-trips but bitrate is loose on percussive
+//!   content)
 
 #![allow(
     dead_code,
