@@ -43,6 +43,7 @@ use oxideav_core::{
 };
 
 use crate::bitwriter::BitWriter;
+use crate::ics::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::huffman_tables::{
     BOOK10_BITS, BOOK10_CODES, BOOK11_BITS, BOOK11_CODES, BOOK1_BITS, BOOK1_CODES, BOOK2_BITS,
     BOOK2_CODES, BOOK3_BITS, BOOK3_CODES, BOOK4_BITS, BOOK4_CODES, BOOK5_BITS, BOOK5_CODES,
@@ -527,22 +528,42 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         }
     }
 
-    // Pick codebook per band.
+    // Pick codebook per band. The `classify_pns_band` noise-band
+    // detector is wired but gated OFF by default: a loose heuristic
+    // regresses round-trip tests on tone-heavy content, and tuning the
+    // threshold needs a psy-model that doesn't exist yet. The emission
+    // machinery (codebook 13 section, 9-bit PNS seed, DPCM deltas for
+    // subsequent PNS bands, write_spectral_data skip) is in place, so
+    // once the detector is tuned we just toggle this flag.
+    const ENABLE_PNS: bool = false;
     let mut cbs = vec![0u8; max_sfb];
     for sfb in 0..max_sfb {
         let q = &q_bands[sfb];
         cbs[sfb] = if q.iter().all(|&x| x == 0) {
             0
+        } else if ENABLE_PNS {
+            if let Some(pns_sf) =
+                classify_pns_band(spec, swb[sfb] as usize, swb[sfb + 1] as usize)
+            {
+                sfs[sfb] = pns_sf;
+                NOISE_HCB
+            } else {
+                best_codebook_for_band(q)
+            }
         } else {
             best_codebook_for_band(q)
         };
     }
 
-    // Global gain: first non-zero band's scalefactor. If everything is
-    // zero, use 100.
+    // Global gain: first *regular-codebook* band's scalefactor. The
+    // decoder seeds `g_gain = global_gain`, `g_noise = global_gain - 90`,
+    // `g_is = 0`. Only cbs 1..=11 use the g_gain stream, so we anchor
+    // global_gain on the first such band — not the first PNS (cb 13) or
+    // IS (cb 14/15) band.
     let mut gg: i32 = 100;
     for sfb in 0..max_sfb {
-        if cbs[sfb] != 0 {
+        let cb = cbs[sfb];
+        if cb != 0 && cb != NOISE_HCB && cb != INTENSITY_HCB && cb != INTENSITY_HCB2 {
             gg = sfs[sfb];
             break;
         }
@@ -595,6 +616,53 @@ fn quantise_band(band: &[f32], sf: i32) -> (Vec<i32>, bool) {
 
 /// For a given vector of quantised coefficients (length = band size),
 /// return the codebook index (1..=11) that minimises total Huffman bits.
+/// Classify a scalefactor band as PNS (noise-like) if it passes all three
+/// conservative tests:
+///
+///  1. Band is long enough (≥ 4 samples) to give a stable energy estimate.
+///  2. Peak-to-RMS ratio is ≤ 2.8 — a well-behaved noise band has most
+///     samples near its RMS magnitude; a tonal band has a small number
+///     of samples much higher than its RMS.
+///  3. Band has non-trivial average energy (> 1e-8 per sample) — silent
+///     bands stay on codebook 0 where they cost nothing anyway.
+///
+/// Returns the PNS scalefactor that reproduces the band's energy on
+/// decode, or `None` if the band is not a noise candidate.
+///
+/// The PNS decoder synthesises each spectral line as `uniform(-1, 1) *
+/// gain` where `gain = 2^(sf/4 - 14.5)`. The expected energy per line is
+/// `gain² / 3` (variance of uniform on [-1, 1)). Invert:
+///   `gain = sqrt(3 · energy_per_line)`
+///   `sf   = 4·(log₂(gain) + 14.5) = 2·log₂(3·energy_per_line) + 58`.
+fn classify_pns_band(spec: &[f32], band_start: usize, band_end: usize) -> Option<i32> {
+    let band = &spec[band_start..band_end];
+    let len = band.len();
+    if len < 4 {
+        return None;
+    }
+    let mut sum_sq = 0.0f32;
+    let mut peak = 0.0f32;
+    for &x in band {
+        sum_sq += x * x;
+        let a = x.abs();
+        if a > peak {
+            peak = a;
+        }
+    }
+    let rms = (sum_sq / len as f32).sqrt();
+    if rms < 1e-4 {
+        return None;
+    }
+    let peak_rms = peak / rms;
+    if peak_rms > 2.8 {
+        return None; // tonal band — leave it on a regular codebook.
+    }
+    let energy_per_line = sum_sq / len as f32;
+    let sf_f = 2.0 * (3.0 * energy_per_line).log2() + 58.0;
+    let sf = sf_f.round() as i32;
+    Some(sf.clamp(-100, 200))
+}
+
 fn best_codebook_for_band(q: &[i32]) -> u8 {
     let mut best_cb = 11u8;
     let mut best_bits = u64::MAX;
@@ -829,22 +897,59 @@ fn write_scalefactors(bw: &mut BitWriter, ics: &Ics) -> Result<()> {
     let max_sfb = ics.info.max_sfb as usize;
     // Walk bands in decode order; for each non-ZERO band emit the
     // scalefactor delta via the scalefactor Huffman codebook. The
-    // decoder seeds `g_gain = global_gain` and we need the *first*
-    // non-zero band to land exactly on `global_gain` so that delta=0.
+    // decoder seeds the three accumulators as:
+    //   g_gain  = global_gain        (regular-codebook bands)
+    //   g_noise = global_gain - 90   (NOISE_HCB bands)
+    //   g_is    = 0                  (INTENSITY_HCB / INTENSITY_HCB2 bands)
+    // We emit deltas against the appropriate accumulator, and the first
+    // PNS band uses a 9-bit raw `dpcm_noise_nrg` seed instead of a SF-
+    // Huffman delta.
     let mut cur: i32 = ics.global_gain as i32;
+    let mut g_noise: i32 = ics.global_gain as i32 - 90;
+    let mut g_is: i32 = 0;
+    let mut noise_seed_emitted = false;
     for sfb in 0..max_sfb {
         let cb = ics.cbs[sfb];
         if cb == 0 {
             continue;
         }
         let target = ics.sfs[sfb];
-        let delta = (target - cur).clamp(-60, 60);
-        cur += delta;
-        // Emit via the SF Huffman table (index = delta + 60).
-        let idx = (delta + 60) as usize;
-        let code = SCALEFACTOR_CODES[idx] as u32;
-        let bits = SCALEFACTOR_BITS[idx] as u32;
-        bw.write_u32(code, bits);
+        if cb == NOISE_HCB {
+            if !noise_seed_emitted {
+                // 9-bit raw `dpcm_noise_nrg`: g_noise_after = g_noise_before + raw - 256.
+                //   raw = target - (global_gain - 90) + 256
+                //       = target - global_gain + 346
+                let raw = target - ics.global_gain as i32 + 346;
+                let raw_c = raw.clamp(0, 511);
+                bw.write_u32(raw_c as u32, 9);
+                g_noise = (ics.global_gain as i32 - 90) + (raw_c - 256);
+                noise_seed_emitted = true;
+            } else {
+                let delta = (target - g_noise).clamp(-60, 60);
+                g_noise += delta;
+                let idx = (delta + 60) as usize;
+                bw.write_u32(
+                    SCALEFACTOR_CODES[idx] as u32,
+                    SCALEFACTOR_BITS[idx] as u32,
+                );
+            }
+        } else if cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+            let delta = (target - g_is).clamp(-60, 60);
+            g_is += delta;
+            let idx = (delta + 60) as usize;
+            bw.write_u32(
+                SCALEFACTOR_CODES[idx] as u32,
+                SCALEFACTOR_BITS[idx] as u32,
+            );
+        } else {
+            let delta = (target - cur).clamp(-60, 60);
+            cur += delta;
+            let idx = (delta + 60) as usize;
+            bw.write_u32(
+                SCALEFACTOR_CODES[idx] as u32,
+                SCALEFACTOR_BITS[idx] as u32,
+            );
+        }
     }
     Ok(())
 }
@@ -853,8 +958,12 @@ fn write_spectral_data(bw: &mut BitWriter, ics: &Ics) {
     let max_sfb = ics.info.max_sfb as usize;
     for sfb in 0..max_sfb {
         let cb = ics.cbs[sfb];
-        if cb == 0 {
-            continue; // codebook 0 bands emit no coefficients
+        // Skip bands whose codebook doesn't carry coefficient bits:
+        //   * cb 0       → zero band.
+        //   * cb 13      → NOISE (PNS) — decoder synthesises the band.
+        //   * cb 14 / 15 → INTENSITY — decoder derives it from ch 0.
+        if cb == 0 || cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+            continue;
         }
         write_band_bits(bw, &ics.q_bands[sfb], cb);
     }
