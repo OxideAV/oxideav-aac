@@ -616,6 +616,54 @@ fn quantise_band(band: &[f32], sf: i32) -> (Vec<i32>, bool) {
 
 /// For a given vector of quantised coefficients (length = band size),
 /// return the codebook index (1..=11) that minimises total Huffman bits.
+/// Classify a scalefactor band as IS-codable if `R ≈ scale·L` holds to
+/// good precision across the band. Returns `(is_position, sign_flip)`
+/// where `is_position` encodes the magnitude scale via
+/// `|scale| = 2^(-is_position/4)` and `sign_flip` is true when scale is
+/// negative (consumed by the decoder as the MS-bit sign repurpose).
+///
+/// Criteria (conservative):
+///  * `||L|| > 1e-3` (otherwise the scale is ill-defined — zero band).
+///  * `|<L, R>| / (||L||·||R||) > 0.95` — L and R are near-colinear.
+///  * |is_position| ≤ 60 so the SF-Huffman delta fits.
+fn classify_is_band(
+    l: &[f32],
+    r: &[f32],
+    band_start: usize,
+    band_end: usize,
+) -> Option<(i32, bool)> {
+    if band_end <= band_start || band_end > l.len() || band_end > r.len() {
+        return None;
+    }
+    let lb = &l[band_start..band_end];
+    let rb = &r[band_start..band_end];
+    let mut sum_ll = 0.0f32;
+    let mut sum_rr = 0.0f32;
+    let mut sum_lr = 0.0f32;
+    for i in 0..lb.len() {
+        sum_ll += lb[i] * lb[i];
+        sum_rr += rb[i] * rb[i];
+        sum_lr += lb[i] * rb[i];
+    }
+    if sum_ll < 1e-8 || sum_rr < 1e-8 {
+        return None;
+    }
+    let corr = sum_lr / (sum_ll * sum_rr).sqrt();
+    if corr.abs() < 0.95 {
+        return None;
+    }
+    let scale = sum_lr / sum_ll; // least-squares R ≈ scale·L
+    let mag = scale.abs();
+    if mag < 1e-4 {
+        return None;
+    }
+    let is_pos = (-4.0 * mag.log2()).round() as i32;
+    if !(-60..=60).contains(&is_pos) {
+        return None;
+    }
+    Some((is_pos, scale < 0.0))
+}
+
 /// Classify a scalefactor band as PNS (noise-like) if it passes all three
 /// conservative tests:
 ///
@@ -1005,15 +1053,77 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
     let cost_ms: Vec<u64> = (0..max_sfb)
         .map(|sfb| band_bit_cost(sfb, &ics_m) + band_bit_cost(sfb, &ics_s))
         .collect();
+    // Per-band decision: pick the cheapest representation.
+    //
+    //   LR:   ch0 = L quantised, ch1 = R quantised.
+    //   MS:   ch0 = M quantised, ch1 = S quantised.
+    //   IS:   ch0 = L quantised, ch1 is synthesised on decode as
+    //         sign·2^(-is_position/4)·spec[L], so it only costs a SF-
+    //         Huffman delta plus the 4-bit codebook in section data.
+    //
+    // IS eligibility (`classify_is_band`) requires a strong L↔R correlation
+    // in the band; when the correlation is weak IS would reconstruct the
+    // wrong ch1 and the error would blow up. Gated behind `ENABLE_IS`
+    // until we have a psy-acoustic bit-allocation model to drive it; the
+    // emission path is fully in place.
+    const ENABLE_IS: bool = false;
+    let swb = SWB_LONG[sf_index as usize];
     let mut ms_used = vec![false; max_sfb];
+    let mut is_used = vec![false; max_sfb];
+    let mut is_sign = vec![false; max_sfb]; // repurposed ms_used bit for IS
+    let mut is_position = vec![0i32; max_sfb];
+
     for sfb in 0..max_sfb {
-        ms_used[sfb] = cost_ms[sfb] < cost_lr[sfb];
+        let mut best_cost = cost_lr[sfb];
+        let mut choice: u8 = 0; // 0 = LR, 1 = MS, 2 = IS
+        if cost_ms[sfb] < best_cost {
+            best_cost = cost_ms[sfb];
+            choice = 1;
+        }
+        if ENABLE_IS {
+            if let Some((pos, sign)) = classify_is_band(
+                l,
+                r,
+                swb[sfb] as usize,
+                swb[sfb + 1] as usize,
+            ) {
+                // IS cost ≈ L-band cost + ~10 bits overhead for the
+                // scalefactor delta + codebook bits in section_data.
+                let is_cost = band_bit_cost(sfb, &ics_l_alone).saturating_add(10);
+                if is_cost < best_cost {
+                    best_cost = is_cost;
+                    choice = 2;
+                    is_position[sfb] = pos;
+                    is_sign[sfb] = sign;
+                }
+            }
+        }
+        let _ = best_cost;
+        match choice {
+            0 => {}
+            1 => ms_used[sfb] = true,
+            2 => {
+                is_used[sfb] = true;
+                // ms_used on an IS band is repurposed as the sign flip.
+                if is_sign[sfb] {
+                    ms_used[sfb] = true;
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     let mut ch0 = empty_ics(max_sfb, sf_index);
     let mut ch1 = empty_ics(max_sfb, sf_index);
     for sfb in 0..max_sfb {
-        if ms_used[sfb] {
+        if is_used[sfb] {
+            // Channel 0 keeps the L spectrum; channel 1 is IS-coded.
+            copy_band(&mut ch0, sfb, &ics_l_alone, sfb);
+            let band_len = (swb[sfb + 1] - swb[sfb]) as usize;
+            ch1.cbs[sfb] = INTENSITY_HCB;
+            ch1.sfs[sfb] = is_position[sfb];
+            ch1.q_bands[sfb] = vec![0i32; band_len];
+        } else if ms_used[sfb] {
             copy_band(&mut ch0, sfb, &ics_m, sfb);
             copy_band(&mut ch1, sfb, &ics_s, sfb);
         } else {
