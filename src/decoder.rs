@@ -176,9 +176,15 @@ impl AacDecoder {
                     // Pulse data: §4.6.5 — applied to long-window spectrum
                     // before PNS / TNS.
                     if let Some(pd) = pulse.as_ref() {
-                        if info.window_sequence != WindowSequence::EightShort {
-                            apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
+                        // §4.6.5.2: pulse_data is only valid for long windows.
+                        // A stream with pulse_data_present=1 on EIGHT_SHORT is
+                        // non-conformant.
+                        if info.window_sequence == WindowSequence::EightShort {
+                            return Err(Error::invalid(
+                                "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
+                            ));
                         }
+                        apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
                     }
                     // PNS first: fill NOISE_HCB bands with shaped noise.
                     if info.window_sequence == WindowSequence::EightShort {
@@ -267,15 +273,18 @@ impl AacDecoder {
                             sfs[ch] = sf;
                             fill_spectrum(&mut br, &infos[ch], &secs[ch], &sfs[ch], &mut spec[ch])?;
                             if let Some(pd) = pulse_all[ch].as_ref() {
-                                if infos[ch].window_sequence != WindowSequence::EightShort {
-                                    apply_pulse_long(
-                                        &mut spec[ch],
-                                        pd,
-                                        self.sf_index,
-                                        infos[ch].max_sfb,
-                                        &sfs[ch],
-                                    )?;
+                                if infos[ch].window_sequence == WindowSequence::EightShort {
+                                    return Err(Error::invalid(
+                                        "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
+                                    ));
                                 }
+                                apply_pulse_long(
+                                    &mut spec[ch],
+                                    pd,
+                                    self.sf_index,
+                                    infos[ch].max_sfb,
+                                    &sfs[ch],
+                                )?;
                             }
                         }
                         // PNS: fill NOISE_HCB bands. For correlated-noise bands
@@ -382,15 +391,18 @@ impl AacDecoder {
                                 decode_ics(&mut br, self.sf_index, true)?;
                             fill_spectrum(&mut br, &info, &sec, &sf, &mut spec[ch])?;
                             if let Some(pd) = pulse.as_ref() {
-                                if info.window_sequence != WindowSequence::EightShort {
-                                    apply_pulse_long(
-                                        &mut spec[ch],
-                                        pd,
-                                        self.sf_index,
-                                        info.max_sfb,
-                                        &sf,
-                                    )?;
+                                if info.window_sequence == WindowSequence::EightShort {
+                                    return Err(Error::invalid(
+                                        "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
+                                    ));
                                 }
+                                apply_pulse_long(
+                                    &mut spec[ch],
+                                    pd,
+                                    self.sf_index,
+                                    info.max_sfb,
+                                    &sf,
+                                )?;
                             }
                             // PNS per channel, independent (no CPE common_window
                             // => no shared ms flags).
