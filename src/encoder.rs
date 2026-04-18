@@ -1235,6 +1235,132 @@ fn write_scalefactors(bw: &mut BitWriter, ics: &Ics) -> Result<()> {
     Ok(())
 }
 
+// ==================== EightShort emission helpers ====================
+
+/// Write ics_info for an EightShort ICS. Layout per §4.6.11 /
+/// `parse_ics_info`:
+///
+///   reserved(1=0) | window_sequence(2=2) | window_shape(1)
+///   | max_sfb(4)   | scale_factor_grouping(7)
+fn write_ics_info_short(bw: &mut BitWriter, ics: &IcsShort) {
+    bw.write_u32(0, 1); // ics_reserved_bit
+    bw.write_u32(2, 2); // window_sequence = EightShort
+    bw.write_u32(0, 1); // window_shape = 0 (sine) — matches the short MDCT path
+    bw.write_u32(ics.max_sfb as u32, 4);
+    bw.write_u32(ics.scale_factor_grouping as u32, 7);
+}
+
+/// Write section_data for an EightShort ICS. `sect_bits = 3`,
+/// `sect_esc_val = 7`. Sections are independent per group.
+fn write_section_data_short(bw: &mut BitWriter, ics: &IcsShort) {
+    let max_sfb = ics.max_sfb as usize;
+    let groups = ics.num_groups as usize;
+    if max_sfb == 0 {
+        return;
+    }
+    let sect_bits: u32 = 3;
+    let sect_esc_val: u32 = (1 << sect_bits) - 1;
+    for g in 0..groups {
+        let base = g * max_sfb;
+        let mut k = 0usize;
+        while k < max_sfb {
+            let cb = ics.cbs[base + k];
+            let mut run = 1usize;
+            while k + run < max_sfb && ics.cbs[base + k + run] == cb {
+                run += 1;
+            }
+            bw.write_u32(cb as u32, 4);
+            let mut remaining = run as u32;
+            while remaining >= sect_esc_val {
+                bw.write_u32(sect_esc_val, sect_bits);
+                remaining -= sect_esc_val;
+            }
+            bw.write_u32(remaining, sect_bits);
+            k += run;
+        }
+    }
+}
+
+/// Write grouped scalefactors for an EightShort ICS. Walks (g, sfb) in
+/// the same order the decoder's `parse_scalefactors` consumes.
+fn write_scalefactors_short(bw: &mut BitWriter, ics: &IcsShort) -> Result<()> {
+    let max_sfb = ics.max_sfb as usize;
+    let groups = ics.num_groups as usize;
+    let mut cur: i32 = ics.global_gain as i32;
+    let mut g_noise: i32 = ics.global_gain as i32 - 90;
+    let mut g_is: i32 = 0;
+    let mut noise_seed_emitted = false;
+    for g in 0..groups {
+        for sfb in 0..max_sfb {
+            let idx = g * max_sfb + sfb;
+            let cb = ics.cbs[idx];
+            if cb == 0 {
+                continue;
+            }
+            let target = ics.sfs[idx];
+            if cb == NOISE_HCB {
+                if !noise_seed_emitted {
+                    let raw = target - ics.global_gain as i32 + 346;
+                    let raw_c = raw.clamp(0, 511);
+                    bw.write_u32(raw_c as u32, 9);
+                    g_noise = (ics.global_gain as i32 - 90) + (raw_c - 256);
+                    noise_seed_emitted = true;
+                } else {
+                    let delta = (target - g_noise).clamp(-60, 60);
+                    g_noise += delta;
+                    let i = (delta + 60) as usize;
+                    bw.write_u32(SCALEFACTOR_CODES[i] as u32, SCALEFACTOR_BITS[i] as u32);
+                }
+            } else if cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+                let delta = (target - g_is).clamp(-60, 60);
+                g_is += delta;
+                let i = (delta + 60) as usize;
+                bw.write_u32(SCALEFACTOR_CODES[i] as u32, SCALEFACTOR_BITS[i] as u32);
+            } else {
+                let delta = (target - cur).clamp(-60, 60);
+                cur += delta;
+                let i = (delta + 60) as usize;
+                bw.write_u32(SCALEFACTOR_CODES[i] as u32, SCALEFACTOR_BITS[i] as u32);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write grouped spectral data for an EightShort ICS. Each (group, sfb)
+/// emits its `q_bands` entry via the band's codebook; zero / PNS / IS
+/// codebooks carry no coefficient bits.
+fn write_spectral_data_short(bw: &mut BitWriter, ics: &IcsShort) {
+    let max_sfb = ics.max_sfb as usize;
+    let groups = ics.num_groups as usize;
+    for g in 0..groups {
+        for sfb in 0..max_sfb {
+            let idx = g * max_sfb + sfb;
+            let cb = ics.cbs[idx];
+            if cb == 0 || cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+                continue;
+            }
+            write_band_bits(bw, &ics.q_bands[idx], cb);
+        }
+    }
+}
+
+/// Write an entire SCE-style EightShort individual_channel_stream:
+/// global_gain + ics_info + section + scalefactors + pulse=0 + tns=0 +
+/// gain_control=0 + spectral_data. Used for both SCE and LFE elements.
+#[allow(dead_code)]
+fn write_single_ics_short(bw: &mut BitWriter, ics: &IcsShort) -> Result<()> {
+    bw.write_u32(ics.global_gain as u32, 8);
+    write_ics_info_short(bw, ics);
+    write_section_data_short(bw, ics);
+    write_scalefactors_short(bw, ics)?;
+    bw.write_u32(0, 1); // pulse_data_present — always 0 for short (spec forbids it)
+    bw.write_u32(0, 1); // tns_data_present   — short-window encoder TNS deferred
+    bw.write_u32(0, 1); // gain_control_data_present
+    write_spectral_data_short(bw, ics);
+    Ok(())
+}
+
 fn write_spectral_data(bw: &mut BitWriter, ics: &Ics) {
     let max_sfb = ics.info.max_sfb as usize;
     for sfb in 0..max_sfb {
@@ -1560,6 +1686,64 @@ fn encoder_book(cb: u8) -> &'static EncBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode an EightShort SCE frame using the short-window helpers,
+    /// wrap it in an ADTS header, and confirm the existing AAC-LC
+    /// decoder parses it end-to-end without error. This validates the
+    /// bit-level contract between write_single_ics_short and the
+    /// decoder's ics/section/scalefactor/spectrum paths.
+    #[test]
+    fn short_ics_roundtrip_through_decoder() {
+        use crate::adts::parse_adts_header;
+        use crate::syntax::ElementType;
+        #[allow(unused_imports)]
+        use oxideav_codec::Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+
+        // Build a spectrum with content in sub-windows 2 and 5.
+        let mut spec = [0.0f32; 1024];
+        for k in 2 * 128..2 * 128 + 32 {
+            spec[k] = 200.0;
+        }
+        for k in 5 * 128..5 * 128 + 16 {
+            spec[k] = -300.0;
+        }
+        let sf_index = 4u8; // 44.1 kHz
+        let ics = analyse_and_quantise_short(&spec, sf_index).unwrap();
+
+        let mut bw = BitWriter::new();
+        bw.write_u32(ElementType::Sce as u32, 3);
+        bw.write_u32(0, 4); // instance_tag
+        write_single_ics_short(&mut bw, &ics).unwrap();
+        bw.write_u32(ElementType::End as u32, 3);
+        bw.align_to_byte();
+        let payload = bw.finish();
+
+        let adts = build_adts_frame(sf_index, 1, payload.len());
+        let mut frame = adts;
+        frame.extend_from_slice(&payload);
+
+        // Sanity: ADTS header parses cleanly.
+        let hdr = parse_adts_header(&frame).expect("ADTS parse");
+        assert_eq!(hdr.frame_length, frame.len());
+
+        // Feed to decoder.
+        let mut params = CodecParameters::audio(CodecId::new("aac"));
+        params.sample_rate = Some(44_100);
+        params.channels = Some(1);
+        let mut dec = crate::decoder::make_decoder(&params).expect("decoder");
+        let tb = TimeBase::new(1, 44_100);
+        let pkt = Packet::new(0, tb, frame);
+        dec.send_packet(&pkt).expect("send_packet");
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Audio(af)) => {
+                assert_eq!(af.channels, 1);
+                assert_eq!(af.samples, 1024);
+            }
+            Ok(other) => panic!("unexpected frame variant: {other:?}"),
+            Err(e) => panic!("decoder rejected EightShort SCE: {e}"),
+        }
+    }
 
     #[test]
     fn analyse_short_silent_spectrum() {
