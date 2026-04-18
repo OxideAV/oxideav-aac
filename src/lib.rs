@@ -65,10 +65,10 @@ pub fn register(reg: &mut CodecRegistry) {
     let dec_caps = CodecCapabilities::audio("aac_sw")
         .with_lossy(true)
         .with_intra_only(true)
-        // We currently decode mono and stereo only; multi-channel returns
-        // `Error::Unsupported`. The cap value is what we *advertise* to the
-        // registry — keep at 2 until we wire 5.1.
-        .with_max_channels(2)
+        // Decoder handles AAC-LC channel configurations 1..=7 (up to 8
+        // channels for config 7 / 7.1). Config 0 (PCE-defined) also works
+        // as long as the PCE-implied channel count fits.
+        .with_max_channels(8)
         .with_max_sample_rate(96_000);
     reg.register_decoder_impl(cid.clone(), dec_caps, make_decoder);
     let enc_caps = CodecCapabilities::audio("aac_sw")

@@ -58,7 +58,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         sf_index,
         channels,
         object_type,
-        chans: vec![ChannelState::new(); 2],
+        chans: vec![ChannelState::new(); 8],
         configured: !params.extradata.is_empty(),
         pns_rng: PnsRng::new(),
     }))
@@ -130,6 +130,22 @@ impl Decoder for AacDecoder {
     }
 }
 
+/// Expected PCM-channel count produced by a raw_data_block given its
+/// `channel_configuration` (§1.6.3, Table 1.19). Config 0 means the
+/// topology is defined by a PCE and must be computed at runtime.
+fn expected_channels(config: u8) -> Option<usize> {
+    match config {
+        1 => Some(1),
+        2 => Some(2),
+        3 => Some(3),
+        4 => Some(4),
+        5 => Some(5),
+        6 => Some(6),
+        7 => Some(8),
+        _ => None,
+    }
+}
+
 impl AacDecoder {
     fn decode_packet(&mut self, pkt: &Packet) -> Result<Frame> {
         // Detect ADTS by syncword. Otherwise treat as raw_data_block (e.g. MP4).
@@ -160,7 +176,10 @@ impl AacDecoder {
 
         // Decode raw_data_block.
         let mut br = BitReader::new(payload);
-        let mut pcm: [Vec<f32>; 2] = [vec![0.0; FRAME_LEN], vec![0.0; FRAME_LEN]];
+        // Up to 8 output channels (7.1). Individual SCE / CPE / LFE
+        // elements write to the slot at the running `got_channels` index
+        // and advance it by 1 (SCE / LFE) or 2 (CPE).
+        let mut pcm: Vec<Vec<f32>> = (0..8).map(|_| vec![0.0; FRAME_LEN]).collect();
         let mut got_channels: usize = 0;
 
         loop {
@@ -201,15 +220,20 @@ impl AacDecoder {
                             apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
                         }
                     }
+                    if got_channels >= pcm.len() {
+                        return Err(Error::invalid(
+                            "AAC: more decoded channels than 8 slots permit",
+                        ));
+                    }
                     let mut channel_pcm = [0.0f32; FRAME_LEN];
                     imdct_and_overlap(
                         &spec,
                         info.window_sequence,
                         info.window_shape,
-                        &mut self.chans[got_channels.min(1)],
+                        &mut self.chans[got_channels],
                         &mut channel_pcm,
                     );
-                    pcm[got_channels.min(1)].copy_from_slice(&channel_pcm);
+                    pcm[got_channels].copy_from_slice(&channel_pcm);
                     got_channels += 1;
                 }
                 ElementType::Cpe => {
@@ -369,18 +393,23 @@ impl AacDecoder {
                                 }
                             }
                         }
+                        if got_channels + 2 > pcm.len() {
+                            return Err(Error::invalid(
+                                "AAC: CPE would overflow 8 channel slots",
+                            ));
+                        }
                         for ch in 0..2 {
                             let mut channel_pcm = [0.0f32; FRAME_LEN];
                             imdct_and_overlap(
                                 &spec[ch],
                                 infos[ch].window_sequence,
                                 infos[ch].window_shape,
-                                &mut self.chans[ch],
+                                &mut self.chans[got_channels + ch],
                                 &mut channel_pcm,
                             );
-                            pcm[ch].copy_from_slice(&channel_pcm);
+                            pcm[got_channels + ch].copy_from_slice(&channel_pcm);
                         }
-                        got_channels = 2;
+                        got_channels += 2;
                     } else {
                         // Independent ICS for each channel.
                         let mut spec = [[0.0f32; SPEC_LEN]; 2];
@@ -448,16 +477,57 @@ impl AacDecoder {
                                 &spec[ch],
                                 infos[ch].window_sequence,
                                 infos[ch].window_shape,
-                                &mut self.chans[ch],
+                                &mut self.chans[got_channels + ch],
                                 &mut channel_pcm,
                             );
-                            pcm[ch].copy_from_slice(&channel_pcm);
+                            pcm[got_channels + ch].copy_from_slice(&channel_pcm);
                         }
-                        got_channels = 2;
+                        if got_channels + 2 > pcm.len() {
+                            return Err(Error::invalid(
+                                "AAC: CPE would overflow 8 channel slots",
+                            ));
+                        }
+                        got_channels += 2;
                     }
                 }
                 ElementType::Lfe => {
-                    return Err(Error::unsupported("AAC: LFE element not implemented"));
+                    // LFE element (§4.6.10) has the same bitstream syntax as
+                    // an SCE but is restricted to long-window output with a
+                    // small max_sfb. Decode the same way and write to the
+                    // next channel slot.
+                    let _instance_tag = br.read_u32(4)?;
+                    let mut spec = [0.0f32; SPEC_LEN];
+                    let (info, sf, sec, tns, pulse) =
+                        decode_ics(&mut br, self.sf_index, false)?;
+                    if info.window_sequence == WindowSequence::EightShort {
+                        return Err(Error::invalid(
+                            "AAC: LFE element with EIGHT_SHORT window (non-conformant)",
+                        ));
+                    }
+                    fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
+                    if let Some(pd) = pulse.as_ref() {
+                        apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
+                    }
+                    apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
+                    if let Some(tns) = tns.as_ref() {
+                        let swb = SWB_LONG[self.sf_index as usize];
+                        apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
+                    }
+                    if got_channels >= pcm.len() {
+                        return Err(Error::invalid(
+                            "AAC: LFE would overflow 8 channel slots",
+                        ));
+                    }
+                    let mut channel_pcm = [0.0f32; FRAME_LEN];
+                    imdct_and_overlap(
+                        &spec,
+                        info.window_sequence,
+                        info.window_shape,
+                        &mut self.chans[got_channels],
+                        &mut channel_pcm,
+                    );
+                    pcm[got_channels].copy_from_slice(&channel_pcm);
+                    got_channels += 1;
                 }
                 ElementType::Cce => {
                     return Err(Error::unsupported("AAC: CCE element not implemented"));
@@ -509,11 +579,17 @@ impl AacDecoder {
             }
         }
 
-        // Convert PCM to interleaved S16.
+        // Convert PCM to interleaved S16. Use whichever is smaller between
+        // what we actually decoded (`got_channels`) and the count
+        // advertised by the channel_configuration — a malformed stream
+        // that produces too few elements is downgraded rather than
+        // crashing. For config 0 (PCE-defined) we output whatever the
+        // elements produced.
+        let expected = expected_channels(self.channels).unwrap_or(got_channels);
         let channels_out = if got_channels == 0 {
             1
         } else {
-            got_channels.min(self.channels.max(1) as usize)
+            got_channels.min(expected.max(1))
         };
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
         let mut out_bytes = Vec::with_capacity(FRAME_LEN * channels_out * bytes_per_sample);
