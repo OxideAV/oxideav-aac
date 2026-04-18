@@ -19,19 +19,23 @@
 //! - Fill / DSE elements
 //!
 //! Encoder implements:
-//! - AAC-LC long-block I-only output, mono + stereo CPE (M/S per band)
+//! - AAC-LC long-block output, channel configurations 1..=7
+//!   (mono / stereo / 3.0 / 4.0 / 5.0 / 5.1 / 7.1) via SCE + CPE + LFE
+//!   element sequencing per §1.6.3
 //! - TNS forward filtering on SCE long windows
+//! - M/S stereo per band in CPE
 //! - ADTS wrap with single raw_data_block per frame
-//! - PNS + IS emission plumbing (scalefactor + spectral-data paths); the
-//!   PNS noise-band detector is gated off pending psy-model tuning
+//! - PNS + IS emission plumbing (scalefactor + spectral-data paths); both
+//!   detector heuristics are gated off pending a psy-acoustic
+//!   bit-allocation model
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
 //! - Gain control (§4.6.12)
 //! - CCE elements (parsed / emitted as unsupported)
 //! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
-//! - Encoder short-block / transient detection
-//! - Encoder multi-channel (≥ 3 channels), VBR rate control
+//! - Encoder short-block / transient detection (long-only output)
+//! - Encoder pulse data, VBR rate control
 
 #![allow(
     dead_code,
