@@ -103,9 +103,165 @@ pub fn kbd_short() -> &'static [f32] {
     KBD_SHORT.get_or_init(|| build_kbd(SHORT_LEN, 6.0))
 }
 
+/// Resolve a `WindowShape` to its long half-window table.
+pub fn long_window_for_shape(shape: crate::syntax::WindowShape) -> &'static [f32] {
+    match shape {
+        crate::syntax::WindowShape::Sine => sine_long(),
+        crate::syntax::WindowShape::Kbd => kbd_long(),
+    }
+}
+
+/// Resolve a `WindowShape` to its short half-window table.
+pub fn short_window_for_shape(shape: crate::syntax::WindowShape) -> &'static [f32] {
+    match shape {
+        crate::syntax::WindowShape::Sine => sine_short(),
+        crate::syntax::WindowShape::Kbd => kbd_short(),
+    }
+}
+
+/// Build the full-length (2 * `LONG_LEN`) long-style window weight vector
+/// for a given (`seq`, current shape, previous shape) triple, per ISO/IEC
+/// 14496-3 §4.6.11 Figure 4.11.
+///
+/// * The first half (positions 0..N) is governed by `prev_shape` — it's
+///   the rising slope used by the PREVIOUS block's right half, so the
+///   TDAC overlap-add cancels the aliasing.
+/// * The second half (positions N..2N) is governed by `shape`.
+///
+/// Result layout:
+///
+///   OnlyLong:  rising sine/KBD (0..N) | falling sine/KBD (N..2N)
+///   LongStart: rising long   | 448 ones | 128 short-fall | 448 zeros
+///   LongStop:  448 zeros | 128 short-rise | 448 ones | falling long
+///
+/// EightShort uses a different, non-1D layout handled by the caller.
+pub fn build_long_window_full(
+    seq: crate::syntax::WindowSequence,
+    shape: crate::syntax::WindowShape,
+    prev_shape: crate::syntax::WindowShape,
+) -> Vec<f32> {
+    use crate::syntax::WindowSequence;
+    let n = LONG_LEN;
+    let mut w = vec![0.0f32; 2 * n];
+    let prev_w = long_window_for_shape(prev_shape);
+    let cur_w = long_window_for_shape(shape);
+    match seq {
+        WindowSequence::OnlyLong | WindowSequence::EightShort => {
+            for i in 0..n {
+                w[i] = prev_w[i];
+                w[n + i] = cur_w[n - 1 - i];
+            }
+        }
+        WindowSequence::LongStart => {
+            for i in 0..n {
+                w[i] = prev_w[i];
+            }
+            let cur_short = short_window_for_shape(shape);
+            for i in 0..448 {
+                w[n + i] = 1.0;
+            }
+            for i in 0..128 {
+                w[n + 448 + i] = cur_short[127 - i];
+            }
+        }
+        WindowSequence::LongStop => {
+            let prev_short = short_window_for_shape(prev_shape);
+            for i in 0..128 {
+                w[448 + i] = prev_short[i];
+            }
+            for i in 576..n {
+                w[i] = 1.0;
+            }
+            for i in 0..n {
+                w[n + i] = cur_w[n - 1 - i];
+            }
+        }
+    }
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syntax::{WindowSequence, WindowShape};
+
+    #[test]
+    fn long_start_window_shape() {
+        let w = build_long_window_full(
+            WindowSequence::LongStart,
+            WindowShape::Sine,
+            WindowShape::Sine,
+        );
+        let n = LONG_LEN;
+        // First half: ordinary sine_long rising.
+        let sine = sine_long();
+        for i in 0..n {
+            assert!((w[i] - sine[i]).abs() < 1e-6, "first half[{i}]");
+        }
+        // [N..N+448): flat 1.0
+        for i in 0..448 {
+            assert!((w[n + i] - 1.0).abs() < 1e-6, "flat region[{i}]");
+        }
+        // [N+448..N+576): sine_short falling
+        let short = sine_short();
+        for i in 0..128 {
+            assert!((w[n + 448 + i] - short[127 - i]).abs() < 1e-6);
+        }
+        // [N+576..2N): zero
+        for i in 576..n {
+            assert!(w[n + i] == 0.0);
+        }
+    }
+
+    #[test]
+    fn long_stop_window_shape() {
+        let w = build_long_window_full(
+            WindowSequence::LongStop,
+            WindowShape::Sine,
+            WindowShape::Sine,
+        );
+        let n = LONG_LEN;
+        // [0..448): zero
+        for i in 0..448 {
+            assert!(w[i] == 0.0);
+        }
+        // [448..576): sine_short rising
+        let short = sine_short();
+        for i in 0..128 {
+            assert!((w[448 + i] - short[i]).abs() < 1e-6);
+        }
+        // [576..1024): flat 1.0
+        for i in 576..n {
+            assert!((w[i] - 1.0).abs() < 1e-6);
+        }
+        // Second half: sine_long falling
+        let sine = sine_long();
+        for i in 0..n {
+            assert!((w[n + i] - sine[n - 1 - i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn only_long_tdac_with_itself() {
+        // Two consecutive OnlyLong blocks must reproduce the input via
+        // overlap-add of their squared window halves: the falling half of
+        // block A and the rising half of block B sum to 1 sample-wise.
+        let wa = build_long_window_full(
+            WindowSequence::OnlyLong,
+            WindowShape::Sine,
+            WindowShape::Sine,
+        );
+        let wb = build_long_window_full(
+            WindowSequence::OnlyLong,
+            WindowShape::Sine,
+            WindowShape::Sine,
+        );
+        let n = LONG_LEN;
+        for i in 0..n {
+            let sum = wa[n + i] * wa[n + i] + wb[i] * wb[i];
+            assert!((sum - 1.0).abs() < 1e-4, "TDAC at {i}: {sum}");
+        }
+    }
 
     #[test]
     fn sine_at_endpoints() {
