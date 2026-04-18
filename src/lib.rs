@@ -28,6 +28,13 @@
 //! - PNS + IS emission plumbing (scalefactor + spectral-data paths); both
 //!   detector heuristics are gated off pending a psy-acoustic
 //!   bit-allocation model
+//! - Short-block encoder building blocks:
+//!   * [`transient::TransientDetector`] — per-channel attack classifier
+//!   * [`window::build_long_window_full`] — LongStart / LongStop shapes
+//!   * [`mdct::mdct_short_eightshort`] — 8 × 256 short MDCTs
+//!   The state-machine integration that consumes these into an
+//!   EightShort raw_data_block is still pending — the encoder still
+//!   always emits OnlyLong windows.
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
 //! - Gain control (§4.6.12)
