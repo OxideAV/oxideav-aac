@@ -52,7 +52,7 @@ use crate::huffman_tables::{
 };
 use crate::ics::SPEC_LEN;
 use crate::mdct::mdct_long;
-use crate::sfband::SWB_LONG;
+use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, AOT_AAC_LC, SAMPLE_RATES};
 use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
 use crate::window::sine_long;
@@ -704,6 +704,151 @@ fn quantise_band(band: &[f32], sf: i32) -> (Vec<i32>, bool) {
 
 /// For a given vector of quantised coefficients (length = band size),
 /// return the codebook index (1..=11) that minimises total Huffman bits.
+/// Encoder-side EightShort ICS. Mirrors [`Ics`] but with arrays sized
+/// `num_groups * max_sfb` instead of `max_sfb`. The simplest emission
+/// uses `num_groups = 8` with `window_group_length = [1; 8]` — every
+/// sub-window is its own group. That produces a slightly-larger
+/// bitstream than a grouped encoder but avoids the scale_factor_grouping
+/// heuristic.
+#[derive(Clone, Debug)]
+struct IcsShort {
+    sf_index: u8,
+    max_sfb: u8,
+    num_groups: u8,
+    window_group_length: [u8; 8],
+    /// `scale_factor_grouping` byte (7 meaningful bits, MSB-first), with
+    /// the convention described in `ics::parse_ics_info`.
+    scale_factor_grouping: u8,
+    /// Per-(group, sfb) scalefactor. Indexed `g * max_sfb + sfb`.
+    sfs: Vec<i32>,
+    /// Per-(group, sfb) codebook.
+    cbs: Vec<u8>,
+    /// Per-(group, sfb) quantised coefficient run (length =
+    /// `group_len * band_len`, laid out as w=0,..w=group_len-1
+    /// concatenated across the band).
+    q_bands: Vec<Vec<i32>>,
+    global_gain: u8,
+}
+
+/// Analyse a 1024-coefficient EightShort spectrum (laid out as 8
+/// contiguous 128-coefficient sub-windows) into an [`IcsShort`] ready
+/// for bitstream emission.
+///
+/// Uses `num_groups = 8` (no grouping) — each sub-window gets its own
+/// group for scalefactor purposes.
+fn analyse_and_quantise_short(spec: &[f32; 1024], sf_index: u8) -> Result<IcsShort> {
+    let swb = SWB_SHORT[sf_index as usize];
+    let total_sfb = swb.len() - 1;
+    const N_WINDOWS: usize = 8;
+
+    // Find the highest active sfb across all sub-windows, using the same
+    // relative-threshold rule the long analyser uses.
+    let global_peak = spec.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    let threshold = (global_peak * 1e-4).max(1e-3);
+    let mut max_band_active = 0usize;
+    for w in 0..N_WINDOWS {
+        for sfb in 0..total_sfb {
+            let base = w * 128;
+            let start = base + swb[sfb] as usize;
+            let end = base + swb[sfb + 1] as usize;
+            let mx = spec[start..end].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            if mx > threshold && sfb + 1 > max_band_active {
+                max_band_active = sfb + 1;
+            }
+        }
+    }
+    // max_sfb is 4 bits → capped at 15.
+    let max_sfb = max_band_active.max(1).min(total_sfb).min(15);
+
+    // Quantise each (group, sfb).
+    let target_max = 7i32;
+    let mut sfs = vec![0i32; N_WINDOWS * max_sfb];
+    let mut cbs = vec![0u8; N_WINDOWS * max_sfb];
+    let mut q_bands: Vec<Vec<i32>> = Vec::with_capacity(N_WINDOWS * max_sfb);
+
+    for g in 0..N_WINDOWS {
+        let base = g * 128;
+        for sfb in 0..max_sfb {
+            let start = base + swb[sfb] as usize;
+            let end = base + swb[sfb + 1] as usize;
+            let band = &spec[start..end];
+            let max_abs = band.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let idx = g * max_sfb + sfb;
+            if max_abs <= threshold {
+                sfs[idx] = 0;
+                q_bands.push(vec![0i32; end - start]);
+                continue;
+            }
+            // Pick scalefactor that keeps |q| ≤ target_max.
+            let tgt_inv = (target_max as f32).powf(4.0 / 3.0);
+            let ratio = max_abs / tgt_inv;
+            let sf_f = 100.0 + 4.0 * ratio.log2();
+            let mut sf = sf_f.ceil() as i32;
+            sf = sf.clamp(0, 255);
+            let (q, ok) = quantise_band(band, sf);
+            if ok {
+                sfs[idx] = sf;
+                q_bands.push(q);
+            } else {
+                let mut sf2 = sf + 1;
+                let final_q;
+                loop {
+                    let (q2, ok2) = quantise_band(band, sf2);
+                    if ok2 || sf2 >= 255 {
+                        final_q = q2;
+                        break;
+                    }
+                    sf2 += 1;
+                }
+                sfs[idx] = sf2;
+                q_bands.push(final_q);
+            }
+        }
+    }
+
+    // Codebook per (group, sfb). Short-window codebook selection uses
+    // the same "smallest book whose LAV fits" heuristic as long.
+    for g in 0..N_WINDOWS {
+        for sfb in 0..max_sfb {
+            let idx = g * max_sfb + sfb;
+            cbs[idx] = if q_bands[idx].iter().all(|&x| x == 0) {
+                0
+            } else {
+                best_codebook_for_band(&q_bands[idx])
+            };
+        }
+    }
+
+    // Anchor global_gain on the first regular-codebook band.
+    let mut gg: i32 = 100;
+    for g in 0..N_WINDOWS {
+        for sfb in 0..max_sfb {
+            let idx = g * max_sfb + sfb;
+            let cb = cbs[idx];
+            if cb != 0 && cb != NOISE_HCB && cb != INTENSITY_HCB && cb != INTENSITY_HCB2 {
+                gg = sfs[idx];
+                break;
+            }
+        }
+        if gg != 100 {
+            break;
+        }
+    }
+    let global_gain = gg.clamp(0, 255) as u8;
+
+    Ok(IcsShort {
+        sf_index,
+        max_sfb: max_sfb as u8,
+        num_groups: N_WINDOWS as u8,
+        window_group_length: [1; N_WINDOWS],
+        scale_factor_grouping: 0, // all 8 windows are separate groups
+        sfs,
+        cbs,
+        q_bands,
+        global_gain,
+    })
+}
+
 /// Classify a scalefactor band as IS-codable if `R ≈ scale·L` holds to
 /// good precision across the band. Returns `(is_position, sign_flip)`
 /// where `is_position` encodes the magnitude scale via
@@ -1415,6 +1560,49 @@ fn encoder_book(cb: u8) -> &'static EncBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analyse_short_silent_spectrum() {
+        let spec = [0.0f32; 1024];
+        let ics = analyse_and_quantise_short(&spec, 4).unwrap();
+        assert_eq!(ics.num_groups, 8);
+        assert_eq!(ics.window_group_length, [1; 8]);
+        assert_eq!(ics.scale_factor_grouping, 0);
+        assert_eq!(ics.max_sfb, 1); // clamped to ≥ 1 by analyser
+        // Every group+sfb should be a zero band (cb = 0).
+        for &cb in ics.cbs.iter() {
+            assert_eq!(cb, 0);
+        }
+    }
+
+    #[test]
+    fn analyse_short_tone_in_one_subwindow() {
+        // Place a concentrated tone in sub-window 3; expect max_sfb > 1 and
+        // at least one non-zero codebook in group 3's bands.
+        let mut spec = [0.0f32; 1024];
+        // Sub-window 3 starts at index 3*128 = 384. Put energy in bands
+        // 2..=4 of that window.
+        for k in 384 + 8..384 + 16 {
+            spec[k] = 500.0;
+        }
+        let ics = analyse_and_quantise_short(&spec, 4).unwrap();
+        assert_eq!(ics.num_groups, 8);
+        assert!(ics.max_sfb >= 2, "max_sfb={}", ics.max_sfb);
+        // Group 3 should carry the non-zero bands.
+        let max_sfb = ics.max_sfb as usize;
+        let g3_nonzero = (0..max_sfb).any(|sfb| ics.cbs[3 * max_sfb + sfb] != 0);
+        assert!(g3_nonzero, "group 3 should have a non-zero band");
+        // Other groups are all zeros (cb = 0).
+        for g in [0, 1, 2, 4, 5, 6, 7] {
+            for sfb in 0..max_sfb {
+                assert_eq!(
+                    ics.cbs[g * max_sfb + sfb],
+                    0,
+                    "group {g} sfb {sfb} should be empty"
+                );
+            }
+        }
+    }
 
     #[test]
     fn build_adts_header_fields() {
