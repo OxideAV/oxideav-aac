@@ -109,7 +109,7 @@ pub fn mdct_short_eightshort(
     let cur_short = crate::window::short_window_for_shape(cur_shape);
     let prev_short = crate::window::short_window_for_shape(prev_shape);
     const SUB_LEN: usize = crate::window::SHORT_LEN; // 128
-    const SUB_INPUT: usize = 2 * SUB_LEN;            // 256
+    const SUB_INPUT: usize = 2 * SUB_LEN; // 256
     let mut sub_time = [0.0f32; SUB_INPUT];
     for w in 0..8 {
         let base = 448 + w * SUB_LEN;

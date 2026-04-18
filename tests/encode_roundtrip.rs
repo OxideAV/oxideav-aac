@@ -295,7 +295,10 @@ fn encode_silence_stereo_self_decoder() {
     assert!(!decoded.is_empty(), "no samples decoded from silence");
     let rms = rms_f32(&decoded);
     eprintln!("stereo silence rms={rms}");
-    assert!(rms < 1e-3, "stereo silence decoded with audible noise rms={rms}");
+    assert!(
+        rms < 1e-3,
+        "stereo silence decoded with audible noise rms={rms}"
+    );
 }
 
 #[test]

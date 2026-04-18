@@ -68,9 +68,7 @@ pub fn apply_pulse_long(
     let swb = SWB_LONG[sf_index as usize];
     let start_sfb = pd.pulse_start_sfb as usize;
     if start_sfb >= max_sfb as usize {
-        return Err(Error::invalid(
-            "AAC: pulse_start_sfb beyond max_sfb",
-        ));
+        return Err(Error::invalid("AAC: pulse_start_sfb beyond max_sfb"));
     }
     let mut k = swb[start_sfb] as usize;
     // Track the current sfb so we know which scalefactor's gain applies.

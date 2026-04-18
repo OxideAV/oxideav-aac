@@ -57,7 +57,11 @@ impl ProgramConfigElement {
     /// CPE as 2, an SCE/LFE as 1). Ignores CC/assoc-data elements.
     pub fn channel_count(&self) -> usize {
         let mut n = 0;
-        for lists in [&self.front_channels, &self.side_channels, &self.back_channels] {
+        for lists in [
+            &self.front_channels,
+            &self.side_channels,
+            &self.back_channels,
+        ] {
             for e in lists.iter() {
                 n += if e.is_cpe { 2 } else { 1 };
             }
@@ -151,10 +155,7 @@ fn parse_channel_list(br: &mut BitReader<'_>, n: usize) -> Result<Vec<PceChannel
         if tag_select > 0xF {
             return Err(Error::invalid("AAC PCE: tag_select > 15"));
         }
-        v.push(PceChannelElement {
-            is_cpe,
-            tag_select,
-        });
+        v.push(PceChannelElement { is_cpe, tag_select });
     }
     Ok(v)
 }
@@ -180,7 +181,7 @@ mod tests {
         w.write_u32(0, 1); // mono_mixdown_present
         w.write_u32(0, 1); // stereo_mixdown_present
         w.write_u32(0, 1); // matrix_mixdown_present
-        // front element 0: is_cpe=1, tag_select=0
+                           // front element 0: is_cpe=1, tag_select=0
         w.write_u32(1, 1);
         w.write_u32(0, 4);
         // no side/back/lfe/assoc/cc

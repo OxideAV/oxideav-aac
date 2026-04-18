@@ -500,11 +500,13 @@ mod tests {
         // grouping. Put a constant signal in sub-windows 0 and 3; attach a
         // TNS filter only to sub-window 0; verify sub-window 0 is IIR-
         // filtered and sub-window 3 is untouched.
-        let mut info = IcsInfo::default();
-        info.sf_index = 4;
-        info.window_sequence = WindowSequence::EightShort;
-        info.max_sfb = 14;
-        info.num_window_groups = 8;
+        let mut info = IcsInfo {
+            sf_index: 4,
+            window_sequence: WindowSequence::EightShort,
+            max_sfb: 14,
+            num_window_groups: 8,
+            ..IcsInfo::default()
+        };
         for g in 0..8 {
             info.window_group_length[g] = 1;
         }
@@ -518,8 +520,10 @@ mod tests {
         // (low→high), coef_res=1, coef_compress=0, coef_raw[0] encodes ≈0.5
         // after dequant. For 4-bit coef, dequant = sin(raw * π/17). We pick
         // raw=3 → sin(3π/17) ≈ 0.508.
-        let mut tns = TnsData::default();
-        tns.num_windows = 8;
+        let mut tns = TnsData {
+            num_windows: 8,
+            ..TnsData::default()
+        };
         tns.windows[0].n_filt = 1;
         tns.windows[0].coef_res = 1;
         tns.windows[0].filters[0] = TnsFilter {
@@ -538,10 +542,7 @@ mod tests {
 
         // Sub-window 3 must still be the constant input.
         for k in 0..128 {
-            assert_eq!(
-                spec[3 * 128 + k], 1.0,
-                "sub-window 3 was modified at k={k}"
-            );
+            assert_eq!(spec[3 * 128 + k], 1.0, "sub-window 3 was modified at k={k}");
         }
         // Sub-window 0 must show the first-order IIR response: first sample
         // stays 1.0, subsequent samples decay toward 1/(1+a).

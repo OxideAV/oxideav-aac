@@ -43,7 +43,6 @@ use oxideav_core::{
 };
 
 use crate::bitwriter::BitWriter;
-use crate::ics::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::huffman_tables::{
     BOOK10_BITS, BOOK10_CODES, BOOK11_BITS, BOOK11_CODES, BOOK1_BITS, BOOK1_CODES, BOOK2_BITS,
     BOOK2_CODES, BOOK3_BITS, BOOK3_CODES, BOOK4_BITS, BOOK4_CODES, BOOK5_BITS, BOOK5_CODES,
@@ -51,6 +50,7 @@ use crate::huffman_tables::{
     BOOK9_CODES, SCALEFACTOR_BITS, SCALEFACTOR_CODES,
 };
 use crate::ics::SPEC_LEN;
+use crate::ics::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::mdct::mdct_long;
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, WindowShape, AOT_AAC_LC, SAMPLE_RATES};
@@ -600,12 +600,7 @@ impl AacEncoder {
                     if l_seq == WindowSequence::EightShort {
                         bw.write_bit(false); // common_window = 0
                         write_single_ics_any(&mut bw, &specs[ch_idx], self.sf_index, l_seq)?;
-                        write_single_ics_any(
-                            &mut bw,
-                            &specs[ch_idx + 1],
-                            self.sf_index,
-                            r_seq,
-                        )?;
+                        write_single_ics_any(&mut bw, &specs[ch_idx + 1], self.sf_index, r_seq)?;
                     } else {
                         write_cpe(
                             &mut bw,
@@ -973,8 +968,7 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         cbs[sfb] = if q.iter().all(|&x| x == 0) {
             0
         } else if ENABLE_PNS {
-            if let Some(pns_sf) =
-                classify_pns_band(spec, swb[sfb] as usize, swb[sfb + 1] as usize)
+            if let Some(pns_sf) = classify_pns_band(spec, swb[sfb] as usize, swb[sfb + 1] as usize)
             {
                 sfs[sfb] = pns_sf;
                 NOISE_HCB
@@ -1556,27 +1550,18 @@ fn write_scalefactors(bw: &mut BitWriter, ics: &Ics) -> Result<()> {
                 let delta = (target - g_noise).clamp(-60, 60);
                 g_noise += delta;
                 let idx = (delta + 60) as usize;
-                bw.write_u32(
-                    SCALEFACTOR_CODES[idx] as u32,
-                    SCALEFACTOR_BITS[idx] as u32,
-                );
+                bw.write_u32(SCALEFACTOR_CODES[idx] as u32, SCALEFACTOR_BITS[idx] as u32);
             }
         } else if cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
             let delta = (target - g_is).clamp(-60, 60);
             g_is += delta;
             let idx = (delta + 60) as usize;
-            bw.write_u32(
-                SCALEFACTOR_CODES[idx] as u32,
-                SCALEFACTOR_BITS[idx] as u32,
-            );
+            bw.write_u32(SCALEFACTOR_CODES[idx] as u32, SCALEFACTOR_BITS[idx] as u32);
         } else {
             let delta = (target - cur).clamp(-60, 60);
             cur += delta;
             let idx = (delta + 60) as usize;
-            bw.write_u32(
-                SCALEFACTOR_CODES[idx] as u32,
-                SCALEFACTOR_BITS[idx] as u32,
-            );
+            bw.write_u32(SCALEFACTOR_CODES[idx] as u32, SCALEFACTOR_BITS[idx] as u32);
         }
     }
     Ok(())
@@ -1787,12 +1772,9 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
             choice = 1;
         }
         if ENABLE_IS {
-            if let Some((pos, sign)) = classify_is_band(
-                l,
-                r,
-                swb[sfb] as usize,
-                swb[sfb + 1] as usize,
-            ) {
+            if let Some((pos, sign)) =
+                classify_is_band(l, r, swb[sfb] as usize, swb[sfb + 1] as usize)
+            {
                 // IS cost ≈ L-band cost + ~10 bits overhead for the
                 // scalefactor delta + codebook bits in section_data.
                 let is_cost = band_bit_cost(sfb, &ics_l_alone).saturating_add(10);
@@ -2100,7 +2082,7 @@ mod tests {
         assert_eq!(ics.window_group_length, [1; 8]);
         assert_eq!(ics.scale_factor_grouping, 0);
         assert_eq!(ics.max_sfb, 1); // clamped to ≥ 1 by analyser
-        // Every group+sfb should be a zero band (cb = 0).
+                                    // Every group+sfb should be a zero band (cb = 0).
         for &cb in ics.cbs.iter() {
             assert_eq!(cb, 0);
         }
@@ -2407,9 +2389,8 @@ mod tests {
         let mut decoded = Vec::new();
         for pkt in pkts.iter() {
             let p2 = Packet::new(0, tb, pkt.data.clone());
-            dec.send_packet(&p2).unwrap_or_else(|e| {
-                panic!("decoder rejected a short-block packet: {e}")
-            });
+            dec.send_packet(&p2)
+                .unwrap_or_else(|e| panic!("decoder rejected a short-block packet: {e}"));
             loop {
                 match dec.receive_frame() {
                     Ok(oxideav_core::Frame::Audio(af)) => {

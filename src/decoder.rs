@@ -189,8 +189,7 @@ impl AacDecoder {
                 ElementType::Sce => {
                     let _instance_tag = br.read_u32(4)?;
                     let mut spec = [0.0f32; SPEC_LEN];
-                    let (info, sf, sec, tns, pulse) =
-                        decode_ics(&mut br, self.sf_index, false)?;
+                    let (info, sf, sec, tns, pulse) = decode_ics(&mut br, self.sf_index, false)?;
                     fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
                     // Pulse data: §4.6.5 — applied to long-window spectrum
                     // before PNS / TNS.
@@ -394,9 +393,7 @@ impl AacDecoder {
                             }
                         }
                         if got_channels + 2 > pcm.len() {
-                            return Err(Error::invalid(
-                                "AAC: CPE would overflow 8 channel slots",
-                            ));
+                            return Err(Error::invalid("AAC: CPE would overflow 8 channel slots"));
                         }
                         for ch in 0..2 {
                             let mut channel_pcm = [0.0f32; FRAME_LEN];
@@ -483,9 +480,7 @@ impl AacDecoder {
                             pcm[got_channels + ch].copy_from_slice(&channel_pcm);
                         }
                         if got_channels + 2 > pcm.len() {
-                            return Err(Error::invalid(
-                                "AAC: CPE would overflow 8 channel slots",
-                            ));
+                            return Err(Error::invalid("AAC: CPE would overflow 8 channel slots"));
                         }
                         got_channels += 2;
                     }
@@ -497,8 +492,7 @@ impl AacDecoder {
                     // next channel slot.
                     let _instance_tag = br.read_u32(4)?;
                     let mut spec = [0.0f32; SPEC_LEN];
-                    let (info, sf, sec, tns, pulse) =
-                        decode_ics(&mut br, self.sf_index, false)?;
+                    let (info, sf, sec, tns, pulse) = decode_ics(&mut br, self.sf_index, false)?;
                     if info.window_sequence == WindowSequence::EightShort {
                         return Err(Error::invalid(
                             "AAC: LFE element with EIGHT_SHORT window (non-conformant)",
@@ -514,9 +508,7 @@ impl AacDecoder {
                         apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
                     }
                     if got_channels >= pcm.len() {
-                        return Err(Error::invalid(
-                            "AAC: LFE would overflow 8 channel slots",
-                        ));
+                        return Err(Error::invalid("AAC: LFE would overflow 8 channel slots"));
                     }
                     let mut channel_pcm = [0.0f32; FRAME_LEN];
                     imdct_and_overlap(
@@ -614,20 +606,21 @@ impl AacDecoder {
     }
 }
 
-/// Decode a single-channel ICS into (info, scalefactors, section_data, tns_data, pulse_data).
-/// Reads global_gain, ics_info, section_data, scalefactors, pulse / TNS / gain-control
-/// fields. Spectrum decoding is left to caller.
-fn decode_ics(
-    br: &mut BitReader<'_>,
-    sf_index: u8,
-    is_in_cpe: bool,
-) -> Result<(
+/// Parsed individual_channel_stream: everything except the spectrum.
+/// Returned by [`decode_ics`]; the spectrum is filled in separately by
+/// `fill_spectrum`.
+type DecodedIcs = (
     IcsInfo,
     Vec<i32>,
     SectionData,
     Option<TnsData>,
     Option<PulseData>,
-)> {
+);
+
+/// Decode a single-channel ICS into (info, scalefactors, section_data, tns_data, pulse_data).
+/// Reads global_gain, ics_info, section_data, scalefactors, pulse / TNS / gain-control
+/// fields. Spectrum decoding is left to caller.
+fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Result<DecodedIcs> {
     let global_gain = br.read_u32(8)? as u8;
     let info = parse_ics_info(br, sf_index)?;
     let sec = parse_section_data(br, &info)?;
@@ -832,11 +825,13 @@ mod tests {
 
     /// Build a minimal long-window IcsInfo for unit-testing the stereo passes.
     fn long_info(sf_index: u8, max_sfb: u8) -> IcsInfo {
-        let mut info = IcsInfo::default();
-        info.sf_index = sf_index;
-        info.window_sequence = WindowSequence::OnlyLong;
-        info.max_sfb = max_sfb;
-        info.num_window_groups = 1;
+        let mut info = IcsInfo {
+            sf_index,
+            window_sequence: WindowSequence::OnlyLong,
+            max_sfb,
+            num_window_groups: 1,
+            ..IcsInfo::default()
+        };
         info.window_group_length[0] = 1;
         info
     }
