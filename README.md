@@ -57,7 +57,7 @@ read it instead of looking for an ADTS sync word on the first packet.
 |----------------------------------------|-----------------------------------------|
 | Object types                           | AAC-LC (`AOT 2`) only                   |
 | Containers                             | ADTS (with or without CRC) and raw + ASC|
-| Channel configurations                 | mono (1) and stereo (2)                 |
+| Channel configurations                 | 1..=7 (mono, stereo, 3.0, 4.0, 5.0, 5.1, 7.1) |
 | Sample rates                           | All 13 standard SF indices (96k - 7350) |
 | Window sequences                       | Long, LongStart, LongStop, EightShort   |
 | Window shapes                          | sine and KBD                            |
@@ -65,17 +65,19 @@ read it instead of looking for an ADTS sync word on the first packet.
 | Scalefactor Huffman book               | Yes                                     |
 | M/S stereo (§4.6.13)                   | Yes (long + short)                      |
 | PNS / Perceptual Noise Sub. (§4.6.13)  | Yes (long + short, correlated noise)    |
-| TNS (§4.6.9)                           | Long-window filters; short-window parsed but bypassed |
-| Pulse data (§4.6.5)                    | Yes (long-window only, per spec)        |
+| Intensity stereo (§4.6.8.2.3)          | Yes (cb 14/15, sign from ms_used)       |
+| TNS (§4.6.9)                           | Long AND short-window filters           |
+| Pulse data (§4.6.5)                    | Yes (long-window only); short-window rejects as non-conformant |
 | Fill / DSE elements                    | Skipped cleanly                         |
-| Intensity stereo (§4.6.14)             | Bands flagged IS leave zeros (not decoded) |
+| LFE element (§4.6.10)                  | Yes (long-window SCE-like path)         |
+| PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
 | Gain control / SSR / Main / LTP        | Refused (`Error::Unsupported`)          |
-| LFE / CCE / PCE elements               | Refused (`Error::Unsupported`)          |
+| CCE elements                           | Refused (`Error::Unsupported`)          |
 | HE-AAC v1 (SBR) / v2 (PS)              | Refused at ASC parse and on FIL ext     |
-| Multi-channel (5.1, 7.1)               | Not supported                           |
 
-The decoder advertises `max_channels = 2` and `max_sample_rate = 96_000` in
-`CodecCapabilities`.
+The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
+`CodecCapabilities`. PCM output is interleaved in AAC element order
+(C, L, R, Ls, Rs, LFE for 5.1) — downstream muxers may remap.
 
 ## Encode support
 
@@ -83,26 +85,29 @@ The decoder advertises `max_channels = 2` and `max_sample_rate = 96_000` in
 |----------------------------------------|-----------------------------------------|
 | Object types                           | AAC-LC (`AOT 2`)                        |
 | Containers                             | ADTS only (one raw_data_block per frame, no CRC) |
-| Channels                               | mono (SCE) and stereo (CPE common_window) |
+| Channels                               | 1..=7 (1, 2, 3, 4, 5, 6, 8 input channels) |
+| Element orchestration                  | SCE + CPE + LFE sequence per AAC channel_configuration §1.6.3 |
 | Sample rates                           | Any of the 13 standard SF indices that match a known SWB table; tested at 44.1 kHz / 48 kHz |
 | Input sample format                    | `S16` and `F32` interleaved             |
-| Window sequence                        | Long-only (no transient detector wired) |
+| Window sequence                        | Long-only by default (short-block toolkit in place, state-machine wiring pending) |
 | Window shape                           | Sine                                    |
 | MDCT scaling                           | Matches ffmpeg's `aacenc.c` 32768x convention |
 | Spectral codebook selection            | Per-band cheapest of books 1-11 (incl. escape) |
 | Section data                           | Run-length compressed; merges adjacent same-cb bands |
-| Scalefactors                           | Huffman-coded deltas with global_gain anchor |
+| Scalefactors                           | Huffman-coded deltas with global_gain anchor; 3-accumulator path (g_gain / g_noise / g_is) for NOISE / IS bands |
 | M/S stereo (§4.6.13)                   | Per-band L/R-vs-M/S decision by bit cost |
 | TNS (§4.6.9)                           | LPC analysis on SCE long blocks; 4-bit parcor quantisation; gated on prediction-gain (~1.4 dB) |
-| PNS encode                             | Not implemented                         |
-| Intensity stereo encode                | Not implemented                         |
-| Pulse data encode                      | Not implemented (decoder accepts it)    |
-| Short blocks / transient detection     | Not implemented                         |
+| PNS encode                             | Emission plumbing in place; noise-band detector gated off pending psy-model |
+| Intensity stereo encode                | Per-band IS/MS/LR decision plumbing; detector gated off pending psy-model |
+| Pulse data encode                      | Not implemented (deferred — low value for tested content)       |
+| Short blocks (building blocks)         | `TransientDetector`, `mdct_short_eightshort`, `analyse_and_quantise_short`, `write_single_ics_short` — all tested; `emit_block` state-machine integration pending |
 | Gain control                           | Not implemented                         |
-| Multi-channel                          | Not supported                           |
 | CBR / VBR                              | Bit_rate accepted but currently advisory; no rate control loop |
 
-The encoder advertises `max_channels = 2` and `max_sample_rate = 48_000`.
+The encoder advertises `max_channels = 8` and `max_sample_rate = 48_000`.
+Multi-channel output emits elements in AAC element order (C, L, R for
+3.0; C, L, R, Ls, Rs, LFE for 5.1; etc.) — round-trip validated via the
+self-decoder for 5.1 and 7.1 layouts in `tests/encode_roundtrip.rs`.
 TNS on stereo (CPE) is gated off until per-band M/S decisions can run on
 TNS-flattened coefficients.
 
@@ -114,6 +119,9 @@ TNS-flattened coefficients.
 - 44.1 kHz stereo sine through our own decoder + ffmpeg (both channels)
 - 48 kHz mono sine through ffmpeg
 - 0.5 s mono and stereo silence through our own decoder (RMS < 1e-3)
+- 44.1 kHz 5.1 sine-per-channel through our own decoder (each of the 6
+  channels recovers its tone above a 20x Goertzel floor)
+- 44.1 kHz 7.1 sine-per-channel through our own decoder (all 8 channels)
 
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
