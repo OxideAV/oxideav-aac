@@ -292,18 +292,34 @@ impl AacEncoder {
                 self.input_buf[ch].resize(FRAME_LEN, 0.0);
             }
             self.emit_block(true)?;
-            return Ok(());
-        }
-        for ch in 0..self.channels as usize {
-            if self.input_buf[ch].len() < FRAME_LEN {
-                self.input_buf[ch].resize(FRAME_LEN, 0.0);
+        } else {
+            for ch in 0..self.channels as usize {
+                if self.input_buf[ch].len() < FRAME_LEN {
+                    self.input_buf[ch].resize(FRAME_LEN, 0.0);
+                }
             }
+            self.emit_block(true)?;
         }
-        self.emit_block(true)?;
+        // The short-block path adds one more frame of latency (the
+        // held lookahead buffer). Drain it so the last real frame is
+        // actually emitted.
+        if self.enable_short_blocks {
+            self.drain_held()?;
+        }
         Ok(())
     }
 
-    fn emit_block(&mut self, _is_last: bool) -> Result<()> {
+    fn emit_block(&mut self, is_last: bool) -> Result<()> {
+        if self.enable_short_blocks {
+            self.emit_block_short(is_last)
+        } else {
+            self.emit_block_long(is_last)
+        }
+    }
+
+    /// Long-only emit path — every frame is OnlyLong. Simpler and used
+    /// whenever `enable_short_blocks` is false.
+    fn emit_block_long(&mut self, _is_last: bool) -> Result<()> {
         let n_ch = self.channels as usize;
         // Build the 2N windowed block per channel:
         //   first_half = overlap[ch]      (was saved after last block)
@@ -344,13 +360,181 @@ impl AacEncoder {
 
         // Frame header + raw_data_block.
         let payload = self.encode_raw_data_block(&specs)?;
+        self.emit_payload(payload)
+    }
 
-        // Wrap in ADTS.
+    /// Short-block emit path. 1-frame lookahead: analyse the new samples,
+    /// decide the current frame's `WindowSequence` from the state table,
+    /// compute its spectrum with the appropriate MDCT/windowing path,
+    /// emit the previously-held spectrum, then stash the current
+    /// spectrum as the new hold.
+    fn emit_block_short(&mut self, _is_last: bool) -> Result<()> {
+        let n_ch = self.channels as usize;
+        let element_seq = element_sequence(self.channel_configuration);
+
+        // Step 1 — per-channel transient detection on the new samples.
+        let mut transients = vec![false; n_ch];
+        for ch in 0..n_ch {
+            transients[ch] = self.short_state[ch]
+                .transient
+                .analyse(&self.input_buf[ch][..FRAME_LEN]);
+        }
+
+        // Step 2 — reduce per element: CPE pairs OR their transient
+        // flags so both channels share a unified decision; LFE is
+        // long-only per §4.6.10 so its transient is forced false.
+        let mut elem_transients = vec![false; n_ch];
+        let mut ch_idx = 0usize;
+        for &el in element_seq {
+            match el {
+                AacElement::Sce => {
+                    elem_transients[ch_idx] = transients[ch_idx];
+                    ch_idx += 1;
+                }
+                AacElement::Cpe => {
+                    let t = transients[ch_idx] || transients[ch_idx + 1];
+                    elem_transients[ch_idx] = t;
+                    elem_transients[ch_idx + 1] = t;
+                    ch_idx += 2;
+                }
+                AacElement::Lfe => {
+                    elem_transients[ch_idx] = false;
+                    ch_idx += 1;
+                }
+            }
+        }
+
+        // Step 3 — compute cur_seq per channel from the state table.
+        // prev_seq is the held spectrum's seq (the one we're ABOUT to
+        // emit); on the first call it defaults to OnlyLong.
+        let mut cur_seqs = vec![WindowSequence::OnlyLong; n_ch];
+        let mut ch_idx = 0usize;
+        for &el in element_seq {
+            match el {
+                AacElement::Sce => {
+                    let prev = self.short_state[ch_idx]
+                        .held
+                        .as_ref()
+                        .map(|h| h.seq)
+                        .unwrap_or(WindowSequence::OnlyLong);
+                    cur_seqs[ch_idx] = next_window_seq(prev, elem_transients[ch_idx]);
+                    ch_idx += 1;
+                }
+                AacElement::Cpe => {
+                    let prev = self.short_state[ch_idx]
+                        .held
+                        .as_ref()
+                        .map(|h| h.seq)
+                        .unwrap_or(WindowSequence::OnlyLong);
+                    let next = next_window_seq(prev, elem_transients[ch_idx]);
+                    cur_seqs[ch_idx] = next;
+                    cur_seqs[ch_idx + 1] = next;
+                    ch_idx += 2;
+                }
+                AacElement::Lfe => {
+                    cur_seqs[ch_idx] = WindowSequence::OnlyLong;
+                    ch_idx += 1;
+                }
+            }
+        }
+
+        // Step 4 — window + forward-MDCT per channel. For long
+        // sequences we use `build_long_window_full` so the asymmetric
+        // LongStart / LongStop shapes are applied correctly. For
+        // EightShort we use `mdct_short_eightshort` which internally
+        // applies per-sub-window sine windowing with w=0's rising edge
+        // coming from the prev shape.
+        let shape = WindowShape::Sine;
+        let mut specs: Vec<Vec<f32>> = vec![vec![0.0f32; FRAME_LEN]; n_ch];
+        for ch in 0..n_ch {
+            let cur_seq = cur_seqs[ch];
+            // Assemble the 2N-sample unwindowed block (= prev overlap |
+            // new samples).
+            let mut block = vec![0.0f32; BLOCK_LEN];
+            for i in 0..FRAME_LEN {
+                block[i] = self.overlap[ch][i];
+                block[FRAME_LEN + i] = self.input_buf[ch][i];
+            }
+            if cur_seq == WindowSequence::EightShort {
+                let mut short_spec = [0.0f32; 1024];
+                crate::mdct::mdct_short_eightshort(&block, shape, shape, &mut short_spec);
+                for v in short_spec.iter_mut() {
+                    *v *= MDCT_FORWARD_SCALE;
+                }
+                specs[ch].copy_from_slice(&short_spec);
+            } else {
+                let window = build_long_window_full(cur_seq, shape, shape);
+                for i in 0..BLOCK_LEN {
+                    block[i] *= window[i];
+                }
+                mdct_long(&block, &mut specs[ch]);
+                for v in specs[ch].iter_mut() {
+                    *v *= MDCT_FORWARD_SCALE;
+                }
+            }
+        }
+
+        // Step 5 — update overlap to the new (unwindowed) samples and
+        // drain them from the input buffer.
+        for ch in 0..n_ch {
+            self.overlap[ch] = self.input_buf[ch][..FRAME_LEN].to_vec();
+            self.input_buf[ch].drain(..FRAME_LEN);
+        }
+
+        // Step 6 — emit the previously-held frame (if any).
+        if self.short_state[0].held.is_some() {
+            self.emit_held_frame()?;
+        }
+
+        // Step 7 — save (specs, cur_seqs) as the new held.
+        for ch in 0..n_ch {
+            self.short_state[ch].held = Some(HeldBlock {
+                spec: std::mem::take(&mut specs[ch]),
+                seq: cur_seqs[ch],
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Emit the currently-held (1-frame-deferred) frame as an ADTS
+    /// packet. Called from `emit_block_short` when a new frame arrives
+    /// and again from `drain_held` on flush.
+    fn emit_held_frame(&mut self) -> Result<()> {
+        let n_ch = self.channels as usize;
+        let mut specs: Vec<Vec<f32>> = Vec::with_capacity(n_ch);
+        let mut seqs: Vec<WindowSequence> = Vec::with_capacity(n_ch);
+        for ch in 0..n_ch {
+            let h = self.short_state[ch]
+                .held
+                .as_ref()
+                .ok_or_else(|| Error::other("AAC encoder: held frame missing"))?;
+            specs.push(h.spec.clone());
+            seqs.push(h.seq);
+        }
+        let payload = self.encode_raw_data_block_seq(&specs, &seqs)?;
+        self.emit_payload(payload)
+    }
+
+    /// Drain any remaining held frame at flush time.
+    fn drain_held(&mut self) -> Result<()> {
+        if self.short_state.is_empty() || self.short_state[0].held.is_none() {
+            return Ok(());
+        }
+        self.emit_held_frame()?;
+        for s in self.short_state.iter_mut() {
+            s.held = None;
+        }
+        Ok(())
+    }
+
+    /// Wrap a raw_data_block payload in ADTS and push onto the output
+    /// queue, advancing `pts` by one frame.
+    fn emit_payload(&mut self, payload: Vec<u8>) -> Result<()> {
         let samples_per_frame = FRAME_LEN as u32;
         let mut adts_frame =
             build_adts_frame(self.sf_index, self.channel_configuration, payload.len());
         adts_frame.extend_from_slice(&payload);
-
         let pkt = Packet::new(0, self.time_base, adts_frame).with_pts(self.pts);
         self.pts += samples_per_frame as i64;
         self.output_queue.push_back(pkt);
@@ -471,6 +655,33 @@ enum AacElement {
     Sce,
     Cpe,
     Lfe,
+}
+
+/// State-machine transition for the short-block encoder:
+///
+/// ```text
+///   OnlyLong  + transient  → LongStart    // prepare for EightShort
+///   OnlyLong  + no-trans   → OnlyLong
+///   LongStart (any)        → EightShort   // LongStart always commits
+///   EightShort + transient → EightShort   // keep resolving
+///   EightShort + no-trans  → LongStop     // decay back
+///   LongStop  (any)        → OnlyLong
+/// ```
+///
+/// All five transitions are spec-legal — each `{right_edge}.{left_edge}`
+/// boundary TDAC-cancels: OnlyLong⇄OnlyLong and LongStop⇄OnlyLong share
+/// the full-length sine/KBD curve; OnlyLong⇄LongStart, LongStart⇄
+/// EightShort, EightShort⇄EightShort, EightShort⇄LongStop chain through
+/// 128-sample short-window edges.
+fn next_window_seq(prev: WindowSequence, transient: bool) -> WindowSequence {
+    match prev {
+        WindowSequence::OnlyLong if transient => WindowSequence::LongStart,
+        WindowSequence::OnlyLong => WindowSequence::OnlyLong,
+        WindowSequence::LongStart => WindowSequence::EightShort,
+        WindowSequence::EightShort if transient => WindowSequence::EightShort,
+        WindowSequence::EightShort => WindowSequence::LongStop,
+        WindowSequence::LongStop => WindowSequence::OnlyLong,
+    }
 }
 
 /// Element sequence for each AAC `channel_configuration` (§1.6.3). Listed
