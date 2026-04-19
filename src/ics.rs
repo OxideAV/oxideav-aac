@@ -7,10 +7,10 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::huffman::{decode_scalefactor_delta, decode_spectral, spectral_book};
 use crate::sfband::{num_swb_long, num_swb_short, SWB_LONG, SWB_SHORT};
 use crate::syntax::{WindowSequence, WindowShape};
+use oxideav_core::bits::BitReader;
 
 /// Maximum scalefactor bands per group (long-window worst case).
 pub const MAX_SFB: usize = 51;

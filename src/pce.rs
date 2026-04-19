@@ -14,7 +14,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
+use oxideav_core::bits::BitReader;
 
 /// A single front / side / back channel element listing in a PCE.
 #[derive(Clone, Copy, Debug, Default)]
@@ -163,7 +163,7 @@ fn parse_channel_list(br: &mut BitReader<'_>, n: usize) -> Result<Vec<PceChannel
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitwriter::BitWriter;
+    use oxideav_core::bits::BitWriter;
 
     #[test]
     fn round_trip_minimal_pce_stereo() {

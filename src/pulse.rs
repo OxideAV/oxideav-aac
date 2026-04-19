@@ -19,9 +19,9 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::ics::{inv_quant, sf_to_gain, SPEC_LEN};
 use crate::sfband::SWB_LONG;
+use oxideav_core::bits::BitReader;
 
 /// Maximum number of pulses (`number_pulse + 1`).
 pub const MAX_PULSES: usize = 4;
@@ -100,7 +100,7 @@ pub fn apply_pulse_long(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitwriter::BitWriter;
+    use oxideav_core::bits::BitWriter;
 
     #[test]
     fn parse_single_pulse_roundtrip() {

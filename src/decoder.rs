@@ -11,7 +11,6 @@ use oxideav_core::{
 
 use crate::adts::parse_adts_header;
 use crate::asc::parse_asc;
-use crate::bitreader::BitReader;
 use crate::ics::{
     decode_spectrum_long, decode_spectrum_short, parse_ics_info, parse_scalefactors,
     parse_section_data, IcsInfo, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, SPEC_LEN,
@@ -23,6 +22,7 @@ use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
 use crate::tns::{apply_tns_long, apply_tns_short, parse_tns_data, TnsData};
+use oxideav_core::bits::BitReader;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     // Figure out the stream config. Two paths:

@@ -42,7 +42,6 @@ use oxideav_core::{
     TimeBase,
 };
 
-use crate::bitwriter::BitWriter;
 use crate::huffman_tables::{
     BOOK10_BITS, BOOK10_CODES, BOOK11_BITS, BOOK11_CODES, BOOK1_BITS, BOOK1_CODES, BOOK2_BITS,
     BOOK2_CODES, BOOK3_BITS, BOOK3_CODES, BOOK4_BITS, BOOK4_CODES, BOOK5_BITS, BOOK5_CODES,
@@ -57,6 +56,7 @@ use crate::syntax::{ElementType, WindowSequence, WindowShape, AOT_AAC_LC, SAMPLE
 use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
 use crate::transient::TransientDetector;
 use crate::window::{build_long_window_full, sine_long};
+use oxideav_core::bits::BitWriter;
 
 /// MDCT length (long block).
 const FRAME_LEN: usize = 1024;
@@ -2283,8 +2283,8 @@ mod tests {
 
     #[test]
     fn sf_huffman_roundtrip() {
-        use crate::bitreader::BitReader;
         use crate::huffman::decode_scalefactor_delta;
+        use oxideav_core::bits::BitReader;
         // Write a series of deltas via the encoder's SF writer logic and
         // verify the decoder reads them back unchanged.
         let deltas: Vec<i32> = (-30..=30).step_by(3).collect();
@@ -2303,8 +2303,8 @@ mod tests {
 
     #[test]
     fn spectral_book_roundtrip_book8() {
-        use crate::bitreader::BitReader;
         use crate::huffman::{decode_spectral, BOOK8};
+        use oxideav_core::bits::BitReader;
         // Encode a few unsigned (lav 7) pairs and verify decode.
         let pairs = [(3i32, -5i32), (7, 0), (0, 0), (-2, -7), (1, 1)];
         let mut bw = BitWriter::new();
@@ -2323,8 +2323,8 @@ mod tests {
 
     #[test]
     fn book7_index_layout() {
-        use crate::bitreader::BitReader;
         use crate::huffman::{decode_spectral, BOOK7};
+        use oxideav_core::bits::BitReader;
         // Book 7 (dim=2, lav=7, unsigned, no escape): index = i*8 + j.
         // Try (1, 0) by setting q = [1, 0].
         let mut bw = BitWriter::new();
@@ -2338,8 +2338,8 @@ mod tests {
 
     #[test]
     fn spectral_book_roundtrip_book11_with_escape() {
-        use crate::bitreader::BitReader;
         use crate::huffman::{decode_spectral, BOOK11};
+        use oxideav_core::bits::BitReader;
         let pairs = [(3i32, -5i32), (16, 0), (-32, 12), (100, -200), (1, 1)];
         let mut bw = BitWriter::new();
         for &(a, b) in &pairs {
@@ -2403,9 +2403,9 @@ mod tests {
     /// samples.
     #[test]
     fn short_block_percussive_round_trip() {
-        use crate::bitreader::BitReader;
         #[allow(unused_imports)]
         use oxideav_codec::Decoder;
+        use oxideav_core::bits::BitReader;
         use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
         let sr = 44_100u32;

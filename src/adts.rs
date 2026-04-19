@@ -25,8 +25,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::syntax::{sample_rate, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SSR};
+use oxideav_core::bits::BitReader;
 
 /// Length of the ADTS fixed header in bytes when no CRC is present.
 pub const ADTS_HEADER_NO_CRC: usize = 7;

@@ -32,10 +32,10 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::ics::{group_starts, IcsInfo, SPEC_LEN};
 use crate::sfband::SWB_SHORT;
 use crate::syntax::WindowSequence;
+use oxideav_core::bits::BitReader;
 
 /// Max TNS filter order for AAC-LC (§4.6.9, Table 4.136): 12 long / 7 short.
 pub const TNS_MAX_ORDER_LONG: u8 = 12;
@@ -414,7 +414,7 @@ pub fn apply_tns_short(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitwriter::BitWriter;
+    use oxideav_core::bits::BitWriter;
 
     #[test]
     fn dequant_tns_coef_sign() {

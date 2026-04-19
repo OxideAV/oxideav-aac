@@ -7,8 +7,8 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::syntax::{sample_rate, AOT_PS, AOT_SBR};
+use oxideav_core::bits::BitReader;
 
 #[derive(Clone, Debug)]
 pub struct AudioSpecificConfig {

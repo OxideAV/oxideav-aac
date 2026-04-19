@@ -15,13 +15,13 @@ use std::sync::OnceLock;
 
 use oxideav_core::{Error, Result};
 
-use crate::bitreader::BitReader;
 use crate::huffman_tables::{
     BOOK10_BITS, BOOK10_CODES, BOOK11_BITS, BOOK11_CODES, BOOK1_BITS, BOOK1_CODES, BOOK2_BITS,
     BOOK2_CODES, BOOK3_BITS, BOOK3_CODES, BOOK4_BITS, BOOK4_CODES, BOOK5_BITS, BOOK5_CODES,
     BOOK6_BITS, BOOK6_CODES, BOOK7_BITS, BOOK7_CODES, BOOK8_BITS, BOOK8_CODES, BOOK9_BITS,
     BOOK9_CODES, SCALEFACTOR_BITS, SCALEFACTOR_CODES,
 };
+use oxideav_core::bits::BitReader;
 
 /// One per code length: holds `(code, index)` pairs sorted by `code`.
 #[derive(Clone, Debug, Default)]

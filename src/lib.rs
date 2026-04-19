@@ -63,8 +63,6 @@
 
 pub mod adts;
 pub mod asc;
-pub mod bitreader;
-pub mod bitwriter;
 pub mod decoder;
 pub mod encoder;
 pub mod huffman;

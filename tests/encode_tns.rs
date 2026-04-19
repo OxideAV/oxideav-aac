@@ -17,8 +17,8 @@ use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
-use oxideav_aac::bitreader::BitReader;
 use oxideav_aac::ics::SPEC_LEN;
+use oxideav_core::bits::BitReader;
 
 /// Build a percussive PCM buffer: short clicks at regular intervals, with
 /// low-amplitude pink-ish filler between them so the encoder has something
