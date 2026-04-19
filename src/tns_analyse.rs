@@ -30,13 +30,18 @@
 //!      so we re-derive consistency.)
 
 use crate::ics::SPEC_LEN;
-use crate::sfband::SWB_LONG;
-use crate::tns::TNS_MAX_ORDER_LONG;
+use crate::sfband::{SWB_LONG, SWB_SHORT};
+use crate::tns::{TNS_MAX_BANDS_SHORT, TNS_MAX_ORDER_LONG, TNS_MAX_ORDER_SHORT};
 
 /// LPC order used by the encoder's TNS (long windows). Keep this modest —
 /// higher orders spend more bits and rarely outperform order-4 on typical
 /// AAC content.
 pub const TNS_ENC_ORDER: usize = 4;
+/// LPC order used by the encoder's TNS on 128-coefficient short
+/// sub-windows. Kept below [`TNS_MAX_ORDER_SHORT`] (= 7) — order 4 hits
+/// the same cost/benefit sweet spot as the long-window path and uses
+/// the same 4-bit (coef_res=1) parcor quantisation.
+pub const TNS_ENC_ORDER_SHORT: usize = 4;
 
 /// Minimum prediction gain (= 1 / levinson_error_ratio) required to apply TNS.
 /// `1.4 dB ≈ 10^(1.4/10) ≈ 1.3804` — below that the bits spent signalling TNS
@@ -332,6 +337,87 @@ pub fn analyse_long(spec: &mut [f32; SPEC_LEN], sf_index: u8, max_sfb: u8) -> Op
     }
     let decoder_lpc_q = parcor_to_decoder_lpc(&parcor_q);
     // Apply the forward filter using the quantised decoder_lpc.
+    apply_forward_tns(
+        spec,
+        start_bin,
+        end_bin - start_bin,
+        &decoder_lpc_q,
+        TNS_ENC_DIRECTION,
+    );
+    Some(TnsEncFilter {
+        length_sfb: top as u8,
+        order: order as u8,
+        direction: TNS_ENC_DIRECTION,
+        coef_compress: TNS_ENC_COEF_COMPRESS,
+        coef_raw,
+    })
+}
+
+/// Short-window TNS analysis. Runs on a single 128-coefficient
+/// sub-window at offset `sub_window * 128` inside a 1024-coefficient
+/// short-block spectrum. Mirror of [`analyse_long`] with three
+/// short-specific caps:
+///   * `length_sfb` is capped at `min(max_sfb, TNS_MAX_BANDS_SHORT)`
+///     (= 14 for AAC-LC, per §4.6.9.1 / Table 4.139).
+///   * `order` is capped at `TNS_ENC_ORDER_SHORT` (4) and bounded by
+///     [`TNS_MAX_ORDER_SHORT`] (= 7) per spec.
+///   * Filter `length_sfb` field is emitted as 4 bits, so must fit in
+///     `[0, 15]`.
+///
+/// On success, mutates `spec[sub_base..sub_base + swb[length_sfb]]` in
+/// place with the forward (all-zero) filter and returns the filter
+/// params to serialise. Returns `None` when TNS wouldn't help (gain
+/// below [`TNS_GAIN_THRESHOLD`], degenerate autocorrelation, etc.) —
+/// callers then emit `n_filt = 0` for the sub-window.
+pub fn analyse_short(
+    spec: &mut [f32; SPEC_LEN],
+    sub_window: usize,
+    sf_index: u8,
+    max_sfb: u8,
+) -> Option<TnsEncFilter> {
+    debug_assert!(sub_window < 8);
+    let swb = SWB_SHORT[sf_index as usize];
+    if max_sfb == 0 {
+        return None;
+    }
+    let tns_cap = (TNS_MAX_BANDS_SHORT as usize).min(max_sfb as usize);
+    // length_sfb is written as 4 bits → must fit in [0, 15].
+    let top = tns_cap.min(15);
+    if top < 2 {
+        return None;
+    }
+    let sub_base = sub_window * 128;
+    let start_bin = sub_base + swb[0] as usize;
+    let end_bin = sub_base + swb[top] as usize;
+    if end_bin <= start_bin || end_bin > SPEC_LEN {
+        return None;
+    }
+    let n = end_bin - start_bin;
+    let order = TNS_ENC_ORDER_SHORT
+        .min(TNS_MAX_ORDER_SHORT as usize)
+        .min(n.saturating_sub(1));
+    if order == 0 {
+        return None;
+    }
+    let window_slice: &[f32] = &spec[start_bin..end_bin];
+    let (lpc_std, _refl, err_ratio) = levinson(window_slice, order);
+    if err_ratio >= 1.0 {
+        return None;
+    }
+    let gain = 1.0 / err_ratio.max(1e-9);
+    if gain < TNS_GAIN_THRESHOLD {
+        return None;
+    }
+    let decoder_lpc_target: Vec<f32> = lpc_std.iter().map(|&v| -v).collect();
+    let parcor_target = lpc_to_parcor(&decoder_lpc_target);
+    let mut coef_raw = [0u8; TNS_MAX_ORDER_LONG as usize];
+    let mut parcor_q = vec![0.0f32; order];
+    for (i, &p) in parcor_target.iter().enumerate() {
+        let code = quantise_parcor(p, TNS_ENC_COEF_RES);
+        coef_raw[i] = code;
+        parcor_q[i] = dequantise_parcor(code, TNS_ENC_COEF_RES);
+    }
+    let decoder_lpc_q = parcor_to_decoder_lpc(&parcor_q);
     apply_forward_tns(
         spec,
         start_bin,

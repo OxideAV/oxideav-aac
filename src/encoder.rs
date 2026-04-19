@@ -1065,6 +1065,11 @@ struct IcsShort {
     /// concatenated across the band).
     q_bands: Vec<Vec<i32>>,
     global_gain: u8,
+    /// Per-sub-window TNS filter (at most one filter per sub-window —
+    /// `TNS_MAX_FILT_SHORT` = 1 per §4.6.9.1). `None` for sub-windows
+    /// where TNS didn't pass the gain threshold; `Some` ones are
+    /// written into the `tns_data()` block as `n_filt = 1`.
+    tns: [Option<TnsEncFilter>; 8],
 }
 
 /// Analyse a 1024-coefficient EightShort spectrum (laid out as 8
@@ -1074,6 +1079,14 @@ struct IcsShort {
 /// Uses `num_groups = 8` (no grouping) — each sub-window gets its own
 /// group for scalefactor purposes.
 fn analyse_and_quantise_short(spec: &[f32; 1024], sf_index: u8) -> Result<IcsShort> {
+    analyse_and_quantise_short_opts(spec, sf_index, true)
+}
+
+fn analyse_and_quantise_short_opts(
+    spec: &[f32; 1024],
+    sf_index: u8,
+    use_tns: bool,
+) -> Result<IcsShort> {
     let swb = SWB_SHORT[sf_index as usize];
     let total_sfb = swb.len() - 1;
     const N_WINDOWS: usize = 8;
@@ -1096,6 +1109,21 @@ fn analyse_and_quantise_short(spec: &[f32; 1024], sf_index: u8) -> Result<IcsSho
     }
     // max_sfb is 4 bits → capped at 15.
     let max_sfb = max_band_active.max(1).min(total_sfb).min(15);
+
+    // Run TNS on a mutable copy of the spectrum laid out as
+    // `[f32; SPEC_LEN]` so `analyse_short` / the decoder-compat filter
+    // runs on matching buffer shapes. Quantisation then proceeds on
+    // `spec_tns` — with TNS off, `spec_tns == spec`.
+    let mut spec_tns = [0.0f32; SPEC_LEN];
+    spec_tns[..1024].copy_from_slice(spec);
+    let mut tns: [Option<TnsEncFilter>; 8] = Default::default();
+    if use_tns {
+        for w in 0..N_WINDOWS {
+            tns[w] = crate::tns_analyse::analyse_short(&mut spec_tns, w, sf_index, max_sfb as u8);
+        }
+    }
+    // From here on everything quantises off the TNS-flattened view.
+    let spec: &[f32] = &spec_tns[..1024];
 
     // Quantise each (group, sfb).
     let target_max = 7i32;
@@ -1183,6 +1211,7 @@ fn analyse_and_quantise_short(spec: &[f32; 1024], sf_index: u8) -> Result<IcsSho
         cbs,
         q_bands,
         global_gain,
+        tns,
     })
 }
 
@@ -1677,8 +1706,40 @@ fn write_spectral_data_short(bw: &mut BitWriter, ics: &IcsShort) {
     }
 }
 
+/// Serialise `tns_data()` for an EightShort ICS — one 1-bit `n_filt`
+/// flag per sub-window, then (if present) the single short-window
+/// filter per §4.6.9.1. Bit layout is the dual of
+/// [`crate::tns::parse_tns_data`]'s EightShort branch.
+fn write_tns_data_short(bw: &mut BitWriter, tns: &[Option<TnsEncFilter>; 8]) {
+    for filt_opt in tns.iter() {
+        match filt_opt {
+            None => bw.write_u32(0, 1), // n_filt = 0
+            Some(filt) => {
+                bw.write_u32(1, 1); // n_filt = 1
+                                    // coef_res — once per window before the filter list.
+                bw.write_u32(crate::tns_analyse::TNS_ENC_COEF_RES as u32, 1);
+                // length (4 bits) + order (3 bits) per filter.
+                bw.write_u32(filt.length_sfb as u32, 4);
+                bw.write_u32(filt.order as u32, 3);
+                if filt.order > 0 {
+                    bw.write_u32(filt.direction as u32, 1);
+                    bw.write_u32(filt.coef_compress as u32, 1);
+                    let coef_bits: u32 =
+                        3 + crate::tns_analyse::TNS_ENC_COEF_RES as u32 - filt.coef_compress as u32;
+                    for o in 0..filt.order as usize {
+                        bw.write_u32(
+                            filt.coef_raw[o] as u32 & ((1u32 << coef_bits) - 1),
+                            coef_bits,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Write an entire SCE-style EightShort individual_channel_stream:
-/// global_gain + ics_info + section + scalefactors + pulse=0 + tns=0 +
+/// global_gain + ics_info + section + scalefactors + pulse=0 + tns +
 /// gain_control=0 + spectral_data. Used for both SCE and LFE elements.
 #[allow(dead_code)]
 fn write_single_ics_short(bw: &mut BitWriter, ics: &IcsShort) -> Result<()> {
@@ -1687,7 +1748,11 @@ fn write_single_ics_short(bw: &mut BitWriter, ics: &IcsShort) -> Result<()> {
     write_section_data_short(bw, ics);
     write_scalefactors_short(bw, ics)?;
     bw.write_u32(0, 1); // pulse_data_present — always 0 for short (spec forbids it)
-    bw.write_u32(0, 1); // tns_data_present   — short-window encoder TNS deferred
+    let tns_present = ics.tns.iter().any(|f| f.is_some());
+    bw.write_u32(tns_present as u32, 1);
+    if tns_present {
+        write_tns_data_short(bw, &ics.tns);
+    }
     bw.write_u32(0, 1); // gain_control_data_present
     write_spectral_data_short(bw, ics);
     Ok(())
@@ -2071,6 +2136,75 @@ mod tests {
             }
             Ok(other) => panic!("unexpected frame variant: {other:?}"),
             Err(e) => panic!("decoder rejected EightShort SCE: {e}"),
+        }
+    }
+
+    /// A highly-correlated per-sub-window spectrum triggers TNS; the
+    /// emitted bitstream carries `tns_data_present = 1` and parses
+    /// through the decoder end-to-end. This is the positive-path
+    /// counterpart to `short_ics_roundtrip_through_decoder` (which
+    /// uses a sparse spectrum that does not trigger TNS).
+    #[test]
+    fn short_tns_roundtrip_through_decoder() {
+        use crate::adts::parse_adts_header;
+        use crate::syntax::ElementType;
+        use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+
+        // Build a spectrum where each 128-coef sub-window carries a
+        // smoothly-correlated envelope (envelope's AR structure is
+        // what makes Levinson find a useful predictor). Use a strong
+        // first-order IIR-like decay so TNS can fit an order-4 model.
+        let sf_index = 4u8; // 44.1 kHz
+        let mut spec = [0.0f32; 1024];
+        for w in 0..8 {
+            let base = w * 128;
+            let mut cur = 800.0f32;
+            for k in 0..128 {
+                spec[base + k] = cur;
+                // Fake AR(1)-ish decay with small sign flips so the
+                // coefficients span a real dynamic range.
+                cur = cur * 0.92 - 60.0 * if k & 7 == 0 { 1.0 } else { 0.0 };
+            }
+        }
+        let ics = analyse_and_quantise_short(&spec, sf_index).unwrap();
+        // At least one sub-window should have a TNS filter attached.
+        let tns_count = ics.tns.iter().filter(|f| f.is_some()).count();
+        assert!(
+            tns_count > 0,
+            "AR-correlated spectrum should trigger TNS in ≥ 1 sub-window",
+        );
+
+        // Build the raw_data_block and wrap it in ADTS.
+        let mut bw = BitWriter::new();
+        bw.write_u32(ElementType::Sce as u32, 3);
+        bw.write_u32(0, 4);
+        write_single_ics_short(&mut bw, &ics).unwrap();
+        bw.write_u32(ElementType::End as u32, 3);
+        bw.align_to_byte();
+        let payload = bw.finish();
+        let adts = build_adts_frame(sf_index, 1, payload.len());
+        let mut frame = adts;
+        frame.extend_from_slice(&payload);
+
+        // Sanity: ADTS parses cleanly.
+        let hdr = parse_adts_header(&frame).expect("ADTS parse");
+        assert_eq!(hdr.frame_length, frame.len());
+
+        // Decoder round-trip: must accept the frame without error.
+        let mut params = CodecParameters::audio(CodecId::new("aac"));
+        params.sample_rate = Some(44_100);
+        params.channels = Some(1);
+        let mut dec = crate::decoder::make_decoder(&params).expect("decoder");
+        let tb = TimeBase::new(1, 44_100);
+        let pkt = Packet::new(0, tb, frame);
+        dec.send_packet(&pkt).expect("send_packet");
+        match dec.receive_frame() {
+            Ok(oxideav_core::Frame::Audio(af)) => {
+                assert_eq!(af.channels, 1);
+                assert_eq!(af.samples, 1024);
+            }
+            Ok(other) => panic!("unexpected frame variant: {other:?}"),
+            Err(e) => panic!("decoder rejected TNS-present EightShort SCE: {e}"),
         }
     }
 

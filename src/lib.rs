@@ -22,7 +22,7 @@
 //! - AAC-LC long-block output, channel configurations 1..=7
 //!   (mono / stereo / 3.0 / 4.0 / 5.0 / 5.1 / 7.1) via SCE + CPE + LFE
 //!   element sequencing per §1.6.3
-//! - TNS forward filtering on SCE long windows
+//! - TNS forward filtering on SCE long and short windows
 //! - M/S stereo per band in CPE
 //! - ADTS wrap with single raw_data_block per frame
 //! - PNS + IS emission plumbing (scalefactor + spectral-data paths); both
@@ -46,8 +46,8 @@
 //! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
 //! - Encoder pulse data, VBR rate control
-//! - Encoder short-window TNS / PNS / IS (short-block path emits them
-//!   gated off — decode round-trips but bitrate is loose on percussive
+//! - Encoder short-window PNS / IS (short-block path emits them gated
+//!   off — decode round-trips but bitrate is loose on percussive
 //!   content)
 
 #![allow(
