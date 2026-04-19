@@ -11,8 +11,8 @@ but usable standalone.
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-aac = "0.0"
 ```
 
