@@ -81,7 +81,7 @@ pub mod tns_analyse;
 pub mod transient;
 pub mod window;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub const CODEC_ID_STR: &str = "aac";
@@ -96,7 +96,23 @@ pub fn register(reg: &mut CodecRegistry) {
         // as long as the PCE-implied channel count fits.
         .with_max_channels(8)
         .with_max_sample_rate(96_000);
-    reg.register_decoder_impl(cid.clone(), dec_caps, make_decoder);
+    // AVI / WAVEFORMATEX tags — several historical wFormatTag values
+    // have been stamped on AAC streams in the wild:
+    //   0x00FF: MPEG-2 AAC "raw" ADTS (the common one).
+    //   0x706D: ASCII "mp" — libavformat / ffmpeg lineage.
+    //   0x4143: ASCII "AC" — seen in some AAC-LC AVI exports.
+    //   0xA106: MPEG-4 AAC (Sony lineage).
+    reg.register(
+        CodecInfo::new(cid.clone())
+            .capabilities(dec_caps)
+            .decoder(make_decoder)
+            .tags([
+                CodecTag::wave_format(0x00FF),
+                CodecTag::wave_format(0x706D),
+                CodecTag::wave_format(0x4143),
+                CodecTag::wave_format(0xA106),
+            ]),
+    );
     let enc_caps = CodecCapabilities::audio("aac_sw")
         .with_lossy(true)
         .with_intra_only(true)
@@ -105,18 +121,11 @@ pub fn register(reg: &mut CodecRegistry) {
         // layouts have no standard configuration and are rejected.
         .with_max_channels(8)
         .with_max_sample_rate(48_000);
-    reg.register_encoder_impl(cid.clone(), enc_caps, make_encoder);
-
-    // AVI / WAVEFORMATEX tags — several historical wFormatTag values
-    // have been stamped on AAC streams in the wild:
-    //   0x00FF: MPEG-2 AAC "raw" ADTS (the common one).
-    //   0x706D: ASCII "mp" — libavformat / ffmpeg lineage.
-    //   0x4143: ASCII "AC" — seen in some AAC-LC AVI exports.
-    //   0xA106: MPEG-4 AAC (Sony lineage).
-    // Priority 10, no probe.
-    for tag in &[0x00FFu16, 0x706D, 0x4143, 0xA106] {
-        reg.claim_tag(cid.clone(), CodecTag::wave_format(*tag), 10, None);
-    }
+    reg.register(
+        CodecInfo::new(cid)
+            .capabilities(enc_caps)
+            .encoder(make_encoder),
+    );
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
