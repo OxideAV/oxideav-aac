@@ -25,9 +25,15 @@
 //! - TNS forward filtering on SCE long and short windows
 //! - M/S stereo per band in CPE
 //! - ADTS wrap with single raw_data_block per frame
-//! - PNS + IS emission plumbing (scalefactor + spectral-data paths); both
-//!   detector heuristics are gated off pending a psy-acoustic
-//!   bit-allocation model
+//! - PNS + intensity-stereo with detection: long-window SCE + CPE
+//!   common-window bands above 4 kHz run `classify_pns_band`
+//!   (peak-to-RMS test) and `classify_is_band` (L/R correlation +
+//!   energy-ratio test); emission plumbing writes cb 13 / 14 / 15 on
+//!   the affected bands with matching scalefactor-stream accumulators
+//! - Pulse data: up to 4 outlier quantised coefficients per frame are
+//!   moved into `pulse_data()` so the residual fits a cheaper Huffman
+//!   codebook. Amplitudes are capped to `|residual| - 1` so the
+//!   decoder's sign-from-residual rule reproduces the original sign
 //! - Short-block encoder — opt-in via
 //!   [`encoder::AacEncoder::set_enable_short_blocks`]. Runs a
 //!   per-channel [`transient::TransientDetector`] with a 1-frame
@@ -45,7 +51,7 @@
 //! - CCE elements (parsed / emitted as unsupported)
 //! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
-//! - Encoder pulse data, VBR rate control
+//! - VBR rate control
 //! - Encoder short-window PNS / IS (short-block path emits them gated
 //!   off — decode round-trips but bitrate is loose on percussive
 //!   content)

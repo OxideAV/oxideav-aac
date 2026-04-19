@@ -848,7 +848,7 @@ struct Ics {
     /// Per-band global scalefactor (8-bit int — first band is absolute,
     /// subsequent bands are deltas on encode).
     sfs: Vec<i32>,
-    /// Per-band chosen codebook (0..=11).
+    /// Per-band chosen codebook (0..=11 spectral, 13 PNS, 14/15 IS).
     cbs: Vec<u8>,
     /// Per-band quantised coefficients laid out in band order.
     q_bands: Vec<Vec<i32>>,
@@ -857,6 +857,27 @@ struct Ics {
     /// TNS filter parameters (at most one filter per window for the
     /// current encoder). `None` => `tns_data_present = 0`.
     tns: Option<TnsEncFilter>,
+    /// Optional pulse_data() record (§4.6.5). When populated, the
+    /// affected q_bands already have the pulse amplitudes subtracted so
+    /// the sum of residual + pulse reconstructs the original quantised
+    /// coefficient. `None` => `pulse_data_present = 0`.
+    pulse: Option<PulseRecord>,
+}
+
+/// Up to 4 pulses per frame per §4.6.5.
+const MAX_PULSES_ENC: usize = 4;
+
+/// Pulse-data record owned by `Ics`. Offsets form a cumulative chain
+/// rooted at `swb[pulse_start_sfb]`: pulse 0 sits at
+/// `swb[pulse_start_sfb] + pulse_offset[0]`, pulse i+1 at the previous
+/// absolute position plus `pulse_offset[i+1]`. Each offset fits in 5
+/// bits and each amp in 4.
+#[derive(Clone, Debug)]
+struct PulseRecord {
+    pulse_start_sfb: u8,
+    number_pulse: u8,
+    pulse_offset: [u8; MAX_PULSES_ENC],
+    pulse_amp: [u8; MAX_PULSES_ENC],
 }
 
 #[derive(Clone, Debug)]
@@ -954,20 +975,23 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         }
     }
 
-    // Pick codebook per band. The `classify_pns_band` noise-band
-    // detector is wired but gated OFF by default: a loose heuristic
-    // regresses round-trip tests on tone-heavy content, and tuning the
-    // threshold needs a psy-model that doesn't exist yet. The emission
-    // machinery (codebook 13 section, 9-bit PNS seed, DPCM deltas for
-    // subsequent PNS bands, write_spectral_data skip) is in place, so
-    // once the detector is tuned we just toggle this flag.
-    const ENABLE_PNS: bool = false;
+    // Pick codebook per band. PNS is enabled: `classify_pns_band`
+    // gates on (a) peak-to-RMS ≤ 2.8 (noise-like), (b) band length
+    // ≥ 4, (c) non-trivial energy, and (d) band center frequency
+    // ≥ PNS_MIN_HZ so we never flip tonal LF bands to noise. The
+    // emission machinery (codebook 13 section, 9-bit PNS seed, DPCM
+    // deltas for subsequent PNS bands, write_spectral_data skip) is
+    // all in place.
+    let sample_rate = SAMPLE_RATES
+        .get(sf_index as usize)
+        .copied()
+        .unwrap_or(44_100);
     let mut cbs = vec![0u8; max_sfb];
     for sfb in 0..max_sfb {
         let q = &q_bands[sfb];
         cbs[sfb] = if q.iter().all(|&x| x == 0) {
             0
-        } else if ENABLE_PNS {
+        } else if pns_eligible_band(swb, sfb, sample_rate) {
             if let Some(pns_sf) = classify_pns_band(spec, swb[sfb] as usize, swb[sfb + 1] as usize)
             {
                 sfs[sfb] = pns_sf;
@@ -980,27 +1004,26 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         };
     }
 
-    // Global gain: first *regular-codebook* band's scalefactor. The
-    // decoder seeds `g_gain = global_gain`, `g_noise = global_gain - 90`,
-    // `g_is = 0`. Only cbs 1..=11 use the g_gain stream, so we anchor
-    // global_gain on the first such band — not the first PNS (cb 13) or
-    // IS (cb 14/15) band.
+    // Pulse data extraction: pull up to 4 outlier peaks out of bands
+    // where a single coefficient sits far above its neighbours. After
+    // subtracting the pulse amplitude, the residual band usually slots
+    // into a cheaper Huffman codebook, so we re-pick codebooks on the
+    // affected bands below.
+    let pulse = extract_pulse_record(swb, max_sfb, &mut q_bands, &mut cbs);
+
+    // Re-anchor global_gain now that PNS / IS / pulse have settled:
+    // pick the first *regular-codebook* band's sf so g_gain's first
+    // delta on decode is zero.
     let mut gg: i32 = 100;
     for sfb in 0..max_sfb {
         let cb = cbs[sfb];
-        if cb != 0 && cb != NOISE_HCB && cb != INTENSITY_HCB && cb != INTENSITY_HCB2 {
-            gg = sfs[sfb];
-            break;
+        if cb == 0 || cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+            continue;
         }
+        gg = sfs[sfb];
+        break;
     }
     let gg_clamped = gg.clamp(0, 255) as u8;
-
-    // Re-anchor sfs so that the *first non-zero band's* scalefactor = gg
-    // and subsequent non-zero bands carry deltas on top of each previous
-    // non-zero band. The decoder uses `g_gain = global_gain`, then for
-    // every band with cb != ZERO it adds a delta. Zero bands don't read
-    // a delta. So we just need the non-zero-band scalefactors. Zero-band
-    // scalefactors are never written.
 
     Ok(Ics {
         info: IcsInfoEnc {
@@ -1012,6 +1035,7 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         q_bands,
         global_gain: gg_clamped,
         tns,
+        pulse,
     })
 }
 
@@ -1215,6 +1239,24 @@ fn analyse_and_quantise_short_opts(
     })
 }
 
+/// Minimum center frequency (Hz) above which PNS and intensity-stereo
+/// are allowed to fire. Below ~4 kHz, the ear is far more sensitive to
+/// phase / tonality and both tools degrade quality; above it, phase
+/// information is already irrelevant to the human auditory system, so
+/// substituting shaped noise for Huffman-coded tones is a clean win.
+const PNS_IS_MIN_HZ: f32 = 4_000.0;
+
+/// True if scalefactor band `sfb` at `sample_rate` sits entirely above
+/// `PNS_IS_MIN_HZ`. Used as a hard gate on PNS and intensity-stereo —
+/// we never want to flip a tonal LF band to either of those tools.
+fn pns_eligible_band(swb: &[u16], sfb: usize, sample_rate: u32) -> bool {
+    let nyquist = sample_rate as f32 * 0.5;
+    let bins_per_hz = SPEC_LEN as f32 / nyquist;
+    let start = swb[sfb] as f32;
+    let center_hz = (start + swb[sfb + 1] as f32) * 0.5 / bins_per_hz;
+    center_hz >= PNS_IS_MIN_HZ
+}
+
 /// Classify a scalefactor band as IS-codable if `R ≈ scale·L` holds to
 /// good precision across the band. Returns `(is_position, sign_flip)`
 /// where `is_position` encodes the magnitude scale via
@@ -1308,6 +1350,152 @@ fn classify_pns_band(spec: &[f32], band_start: usize, band_end: usize) -> Option
     let sf_f = 2.0 * (3.0 * energy_per_line).log2() + 58.0;
     let sf = sf_f.round() as i32;
     Some(sf.clamp(-100, 200))
+}
+
+/// Minimum unsigned outlier magnitude (in quantised units) to be worth
+/// moving into pulse_data, and minimum peak-to-second gap before we
+/// call it an outlier. Values below this aren't worth the header
+/// overhead — the surrounding book already encodes them cheaply.
+const PULSE_MIN_MAG: i32 = 6;
+
+/// Try to extract 1..=4 outlier coefficients into a single
+/// `PulseRecord`. On success, the chosen `q_bands[sfb]` entries have
+/// been decremented (preserving sign) so that decoder's pulse-add step
+/// reconstructs the original value. The affected bands then get their
+/// codebook re-picked so we actually cash in the bit savings.
+///
+/// Constraints:
+///  - pulse_offset is 5-bit (0..=31) and cumulative from the previous
+///    pulse's absolute position (or from `swb[pulse_start_sfb]` for the
+///    first pulse).
+///  - pulse_amp is 4-bit (1..=15).
+///  - The amp is capped at `|residual| - 1` so the residual keeps the
+///    original sign — the decoder takes the sign from the residual and
+///    re-adds amp, so a zero residual would flip a negative peak to
+///    positive (phase-inversion disaster on tonal content).
+fn extract_pulse_record(
+    swb: &[u16],
+    max_sfb: usize,
+    q_bands: &mut [Vec<i32>],
+    cbs: &mut [u8],
+) -> Option<PulseRecord> {
+    // Candidates: (sfb, local_offset_in_band, signed_q_value).
+    let mut candidates: Vec<(usize, u8, i32)> = Vec::new();
+    for sfb in 0..max_sfb {
+        let cb = cbs[sfb];
+        if cb == 0 || cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+            continue;
+        }
+        let q = &q_bands[sfb];
+        if q.is_empty() {
+            continue;
+        }
+        let mut max_i = 0usize;
+        let mut max_v = 0i32;
+        let mut second_v = 0i32;
+        for (i, &v) in q.iter().enumerate() {
+            let a = v.abs();
+            if a > max_v {
+                second_v = max_v;
+                max_v = a;
+                max_i = i;
+            } else if a > second_v {
+                second_v = a;
+            }
+        }
+        if max_v < PULSE_MIN_MAG || (max_v - second_v) < PULSE_MIN_MAG {
+            continue;
+        }
+        if max_i >= 32 {
+            continue; // doesn't fit in the 5-bit local offset.
+        }
+        candidates.push((sfb, max_i as u8, q[max_i]));
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.truncate(MAX_PULSES_ENC);
+    // Compute absolute positions for each candidate.
+    let abs_positions: Vec<usize> = candidates
+        .iter()
+        .map(|&(sfb, off, _)| swb[sfb] as usize + off as usize)
+        .collect();
+    // Subtract amplitudes, capped to preserve sign.
+    let mut amps = [0u8; MAX_PULSES_ENC];
+    for (i, &(sfb, off, v)) in candidates.iter().enumerate() {
+        let local = off as usize;
+        let band = &mut q_bands[sfb];
+        if local >= band.len() {
+            continue;
+        }
+        let max_amp = v.abs() - 1;
+        if max_amp <= 0 {
+            amps[i] = 0;
+            continue;
+        }
+        let amp = max_amp.min(15);
+        amps[i] = amp as u8;
+        if v > 0 {
+            band[local] = v - amp;
+        } else {
+            band[local] = v + amp;
+        }
+    }
+    // Compact: drop amp=0 entries and re-encode the cumulative offsets.
+    let live: Vec<(usize, u8)> = abs_positions
+        .iter()
+        .zip(amps.iter())
+        .filter(|(_, &a)| a > 0)
+        .map(|(&p, &a)| (p, a))
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    let first_abs = live[0].0;
+    let mut start_sfb = 0usize;
+    while start_sfb + 1 < max_sfb && (first_abs as u16) >= swb[start_sfb + 1] {
+        start_sfb += 1;
+    }
+    let first_offset = first_abs - swb[start_sfb] as usize;
+    if first_offset >= 32 || start_sfb > 63 {
+        return None;
+    }
+    let mut pulse_offset = [0u8; MAX_PULSES_ENC];
+    let mut pulse_amp = [0u8; MAX_PULSES_ENC];
+    pulse_offset[0] = first_offset as u8;
+    pulse_amp[0] = live[0].1;
+    let mut prev_abs = first_abs;
+    let mut count = 1usize;
+    for (pos, a) in live.into_iter().skip(1) {
+        let delta = pos - prev_abs;
+        if delta == 0 || delta >= 32 || count >= MAX_PULSES_ENC {
+            continue;
+        }
+        pulse_offset[count] = delta as u8;
+        pulse_amp[count] = a;
+        prev_abs = pos;
+        count += 1;
+    }
+    // Re-pick codebooks on every affected (regular-coded) band — the
+    // peak just dropped so a cheaper book may fit.
+    for sfb in 0..max_sfb {
+        let cb = cbs[sfb];
+        if cb == 0 || cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+            continue;
+        }
+        let q = &q_bands[sfb];
+        if q.iter().all(|&x| x == 0) {
+            cbs[sfb] = 0;
+        } else {
+            cbs[sfb] = best_codebook_for_band(q);
+        }
+    }
+    Some(PulseRecord {
+        pulse_start_sfb: start_sfb as u8,
+        number_pulse: count as u8,
+        pulse_offset,
+        pulse_amp,
+    })
 }
 
 fn best_codebook_for_band(q: &[i32]) -> u8 {
@@ -1481,7 +1669,11 @@ fn write_ics_body_no_global_gain(bw: &mut BitWriter, ics: &Ics) -> Result<()> {
     let _ = ics.info.sf_index;
     write_section_data(bw, ics);
     write_scalefactors(bw, ics)?;
-    bw.write_bit(false); // pulse_data_present
+    let pulse_present = ics.pulse.is_some();
+    bw.write_bit(pulse_present);
+    if let Some(ref pd) = ics.pulse {
+        write_pulse_data(bw, pd);
+    }
     let tns_present = ics.tns.is_some();
     bw.write_bit(tns_present);
     if let Some(ref f) = ics.tns {
@@ -1490,6 +1682,18 @@ fn write_ics_body_no_global_gain(bw: &mut BitWriter, ics: &Ics) -> Result<()> {
     bw.write_bit(false); // gain_control_data_present
     write_spectral_data(bw, ics);
     Ok(())
+}
+
+/// Serialise `pulse_data()` per §4.6.5. Matches the bit layout consumed
+/// by `pulse::parse_pulse_data`.
+fn write_pulse_data(bw: &mut BitWriter, pd: &PulseRecord) {
+    let n = pd.number_pulse.clamp(1, MAX_PULSES_ENC as u8);
+    bw.write_u32((n - 1) as u32, 2);
+    bw.write_u32(pd.pulse_start_sfb as u32, 6);
+    for i in 0..n as usize {
+        bw.write_u32(pd.pulse_offset[i] as u32, 5);
+        bw.write_u32(pd.pulse_amp[i] as u32, 4);
+    }
 }
 
 /// Serialise `tns_data()` for a single long window with one filter. Matches
@@ -1818,11 +2022,14 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
     //         Huffman delta plus the 4-bit codebook in section data.
     //
     // IS eligibility (`classify_is_band`) requires a strong L↔R correlation
-    // in the band; when the correlation is weak IS would reconstruct the
-    // wrong ch1 and the error would blow up. Gated behind `ENABLE_IS`
-    // until we have a psy-acoustic bit-allocation model to drive it; the
-    // emission path is fully in place.
-    const ENABLE_IS: bool = false;
+    // in the band; we also gate on the band centre sitting above
+    // `PNS_IS_MIN_HZ` so a tonal LF image doesn't get IS-swapped. The
+    // cost model charges ~10 bits of overhead for the SF-Huffman delta
+    // plus the 4-bit section codebook.
+    let sample_rate = SAMPLE_RATES
+        .get(sf_index as usize)
+        .copied()
+        .unwrap_or(44_100);
     let swb = SWB_LONG[sf_index as usize];
     let mut ms_used = vec![false; max_sfb];
     let mut is_used = vec![false; max_sfb];
@@ -1836,12 +2043,10 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
             best_cost = cost_ms[sfb];
             choice = 1;
         }
-        if ENABLE_IS {
+        if pns_eligible_band(swb, sfb, sample_rate) {
             if let Some((pos, sign)) =
                 classify_is_band(l, r, swb[sfb] as usize, swb[sfb + 1] as usize)
             {
-                // IS cost ≈ L-band cost + ~10 bits overhead for the
-                // scalefactor delta + codebook bits in section_data.
                 let is_cost = band_bit_cost(sfb, &ics_l_alone).saturating_add(10);
                 if is_cost < best_cost {
                     best_cost = is_cost;
@@ -1900,6 +2105,13 @@ fn band_bit_cost(sfb: usize, ics: &Ics) -> u64 {
     if cb == 0 {
         return 0;
     }
+    if cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+        // PNS / IS bands carry no Huffman coefficients — the only cost
+        // is the SF-Huffman delta written in `write_scalefactors` (~6
+        // bits average for a small delta, plus the 4-bit section-data
+        // codebook). Use 10 bits flat as a stand-in.
+        return 10;
+    }
     try_encode_bits(&ics.q_bands[sfb], cb).unwrap_or(u64::MAX / 4)
 }
 
@@ -1920,6 +2132,7 @@ fn empty_ics(max_sfb: usize, sf_index: u8) -> Ics {
         q_bands,
         global_gain: 100,
         tns: None,
+        pulse: None,
     }
 }
 

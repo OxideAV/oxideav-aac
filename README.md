@@ -97,9 +97,9 @@ The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 | Scalefactors                           | Huffman-coded deltas with global_gain anchor; 3-accumulator path (g_gain / g_noise / g_is) for NOISE / IS bands |
 | M/S stereo (§4.6.13)                   | Per-band L/R-vs-M/S decision by bit cost |
 | TNS (§4.6.9)                           | LPC analysis on SCE long blocks; 4-bit parcor quantisation; gated on prediction-gain (~1.4 dB) |
-| PNS encode                             | Emission plumbing in place; noise-band detector gated off pending psy-model |
-| Intensity stereo encode                | Per-band IS/MS/LR decision plumbing; detector gated off pending psy-model |
-| Pulse data encode                      | Not implemented (deferred — low value for tested content)       |
+| PNS encode (§4.6.12)                   | Yes (long windows; peak-to-RMS noise test, >=4 kHz band-centre gate) |
+| Intensity stereo encode (§4.6.8.1.4)   | Yes (long windows; L/R correlation + energy ratio above 4 kHz in CPE common-window path) |
+| Pulse data encode (§4.6.10)            | Yes (up to 4 per frame; sign-preserving outlier extraction, amp capped at `\|residual\| - 1`) |
 | Short blocks (building blocks)         | `TransientDetector`, `mdct_short_eightshort`, `analyse_and_quantise_short`, `write_single_ics_short` — all tested; `emit_block` state-machine integration pending |
 | Gain control                           | Not implemented                         |
 | CBR / VBR                              | Bit_rate accepted but currently advisory; no rate control loop |
@@ -126,6 +126,14 @@ TNS-flattened coefficients.
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
 and that TNS-bearing frames decode without error.
+`tests/encode_pns_is_pulse.rs` verifies:
+
+- PNS fires on >=75% of >=4 kHz bands for white-noise input and
+  round-trips within a factor of 4 in total RMS energy.
+- Intensity stereo fires on >=2 HF bands for a stereo clip with a
+  quiet correlated R channel; decoded R tracks L's sign.
+- Pulse data is emitted on at least one frame of a loud 440 Hz tone
+  and the round-trip Goertzel ratio stays >=50x.
 
 ## Codec id
 

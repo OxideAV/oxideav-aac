@@ -135,7 +135,13 @@ fn decode_self(bytes: &[u8]) -> Vec<i16> {
 /// succeeded; `None` if ffmpeg is missing — caller-side tests then
 /// skip cleanly so CI without ffmpeg passes.
 fn ffmpeg_decode(bytes: &[u8], out_wav: &Path) -> Option<Vec<i16>> {
-    let in_path = std::env::temp_dir().join("oxideav_aac_enc_test.aac");
+    // Use a per-output-path input file so parallel tests don't trample
+    // each other's encoded streams. `out_wav`'s stem is unique per test.
+    let stem = out_wav
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("oxideav_aac_enc_test");
+    let in_path = std::env::temp_dir().join(format!("{stem}.aac"));
     std::fs::write(&in_path, bytes).expect("write tmp aac");
     let status = std::process::Command::new("ffmpeg")
         .args(["-y", "-hide_banner", "-loglevel", "error"])
