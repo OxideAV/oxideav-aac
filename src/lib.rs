@@ -46,10 +46,32 @@
 //!   short-block mode is off until the caller opts in, because the
 //!   transient-driven path has higher bitrate on tonal content.
 //!
+//! HE-AACv1 (SBR):
+//! - SBR bitstream parsing (§4.6.18, Tables 4.62-4.74) — sbr_header,
+//!   sbr_single_channel_element, sbr_grid, sbr_dtdf, sbr_invf,
+//!   sbr_envelope, sbr_noise, sbr_sinusoidal_coding.
+//! - SBR Huffman tables (Annex 4.A.6.1 — all 10 tables).
+//! - 32-channel analysis / 64-channel complex synthesis QMF banks
+//!   (§4.6.18.4.1-2, Table 4.A.89 coefficients transcribed from the spec).
+//! - Frequency band tables (§4.6.18.3.2): fMaster (bark + linear),
+//!   fTableHigh, fTableLow, fTableNoise.
+//! - HF generator — copy-up patching with bwArray inverse filtering
+//!   (§4.6.18.6). Alpha coefficients default to zero (reduced-quality
+//!   patching; full covariance-method LPC is not yet wired in).
+//! - HF adjuster — envelope-gain application per-band so the SBR range
+//!   tracks the transmitted envelope (§4.6.18.7). Noise and sinusoid
+//!   insertion are not yet applied.
+//! - Synthesis produces PCM at twice the core sample rate, making mono
+//!   HE-AACv1 decode sample-rate-doubled.
+//!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
 //! - Gain control (§4.6.12)
 //! - CCE elements (parsed / emitted as unsupported)
-//! - HE-AAC SBR (§4.6.18.4) / PS — return Unsupported when detected
+//! - HE-AAC PS / CPE-coupled SBR — return Unsupported when detected
+//! - SBR noise/sinusoid insertion, full covariance-method HF LPC,
+//!   limiter-band energy compensation (§4.6.18.7.4-5) — simplified
+//!   envelope-only adjustment is used instead, sufficient for
+//!   audible-bandwidth doubling.
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
 //! - VBR rate control
 //! - Encoder short-window PNS / IS (short-block path emits them gated
@@ -79,6 +101,7 @@ pub mod mdct;
 pub mod pce;
 pub mod pns;
 pub mod pulse;
+pub mod sbr;
 pub mod sfband;
 pub mod syntax;
 pub mod synth;
