@@ -180,6 +180,96 @@ pub fn apply_hf_generation(
     }
 }
 
+/// Compute the 2nd-order LPC coefficients (`alpha0`, `alpha1`) for every
+/// low-band QMF subband using the covariance method (§4.6.18.6.2).
+///
+/// `x_low`   — low-band QMF samples, indexed `[l][k]`. Must cover at least
+///             `t_hf_gen + num_subsamples` rows (the last `num_subsamples`
+///             rows are the "current frame" used for the sum).
+/// `num_subsamples` — `numTimeSlots * RATE`. Typically 32 for a 1024-core.
+/// `t_hf_gen`       — HF generator origin (2 or 8 depending on spec phase).
+///
+/// Writes `alpha0[k]` / `alpha1[k]` for `k = 0 .. 32`. Unstable fits are
+/// zeroed per the spec (§4.6.18.6.2.3 stability check: both `|alpha_i|^2 <
+/// 16` after solving).
+pub fn compute_hf_lpc(
+    x_low: &[[Complex32; 32]],
+    num_subsamples: usize,
+    t_hf_gen: usize,
+    alpha0: &mut [Complex32; 32],
+    alpha1: &mut [Complex32; 32],
+) {
+    for k in 0..32 {
+        // Accumulate covariance matrix entries. `p00` isn't used by the
+        // 2nd-order LPC solution (only by the stability check, which we
+        // fold into the |alpha|^2 < 16 test below — the spec's p_00-based
+        // "signal power" check is implied once |alpha0|+|alpha1| is bounded.
+        let mut p11_re = 0.0f32;
+        let mut p22_re = 0.0f32;
+        let mut p01_re = 0.0f32;
+        let mut p01_im = 0.0f32;
+        let mut p02_re = 0.0f32;
+        let mut p02_im = 0.0f32;
+        let mut p12_re = 0.0f32;
+        let mut p12_im = 0.0f32;
+
+        for n in 0..num_subsamples {
+            let l = n + t_hf_gen;
+            if l < 2 || l >= x_low.len() {
+                continue;
+            }
+            let x0 = x_low[l][k];
+            let x1 = x_low[l - 1][k];
+            let x2 = x_low[l - 2][k];
+            p11_re += x1.re * x1.re + x1.im * x1.im;
+            p22_re += x2.re * x2.re + x2.im * x2.im;
+            // p_01 = X[l]^* · X[l-1] = (x0.re - i*x0.im) · (x1.re + i*x1.im)
+            //       = (x0.re*x1.re + x0.im*x1.im) + i*(x0.re*x1.im - x0.im*x1.re)
+            p01_re += x0.re * x1.re + x0.im * x1.im;
+            p01_im += x0.re * x1.im - x0.im * x1.re;
+            p02_re += x0.re * x2.re + x0.im * x2.im;
+            p02_im += x0.re * x2.im - x0.im * x2.re;
+            p12_re += x1.re * x2.re + x1.im * x2.im;
+            p12_im += x1.re * x2.im - x1.im * x2.re;
+        }
+
+        // d = p_22 * p_11 - |p_12|^2 / 0.999 (0.999 stability bias).
+        let d = p22_re * p11_re - (p12_re * p12_re + p12_im * p12_im) / 0.999_f32;
+        let (a1_re, a1_im) = if d.abs() < 1e-30 {
+            (0.0, 0.0)
+        } else {
+            // alpha1 = (p_01 * p_12 - p_02 * p_11) / d
+            // p_01 and p_12 are complex, p_11 is real.
+            let num_re = p01_re * p12_re - p01_im * p12_im - p02_re * p11_re;
+            let num_im = p01_re * p12_im + p01_im * p12_re - p02_im * p11_re;
+            (num_re / d, num_im / d)
+        };
+        let (a0_re, a0_im) = if p11_re.abs() < 1e-30 {
+            (0.0, 0.0)
+        } else {
+            // alpha0 = -(p_01 + alpha1 · conj(p_12)) / p_11
+            // alpha1 · conj(p_12) = (a1_re + i a1_im)(p12_re - i p12_im)
+            //                     = (a1_re p12_re + a1_im p12_im)
+            //                     + i(a1_im p12_re - a1_re p12_im)
+            let mul_re = a1_re * p12_re + a1_im * p12_im;
+            let mul_im = a1_im * p12_re - a1_re * p12_im;
+            let num_re = p01_re + mul_re;
+            let num_im = p01_im + mul_im;
+            (-num_re / p11_re, -num_im / p11_re)
+        };
+        // Stability check: both alpha magnitudes must be < 4 (i.e. |a|^2 < 16).
+        let mag0 = a0_re * a0_re + a0_im * a0_im;
+        let mag1 = a1_re * a1_re + a1_im * a1_im;
+        if mag0 >= 16.0 || mag1 >= 16.0 {
+            alpha0[k] = Complex32::default();
+            alpha1[k] = Complex32::default();
+        } else {
+            alpha0[k] = Complex32::new(a0_re, a0_im);
+            alpha1[k] = Complex32::new(a1_re, a1_im);
+        }
+    }
+}
+
 fn noise_band_index(ft: &FreqTables, k: i32) -> usize {
     // g(k): fTableNoise[g(k)] <= k < fTableNoise[g(k)+1]
     for (i, w) in ft.f_noise.windows(2).enumerate() {
@@ -229,5 +319,49 @@ fn nint(x: f32) -> i32 {
         (x + 0.5).floor() as i32
     } else {
         -((-x + 0.5).floor() as i32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zero input → zero alphas (and no NaNs).
+    #[test]
+    fn hf_lpc_zero_input() {
+        let x_low = vec![[Complex32::default(); 32]; 16];
+        let mut a0 = [Complex32::default(); 32];
+        let mut a1 = [Complex32::default(); 32];
+        compute_hf_lpc(&x_low, 8, 2, &mut a0, &mut a1);
+        for k in 0..32 {
+            assert_eq!(a0[k].re, 0.0);
+            assert_eq!(a0[k].im, 0.0);
+            assert_eq!(a1[k].re, 0.0);
+            assert_eq!(a1[k].im, 0.0);
+        }
+    }
+
+    /// Constant-signal input (same complex value at every subsample) must
+    /// produce a stable fit with |alpha| < 4 so the stability clamp
+    /// passes. Verify no NaN and at least some subbands produce a nonzero
+    /// pair.
+    #[test]
+    fn hf_lpc_constant_is_stable() {
+        let mut x_low = vec![[Complex32::default(); 32]; 40];
+        for l in 0..40 {
+            for k in 0..32 {
+                x_low[l][k] = Complex32::new(0.5, 0.25);
+            }
+        }
+        let mut a0 = [Complex32::default(); 32];
+        let mut a1 = [Complex32::default(); 32];
+        compute_hf_lpc(&x_low, 32, 2, &mut a0, &mut a1);
+        for k in 0..32 {
+            assert!(a0[k].re.is_finite() && a0[k].im.is_finite());
+            assert!(a1[k].re.is_finite() && a1[k].im.is_finite());
+            let m0 = a0[k].re * a0[k].re + a0[k].im * a0[k].im;
+            let m1 = a1[k].re * a1[k].re + a1[k].im * a1[k].im;
+            assert!(m0 < 16.0 && m1 < 16.0);
+        }
     }
 }

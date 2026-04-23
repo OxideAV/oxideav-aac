@@ -14,7 +14,9 @@ use super::bitstream::{
 };
 use super::freq::FreqTables;
 use super::hf_adjust::{apply_envelope, apply_envelope_coupled, envelope_time_borders};
-use super::hf_gen::{apply_hf_generation, build_patches, update_bw, BwArray, PatchInfo};
+use super::hf_gen::{
+    apply_hf_generation, build_patches, compute_hf_lpc, update_bw, BwArray, PatchInfo,
+};
 use super::qmf::{QmfAnalysis, QmfSynthesis, ANALYSIS_BANDS};
 use super::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024, RATE};
 
@@ -260,12 +262,12 @@ pub fn decode_sbr_frame(
     };
     let bw = update_bw(&state.bw_array, &state.prev_invf_modes, &cur_modes, ft.nq);
 
-    // 3) HF generator — produce XHigh from XLow. Alpha coefficients
-    //    default to zero (simplified — covariance-method HF LPC not
-    //    implemented). Copy-up alone already reconstructs the spectrum
-    //    shape.
-    let alpha0 = [Complex32::default(); 32];
-    let alpha1 = [Complex32::default(); 32];
+    // 3) HF generator — produce XHigh from XLow. Alpha coefficients come
+    //    from the 2nd-order covariance-method LPC fit on the low-band
+    //    subbands. Stability-clipped to zero when |alpha|^2 >= 16.
+    let mut alpha0 = [Complex32::default(); 32];
+    let mut alpha1 = [Complex32::default(); 32];
+    compute_hf_lpc(&x_low, num_slots, super::T_HF_ADJ, &mut alpha0, &mut alpha1);
     let mut x_high: Vec<[Complex32; NUM_QMF_BANDS]> = vec![
         [Complex32::default(); NUM_QMF_BANDS];
         x_low.len()
@@ -363,8 +365,9 @@ pub fn decode_sbr_cpe_frame(
     };
     let bw_l = update_bw(&state_l.bw_array, &state_l.prev_invf_modes, &cur_modes_l, ft_l.nq);
 
-    let alpha0 = [Complex32::default(); 32];
-    let alpha1 = [Complex32::default(); 32];
+    let mut alpha0_l = [Complex32::default(); 32];
+    let mut alpha1_l = [Complex32::default(); 32];
+    compute_hf_lpc(&x_low_l, num_slots, super::T_HF_ADJ, &mut alpha0_l, &mut alpha1_l);
     let mut x_high_l: Vec<[Complex32; NUM_QMF_BANDS]> =
         vec![[Complex32::default(); NUM_QMF_BANDS]; x_low_l.len()];
     apply_hf_generation(
@@ -373,8 +376,8 @@ pub fn decode_sbr_cpe_frame(
         patches_l,
         ft_l,
         &bw_l,
-        &alpha0,
-        &alpha1,
+        &alpha0_l,
+        &alpha1_l,
         super::T_HF_ADJ,
         0,
         num_time_slots as usize,
@@ -396,6 +399,9 @@ pub fn decode_sbr_cpe_frame(
         m
     };
     let bw_r = update_bw(&state_r.bw_array, &state_r.prev_invf_modes, &cur_modes_r, ft_r.nq);
+    let mut alpha0_r = [Complex32::default(); 32];
+    let mut alpha1_r = [Complex32::default(); 32];
+    compute_hf_lpc(&x_low_r, num_slots, super::T_HF_ADJ, &mut alpha0_r, &mut alpha1_r);
     let mut x_high_r: Vec<[Complex32; NUM_QMF_BANDS]> =
         vec![[Complex32::default(); NUM_QMF_BANDS]; x_low_r.len()];
     apply_hf_generation(
@@ -404,8 +410,8 @@ pub fn decode_sbr_cpe_frame(
         patches_r,
         ft_r,
         &bw_r,
-        &alpha0,
-        &alpha1,
+        &alpha0_r,
+        &alpha1_r,
         super::T_HF_ADJ,
         0,
         num_time_slots as usize,
