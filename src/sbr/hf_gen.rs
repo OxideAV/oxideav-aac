@@ -47,10 +47,26 @@ pub fn build_patches(ft: &FreqTables, fs_sbr: u32) -> Result<PatchInfo> {
 
     let mut j = k;
     let mut patch_counter = 0usize;
+    // Cap the iterations — build_patches is O(numPatches) and the spec
+    // caps numPatches at 5. Each outer pass adds at most one patch;
+    // bounding the outer loop at ~NMaster * 2 is a safe upper bound.
+    let max_outer = ft.n_master * 4 + 16;
+    let mut iter_guard = 0usize;
     loop {
+        iter_guard += 1;
+        if iter_guard > max_outer {
+            // Didn't converge — abort, caller will treat as "no patches" and
+            // fall back to low-band-only output.
+            break;
+        }
         let mut sb: i32;
         // Decrement j until condition met.
+        let mut inner_guard = 0usize;
         loop {
+            inner_guard += 1;
+            if inner_guard > ft.n_master + 2 {
+                break;
+            }
             sb = ft.f_master[j];
             let odd = ((sb - 2 + ft.k0).rem_euclid(2)).abs();
             if sb <= (ft.k0 - 1 + msb - odd) {
@@ -61,6 +77,7 @@ pub fn build_patches(ft: &FreqTables, fs_sbr: u32) -> Result<PatchInfo> {
             }
             j -= 1;
         }
+        sb = ft.f_master[j];
         let odd = ((sb - 2 + ft.k0).rem_euclid(2)).abs();
         let pns = (sb - usb).max(0);
         let pss = ft.k0 - odd - pns;
@@ -76,10 +93,14 @@ pub fn build_patches(ft: &FreqTables, fs_sbr: u32) -> Result<PatchInfo> {
         } else {
             msb = ft.kx;
         }
-        if ft.f_master[k] - sb < 3 {
+        if k < ft.f_master.len() && ft.f_master[k] - sb < 3 {
             k = ft.n_master;
         }
         if sb == ft.kx + ft.m {
+            break;
+        }
+        // If we haven't advanced at all (sb hasn't changed), force progress.
+        if pns == 0 && j == 0 {
             break;
         }
     }

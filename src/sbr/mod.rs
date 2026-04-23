@@ -17,6 +17,7 @@
 //! (HE-AACv2) are not implemented.
 
 pub mod bitstream;
+pub mod decode;
 pub mod freq;
 pub mod hf_adjust;
 pub mod hf_gen;
