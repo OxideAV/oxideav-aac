@@ -25,7 +25,6 @@ pub fn build_patches(ft: &FreqTables, fs_sbr: u32) -> Result<PatchInfo> {
     let mut info = PatchInfo::default();
     let mut msb = ft.k0;
     let mut usb = ft.kx;
-    let mut num_patches = 0usize;
 
     // goalSb = NINT( 2.048e6 / Fs )
     let goal_sb = nint(2_048_000.0f32 / fs_sbr as f32);
@@ -107,7 +106,7 @@ pub fn build_patches(ft: &FreqTables, fs_sbr: u32) -> Result<PatchInfo> {
     if patch_counter > 1 && info.patch_num_subbands[patch_counter - 1] < 3 {
         patch_counter -= 1;
     }
-    num_patches = patch_counter;
+    let num_patches = patch_counter;
     info.num_patches = num_patches;
     // Patch borders for the limiter-band construction.
     info.patch_borders[0] = ft.kx;

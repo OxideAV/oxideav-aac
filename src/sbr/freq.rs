@@ -66,12 +66,8 @@ impl FreqTables {
         let one_m_neg = if n_high % 2 == 0 { 0 } else { 1 };
         let mut f_low = Vec::with_capacity(n_low + 1);
         for k in 0..=n_low {
-            let i_k = if k == 0 {
-                0usize
-            } else {
-                2 * k - one_m_neg / 2 /* always 0 per 1-(-1)^x /2 integer */
-            };
             // Re-evaluate per spec: i(k) = 2k - (1-(-1)^NHigh)/2.
+            let _ = one_m_neg;
             let i_k = if k == 0 {
                 0
             } else if n_high % 2 == 0 {
