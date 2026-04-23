@@ -421,6 +421,22 @@ pub fn parse_single_channel_element(
     num_env_bands: [usize; 2],
     num_high_res: usize,
 ) -> Result<()> {
+    parse_single_channel_element_ext(br, data, num_noise_bands, num_env_bands, num_high_res, None)
+}
+
+/// Parse sbr_single_channel_element() and optionally capture a PS
+/// extended_data payload (bs_extension_id = 2). When `ps_state` is `Some`,
+/// any `ps_data()` payload found in the extension is parsed via
+/// `ps::parse_ps_data` and returned via `*ps_out` if provided.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_single_channel_element_ext(
+    br: &mut BitReader<'_>,
+    data: &mut SbrChannelData,
+    num_noise_bands: usize,
+    num_env_bands: [usize; 2],
+    num_high_res: usize,
+    ps_capture: Option<(&mut super::ps::PsState, &mut Option<super::ps::PsFrame>)>,
+) -> Result<()> {
     let bs_data_extra = br.read_bit()?;
     if bs_data_extra {
         let _bs_reserved = br.read_u32(4)?;
@@ -440,10 +456,30 @@ pub fn parse_single_channel_element(
         if cnt == 15 {
             cnt += br.read_u32(8)?;
         }
-        let num_bits = 8 * cnt as i64;
-        // Skip the extension blob — we don't handle MPS or PS here.
-        for _ in 0..num_bits {
-            br.read_u32(1)?;
+        let total_ext_bits = 8 * cnt as u32;
+        // Each extension element: 2-bit bs_extension_id + data bits. The
+        // spec allows multiple back-to-back elements within total_ext_bits.
+        let start_bits = br.bit_position() as u32;
+        let mut maybe_ps = ps_capture;
+        // Try to read a single extension element — the spec allows a
+        // 2-bit ext_id up front followed by its data. Multiple back-to-
+        // back elements may follow but most real streams carry one
+        // (either SBR-internal or PS).
+        if total_ext_bits >= 2 {
+            let ext_id = br.read_u32(2)?;
+            if ext_id == super::ps::EXT_ID_PS_DATA as u32 && maybe_ps.is_some() {
+                let (state, out_slot) = maybe_ps.take().unwrap();
+                let frame = super::ps::parse_ps_data(br, state)?;
+                *out_slot = Some(frame);
+            }
+        }
+        // Drain any remaining bits to match the declared total.
+        let actual = (br.bit_position() as u32).saturating_sub(start_bits);
+        if actual < total_ext_bits {
+            let remaining = total_ext_bits - actual;
+            for _ in 0..remaining {
+                let _ = br.read_u32(1)?;
+            }
         }
     }
     Ok(())

@@ -48,30 +48,39 @@
 //!
 //! HE-AACv1 (SBR):
 //! - SBR bitstream parsing (§4.6.18, Tables 4.62-4.74) — sbr_header,
-//!   sbr_single_channel_element, sbr_grid, sbr_dtdf, sbr_invf,
-//!   sbr_envelope, sbr_noise, sbr_sinusoidal_coding.
+//!   sbr_single_channel_element, sbr_channel_pair_element (both
+//!   bs_coupling modes), sbr_grid, sbr_dtdf, sbr_invf, sbr_envelope,
+//!   sbr_noise, sbr_sinusoidal_coding. Balance-mode Huffman tables
+//!   wired in for coupled CPE.
 //! - SBR Huffman tables (Annex 4.A.6.1 — all 10 tables).
 //! - 32-channel analysis / 64-channel complex synthesis QMF banks
 //!   (§4.6.18.4.1-2, Table 4.A.89 coefficients transcribed from the spec).
 //! - Frequency band tables (§4.6.18.3.2): fMaster (bark + linear),
 //!   fTableHigh, fTableLow, fTableNoise.
 //! - HF generator — copy-up patching with bwArray inverse filtering
-//!   (§4.6.18.6). Alpha coefficients default to zero (reduced-quality
-//!   patching; full covariance-method LPC is not yet wired in).
-//! - HF adjuster — envelope-gain application per-band so the SBR range
-//!   tracks the transmitted envelope (§4.6.18.7). Noise and sinusoid
-//!   insertion are not yet applied.
-//! - Synthesis produces PCM at twice the core sample rate, making mono
-//!   HE-AACv1 decode sample-rate-doubled.
+//!   and covariance-method alpha0/alpha1 LPC fit per-subband
+//!   (§4.6.18.6, stability-clipped at |alpha|^2 >= 16).
+//! - HF adjuster — envelope / noise / sinusoid synthesis + limiter-band
+//!   gain compensation (§4.6.18.7). Park-Miller PRNG drives noise.
+//!   Sinusoid injected at the mid-odd subband of each flagged high-res
+//!   band with a π/2-per-subsample phase.
+//! - Synthesis produces PCM at twice the core sample rate. Stereo CPE
+//!   pairs (coupled and independent) both decode to 2× rate stereo.
+//!
+//! HE-AACv2 (Parametric Stereo):
+//! - `sbr::ps` module parses ps_data() carried in the SBR extended_data
+//!   block (bs_extension_id = 2) — IID + ICC envelopes with coarse /
+//!   fine resolution.
+//! - Simplified time-domain upmix: panning per average IID, short-delay
+//!   decorrelator contribution per average ICC. Mono-SBR streams with
+//!   PS produce stereo output at 2× sample rate.
+//! - IPD/OPD, allpass-chain decorrelator, and true QMF-domain upmix are
+//!   not yet implemented.
 //!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
 //! - Gain control (§4.6.12)
 //! - CCE elements (parsed / emitted as unsupported)
-//! - HE-AAC PS / CPE-coupled SBR — return Unsupported when detected
-//! - SBR noise/sinusoid insertion, full covariance-method HF LPC,
-//!   limiter-band energy compensation (§4.6.18.7.4-5) — simplified
-//!   envelope-only adjustment is used instead, sufficient for
-//!   audible-bandwidth doubling.
+//! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
 //! - Main / SSR / LTP profiles (§4.6.7-8) — only AAC-LC accepted
 //! - VBR rate control
 //! - Encoder short-window PNS / IS (short-block path emits them gated

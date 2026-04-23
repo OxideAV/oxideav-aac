@@ -9,9 +9,10 @@
 //! into 2048 output PCM samples at twice the sample rate.
 
 use super::bitstream::{
-    parse_channel_pair_element, parse_single_channel_element, parse_sbr_header, SbrChannelData,
-    SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
+    parse_channel_pair_element, parse_sbr_header, parse_single_channel_element_ext,
+    SbrChannelData, SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
 };
+use super::ps::{PsFrame, PsState};
 use super::freq::FreqTables;
 use super::hf_adjust::{
     apply_envelope_coupled_with_limiter, apply_envelope_with_limiter, build_limiter_bands,
@@ -39,6 +40,8 @@ pub struct SbrChannelState {
     pub header_seen: bool,
     /// Frame counter — tracks whether this is the first SBR frame.
     pub frame_count: u64,
+    /// Running PS state (header + delay line for the decorrelator).
+    pub ps: PsState,
 }
 
 impl SbrChannelState {
@@ -54,6 +57,7 @@ impl SbrChannelState {
             prev_invf_modes: [0; 5],
             header_seen: false,
             frame_count: 0,
+            ps: PsState::new(),
         }
     }
 }
@@ -65,11 +69,15 @@ impl Default for SbrChannelState {
 }
 
 /// Result of `try_parse_sbr_extension` — distinguishes SCE mono payload
-/// from a stereo CPE payload.
+/// from a stereo CPE payload. Mono payloads may additionally carry a PS
+/// extension for HE-AACv2 stereo upmix.
 #[derive(Clone, Debug)]
 pub enum SbrPayload {
-    /// Single channel (mono HE-AACv1).
-    Single(SbrChannelData),
+    /// Single channel (mono HE-AACv1 or HE-AACv2 when `ps` is `Some`).
+    Single {
+        data: SbrChannelData,
+        ps: Option<PsFrame>,
+    },
     /// Channel pair. `coupled` indicates whether the two channels share a
     /// grid and the right-channel envelope is encoded as a balance.
     Pair {
@@ -93,7 +101,7 @@ pub fn try_parse_sbr_extension(
     fs_core: u32,
 ) -> Result<Option<SbrChannelData>> {
     match try_parse_sbr_extension_ext(br, num_payload_bits, is_sce, state, fs_core)? {
-        Some(SbrPayload::Single(data)) => Ok(Some(data)),
+        Some(SbrPayload::Single { data, .. }) => Ok(Some(data)),
         // A CPE slipped through the is_sce=true path — silently drop; the
         // stereo-capable caller should use the _ext variant.
         Some(SbrPayload::Pair { l, .. }) => Ok(Some(l)),
@@ -168,14 +176,16 @@ pub fn try_parse_sbr_extension_ext(
             bs_amp_res: state.header.bs_amp_res,
             ..SbrChannelData::default()
         };
-        parse_single_channel_element(
+        let mut ps_frame: Option<PsFrame> = None;
+        parse_single_channel_element_ext(
             br,
             &mut data,
             num_noise_bands,
             [num_env_bands_lo, num_env_bands_hi],
             num_high_res,
+            Some((&mut state.ps, &mut ps_frame)),
         )?;
-        SbrPayload::Single(data)
+        SbrPayload::Single { data, ps: ps_frame }
     } else {
         let mut data_l = SbrChannelData {
             bs_amp_res: state.header.bs_amp_res,

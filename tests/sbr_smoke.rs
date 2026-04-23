@@ -122,6 +122,49 @@ fn sbr_decode_frame_doubles_length() {
     assert!(rms > 1e-4, "SBR output is silent: rms = {rms}");
 }
 
+/// Decoder accepts an AOT_PS extradata — previously this was rejected
+/// outright with `Error::unsupported`. Confirm mono AAC-LC → PS
+/// extradata path doesn't panic and emits stereo output.
+#[test]
+fn decoder_with_ps_extradata_upmixes_to_stereo() {
+    let sr_core = 24_000u32;
+    let pcm = pcm_sine_mono_bytes(440.0, sr_core, 0.2, 0.2);
+    let aac = encode_mono(pcm, sr_core, 32_000);
+    let frames = iter_adts(&aac);
+    assert!(!frames.is_empty());
+    // ASC: AOT_PS (29) needs 6-bit extended AOT. AOT = 31 then +6 bit value 29-32
+    // but PS is value 29 which fits directly in 5 bits. Layout:
+    //   5 bits aot=29 (PS = 11101)
+    //   4 bits core_idx=6 (24 kHz)
+    //   4 bits channels=1
+    //   4 bits ext_idx=3 (48 kHz)
+    //   5 bits inner_aot=2
+    // = 22 bits.
+    //   11101 0110 0001 0011 00010 -> 1110101100001001100010 (22 bits)
+    //   padded to 24: 11101011 00001001 10001000
+    //       = 0xEB, 0x09, 0x88
+    let extradata = vec![0xEBu8, 0x09, 0x88];
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.sample_rate = Some(sr_core);
+    params.channels = Some(1);
+    params.extradata = extradata;
+    // Should not error out (previously returned Unsupported).
+    let mut dec = oxideav_aac::decoder::make_decoder(&params).expect("make dec");
+    let tb = TimeBase::new(1, sr_core as i64);
+    let &(off, len) = &frames[0];
+    let pkt = Packet::new(0, tb, aac[off..off + len].to_vec());
+    dec.send_packet(&pkt).expect("send");
+    let frame = dec.receive_frame().expect("receive");
+    match frame {
+        Frame::Audio(af) => {
+            // PS upmixes mono to stereo; sample rate is still doubled.
+            assert_eq!(af.channels, 2, "PS did not upmix to stereo");
+            assert_eq!(af.sample_rate, sr_core * 2);
+        }
+        other => panic!("expected audio frame, got {other:?}"),
+    }
+}
+
 /// Full pipeline: AAC-LC encode; decode through a decoder whose extradata
 /// declares SBR; confirm the output sample rate is doubled.
 #[test]

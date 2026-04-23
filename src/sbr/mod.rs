@@ -21,6 +21,7 @@ pub mod decode;
 pub mod freq;
 pub mod hf_adjust;
 pub mod hf_gen;
+pub mod ps;
 pub mod qmf;
 pub mod tables;
 
