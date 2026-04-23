@@ -19,7 +19,10 @@ use crate::ics::{
 use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
 use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
 use crate::sbr::bitstream::SbrChannelData;
-use crate::sbr::decode::{decode_sbr_frame, try_parse_sbr_extension, SbrChannelState};
+use crate::sbr::decode::{
+    decode_sbr_cpe_frame, decode_sbr_frame, try_parse_sbr_extension_ext, SbrChannelState,
+    SbrPayload,
+};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
@@ -67,6 +70,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         sbr_explicit: sbr_present,
         sbr_state: (0..8).map(|_| SbrChannelState::new()).collect(),
         sbr_data: vec![None; 8],
+        sbr_pair: vec![None; 8],
     }))
 }
 
@@ -96,6 +100,10 @@ struct AacDecoder {
     /// Per-SCE-slot SBR parsed data for the *current* frame (filled by the
     /// FIL-element handler, consumed at frame finalise).
     sbr_data: Vec<Option<SbrChannelData>>,
+    /// For each channel-pair start index `c`, if `sbr_pair[c]` is `Some`
+    /// the SBR payload attached to the CPE at slot `c..c+2` had stereo data
+    /// and the second channel's parsed data + coupling flag are here.
+    sbr_pair: Vec<Option<(SbrChannelData, bool)>>,
 }
 
 impl Decoder for AacDecoder {
@@ -197,12 +205,19 @@ impl AacDecoder {
         // and advance it by 1 (SCE / LFE) or 2 (CPE).
         let mut pcm: Vec<Vec<f32>> = (0..8).map(|_| vec![0.0; FRAME_LEN]).collect();
         let mut got_channels: usize = 0;
+        // Track the index & kind of the most recent SCE / CPE / LFE so
+        // fill_element can route SBR extension payloads to the right slot
+        // per Note 1 of Table 4.57.
+        let mut last_elem_start: usize = 0;
+        let mut last_elem_is_cpe: bool = false;
 
         loop {
             let id = br.read_u32(3)?;
             let kind = ElementType::from_id(id);
             match kind {
                 ElementType::Sce => {
+                    last_elem_start = got_channels;
+                    last_elem_is_cpe = false;
                     let _instance_tag = br.read_u32(4)?;
                     let mut spec = [0.0f32; SPEC_LEN];
                     let (info, sf, sec, tns, pulse) = decode_ics(&mut br, self.sf_index, false)?;
@@ -252,6 +267,8 @@ impl AacDecoder {
                     got_channels += 1;
                 }
                 ElementType::Cpe => {
+                    last_elem_start = got_channels;
+                    last_elem_is_cpe = true;
                     let _instance_tag = br.read_u32(4)?;
                     let common_window = br.read_bit()?;
                     if common_window {
@@ -502,6 +519,8 @@ impl AacDecoder {
                     }
                 }
                 ElementType::Lfe => {
+                    last_elem_start = got_channels;
+                    last_elem_is_cpe = false;
                     // LFE element (§4.6.10) has the same bitstream syntax as
                     // an SCE but is restricted to long-window output with a
                     // small max_sfb. Decode the same way and write to the
@@ -573,32 +592,54 @@ impl AacDecoder {
                         let is_sbr = peeked == 0xD || peeked == 0xE;
                         if is_sbr {
                             // SBR payload belongs to the most recent SCE /
-                            // CPE element (Note 1 of Table 4.57). The
-                            // AAC core rate is the carried `sf_index` — but
-                            // if the ASC said SBR is present the core rate
-                            // index equals the output rate divided by 2,
-                            // which is what we want here. `sf_index` in
-                            // self is already that core rate.
+                            // CPE element (Note 1 of Table 4.57). `sf_index`
+                            // carries the core sample rate.
                             let core_rate = crate::syntax::sample_rate(self.sf_index)
                                 .unwrap_or(44_100);
-                            let target_ch = got_channels.saturating_sub(1);
+                            let target_ch = last_elem_start;
+                            let is_sce = !last_elem_is_cpe;
                             if target_ch < self.sbr_state.len() {
-                                let state = &mut self.sbr_state[target_ch];
-                                match try_parse_sbr_extension(
+                                // Split the mutable borrow so we can hand
+                                // out two disjoint `&mut SbrChannelState`
+                                // for the CPE path.
+                                let state_state_len = self.sbr_state.len();
+                                let (state_l_slice, tail) =
+                                    self.sbr_state.split_at_mut(target_ch + 1);
+                                let state_l = &mut state_l_slice[target_ch];
+                                match try_parse_sbr_extension_ext(
                                     &mut br,
                                     total_bits,
-                                    true, // SCE — mono HE-AACv1 path
-                                    state,
+                                    is_sce,
+                                    state_l,
                                     core_rate,
                                 )? {
-                                    Some(sbr) => {
+                                    Some(SbrPayload::Single(sbr)) => {
                                         self.sbr_data[target_ch] = Some(sbr);
+                                        self.sbr_pair[target_ch] = None;
+                                        self.sbr_explicit = true;
+                                    }
+                                    Some(SbrPayload::Pair { l, r, coupled }) => {
+                                        // Replicate header + freq tables into
+                                        // the right-channel state so it can
+                                        // run the analysis/synthesis banks
+                                        // with matching config.
+                                        if target_ch + 1 < state_state_len {
+                                            // Right state is the first entry
+                                            // of `tail` (it was split off at
+                                            // target_ch+1).
+                                            let state_r = &mut tail[0];
+                                            state_r.header = state_l.header.clone();
+                                            state_r.freq = state_l.freq.clone();
+                                            state_r.patches = state_l.patches.clone();
+                                            state_r.header_seen = state_l.header_seen;
+                                        }
+                                        self.sbr_data[target_ch] = Some(l);
+                                        self.sbr_pair[target_ch] = Some((r, coupled));
                                         self.sbr_explicit = true;
                                     }
                                     None => {
-                                        // Not actually SBR (extension_type fell
-                                        // through). Bits were already consumed by
-                                        // try_parse_sbr_extension.
+                                        // Not actually SBR — bits already
+                                        // consumed.
                                     }
                                 }
                             } else {
@@ -633,45 +674,92 @@ impl AacDecoder {
         };
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
 
-        // SBR doubling — if we have SBR data for any channel, run the
-        // mono HE-AACv1 decode path per-channel and produce 2× samples at
-        // 2× sample rate. The CPE-coupled path isn't wired, so SBR only
-        // applies cleanly to mono.
-        let sbr_active =
-            (self.sbr_explicit || self.sbr_data.iter().any(|s| s.is_some())) && channels_out == 1;
+        // SBR doubling — if any channel has SBR data, run the HE-AACv1
+        // decode path per-channel and produce 2× samples at 2× rate. Mono
+        // SCE and stereo CPE (coupled + independent) are both supported.
+        let sbr_active = (self.sbr_explicit || self.sbr_data.iter().any(|s| s.is_some()))
+            && (1..=2).contains(&channels_out);
         let core_rate = crate::syntax::sample_rate(self.sf_index).unwrap_or(44_100);
         if sbr_active {
             let out_samples = 2 * FRAME_LEN;
-            let mut sbr_pcm = vec![0.0f32; out_samples];
-            if let Some(sbr) = self.sbr_data[0].take() {
-                let state = &mut self.sbr_state[0];
-                // best-effort SBR decode; on error fall back to low-band
-                // doubled via zero-insertion to keep the stream playable.
-                if decode_sbr_frame(&pcm[0], &sbr, state, &mut sbr_pcm).is_err() {
-                    for i in 0..FRAME_LEN {
-                        sbr_pcm[2 * i] = pcm[0][i];
-                        sbr_pcm[2 * i + 1] = pcm[0][i];
+            let mut sbr_pcm: Vec<Vec<f32>> =
+                (0..channels_out).map(|_| vec![0.0f32; out_samples]).collect();
+
+            // Stereo CPE path: slot 0 holds the SCE/CPE-left data; slot 0
+            // in `sbr_pair` holds the right-channel data + coupling flag.
+            if channels_out == 2 && self.sbr_pair[0].is_some() {
+                let sbr_l = self.sbr_data[0].take();
+                let pair = self.sbr_pair[0].take();
+                if let (Some(sbr_l), Some((sbr_r, coupled))) = (sbr_l, pair) {
+                    // Split sbr_state into two disjoint borrows.
+                    let (head, tail) = self.sbr_state.split_at_mut(1);
+                    let state_l = &mut head[0];
+                    let state_r = &mut tail[0];
+                    let (lo, hi) = sbr_pcm.split_at_mut(1);
+                    if decode_sbr_cpe_frame(
+                        &pcm[0],
+                        &pcm[1],
+                        &sbr_l,
+                        &sbr_r,
+                        coupled,
+                        state_l,
+                        state_r,
+                        &mut lo[0],
+                        &mut hi[0],
+                    )
+                    .is_err()
+                    {
+                        // Fallback: zero-order-hold doubling.
+                        for i in 0..FRAME_LEN {
+                            sbr_pcm[0][2 * i] = pcm[0][i];
+                            sbr_pcm[0][2 * i + 1] = pcm[0][i];
+                            sbr_pcm[1][2 * i] = pcm[1][i];
+                            sbr_pcm[1][2 * i + 1] = pcm[1][i];
+                        }
                     }
                 }
             } else {
-                // No SBR payload this frame (rare before the first header
-                // arrives) — duplicate low-band samples to preserve rate.
-                for i in 0..FRAME_LEN {
-                    sbr_pcm[2 * i] = pcm[0][i];
-                    sbr_pcm[2 * i + 1] = pcm[0][i];
+                for ch in 0..channels_out {
+                    let mut this = std::mem::take(&mut sbr_pcm[ch]);
+                    if let Some(sbr) = self.sbr_data[ch].take() {
+                        let state = &mut self.sbr_state[ch];
+                        if decode_sbr_frame(&pcm[ch], &sbr, state, &mut this).is_err() {
+                            for i in 0..FRAME_LEN {
+                                this[2 * i] = pcm[ch][i];
+                                this[2 * i + 1] = pcm[ch][i];
+                            }
+                        }
+                    } else {
+                        for i in 0..FRAME_LEN {
+                            this[2 * i] = pcm[ch][i];
+                            this[2 * i + 1] = pcm[ch][i];
+                        }
+                    }
+                    sbr_pcm[ch] = this;
                 }
             }
-            let mut out_bytes =
-                Vec::with_capacity(out_samples * bytes_per_sample);
+
+            // Clear any leftover SBR slots for next frame.
+            for slot in self.sbr_data.iter_mut() {
+                *slot = None;
+            }
+            for slot in self.sbr_pair.iter_mut() {
+                *slot = None;
+            }
+
+            // Interleave channels (S16 LE).
+            let mut out_bytes = Vec::with_capacity(out_samples * channels_out * bytes_per_sample);
             for n in 0..out_samples {
-                let v = sbr_pcm[n].clamp(-1.0, 1.0);
-                let s = (v * 32767.0) as i16;
-                out_bytes.extend_from_slice(&s.to_le_bytes());
+                for ch in 0..channels_out {
+                    let v = sbr_pcm[ch][n].clamp(-1.0, 1.0);
+                    let s = (v * 32767.0) as i16;
+                    out_bytes.extend_from_slice(&s.to_le_bytes());
+                }
             }
             let output_rate = core_rate.saturating_mul(2);
             return Ok(Frame::Audio(AudioFrame {
                 format: SampleFormat::S16,
-                channels: 1,
+                channels: channels_out as u16,
                 sample_rate: output_rate,
                 samples: out_samples as u32,
                 pts: pkt.pts,
@@ -692,6 +780,9 @@ impl AacDecoder {
         // Reset pending SBR data — frames without SBR payloads clear out any
         // stale bits.
         for slot in self.sbr_data.iter_mut() {
+            *slot = None;
+        }
+        for slot in self.sbr_pair.iter_mut() {
             *slot = None;
         }
 

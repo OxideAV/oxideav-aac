@@ -94,6 +94,104 @@ pub fn apply_envelope(
     }
 }
 
+/// Apply coupled-mode envelope adjustment to a CPE pair.
+///
+/// Coupled-mode encoding (§4.6.18.3.5) shares one envelope/noise grid + flags
+/// between the two channels. `data_l` carries the total-energy scalefactors;
+/// `data_r` carries balance values encoded against the `bs_amp_res`-dependent
+/// balance Huffman tables. For each (env, band) pair the spec defines
+///
+///   `pan = 2^(E_balance / a)` where `a = 1` at 3.0 dB or `a = 2` at 1.5 dB,
+///   `E_orig_L = E_total / (1 + pan)`,
+///   `E_orig_R = E_total * pan / (1 + pan)`.
+///
+/// `E_total` comes from `data_l.env_sf` using the same
+/// `64 * 2^(E_total / a)` formula as the uncoupled SCE path (the coupled raw
+/// value is the sum, not each channel separately). After unpacking, we apply
+/// gains to each channel independently.
+pub fn apply_envelope_coupled(
+    x_high_l: &mut [[Complex32; NUM_QMF_BANDS]],
+    x_high_r: &mut [[Complex32; NUM_QMF_BANDS]],
+    data_l: &SbrChannelData,
+    data_r: &SbrChannelData,
+    ft: &FreqTables,
+    t_e: &[i32],
+    t_hf_adj: usize,
+) {
+    let le = data_l.bs_num_env as usize;
+    if le == 0 || t_e.len() < le + 1 {
+        return;
+    }
+    let amp_res_bits = if data_l.bs_amp_res != 0 { 1 } else { 2 };
+    for env in 0..le {
+        let n_bands_idx = data_l.freq_res[env] as usize;
+        let band_table: &[i32] = if n_bands_idx != 0 {
+            &ft.f_high
+        } else {
+            &ft.f_low
+        };
+        let n_bands = if n_bands_idx != 0 { ft.n_high } else { ft.n_low };
+        let mut acc_t = 0i32;
+        let mut acc_b = 0i32;
+        for k in 0..n_bands {
+            let d_t = data_l.env_sf[env][k];
+            let d_b = data_r.env_sf[env][k];
+            if data_l.bs_df_env[env] == 0 && k > 0 {
+                acc_t += d_t;
+            } else {
+                acc_t = d_t;
+            }
+            if data_r.bs_df_env[env] == 0 && k > 0 {
+                acc_b += d_b;
+            } else {
+                acc_b = d_b;
+            }
+            // E_total value decoded from the "raw" scalefactor. The spec's
+            // coupled formula treats `acc_t` as the joint energy scalefactor.
+            let e_total = 64.0f32 * 2.0f32.powf(acc_t as f32 / amp_res_bits as f32);
+            // Balance "pan" ratio. For balance Huffman tables the LAV is
+            // smaller so `acc_b` is the signed balance code.
+            let pan = 2.0f32.powf(acc_b as f32 / amp_res_bits as f32);
+            let e_l = e_total / (1.0 + pan);
+            let e_r = e_total * pan / (1.0 + pan);
+            let k0 = band_table[k].max(0) as usize;
+            let k1 = band_table[k + 1].min(NUM_QMF_BANDS as i32).max(0) as usize;
+            if k1 <= k0 {
+                continue;
+            }
+            let l_start = (RATE as i32 * t_e[env]) as usize + t_hf_adj;
+            let l_end = (RATE as i32 * t_e[env + 1]) as usize + t_hf_adj;
+            if l_start >= x_high_l.len() || l_start >= x_high_r.len() {
+                continue;
+            }
+            let l_end = l_end.min(x_high_l.len()).min(x_high_r.len());
+            let mut sum_l = 0.0f32;
+            let mut sum_r = 0.0f32;
+            let mut count = 0usize;
+            for l in l_start..l_end {
+                for kk in k0..k1 {
+                    sum_l += x_high_l[l][kk].norm_sqr();
+                    sum_r += x_high_r[l][kk].norm_sqr();
+                    count += 1;
+                }
+            }
+            let eps = 1e-12f32;
+            let e_curr_l = if count > 0 { sum_l / count as f32 } else { 0.0 };
+            let e_curr_r = if count > 0 { sum_r / count as f32 } else { 0.0 };
+            let gain_l = (e_l / (e_curr_l + eps)).max(0.0).sqrt().min(1e4);
+            let gain_r = (e_r / (e_curr_r + eps)).max(0.0).sqrt().min(1e4);
+            for l in l_start..l_end {
+                for kk in k0..k1 {
+                    let cl = x_high_l[l][kk];
+                    let cr = x_high_r[l][kk];
+                    x_high_l[l][kk] = Complex32::new(cl.re * gain_l, cl.im * gain_l);
+                    x_high_r[l][kk] = Complex32::new(cr.re * gain_r, cr.im * gain_r);
+                }
+            }
+        }
+    }
+}
+
 /// Compute envelope time-border vector tE (§4.6.18.3.3).
 pub fn envelope_time_borders(
     data: &SbrChannelData,

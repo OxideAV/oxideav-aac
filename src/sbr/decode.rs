@@ -9,11 +9,11 @@
 //! into 2048 output PCM samples at twice the sample rate.
 
 use super::bitstream::{
-    parse_single_channel_element, parse_sbr_header, SbrChannelData, SbrHeader, EXT_SBR_DATA,
-    EXT_SBR_DATA_CRC,
+    parse_channel_pair_element, parse_single_channel_element, parse_sbr_header, SbrChannelData,
+    SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
 };
 use super::freq::FreqTables;
-use super::hf_adjust::{apply_envelope, envelope_time_borders};
+use super::hf_adjust::{apply_envelope, apply_envelope_coupled, envelope_time_borders};
 use super::hf_gen::{apply_hf_generation, build_patches, update_bw, BwArray, PatchInfo};
 use super::qmf::{QmfAnalysis, QmfSynthesis, ANALYSIS_BANDS};
 use super::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024, RATE};
@@ -59,13 +59,27 @@ impl Default for SbrChannelState {
     }
 }
 
+/// Result of `try_parse_sbr_extension` — distinguishes SCE mono payload
+/// from a stereo CPE payload.
+#[derive(Clone, Debug)]
+pub enum SbrPayload {
+    /// Single channel (mono HE-AACv1).
+    Single(SbrChannelData),
+    /// Channel pair. `coupled` indicates whether the two channels share a
+    /// grid and the right-channel envelope is encoded as a balance.
+    Pair {
+        l: SbrChannelData,
+        r: SbrChannelData,
+        coupled: bool,
+    },
+}
+
 /// Attempt to recognise an SBR extension payload in the given FIL buffer.
 ///
-/// `fil_bytes` is the raw payload of a `fill_element` (NOT including the
-/// 4-bit count header — that is, the bits starting with the
-/// extension_type nibble). Returns `Ok(Some(..))` with the parsed data if
-/// it really was an SBR payload, `Ok(None)` if the extension_type was
-/// something else, or `Err` on parse failure.
+/// `num_payload_bits` is the total bit-size of the fill-element payload
+/// (including the 4-bit extension_type field). Returns `Ok(Some(..))` with
+/// the parsed data if it really was an SBR payload, `Ok(None)` if the
+/// extension_type was something else, or `Err` on parse failure.
 pub fn try_parse_sbr_extension(
     br: &mut BitReader<'_>,
     num_payload_bits: u32,
@@ -73,6 +87,24 @@ pub fn try_parse_sbr_extension(
     state: &mut SbrChannelState,
     fs_core: u32,
 ) -> Result<Option<SbrChannelData>> {
+    match try_parse_sbr_extension_ext(br, num_payload_bits, is_sce, state, fs_core)? {
+        Some(SbrPayload::Single(data)) => Ok(Some(data)),
+        // A CPE slipped through the is_sce=true path — silently drop; the
+        // stereo-capable caller should use the _ext variant.
+        Some(SbrPayload::Pair { l, .. }) => Ok(Some(l)),
+        None => Ok(None),
+    }
+}
+
+/// Like `try_parse_sbr_extension` but returns the richer [`SbrPayload`]
+/// enum covering both SCE and CPE payloads.
+pub fn try_parse_sbr_extension_ext(
+    br: &mut BitReader<'_>,
+    num_payload_bits: u32,
+    is_sce: bool,
+    state: &mut SbrChannelState,
+    fs_core: u32,
+) -> Result<Option<SbrPayload>> {
     if num_payload_bits < 4 {
         return Ok(None);
     }
@@ -126,11 +158,11 @@ pub fn try_parse_sbr_extension(
     let (num_env_bands_lo, num_env_bands_hi) = (ft.n_low, ft.n_high);
     let num_noise_bands = ft.nq;
     let num_high_res = ft.n_high;
-    let mut data = SbrChannelData {
-        bs_amp_res: state.header.bs_amp_res,
-        ..SbrChannelData::default()
-    };
-    if is_sce {
+    let payload = if is_sce {
+        let mut data = SbrChannelData {
+            bs_amp_res: state.header.bs_amp_res,
+            ..SbrChannelData::default()
+        };
         parse_single_channel_element(
             br,
             &mut data,
@@ -138,19 +170,37 @@ pub fn try_parse_sbr_extension(
             [num_env_bands_lo, num_env_bands_hi],
             num_high_res,
         )?;
+        SbrPayload::Single(data)
     } else {
-        // CPE / stereo HE-AACv1 not supported yet — mark and return early.
-        return Err(Error::unsupported(
-            "SBR: channel_pair_element in SBR payload not implemented",
-        ));
-    }
+        let mut data_l = SbrChannelData {
+            bs_amp_res: state.header.bs_amp_res,
+            ..SbrChannelData::default()
+        };
+        let mut data_r = SbrChannelData {
+            bs_amp_res: state.header.bs_amp_res,
+            ..SbrChannelData::default()
+        };
+        let coupled = parse_channel_pair_element(
+            br,
+            &mut data_l,
+            &mut data_r,
+            num_noise_bands,
+            [num_env_bands_lo, num_env_bands_hi],
+            num_high_res,
+        )?;
+        SbrPayload::Pair {
+            l: data_l,
+            r: data_r,
+            coupled,
+        }
+    };
     // Bit-align: skip any remaining bits inside the payload.
     let consumed = (br.bit_position() - start_pos) as u32;
     let remaining = num_payload_bits.saturating_sub(consumed);
     for _ in 0..remaining {
         let _ = br.read_u32(1)?;
     }
-    Ok(Some(data))
+    Ok(Some(payload))
 }
 
 /// Run the full SBR decode on one frame of 1024 mono PCM samples.
@@ -262,4 +312,161 @@ pub fn decode_sbr_frame(
     state.prev_invf_modes = cur_modes;
     state.frame_count = state.frame_count.wrapping_add(1);
     Ok(())
+}
+
+/// Run SBR on a CPE pair. `pcm_l` / `pcm_r` each hold 1024 low-band samples;
+/// `out_l` / `out_r` receive 2048 output samples each at 2× rate.
+///
+/// When `coupled` is true, the dequantisation pulls `E_total` + balance
+/// (`E_balance`) from `data_l` / `data_r` as described in
+/// `apply_envelope_coupled`. When it's false, each channel's envelope is
+/// applied independently.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_sbr_cpe_frame(
+    pcm_l: &[f32],
+    pcm_r: &[f32],
+    data_l: &SbrChannelData,
+    data_r: &SbrChannelData,
+    coupled: bool,
+    state_l: &mut SbrChannelState,
+    state_r: &mut SbrChannelState,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) -> Result<()> {
+    if pcm_l.len() < 1024 || pcm_r.len() < 1024 || out_l.len() < 2048 || out_r.len() < 2048 {
+        return Err(Error::invalid(
+            "SBR: decode_sbr_cpe_frame requires 1024 input / 2048 output PCM per channel",
+        ));
+    }
+    let num_time_slots = NUM_TIME_SLOTS_1024 as i32;
+    let num_slots = NUM_TIME_SLOTS_1024 * RATE;
+
+    // Analysis for both channels.
+    let (x_low_l, tail_len_l) = run_analysis(state_l, pcm_l, num_slots);
+    let (x_low_r, tail_len_r) = run_analysis(state_r, pcm_r, num_slots);
+
+    // Update bwArray per channel.
+    let ft_l = state_l
+        .freq
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: CPE decode without freq tables (L)"))?;
+    let patches_l = state_l
+        .patches
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: CPE decode without patches (L)"))?;
+    let cur_modes_l: [u8; 5] = {
+        let mut m = [0u8; 5];
+        for i in 0..ft_l.nq.min(5) {
+            m[i] = data_l.bs_invf_mode[i];
+        }
+        m
+    };
+    let bw_l = update_bw(&state_l.bw_array, &state_l.prev_invf_modes, &cur_modes_l, ft_l.nq);
+
+    let alpha0 = [Complex32::default(); 32];
+    let alpha1 = [Complex32::default(); 32];
+    let mut x_high_l: Vec<[Complex32; NUM_QMF_BANDS]> =
+        vec![[Complex32::default(); NUM_QMF_BANDS]; x_low_l.len()];
+    apply_hf_generation(
+        &x_low_l,
+        &mut x_high_l,
+        patches_l,
+        ft_l,
+        &bw_l,
+        &alpha0,
+        &alpha1,
+        super::T_HF_ADJ,
+        0,
+        num_time_slots as usize,
+    );
+
+    let ft_r = state_r
+        .freq
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: CPE decode without freq tables (R)"))?;
+    let patches_r = state_r
+        .patches
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: CPE decode without patches (R)"))?;
+    let cur_modes_r: [u8; 5] = {
+        let mut m = [0u8; 5];
+        for i in 0..ft_r.nq.min(5) {
+            m[i] = data_r.bs_invf_mode[i];
+        }
+        m
+    };
+    let bw_r = update_bw(&state_r.bw_array, &state_r.prev_invf_modes, &cur_modes_r, ft_r.nq);
+    let mut x_high_r: Vec<[Complex32; NUM_QMF_BANDS]> =
+        vec![[Complex32::default(); NUM_QMF_BANDS]; x_low_r.len()];
+    apply_hf_generation(
+        &x_low_r,
+        &mut x_high_r,
+        patches_r,
+        ft_r,
+        &bw_r,
+        &alpha0,
+        &alpha1,
+        super::T_HF_ADJ,
+        0,
+        num_time_slots as usize,
+    );
+
+    // Envelope application.
+    let t_e_l = envelope_time_borders(data_l, num_time_slots);
+    if coupled {
+        apply_envelope_coupled(&mut x_high_l, &mut x_high_r, data_l, data_r, ft_l, &t_e_l, super::T_HF_ADJ);
+    } else {
+        apply_envelope(&mut x_high_l, data_l, ft_l, &t_e_l, super::T_HF_ADJ);
+        let t_e_r = envelope_time_borders(data_r, num_time_slots);
+        apply_envelope(&mut x_high_r, data_r, ft_r, &t_e_r, super::T_HF_ADJ);
+    }
+
+    // Synthesis.
+    let mut out64 = [0.0f32; 64];
+    for l in 0..num_slots {
+        let src = &x_high_l[tail_len_l + l];
+        state_l.qmf_synthesis.process(src, &mut out64);
+        out_l[l * 64..l * 64 + 64].copy_from_slice(&out64);
+    }
+    for l in 0..num_slots {
+        let src = &x_high_r[tail_len_r + l];
+        state_r.qmf_synthesis.process(src, &mut out64);
+        out_r[l * 64..l * 64 + 64].copy_from_slice(&out64);
+    }
+
+    // Carry forward.
+    for (i, row) in x_low_l.iter().rev().take(tail_len_l).rev().enumerate() {
+        state_l.x_low_tail[i] = *row;
+    }
+    for (i, row) in x_low_r.iter().rev().take(tail_len_r).rev().enumerate() {
+        state_r.x_low_tail[i] = *row;
+    }
+    state_l.bw_array = bw_l;
+    state_l.prev_invf_modes = cur_modes_l;
+    state_l.frame_count = state_l.frame_count.wrapping_add(1);
+    state_r.bw_array = bw_r;
+    state_r.prev_invf_modes = cur_modes_r;
+    state_r.frame_count = state_r.frame_count.wrapping_add(1);
+    Ok(())
+}
+
+fn run_analysis(
+    state: &mut SbrChannelState,
+    pcm_in: &[f32],
+    num_slots: usize,
+) -> (Vec<[Complex32; ANALYSIS_BANDS]>, usize) {
+    let tail_len = state.x_low_tail.len();
+    let mut x_low: Vec<[Complex32; ANALYSIS_BANDS]> =
+        vec![[Complex32::default(); ANALYSIS_BANDS]; tail_len + num_slots];
+    for (i, row) in state.x_low_tail.iter().enumerate() {
+        x_low[i] = *row;
+    }
+    let mut tmp_in = [0.0f32; 32];
+    for l in 0..num_slots {
+        tmp_in.copy_from_slice(&pcm_in[l * 32..l * 32 + 32]);
+        let mut col = [Complex32::default(); ANALYSIS_BANDS];
+        state.qmf_analysis.process(&tmp_in, &mut col);
+        x_low[tail_len + l] = col;
+    }
+    (x_low, tail_len)
 }
