@@ -13,7 +13,10 @@ use super::bitstream::{
     SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
 };
 use super::freq::FreqTables;
-use super::hf_adjust::{apply_envelope, apply_envelope_coupled, envelope_time_borders};
+use super::hf_adjust::{
+    apply_envelope_coupled_with_limiter, apply_envelope_with_limiter, build_limiter_bands,
+    envelope_time_borders,
+};
 use super::hf_gen::{
     apply_hf_generation, build_patches, compute_hf_lpc, update_bw, BwArray, PatchInfo,
 };
@@ -285,14 +288,20 @@ pub fn decode_sbr_frame(
         num_time_slots as usize,
     );
 
-    // 4) HF adjuster — apply envelope gains.
+    // 4) HF adjuster — envelope gains + noise + sinusoid + limiter.
     let t_e = envelope_time_borders(sbr_data, num_time_slots);
-    apply_envelope(
+    let lim = build_limiter_bands(ft, patches, state.header.bs_limiter_bands);
+    let seed = (state.frame_count as u32)
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(0x9E37_79B9);
+    apply_envelope_with_limiter(
         &mut x_high,
         sbr_data,
         ft,
         &t_e,
         super::T_HF_ADJ,
+        Some(&lim),
+        seed,
     );
 
     // 5) Synthesis QMF — 64 complex subbands × one subsample → 64 PCM
@@ -419,12 +428,46 @@ pub fn decode_sbr_cpe_frame(
 
     // Envelope application.
     let t_e_l = envelope_time_borders(data_l, num_time_slots);
+    let lim_l = build_limiter_bands(ft_l, patches_l, state_l.header.bs_limiter_bands);
+    let lim_r = build_limiter_bands(ft_r, patches_r, state_r.header.bs_limiter_bands);
+    let seed_l = (state_l.frame_count as u32)
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(0x9E37_79B9);
+    let seed_r = (state_r.frame_count as u32)
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(0x632B_E593);
     if coupled {
-        apply_envelope_coupled(&mut x_high_l, &mut x_high_r, data_l, data_r, ft_l, &t_e_l, super::T_HF_ADJ);
+        apply_envelope_coupled_with_limiter(
+            &mut x_high_l,
+            &mut x_high_r,
+            data_l,
+            data_r,
+            ft_l,
+            &t_e_l,
+            super::T_HF_ADJ,
+            Some(&lim_l),
+            seed_l,
+        );
     } else {
-        apply_envelope(&mut x_high_l, data_l, ft_l, &t_e_l, super::T_HF_ADJ);
+        apply_envelope_with_limiter(
+            &mut x_high_l,
+            data_l,
+            ft_l,
+            &t_e_l,
+            super::T_HF_ADJ,
+            Some(&lim_l),
+            seed_l,
+        );
         let t_e_r = envelope_time_borders(data_r, num_time_slots);
-        apply_envelope(&mut x_high_r, data_r, ft_r, &t_e_r, super::T_HF_ADJ);
+        apply_envelope_with_limiter(
+            &mut x_high_r,
+            data_r,
+            ft_r,
+            &t_e_r,
+            super::T_HF_ADJ,
+            Some(&lim_r),
+            seed_r,
+        );
     }
 
     // Synthesis.
