@@ -3,8 +3,11 @@
 use oxideav_core::{bits::BitReader, Error, Result};
 
 use super::tables::{
-    sbr_huff_decode, F_HUFFMAN_ENV_1_5DB, F_HUFFMAN_ENV_3_0DB, LAV_ENV_1_5DB, LAV_ENV_3_0DB,
-    LAV_NOISE_3_0DB, T_HUFFMAN_ENV_1_5DB, T_HUFFMAN_ENV_3_0DB, T_HUFFMAN_NOISE_3_0DB,
+    sbr_huff_decode, F_HUFFMAN_ENV_1_5DB, F_HUFFMAN_ENV_3_0DB, F_HUFFMAN_ENV_BAL_1_5DB,
+    F_HUFFMAN_ENV_BAL_3_0DB, LAV_ENV_1_5DB, LAV_ENV_3_0DB, LAV_ENV_BAL_1_5DB, LAV_ENV_BAL_3_0DB,
+    LAV_NOISE_3_0DB, LAV_NOISE_BAL_3_0DB, T_HUFFMAN_ENV_1_5DB, T_HUFFMAN_ENV_3_0DB,
+    T_HUFFMAN_ENV_BAL_1_5DB, T_HUFFMAN_ENV_BAL_3_0DB, T_HUFFMAN_NOISE_3_0DB,
+    T_HUFFMAN_NOISE_BAL_3_0DB,
 };
 
 pub const MAX_SBR_ENVELOPES: usize = 5;
@@ -144,6 +147,10 @@ pub struct SbrChannelData {
     pub env_sf: [[i32; MAX_ENV_BANDS]; MAX_SBR_ENVELOPES],
     /// Delta-decoded noise scalefactors per (noise_floor, band).
     pub noise_sf: [[i32; MAX_NOISE_BANDS]; MAX_NOISE_FLOORS],
+    /// When `true` this channel carries the *balance* side of a coupled CPE
+    /// pair (Table 4.68 coupling-mode envelope / noise values, §4.6.18.3.5).
+    /// Envelope and noise dequantisation is different for balance data.
+    pub bs_coupling_balance: bool,
 }
 
 impl Default for SbrChannelData {
@@ -168,6 +175,7 @@ impl Default for SbrChannelData {
             bs_add_harmonic: [0; MAX_ENV_BANDS],
             env_sf: [[0; MAX_ENV_BANDS]; MAX_SBR_ENVELOPES],
             noise_sf: [[0; MAX_NOISE_BANDS]; MAX_NOISE_FLOORS],
+            bs_coupling_balance: false,
         }
     }
 }
@@ -279,34 +287,47 @@ pub fn parse_sbr_invf(
     Ok(())
 }
 
-/// Parse sbr_envelope() for a single channel (Table 4.72, `bs_coupling = 0`).
+/// Parse sbr_envelope() for a single channel (Table 4.72).
 ///
 /// `num_env_bands` is an array giving the number of bands for each
 /// frequency resolution (LO/HI): `num_env_bands[0]` = `NLow`,
 /// `num_env_bands[1]` = `NHigh`.
+///
+/// When `data.bs_coupling_balance` is set, the balance-mode Huffman tables
+/// and "balance" start-value bit count are used instead (§4.6.18.3.5).
 pub fn parse_sbr_envelope(
     br: &mut BitReader<'_>,
     data: &mut SbrChannelData,
     num_env_bands: [usize; 2],
 ) -> Result<()> {
-    // Pick Huffman tables by amp_res.
-    let (t_huff, f_huff, start_bits) = if data.bs_amp_res != 0 {
-        (
+    // Pick Huffman tables by amp_res and by coupling-balance flag. Balance
+    // tables encode the *difference* between the two coupled channels; they
+    // have smaller LAV and a smaller start-value field (5 bits vs 6/7).
+    let (t_huff, f_huff, start_bits, lav) = match (data.bs_amp_res != 0, data.bs_coupling_balance) {
+        (true, false) => (
             &T_HUFFMAN_ENV_3_0DB[..],
             &F_HUFFMAN_ENV_3_0DB[..],
             6u32,
-        )
-    } else {
-        (
+            LAV_ENV_3_0DB,
+        ),
+        (false, false) => (
             &T_HUFFMAN_ENV_1_5DB[..],
             &F_HUFFMAN_ENV_1_5DB[..],
             7u32,
-        )
-    };
-    let lav = if data.bs_amp_res != 0 {
-        LAV_ENV_3_0DB
-    } else {
-        LAV_ENV_1_5DB
+            LAV_ENV_1_5DB,
+        ),
+        (true, true) => (
+            &T_HUFFMAN_ENV_BAL_3_0DB[..],
+            &F_HUFFMAN_ENV_BAL_3_0DB[..],
+            5u32,
+            LAV_ENV_BAL_3_0DB,
+        ),
+        (false, true) => (
+            &T_HUFFMAN_ENV_BAL_1_5DB[..],
+            &F_HUFFMAN_ENV_BAL_1_5DB[..],
+            6u32,
+            LAV_ENV_BAL_1_5DB,
+        ),
     };
 
     for env in 0..data.bs_num_env as usize {
@@ -334,20 +355,35 @@ pub fn parse_sbr_envelope(
     Ok(())
 }
 
-/// Parse sbr_noise() for a single channel (Table 4.73, bs_coupling=0).
+/// Parse sbr_noise() for a single channel (Table 4.73).
+///
+/// Uses the balance-mode Huffman tables when `data.bs_coupling_balance` is
+/// set.
 pub fn parse_sbr_noise(
     br: &mut BitReader<'_>,
     data: &mut SbrChannelData,
     num_noise_bands: usize,
 ) -> Result<()> {
-    let (t_huff, f_huff) = (
-        &T_HUFFMAN_NOISE_3_0DB[..],
-        &F_HUFFMAN_ENV_3_0DB[..], // Note 2: noise f-table == env f-table at 3.0dB.
-    );
-    let lav = LAV_NOISE_3_0DB;
+    let (t_huff, f_huff, start_bits, lav) = if data.bs_coupling_balance {
+        (
+            &T_HUFFMAN_NOISE_BAL_3_0DB[..],
+            // Balance noise uses the BAL 3.0 dB env f-table (Note 2 of
+            // Table 4.73: noise f-table == env f-table at the same res).
+            &F_HUFFMAN_ENV_BAL_3_0DB[..],
+            5u32,
+            LAV_NOISE_BAL_3_0DB,
+        )
+    } else {
+        (
+            &T_HUFFMAN_NOISE_3_0DB[..],
+            &F_HUFFMAN_ENV_3_0DB[..], // Note 2: noise f-table == env f-table at 3.0dB.
+            5u32,
+            LAV_NOISE_3_0DB,
+        )
+    };
     for n in 0..data.bs_num_noise as usize {
         if data.bs_df_noise[n] == 0 {
-            data.noise_sf[n][0] = br.read_u32(5)? as i32;
+            data.noise_sf[n][0] = br.read_u32(start_bits)? as i32;
             for band in 1..num_noise_bands {
                 let sym = sbr_huff_decode(br, f_huff)? as i32;
                 data.noise_sf[n][band] = sym - lav;
@@ -413,19 +449,110 @@ pub fn parse_single_channel_element(
     Ok(())
 }
 
-/// Unused in SCE decode path but kept for parse symmetry.
-#[allow(dead_code)]
+/// Parse `sbr_channel_pair_element()` — Table 4.66.
+///
+/// A CPE can be either
+///   * **coupled**    (`bs_coupling = 1`): the two channels share time/freq
+///     grid, df flags and inverse-filter modes. `data_l` carries the
+///     *shared* envelope/noise values; `data_r` carries balance values
+///     (with `bs_coupling_balance = true`).
+///   * **independent** (`bs_coupling = 0`): each channel carries its own
+///     grid + data, just like back-to-back single_channel_elements.
+///
+/// Returns `Ok(coupling)` so callers can apply the coupled-mode gain at
+/// envelope-application time. Bit-alignment and any trailing extension data
+/// are consumed by the caller that invoked this function.
+#[allow(clippy::too_many_arguments)]
 pub fn parse_channel_pair_element(
-    _br: &mut BitReader<'_>,
-    _data_l: &mut SbrChannelData,
-    _data_r: &mut SbrChannelData,
-    _num_noise_bands: usize,
-    _num_env_bands: [usize; 2],
-    _num_high_res: usize,
+    br: &mut BitReader<'_>,
+    data_l: &mut SbrChannelData,
+    data_r: &mut SbrChannelData,
+    num_noise_bands: usize,
+    num_env_bands: [usize; 2],
+    num_high_res: usize,
 ) -> Result<bool> {
-    // CPE + coupling/stereo are not supported yet — surface Unsupported.
-    Err(Error::unsupported(
-        "SBR: channel_pair_element not implemented (mono HE-AACv1 only)",
-    ))
+    let bs_data_extra = br.read_bit()?;
+    if bs_data_extra {
+        let _reserved_l = br.read_u32(4)?;
+        let _reserved_r = br.read_u32(4)?;
+    }
+    let bs_coupling = br.read_bit()?;
+    if bs_coupling {
+        parse_sbr_grid(br, data_l)?;
+        // Right-channel inherits every grid parameter from left.
+        copy_grid(data_l, data_r);
+        parse_sbr_dtdf(br, data_l)?;
+        parse_sbr_dtdf(br, data_r)?;
+        parse_sbr_invf(br, data_l, num_noise_bands)?;
+        for n in 0..num_noise_bands.min(MAX_NOISE_BANDS) {
+            data_r.bs_invf_mode[n] = data_l.bs_invf_mode[n];
+        }
+        // Left carries the raw envelope/noise, right carries the balance.
+        data_l.bs_coupling_balance = false;
+        data_r.bs_coupling_balance = true;
+        data_r.bs_amp_res = data_l.bs_amp_res;
+        parse_sbr_envelope(br, data_l, num_env_bands)?;
+        parse_sbr_noise(br, data_l, num_noise_bands)?;
+        parse_sbr_envelope(br, data_r, num_env_bands)?;
+        parse_sbr_noise(br, data_r, num_noise_bands)?;
+        data_l.bs_add_harmonic_flag = br.read_bit()?;
+        if data_l.bs_add_harmonic_flag {
+            parse_sbr_sinusoidal(br, data_l, num_high_res)?;
+        }
+        data_r.bs_add_harmonic_flag = br.read_bit()?;
+        if data_r.bs_add_harmonic_flag {
+            parse_sbr_sinusoidal(br, data_r, num_high_res)?;
+        }
+    } else {
+        parse_sbr_grid(br, data_l)?;
+        parse_sbr_grid(br, data_r)?;
+        parse_sbr_dtdf(br, data_l)?;
+        parse_sbr_dtdf(br, data_r)?;
+        parse_sbr_invf(br, data_l, num_noise_bands)?;
+        parse_sbr_invf(br, data_r, num_noise_bands)?;
+        data_l.bs_coupling_balance = false;
+        data_r.bs_coupling_balance = false;
+        parse_sbr_envelope(br, data_l, num_env_bands)?;
+        parse_sbr_noise(br, data_l, num_noise_bands)?;
+        parse_sbr_envelope(br, data_r, num_env_bands)?;
+        parse_sbr_noise(br, data_r, num_noise_bands)?;
+        data_l.bs_add_harmonic_flag = br.read_bit()?;
+        if data_l.bs_add_harmonic_flag {
+            parse_sbr_sinusoidal(br, data_l, num_high_res)?;
+        }
+        data_r.bs_add_harmonic_flag = br.read_bit()?;
+        if data_r.bs_add_harmonic_flag {
+            parse_sbr_sinusoidal(br, data_r, num_high_res)?;
+        }
+    }
+    // Mirror the extended-data handling of the SCE parser at the tail — the
+    // shared sbr_extension() logic lives with the caller.
+    let bs_extended_data = br.read_bit()?;
+    if bs_extended_data {
+        let mut cnt = br.read_u32(4)?;
+        if cnt == 15 {
+            cnt += br.read_u32(8)?;
+        }
+        let num_bits = 8 * cnt as i64;
+        for _ in 0..num_bits {
+            br.read_u32(1)?;
+        }
+    }
+    Ok(bs_coupling)
+}
+
+fn copy_grid(src: &SbrChannelData, dst: &mut SbrChannelData) {
+    dst.frame_class = src.frame_class;
+    dst.bs_num_env = src.bs_num_env;
+    dst.bs_num_noise = src.bs_num_noise;
+    dst.bs_amp_res = src.bs_amp_res;
+    dst.freq_res = src.freq_res;
+    dst.bs_var_bord_0 = src.bs_var_bord_0;
+    dst.bs_var_bord_1 = src.bs_var_bord_1;
+    dst.bs_num_rel_0 = src.bs_num_rel_0;
+    dst.bs_num_rel_1 = src.bs_num_rel_1;
+    dst.bs_rel_bord_0 = src.bs_rel_bord_0;
+    dst.bs_rel_bord_1 = src.bs_rel_bord_1;
+    dst.bs_pointer = src.bs_pointer;
 }
 
