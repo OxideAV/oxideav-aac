@@ -10,11 +10,9 @@ use oxideav_codec::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn decoder_for(codec_id: &str, sr: u32, channels: u16) -> Box<dyn Decoder> {
-    let params = CodecParameters {
-        sample_rate: Some(sr),
-        channels: Some(channels),
-        ..CodecParameters::audio(CodecId::new(codec_id))
-    };
+    let mut params = CodecParameters::audio(CodecId::new(codec_id));
+    params.sample_rate = Some(sr);
+    params.channels = Some(channels);
     oxideav_aac::decoder::make_decoder(&params).expect("make decoder")
 }
 

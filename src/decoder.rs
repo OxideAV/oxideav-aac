@@ -816,11 +816,19 @@ impl AacDecoder {
             }
 
             // Interleave channels (S16 LE).
+            //
+            // IMDCT + windowing output is scaled to native int16 range — the
+            // forward/inverse MDCT pair in this crate deliberately sits at a
+            // gain of 2 (unscaled forward + `2/input_n` inverse) for
+            // numerical reasons; the `* 0.5` here restores unity gain
+            // relative to the encoder input. The synthesis QMF preserves
+            // this scale (spec prescribes 1/64 inside the bank — see
+            // §4.6.18.4.2 / Fig. 4.43). Clamp to i16 range and cast.
             let mut out_bytes = Vec::with_capacity(out_samples * out_channels * bytes_per_sample);
             for n in 0..out_samples {
                 for ch in 0..out_channels {
-                    let v = final_pcm[ch][n].clamp(-1.0, 1.0);
-                    let s = (v * 32767.0) as i16;
+                    let v = (final_pcm[ch][n] * 0.5).clamp(-32768.0, 32767.0);
+                    let s = v as i16;
                     out_bytes.extend_from_slice(&s.to_le_bytes());
                 }
             }
@@ -836,11 +844,14 @@ impl AacDecoder {
             }));
         }
 
+        // IMDCT output is already in native int16 range (see SBR path above
+        // for the rationale), so scale-by-½ to compensate the transform
+        // pair's 2× gain and cast.
         let mut out_bytes = Vec::with_capacity(FRAME_LEN * channels_out * bytes_per_sample);
         for n in 0..FRAME_LEN {
             for ch in 0..channels_out {
-                let v = pcm[ch][n].clamp(-1.0, 1.0);
-                let s = (v * 32767.0) as i16;
+                let v = (pcm[ch][n] * 0.5).clamp(-32768.0, 32767.0);
+                let s = v as i16;
                 out_bytes.extend_from_slice(&s.to_le_bytes());
             }
         }

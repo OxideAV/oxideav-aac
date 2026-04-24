@@ -57,6 +57,19 @@ fn short_cos() -> &'static CosTable {
 }
 
 /// Compute the IMDCT of `spec[0..input_n]` into `out[0..2*input_n]`.
+///
+/// Per ISO/IEC 14496-3 §4.6.11.3.1:
+///
+/// ```text
+/// x[i][n] = (2/N) * Σ_{k=0}^{N/2-1} spec[i][k] * cos((2π/N)(n+n0)(k+½))
+/// ```
+///
+/// where `N` is the *window* length = `2 * input_n`. The spec-prescribed
+/// scale factor would be `2/N = 1/input_n`, but this implementation pairs
+/// an unscaled forward MDCT (see [`crate::mdct`]) with a `2/input_n` scale
+/// here, which yields exact TDAC round-trip at gain 2. The missing factor
+/// of 2 relative to the spec formula is compensated at the PCM-output
+/// stage by scaling down when converting to the S16 sample format.
 fn imdct_direct(spec: &[f32], out: &mut [f32], cos: &CosTable, input_n: usize) {
     debug_assert_eq!(spec.len(), input_n);
     debug_assert!(out.len() >= 2 * input_n);

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- SBR PCM clipping / 6.8x reference amplitude overshoot on HE-AAC mono
+  decode. Root cause was the S16 output path multiplying IMDCT results by
+  `32767` even though the IMDCT pair operates at native int16 range; the
+  MDCT+IMDCT transform pair in this crate sits at a gain of 2 by design
+  (unscaled forward + `2/input_n` inverse), so the correct output scale
+  is `* 0.5` clamped to i16 range, not `* 32767` clamped to [-1, 1].
+  HE-AACv1 stereo PSNR vs ffmpeg jumps from ~1 dB to ~48 dB.
+- Non-exhaustive-struct compile break in `tests/decode_fixture.rs`
+  (`CodecParameters` is `#[non_exhaustive]`).
+
+### Added
+- `tests/sbr_he_aac_psnr.rs` — end-to-end PSNR regression test that
+  encodes a sine via afconvert (or ffmpeg+libfdk_aac), decodes through
+  the crate and ffmpeg, and asserts steady-state PSNR ≥ 40 dB. Skips
+  gracefully without an HE-AAC encoder.
+- `examples/sbr_probe.rs` — CLI helper that prints per-frame PCM peaks
+  and a PSNR figure against a reference PCM. Useful for bisecting SBR
+  amplitude / scaling regressions.
+
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-aac/compare/v0.0.5...v0.0.6) - 2026-04-19
 
 ### Other
