@@ -450,18 +450,23 @@ pub fn write_single_channel_element_mono(
 pub fn write_envelope_1_5db_freq_delta(bw: &mut BitWriter, env: &[i32], n_bands: usize) {
     use super::tables::{F_HUFFMAN_ENV_1_5DB, LAV_ENV_1_5DB};
     let n = n_bands.min(env.len());
+    // Spec limit on the accumulated absolute scalefactor value at
+    // amp_res=0 is 127 (7-bit unsigned start + any positive delta run).
+    // ffmpeg rejects `env_facs_q > 127`. Keep reconstructed values
+    // inside [0, 127] at every band.
+    const MAX_ACC: i32 = 127;
     let mut prev_abs = 0i32;
     for i in 0..n {
-        // Clamp to the full legal range: abs value in 0..120 (2*LAV).
-        // Since we can't express negative absolutes, the first band's
-        // value is floored at 0. Subsequent bands can delta downward
-        // via the Huffman table (which covers -LAV..+LAV).
         if i == 0 {
-            let v = env[i].clamp(0, 2 * LAV_ENV_1_5DB);
+            let v = env[i].clamp(0, MAX_ACC);
             bw.write_u32(v as u32, 7);
             prev_abs = v;
         } else {
-            let v = env[i].clamp(prev_abs - LAV_ENV_1_5DB, prev_abs + LAV_ENV_1_5DB);
+            // Requested reconstructed value, bounded by both the
+            // Huffman delta range and the cumulative absolute cap.
+            let v = env[i]
+                .clamp(prev_abs - LAV_ENV_1_5DB, prev_abs + LAV_ENV_1_5DB)
+                .clamp(0, MAX_ACC);
             let delta = v - prev_abs;
             write_huffman_sym(bw, delta + LAV_ENV_1_5DB, &F_HUFFMAN_ENV_1_5DB);
             prev_abs = v;
