@@ -75,6 +75,12 @@ impl Default for SbrChannelState {
 /// Result of `try_parse_sbr_extension` — distinguishes SCE mono payload
 /// from a stereo CPE payload. Mono payloads may additionally carry a PS
 /// extension for HE-AACv2 stereo upmix.
+// `SbrChannelData` is intentionally stack-allocated (~1.4 KiB) so the Pair
+// variant reaches ~2.8 KiB. Boxing would add a heap-alloc per SBR frame on
+// the hot decode path without reducing peak working set (the parent
+// stack-frame already holds the data either way). Behaviour-preserving
+// suppression — hot path; boxing adds heap alloc per frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum SbrPayload {
     /// Single channel (mono HE-AACv1 or HE-AACv2 when `ps` is `Some`).

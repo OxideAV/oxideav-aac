@@ -583,7 +583,7 @@ pub fn write_fil_body_with_sbr(
     // The FIL element has a byte-granular count that includes the 4-bit
     // extension_id. Round-up bits.
     let total_bits = 4 + sbr_payload_nbits;
-    let total_bytes = ((total_bits + 7) / 8) as usize;
+    let total_bytes = total_bits.div_ceil(8) as usize;
     if total_bytes >= 15 {
         bw.write_u32(15, 4);
         bw.write_u32((total_bytes - 15 + 1) as u32, 8);

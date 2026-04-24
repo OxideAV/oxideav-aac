@@ -464,49 +464,6 @@ pub fn apply_envelope_coupled_with_limiter(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sbr::hf_gen::PatchInfo;
-
-    #[test]
-    fn noise_rng_unit_range() {
-        let mut rng = SbrNoiseRng::new(12345);
-        for _ in 0..10_000 {
-            let v = rng.next_unit();
-            assert!(v >= -1.0 && v < 1.0);
-        }
-    }
-
-    #[test]
-    fn limiter_bands_are_monotonic() {
-        let ft = crate::sbr::freq::FreqTables::build(48_000, 5, 9, 0, 2, false, 2).unwrap();
-        let mut pi = PatchInfo::default();
-        pi.num_patches = 1;
-        pi.patch_num_subbands[0] = ft.m;
-        pi.patch_borders[0] = ft.kx;
-        pi.patch_borders[1] = ft.kx + ft.m;
-        let lim = build_limiter_bands(&ft, &pi, 2);
-        for w in lim.windows(2) {
-            assert!(w[1] > w[0]);
-        }
-        assert_eq!(lim[0], ft.kx);
-        assert_eq!(*lim.last().unwrap(), ft.kx + ft.m);
-    }
-
-    #[test]
-    fn limiter_bands_disabled_is_flat() {
-        let ft = crate::sbr::freq::FreqTables::build(48_000, 5, 9, 0, 2, false, 2).unwrap();
-        let mut pi = PatchInfo::default();
-        pi.num_patches = 1;
-        pi.patch_num_subbands[0] = ft.m;
-        pi.patch_borders[0] = ft.kx;
-        pi.patch_borders[1] = ft.kx + ft.m;
-        let lim = build_limiter_bands(&ft, &pi, 0);
-        assert_eq!(lim, vec![ft.kx, ft.kx + ft.m]);
-    }
-}
-
 /// Compute envelope time-border vector tE (§4.6.18.3.3).
 pub fn envelope_time_borders(data: &SbrChannelData, num_time_slots: i32) -> [i32; 6] {
     use super::bitstream::FrameClass;
@@ -540,8 +497,7 @@ pub fn envelope_time_borders(data: &SbrChannelData, num_time_slots: i32) -> [i32
                 let val = match data.frame_class {
                     FrameClass::FixFix => {
                         // NINT(numTimeSlots / LE)
-                        let nint = (num_time_slots as f32 / le as f32 + 0.5).floor() as i32;
-                        nint
+                        (num_time_slots as f32 / le as f32 + 0.5).floor() as i32
                     }
                     FrameClass::FixVar => 0, // NA
                     FrameClass::VarVar | FrameClass::VarFix => data.bs_rel_bord_0[i] as i32,
@@ -564,4 +520,51 @@ pub fn envelope_time_borders(data: &SbrChannelData, num_time_slots: i32) -> [i32
         let _ = n_rel_trail;
     }
     t_e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sbr::hf_gen::PatchInfo;
+
+    #[test]
+    fn noise_rng_unit_range() {
+        let mut rng = SbrNoiseRng::new(12345);
+        for _ in 0..10_000 {
+            let v = rng.next_unit();
+            assert!((-1.0..1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn limiter_bands_are_monotonic() {
+        let ft = crate::sbr::freq::FreqTables::build(48_000, 5, 9, 0, 2, false, 2).unwrap();
+        let mut pi = PatchInfo {
+            num_patches: 1,
+            ..PatchInfo::default()
+        };
+        pi.patch_num_subbands[0] = ft.m;
+        pi.patch_borders[0] = ft.kx;
+        pi.patch_borders[1] = ft.kx + ft.m;
+        let lim = build_limiter_bands(&ft, &pi, 2);
+        for w in lim.windows(2) {
+            assert!(w[1] > w[0]);
+        }
+        assert_eq!(lim[0], ft.kx);
+        assert_eq!(*lim.last().unwrap(), ft.kx + ft.m);
+    }
+
+    #[test]
+    fn limiter_bands_disabled_is_flat() {
+        let ft = crate::sbr::freq::FreqTables::build(48_000, 5, 9, 0, 2, false, 2).unwrap();
+        let mut pi = PatchInfo {
+            num_patches: 1,
+            ..PatchInfo::default()
+        };
+        pi.patch_num_subbands[0] = ft.m;
+        pi.patch_borders[0] = ft.kx;
+        pi.patch_borders[1] = ft.kx + ft.m;
+        let lim = build_limiter_bands(&ft, &pi, 0);
+        assert_eq!(lim, vec![ft.kx, ft.kx + ft.m]);
+    }
 }
