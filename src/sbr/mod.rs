@@ -18,6 +18,7 @@
 
 pub mod bitstream;
 pub mod decode;
+pub mod encode;
 pub mod freq;
 pub mod hf_adjust;
 pub mod hf_gen;
