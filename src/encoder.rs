@@ -130,6 +130,26 @@ pub struct AacEncoder {
     /// Per-channel short-block state; only populated when
     /// `enable_short_blocks` is true.
     short_state: Vec<ChannelShortState>,
+    /// Optional SBR payload bits to splice in as a FIL element on the
+    /// *next* raw_data_block, before `ID_END`. When `Some`, the encoder
+    /// writes the Fil element header (3-bit ID + 4-bit cnt [or 4+8],
+    /// 4-bit EXT_SBR_DATA) followed by the payload bytes. Consumed
+    /// (taken) each call — the HE-AAC wrapper must set it before every
+    /// frame.
+    pending_sbr_fil: Option<SbrFilBits>,
+}
+
+/// Staged SBR FIL payload: raw byte-aligned SBR bytes (produced by
+/// [`crate::sbr::encode::SbrEncoder::emit_sbr_payload`]) plus the exact
+/// number of bits they contain.
+#[derive(Clone, Debug)]
+pub struct SbrFilBits {
+    /// Byte-aligned SBR payload. The `bits` field is authoritative — the
+    /// final byte may have tail zero-padding.
+    pub bytes: Vec<u8>,
+    /// Number of *bits* of meaningful SBR data in `bytes` (the
+    /// byte-alignment padding is not counted).
+    pub bits: u32,
 }
 
 impl AacEncoder {
@@ -197,7 +217,19 @@ impl AacEncoder {
             flushed: false,
             enable_short_blocks: false,
             short_state: (0..n_ch).map(|_| ChannelShortState::default()).collect(),
+            pending_sbr_fil: None,
         })
+    }
+
+    /// Stage an SBR payload (as produced by the HE-AACv1 encoder) so the
+    /// *next* `raw_data_block` carries it as a FIL / EXT_SBR_DATA
+    /// element inserted before `ID_END`. One-shot — consumed on the next
+    /// frame emission.
+    ///
+    /// Use [`crate::sbr::encode::SbrEncoder`] to produce the bytes and
+    /// call this before feeding the matching low-band PCM frame.
+    pub fn stage_sbr_fil(&mut self, sbr: SbrFilBits) {
+        self.pending_sbr_fil = Some(sbr);
     }
 
     /// Enable (or disable) the short-block encoder state machine. Off by
@@ -550,7 +582,7 @@ impl AacEncoder {
         Ok(())
     }
 
-    fn encode_raw_data_block(&self, specs: &[Vec<f32>]) -> Result<Vec<u8>> {
+    fn encode_raw_data_block(&mut self, specs: &[Vec<f32>]) -> Result<Vec<u8>> {
         let all_long = vec![WindowSequence::OnlyLong; specs.len()];
         self.encode_raw_data_block_seq(specs, &all_long)
     }
@@ -563,7 +595,7 @@ impl AacEncoder {
     /// LongStart / LongStop) go through the existing long writers with
     /// common-window M/S intact.
     fn encode_raw_data_block_seq(
-        &self,
+        &mut self,
         specs: &[Vec<f32>],
         seqs: &[WindowSequence],
     ) -> Result<Vec<u8>> {
@@ -626,10 +658,67 @@ impl AacEncoder {
                 }
             }
         }
+        // Optional FIL/SBR element — one-shot, consumed here. Writes the
+        // 3-bit Fil element id, then the FIL payload (length field +
+        // 4-bit extension_id + SBR payload bits).
+        if let Some(sbr) = self.pending_sbr_fil.take() {
+            write_fil_sbr_element(&mut bw, &sbr);
+        }
         // ID_END
         bw.write_u32(ElementType::End as u32, 3);
         bw.align_to_byte();
         Ok(bw.finish())
+    }
+}
+
+/// Write a Fil / EXT_SBR_DATA element body into `bw`. Layout:
+///   3 bits  element id   = ElementType::Fil (6)
+///   4 bits  cnt          (or 4 + 8 bits when total_bytes >= 15)
+///   4 bits  extension_id = EXT_SBR_DATA (0xD)
+///   N bits  SBR payload
+///
+/// The cnt field counts *bytes* covering the 4-bit extension_id plus
+/// the SBR payload — the FIL element in raw_data_block is byte-oriented
+/// so the SBR payload itself must be bit-stuffed with zeros up to a byte
+/// boundary. `sbr.bits` is the exact count of meaningful bits; any
+/// trailing zero-bits inside the final byte of `sbr.bytes` are inert
+/// padding that the decoder consumes and discards.
+fn write_fil_sbr_element(bw: &mut BitWriter, sbr: &SbrFilBits) {
+    // Element id — Fil (6). Writes 3 bits at the current bit position.
+    bw.write_u32(ElementType::Fil as u32, 3);
+    // `total_bits_content` = 4 (extension_id) + sbr.bits bits of SBR
+    // payload. The FIL `cnt` field counts *bytes* of content, so pad
+    // the content to a multiple of 8 bits (independently of the
+    // surrounding byte alignment — cnt is measured in bits relative to
+    // the end of the cnt field, not the start of the raw_data_block).
+    let content_bits = 4 + sbr.bits;
+    let pad_bits = (8 - (content_bits % 8)) % 8;
+    let total_bytes = (content_bits + pad_bits) / 8;
+    if total_bytes < 15 {
+        bw.write_u32(total_bytes, 4);
+    } else {
+        bw.write_u32(15, 4);
+        // "cnt == 15 means the real count is cnt + esc - 1".
+        bw.write_u32(total_bytes + 1 - 15, 8);
+    }
+    // 4-bit extension_id.
+    bw.write_u32(crate::sbr::bitstream::EXT_SBR_DATA, 4);
+    // SBR payload bits — exactly sbr.bits bits.
+    let full = (sbr.bits / 8) as usize;
+    for byte in &sbr.bytes[..full.min(sbr.bytes.len())] {
+        bw.write_u32(*byte as u32, 8);
+    }
+    let tail = sbr.bits - (full as u32 * 8);
+    if tail > 0 && full < sbr.bytes.len() {
+        let last = sbr.bytes[full] >> (8 - tail);
+        bw.write_u32(last as u32, tail);
+    }
+    // Content-bit pad — this is part of the declared `cnt` byte count so
+    // the decoder will consume it as part of the SBR payload. The spec
+    // allows this because `sbr_extension()` includes bs_fill_bits up to
+    // the declared length.
+    if pad_bits > 0 {
+        bw.write_u32(0, pad_bits);
     }
 }
 

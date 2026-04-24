@@ -324,21 +324,22 @@ impl SbrEncoder {
         out
     }
 
-    /// Emit one mono SBR payload as a bit-aligned byte stream suitable for
-    /// embedding inside a FIL element (minus the 4-bit `extension_type`
-    /// header — that's written by [`write_fil_element_with_sbr`]).
+    /// Emit one mono SBR payload as a bit-aligned byte stream plus the
+    /// exact bit count. The returned bytes are 0-padded on the tail to
+    /// the next byte boundary so they can be written back with byte-
+    /// oriented writers; `bits` is authoritative.
     ///
     /// `x_high_sbr` is the 32-slot × 64-band complex QMF matrix produced
-    /// by [`Self::analyse`]. Returns the number of *bits* written and the
-    /// raw `BitWriter` so the caller can pack additional padding.
+    /// by [`Self::analyse`].
     pub fn emit_sbr_payload(
         &mut self,
         x_high_sbr: &[[Complex32; NUM_QMF_BANDS]],
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, u32) {
         let sf = estimate_envelope(x_high_sbr, &self.freq);
         let mut bw = BitWriter::with_capacity(64);
-        // bs_sbr_crc_info = 0 (no CRC extension)
-        // Header re-emitted every 8 frames to resync the decoder state.
+        let start = bw.bit_position();
+        // Header re-emitted on frame 0 and every 8 frames thereafter to
+        // resync decoder state.
         let emit_header = self.frame_count == 0 || (self.frame_count % 8) == 0;
         bw.write_bit(emit_header); // bs_header_flag
         if emit_header {
@@ -346,20 +347,19 @@ impl SbrEncoder {
         }
         // sbr_data() for SCE: sbr_single_channel_element()
         write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
-        // No extended_data.
-        bw.write_bit(false);
+        let bits_written = (bw.bit_position() - start) as u32;
         bw.align_to_byte();
 
         // Update state for next frame.
         self.prev_env.clone_from(&sf.env);
         self.prev_noise.clone_from(&sf.noise);
         self.frame_count = self.frame_count.wrapping_add(1);
-        bw.finish()
+        (bw.finish(), bits_written)
     }
 
     /// Convenience wrapper: given 2048 samples of 2× rate PCM, run the
-    /// analysis QMF and emit the full FIL-wrapped SBR payload.
-    pub fn encode_frame_fil(&mut self, high_pcm: &[f32]) -> Vec<u8> {
+    /// analysis QMF and emit the SBR payload (plus bit count).
+    pub fn encode_frame_fil(&mut self, high_pcm: &[f32]) -> (Vec<u8>, u32) {
         let x = self.analyse(high_pcm);
         self.emit_sbr_payload(&x)
     }
@@ -592,7 +592,49 @@ mod tests {
         let pcm: Vec<f32> = (0..2048)
             .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
             .collect();
-        let bytes = enc.encode_frame_fil(&pcm);
+        let (bytes, bits) = enc.encode_frame_fil(&pcm);
         assert!(!bytes.is_empty());
+        assert!(bits > 0);
+    }
+
+    /// Produce an SBR payload, then parse it back through the decoder's
+    /// `try_parse_sbr_extension_ext` — confirms encoder / parser are
+    /// bitstream-compatible.
+    #[test]
+    fn emit_payload_round_trips_through_parser() {
+        use crate::sbr::decode::{try_parse_sbr_extension_ext, SbrChannelState, SbrPayload};
+        use oxideav_core::bits::BitReader;
+        let mut enc = SbrEncoder::new(24_000).expect("construct");
+        let pcm: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let x = enc.analyse(&pcm);
+        let (bytes, bits) = enc.emit_sbr_payload(&x);
+        // Feed the bytes as if they were the FIL-inner payload: we need
+        // to prepend the 4-bit EXT_SBR_DATA so try_parse consumes it.
+        let mut bw = BitWriter::with_capacity(bytes.len() + 1);
+        bw.write_u32(EXT_SBR_DATA, 4);
+        // Write exactly `bits` of SBR payload.
+        let full = (bits / 8) as usize;
+        for b in &bytes[..full] {
+            bw.write_u32(*b as u32, 8);
+        }
+        let tail = bits - full as u32 * 8;
+        if tail > 0 {
+            bw.write_u32((bytes[full] >> (8 - tail)) as u32, tail);
+        }
+        bw.align_to_byte();
+        let framed = bw.finish();
+        let mut br = BitReader::new(&framed);
+        let num_payload_bits = 4 + bits;
+        let mut state = SbrChannelState::new();
+        let parsed = try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
+            .expect("parse ok");
+        match parsed {
+            Some(SbrPayload::Single { data, .. }) => {
+                assert_eq!(data.bs_num_env, 1);
+            }
+            other => panic!("expected Single SCE payload, got {other:?}"),
+        }
     }
 }
