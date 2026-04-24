@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-aac/compare/v0.0.6...v0.0.7) - 2026-04-24
+
+### Other
+
+- clippy round-9 — zero warnings crate-wide
+- aac SBR: targeted lint cleanup (hf_adjust + decode + encode)
+- aac PS: fixture hunt for enable_ipdopd + Fil-count underflow fix
+- aac PS: apply IPD/OPD phase correction to mixing matrix (§8.6.4.6.3.2)
+- aac PS: implement hybrid sub-QMF filterbank (§8.6.4.3)
+- fix S16 output scale — HE-AAC decode PSNR 1dB → 48dB
+- promote HE-AACv2 PS to spec-accurate QMF-domain upmix
+- HE-AAC interop test against afconvert / libfdk-aac
+- aac SBR encoder: clamp cumulative envelope scalefactor at 127
+- document new HE-AACv1 mono encoder in lib.rs header
+- aac SBR encoder: envelope estimation uses 1.5 dB quantisation directly
+- aac SBR encoder: FIL element hook + HE-AACv1 mono wrapper
+- aac SBR encoder: downsampler + 64-band analysis QMF + payload scaffold
+- minimal HE-AACv2 Parametric Stereo upmix
+- SBR noise + sinusoid synthesis + limiter-band pass
+- SBR HF LPC — covariance method alpha0 / alpha1
+- wire SBR CPE through decoder, coupled-mode envelope apply
+- SBR channel_pair_element parser + balance Huffman tables
+- clean up SBR warnings
+- wire SBR into AAC-LC decoder + E2E smoke tests
+- SBR bitstream parsing + QMF banks + freq tables
+
 ### Added
 - IPD/OPD phase-correction in the HE-AACv2 PS mixing matrix
   (§8.6.4.6.3.2). Previously the baseline decoder decoded the IPD/OPD
