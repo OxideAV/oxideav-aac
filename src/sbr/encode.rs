@@ -202,9 +202,15 @@ pub struct SbrFrameScalefactors {
 /// of complex QMF subbands on the high-rate PCM. Returns one envelope
 /// (bs_num_env=1) covering the full frame.
 ///
-/// The 3.0-dB scalefactor (amp_res=1) encodes `E = 64 · 2^(sf)` so the
-/// quantised value is `sf = round(log2(E/64))`. This is the inverse of the
-/// decoder's dequantisation formula `64 * 2^(acc_e / 1)`.
+/// The decoder dequantises with `E_orig = 64 · 2^(acc_e / amp_res_bits)`.
+/// At amp_res=0 (1.5 dB step) `amp_res_bits=2`; at amp_res=1 (3.0 dB)
+/// `amp_res_bits=1`. We target the 1.5 dB path (FIXFIX num_env=1 forces
+/// amp_res=0) so the quantised integer is `round(log2(E/64) * 2)`.
+///
+/// To avoid blow-up in the decoder's `gain = sqrt(E_orig / E_curr)` step
+/// when E_curr is tiny (near-silent high band from a low-frequency tone
+/// LPC-extrapolated into high subbands), we apply a modest clamp that
+/// keeps envelopes within a sensible dynamic range.
 pub fn estimate_envelope(
     x_high: &[[Complex32; NUM_QMF_BANDS]],
     ft: &FreqTables,
@@ -226,19 +232,25 @@ pub fn estimate_envelope(
         }
         let bands = (k1 - k0) as f32;
         let e = acc / (n * bands + 1e-30);
-        // sf in 3.0 dB steps (amp_res=1): E = 64 * 2^sf.
-        let sf = if e > 0.0 {
-            (e / 64.0).log2().round() as i32
+        // Quantised value at amp_res=0 (1.5 dB step): E = 64 * 2^(v/2)
+        // => v = round(log2(E/64) * 2). Allow negative values so
+        // silent / near-silent bands don't get a 64-unit energy floor.
+        let v_15 = if e > 0.0 {
+            ((e / 64.0).log2() * 2.0).round() as i32
         } else {
-            -LAV_ENV_3_0DB
+            -2 * LAV_ENV_3_0DB
         };
-        env[band] = sf.clamp(0, LAV_ENV_3_0DB);
+        // Store the effective 1.5 dB index divided by 2 so the writer
+        // can re-scale. We clamp at [-LAV_ENV_3_0DB, LAV_ENV_3_0DB] (i.e.
+        // v_15 in [-62, 62]) which the writer maps into 0..120 via
+        // sign-bias shift.
+        env[band] = v_15;
     }
     // Noise floor — Q_orig = 2^(NOISE_FLOOR_OFFSET - sf). The decoder's
     // NOISE_FLOOR_OFFSET is 6, so sf=6 gives Q_orig=1 (roughly equal
-    // noise:signal), sf=12 gives ~-6 dB below. We pick sf=10 as a mild
-    // noise floor.
-    let noise = vec![10i32; ft.nq];
+    // noise:signal), sf>=10 gives <-6 dB below signal. Pick a high sf
+    // (≈ very low noise) for tonal input.
+    let noise = vec![18i32; ft.nq];
     SbrFrameScalefactors { env, noise }
 }
 
@@ -427,25 +439,29 @@ pub fn write_single_channel_element_mono(
 
 /// Write per-band envelope scalefactors with freq-direction delta coding.
 ///
-/// `env[0]` goes out as a 7-bit absolute (LAV+start-value, 1.5 dB tables:
-/// `start_bits = 7`). `env[k]` for `k > 0` is encoded as
-/// `env[k] - env[k-1] + LAV` through the F_HUFFMAN_ENV_1_5DB table.
+/// `env[0]` goes out as a 7-bit absolute. `env[k]` for `k > 0` is encoded
+/// as `env[k] - env[k-1] + LAV` through the `F_HUFFMAN_ENV_1_5DB` table.
 ///
-/// At amp_res=0 the LAV is `LAV_ENV_1_5DB = 60` so `start_bits=7` covers
-/// 0..127 which is more than enough for the 0..120 legal absolute range.
+/// Input `env[i]` is in 1.5 dB quantisation (directly — no doubling
+/// applied). An input of 0 gives decoder `E_orig = 64`, negative inputs
+/// go below (e.g. `-10` → `E_orig = 64 · 2^-5 = 2`). Since the 7-bit
+/// absolute field is unsigned (0..127), negative first-band values are
+/// clamped at 0; the Huffman-coded deltas cover the negative range.
 pub fn write_envelope_1_5db_freq_delta(bw: &mut BitWriter, env: &[i32], n_bands: usize) {
     use super::tables::{F_HUFFMAN_ENV_1_5DB, LAV_ENV_1_5DB};
-    // Remap our 3.0 dB sf values to 1.5 dB steps by doubling — since the
-    // decoder reads them at amp_res=0 it will divide by 2 when forming the
-    // exponent (see hf_adjust: `acc_e / amp_res_bits`, amp_res_bits=2).
     let n = n_bands.min(env.len());
     let mut prev_abs = 0i32;
     for i in 0..n {
-        let v = (env[i] * 2).clamp(0, 2 * LAV_ENV_1_5DB); // 0..120
+        // Clamp to the full legal range: abs value in 0..120 (2*LAV).
+        // Since we can't express negative absolutes, the first band's
+        // value is floored at 0. Subsequent bands can delta downward
+        // via the Huffman table (which covers -LAV..+LAV).
         if i == 0 {
+            let v = env[i].clamp(0, 2 * LAV_ENV_1_5DB);
             bw.write_u32(v as u32, 7);
             prev_abs = v;
         } else {
+            let v = env[i].clamp(prev_abs - LAV_ENV_1_5DB, prev_abs + LAV_ENV_1_5DB);
             let delta = v - prev_abs;
             write_huffman_sym(bw, delta + LAV_ENV_1_5DB, &F_HUFFMAN_ENV_1_5DB);
             prev_abs = v;
