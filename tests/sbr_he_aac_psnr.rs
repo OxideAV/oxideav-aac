@@ -72,7 +72,16 @@ fn produce_he_aac_v1_stereo(wav_in: &Path, adts_out: &Path, bitrate: u32) -> Opt
     if which("afconvert").is_some() {
         // `-c 2` forces stereo-in -> HE-AACv1 (no PS).
         let status = Command::new("afconvert")
-            .args(["-f", "adts", "-d", "aach", "-b", &bitrate.to_string(), "-c", "2"])
+            .args([
+                "-f",
+                "adts",
+                "-d",
+                "aach",
+                "-b",
+                &bitrate.to_string(),
+                "-c",
+                "2",
+            ])
             .arg(wav_in)
             .arg(adts_out)
             .status()
@@ -87,8 +96,14 @@ fn produce_he_aac_v1_stereo(wav_in: &Path, adts_out: &Path, bitrate: u32) -> Opt
             .arg("-i")
             .arg(wav_in)
             .args([
-                "-c:a", "libfdk_aac", "-profile:a", "aac_he",
-                "-b:a", &format!("{bitrate}"), "-ac", "2",
+                "-c:a",
+                "libfdk_aac",
+                "-profile:a",
+                "aac_he",
+                "-b:a",
+                &format!("{bitrate}"),
+                "-ac",
+                "2",
             ])
             .args(["-f", "adts"])
             .arg(adts_out)
@@ -141,8 +156,7 @@ fn decode_all(bytes: &[u8]) -> (Vec<u8>, u32, u16, usize) {
     let mut out_ch = ch;
     let mut frame_count = 0;
     for (i, &(off, len)) in frames.iter().enumerate() {
-        let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec())
-            .with_pts(i as i64 * 1024);
+        let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec()).with_pts(i as i64 * 1024);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(af)) = dec.receive_frame() {
             out_sr = af.sample_rate;
@@ -233,7 +247,9 @@ fn he_aac_v1_stereo_decode_matches_ffmpeg_within_40db() {
         if let Ok(o) = probe {
             let s = String::from_utf8_lossy(&o.stdout);
             if !s.contains("libfdk_aac") {
-                eprintln!("no HE-AAC encoder available (neither afconvert nor libfdk_aac) — skipping");
+                eprintln!(
+                    "no HE-AAC encoder available (neither afconvert nor libfdk_aac) — skipping"
+                );
                 return;
             }
         } else {
@@ -263,7 +279,8 @@ fn he_aac_v1_stereo_decode_matches_ffmpeg_within_40db() {
     // -ac 2` pins the output format so we can compare byte-for-byte.
     let ff = Command::new("ffmpeg")
         .args(["-y", "-hide_banner", "-loglevel", "error"])
-        .arg("-i").arg(&adts_out)
+        .arg("-i")
+        .arg(&adts_out)
         .args(["-f", "s16le", "-ar", "48000", "-ac", "2"])
         .arg(&ref_pcm)
         .status();

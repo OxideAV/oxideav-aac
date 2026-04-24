@@ -34,24 +34,26 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     // Figure out the stream config. Two paths:
     //   (a) extradata holds an AudioSpecificConfig (MP4 path).
     //   (b) ADTS — config will come from the first packet's ADTS header.
-    let (sf_index, channels, object_type, sbr_present, ps_explicit) = if !params.extradata.is_empty() {
-        let asc = parse_asc(&params.extradata)?;
-        if asc.object_type != AOT_AAC_LC {
-            return Err(Error::unsupported(
-                "AAC: only AAC-LC profile (object_type=2) supported",
-            ));
-        }
-        (
-            sample_rate_to_index(asc.sampling_frequency).unwrap_or(asc.sampling_frequency_index),
-            asc.channel_configuration,
-            asc.object_type,
-            asc.sbr_present,
-            asc.ps_present,
-        )
-    } else {
-        // Will be filled in after seeing the first ADTS frame.
-        (0xFF, 0, 0, false, false)
-    };
+    let (sf_index, channels, object_type, sbr_present, ps_explicit) =
+        if !params.extradata.is_empty() {
+            let asc = parse_asc(&params.extradata)?;
+            if asc.object_type != AOT_AAC_LC {
+                return Err(Error::unsupported(
+                    "AAC: only AAC-LC profile (object_type=2) supported",
+                ));
+            }
+            (
+                sample_rate_to_index(asc.sampling_frequency)
+                    .unwrap_or(asc.sampling_frequency_index),
+                asc.channel_configuration,
+                asc.object_type,
+                asc.sbr_present,
+                asc.ps_present,
+            )
+        } else {
+            // Will be filled in after seeing the first ADTS frame.
+            (0xFF, 0, 0, false, false)
+        };
 
     Ok(Box::new(AacDecoder {
         codec_id: params.codec_id.clone(),
@@ -598,8 +600,8 @@ impl AacDecoder {
                             // SBR payload belongs to the most recent SCE /
                             // CPE element (Note 1 of Table 4.57). `sf_index`
                             // carries the core sample rate.
-                            let core_rate = crate::syntax::sample_rate(self.sf_index)
-                                .unwrap_or(44_100);
+                            let core_rate =
+                                crate::syntax::sample_rate(self.sf_index).unwrap_or(44_100);
                             let target_ch = last_elem_start;
                             let is_sce = !last_elem_is_cpe;
                             if target_ch < self.sbr_state.len() {
@@ -611,11 +613,7 @@ impl AacDecoder {
                                     self.sbr_state.split_at_mut(target_ch + 1);
                                 let state_l = &mut state_l_slice[target_ch];
                                 match try_parse_sbr_extension_ext(
-                                    &mut br,
-                                    total_bits,
-                                    is_sce,
-                                    state_l,
-                                    core_rate,
+                                    &mut br, total_bits, is_sce, state_l, core_rate,
                                 )? {
                                     Some(SbrPayload::Single { data: sbr, ps }) => {
                                         self.sbr_data[target_ch] = Some(sbr);
@@ -687,8 +685,7 @@ impl AacDecoder {
         // SCE and stereo CPE (coupled + independent) are both supported.
         // HE-AACv2: a mono SBR with an attached PS payload produces a
         // stereo output via apply_ps_simple.
-        let ps_active =
-            self.ps_explicit || self.sbr_ps.iter().any(|p| p.is_some());
+        let ps_active = self.ps_explicit || self.sbr_ps.iter().any(|p| p.is_some());
         let sbr_active = (self.sbr_explicit || self.sbr_data.iter().any(|s| s.is_some()))
             && (1..=2).contains(&channels_out);
         let core_rate = crate::syntax::sample_rate(self.sf_index).unwrap_or(44_100);
@@ -696,8 +693,9 @@ impl AacDecoder {
             let out_samples = 2 * FRAME_LEN;
             // Allocate for the HE-AACv1 output (mono or stereo CPE). PS
             // upmix adds a second buffer post-hoc when `ps_active && mono`.
-            let mut sbr_pcm: Vec<Vec<f32>> =
-                (0..channels_out).map(|_| vec![0.0f32; out_samples]).collect();
+            let mut sbr_pcm: Vec<Vec<f32>> = (0..channels_out)
+                .map(|_| vec![0.0f32; out_samples])
+                .collect();
 
             // Stereo CPE path: slot 0 holds the SCE/CPE-left data; slot 0
             // in `sbr_pair` holds the right-channel data + coupling flag.
@@ -711,14 +709,7 @@ impl AacDecoder {
                     let state_r = &mut tail[0];
                     let (lo, hi) = sbr_pcm.split_at_mut(1);
                     if decode_sbr_cpe_frame(
-                        &pcm[0],
-                        &pcm[1],
-                        &sbr_l,
-                        &sbr_r,
-                        coupled,
-                        state_l,
-                        state_r,
-                        &mut lo[0],
+                        &pcm[0], &pcm[1], &sbr_l, &sbr_r, coupled, state_l, state_r, &mut lo[0],
                         &mut hi[0],
                     )
                     .is_err()
@@ -732,7 +723,9 @@ impl AacDecoder {
                         }
                     }
                 }
-            } else if channels_out == 1 && ps_active && self.sbr_ps[0].is_some()
+            } else if channels_out == 1
+                && ps_active
+                && self.sbr_ps[0].is_some()
                 && self.sbr_data[0].is_some()
             {
                 // HE-AACv2: mono + PS. Route through the QMF-domain upmix —
@@ -752,9 +745,16 @@ impl AacDecoder {
                 // then its right-qmf field. Easiest: temporarily move the
                 // field out via std::mem::take, call, and restore.
                 let mut right_qmf = std::mem::take(&mut state.ps_right_qmf);
-                let decode_ok =
-                    decode_sbr_frame_ps(&pcm[0], &sbr, &ps_frame, state, &mut right_qmf, &mut l, &mut r)
-                        .is_ok();
+                let decode_ok = decode_sbr_frame_ps(
+                    &pcm[0],
+                    &sbr,
+                    &ps_frame,
+                    state,
+                    &mut right_qmf,
+                    &mut l,
+                    &mut r,
+                )
+                .is_ok();
                 state.ps_right_qmf = right_qmf;
                 if !decode_ok {
                     // Fallback: duplicate LBR.
@@ -790,7 +790,8 @@ impl AacDecoder {
             // HE-AACv2 PS upmix fallback: if PS is active but the QMF-domain
             // path wasn't taken (no PS frame this packet, or mono SBR
             // produced), fall back to the simple time-domain duplication.
-            let (out_channels, final_pcm) = if channels_out == 1 && ps_active && sbr_pcm.len() == 1 {
+            let (out_channels, final_pcm) = if channels_out == 1 && ps_active && sbr_pcm.len() == 1
+            {
                 let mono = std::mem::take(&mut sbr_pcm[0]);
                 let mut l = vec![0.0f32; out_samples];
                 let mut r = vec![0.0f32; out_samples];

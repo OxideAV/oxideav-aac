@@ -176,7 +176,11 @@ fn decode_he_aac_v2_ps_produces_distinct_stereo() {
 
     let bytes = std::fs::read(&adts_out).expect("read encoded adts");
     let frames = iter_adts(&bytes);
-    assert!(!frames.is_empty(), "no ADTS frames in {} bytes", bytes.len());
+    assert!(
+        !frames.is_empty(),
+        "no ADTS frames in {} bytes",
+        bytes.len()
+    );
 
     // ADTS of HE-AACv2 advertises the *core* rate — usually 22050 Hz when
     // input was 44.1k. Decode with our crate.

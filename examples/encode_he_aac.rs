@@ -39,7 +39,9 @@ fn main() {
     };
     enc.send_frame(&Frame::Audio(af)).expect("send");
     enc.flush().expect("flush");
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/tmp/oxideav_he_aac.aac".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/oxideav_he_aac.aac".into());
     let mut out = File::create(&path).expect("open out");
     let mut frames = 0usize;
     let mut byteslen = 0usize;

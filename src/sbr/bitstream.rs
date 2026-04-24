@@ -189,9 +189,7 @@ pub fn parse_sbr_grid(br: &mut BitReader<'_>, data: &mut SbrChannelData) -> Resu
             data.bs_num_env = 1 << tmp; // 1, 2, 4, or 8
             if data.bs_num_env as usize > MAX_SBR_ENVELOPES {
                 // Spec caps at 4 for FIXFIX, 5 for VARVAR.
-                return Err(Error::invalid(
-                    "SBR: bs_num_env exceeds FIXFIX maximum",
-                ));
+                return Err(Error::invalid("SBR: bs_num_env exceeds FIXFIX maximum"));
             }
             // bs_amp_res forced to 0 when bs_num_env == 1 in FIXFIX.
             if data.bs_num_env == 1 {
@@ -237,9 +235,7 @@ pub fn parse_sbr_grid(br: &mut BitReader<'_>, data: &mut SbrChannelData) -> Resu
             data.bs_num_rel_1 = br.read_u32(2)? as u8;
             data.bs_num_env = data.bs_num_rel_0 + data.bs_num_rel_1 + 1;
             if data.bs_num_env as usize > MAX_SBR_ENVELOPES {
-                return Err(Error::invalid(
-                    "SBR: bs_num_env exceeds VARVAR maximum",
-                ));
+                return Err(Error::invalid("SBR: bs_num_env exceeds VARVAR maximum"));
             }
             for rel in 0..data.bs_num_rel_0 as usize {
                 data.bs_rel_bord_0[rel] = 2 * (br.read_u32(2)? as u8) + 2;
@@ -591,4 +587,3 @@ fn copy_grid(src: &SbrChannelData, dst: &mut SbrChannelData) {
     dst.bs_rel_bord_1 = src.bs_rel_bord_1;
     dst.bs_pointer = src.bs_pointer;
 }
-

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Hybrid sub-QMF analysis/synthesis filterbank for the HE-AACv2 PS
+  upmix (§8.6.4.3). QMF band 0 is split into 6 sub-subbands via a 13-tap
+  Type A (8-way complex) filter; bands 1 and 2 are split into 2 each via
+  Type B (2-way cosine) filters. Each of the resulting 10 low-band
+  sub-subbands is mapped to its own parameter index per Table 8.48,
+  giving finer stereo resolution below ~500 Hz where it matters most.
+  `hybrid_analysis_slot` / `hybrid_synthesis_slot` run inside
+  `apply_ps_qmf`; bands 3..63 continue to mix at QMF granularity.
+  Net effect: HE-AACv2 PSNR vs ffmpeg on afconvert-encoded stereo
+  fixtures improves from ~19 dB to ~24 dB; amplitude overshoot drops
+  from ~3.2× to ~1.2× of reference.
+- `tests/sbr_he_aac_psnr.rs` — end-to-end PSNR regression test that
+  encodes a sine via afconvert (or ffmpeg+libfdk_aac), decodes through
+  the crate and ffmpeg, and asserts steady-state PSNR ≥ 40 dB. Skips
+  gracefully without an HE-AAC encoder.
+- `examples/sbr_probe.rs` — CLI helper that prints per-frame PCM peaks
+  and a PSNR figure against a reference PCM. Useful for bisecting SBR
+  amplitude / scaling regressions.
+
 ### Fixed
 - SBR PCM clipping / 6.8x reference amplitude overshoot on HE-AAC mono
   decode. Root cause was the S16 output path multiplying IMDCT results by
@@ -17,15 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HE-AACv1 stereo PSNR vs ffmpeg jumps from ~1 dB to ~48 dB.
 - Non-exhaustive-struct compile break in `tests/decode_fixture.rs`
   (`CodecParameters` is `#[non_exhaustive]`).
-
-### Added
-- `tests/sbr_he_aac_psnr.rs` — end-to-end PSNR regression test that
-  encodes a sine via afconvert (or ffmpeg+libfdk_aac), decodes through
-  the crate and ffmpeg, and asserts steady-state PSNR ≥ 40 dB. Skips
-  gracefully without an HE-AAC encoder.
-- `examples/sbr_probe.rs` — CLI helper that prints per-frame PCM peaks
-  and a PSNR figure against a reference PCM. Useful for bisecting SBR
-  amplitude / scaling regressions.
 
 
 ## [0.0.6](https://github.com/OxideAV/oxideav-aac/compare/v0.0.5...v0.0.6) - 2026-04-19

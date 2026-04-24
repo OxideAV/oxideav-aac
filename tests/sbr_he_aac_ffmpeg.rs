@@ -85,9 +85,7 @@ fn write_sine_wav(path: &Path, sr: u32, freq: f32, secs: f32) {
 fn produce_he_aac_adts(wav_in: &Path, adts_out: &Path, bitrate: u32) -> Option<()> {
     if which("afconvert").is_some() {
         let status = Command::new("afconvert")
-            .args([
-                "-f", "adts", "-d", "aach", "-b", &bitrate.to_string(),
-            ])
+            .args(["-f", "adts", "-d", "aach", "-b", &bitrate.to_string()])
             .arg(wav_in)
             .arg(adts_out)
             .status()
@@ -101,8 +99,16 @@ fn produce_he_aac_adts(wav_in: &Path, adts_out: &Path, bitrate: u32) -> Option<(
         // Builds without it will error out here; we detect and skip.
         let status = Command::new("ffmpeg")
             .args(["-y", "-hide_banner", "-loglevel", "error"])
-            .arg("-i").arg(wav_in)
-            .args(["-c:a", "libfdk_aac", "-profile:a", "aac_he", "-b:a", &format!("{bitrate}")])
+            .arg("-i")
+            .arg(wav_in)
+            .args([
+                "-c:a",
+                "libfdk_aac",
+                "-profile:a",
+                "aac_he",
+                "-b:a",
+                &format!("{bitrate}"),
+            ])
             .args(["-f", "adts"])
             .arg(adts_out)
             .status()
@@ -159,7 +165,11 @@ fn decode_third_party_he_aac_doubles_output_rate() {
 
     let bytes = std::fs::read(&adts_out).expect("read encoded adts");
     let frames = iter_adts(&bytes);
-    assert!(!frames.is_empty(), "no ADTS frames parsed out of {} bytes", bytes.len());
+    assert!(
+        !frames.is_empty(),
+        "no ADTS frames parsed out of {} bytes",
+        bytes.len()
+    );
 
     let first = parse_adts_header(&bytes[frames[0].0..]).expect("parse first adts");
     let core_sr = first.sample_rate().expect("adts sr");
@@ -180,8 +190,7 @@ fn decode_third_party_he_aac_doubles_output_rate() {
     let mut observed_samples = 0u32;
     let mut observed_channels: u16 = channels;
     for (i, &(off, len)) in frames.iter().enumerate().take(8) {
-        let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec())
-            .with_pts(i as i64 * 1024);
+        let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec()).with_pts(i as i64 * 1024);
         dec.send_packet(&pkt).expect("send_packet");
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
@@ -203,7 +212,10 @@ fn decode_third_party_he_aac_doubles_output_rate() {
         }
     }
 
-    assert!(got_frames >= 2, "decoded only {got_frames} frames — expected >= 2");
+    assert!(
+        got_frames >= 2,
+        "decoded only {got_frames} frames — expected >= 2"
+    );
     assert_eq!(
         observed_output_sr,
         core_sr * 2,

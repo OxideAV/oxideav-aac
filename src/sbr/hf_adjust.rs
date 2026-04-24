@@ -55,11 +55,7 @@ impl SbrNoiseRng {
 /// `bs_limiter_bands` ∈ {0, 1, 2, 3} selects the ratio: 0 disables limiting
 /// (one band covering everything), 1 uses 1.2, 2 uses 2.0, 3 uses 3.0 — the
 /// larger the number, the coarser the limiter bands (fewer, wider).
-pub fn build_limiter_bands(
-    ft: &FreqTables,
-    patches: &PatchInfo,
-    bs_limiter_bands: u8,
-) -> Vec<i32> {
+pub fn build_limiter_bands(ft: &FreqTables, patches: &PatchInfo, bs_limiter_bands: u8) -> Vec<i32> {
     if bs_limiter_bands == 0 {
         return vec![ft.kx, ft.kx + ft.m];
     }
@@ -140,12 +136,24 @@ pub fn apply_envelope_with_limiter(
 
     for env in 0..le {
         let n_bands_idx = data.freq_res[env] as usize;
-        let band_table: &[i32] = if n_bands_idx != 0 { &ft.f_high } else { &ft.f_low };
-        let n_bands = if n_bands_idx != 0 { ft.n_high } else { ft.n_low };
+        let band_table: &[i32] = if n_bands_idx != 0 {
+            &ft.f_high
+        } else {
+            &ft.f_low
+        };
+        let n_bands = if n_bands_idx != 0 {
+            ft.n_high
+        } else {
+            ft.n_low
+        };
         // Pick the noise-floor index to use for this envelope (§4.6.18.3.3
         // Note: noise-floor envelope count is bs_num_noise; envelopes map
         // to the nearest noise floor).
-        let n_idx = if le == 1 { 0 } else { env.min(data.bs_num_noise as usize - 1) };
+        let n_idx = if le == 1 {
+            0
+        } else {
+            env.min(data.bs_num_noise as usize - 1)
+        };
         let l_start = (RATE as i32 * t_e[env]) as usize + t_hf_adj;
         let l_end_raw = (RATE as i32 * t_e[env + 1]) as usize + t_hf_adj;
         if l_start >= x_high.len() {
@@ -308,7 +316,11 @@ pub fn apply_envelope_with_limiter(
                 // over 4 subsamples the complex exponential cycles.
                 let sinus = if s_m_sb[kk] > 0.0 {
                     let phi = ((l as i32) & 3) as f32 * core::f32::consts::FRAC_PI_2;
-                    let sign = if (kk as i32 - ft.kx) & 1 == 0 { 1.0 } else { -1.0 };
+                    let sign = if (kk as i32 - ft.kx) & 1 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
                     Complex32::new(s_m_sb[kk] * sign * phi.cos(), s_m_sb[kk] * sign * phi.sin())
                 } else {
                     Complex32::default()
@@ -386,7 +398,11 @@ pub fn apply_envelope_coupled_with_limiter(
         } else {
             &ft.f_low
         };
-        let n_bands = if n_bands_idx != 0 { ft.n_high } else { ft.n_low };
+        let n_bands = if n_bands_idx != 0 {
+            ft.n_high
+        } else {
+            ft.n_low
+        };
         let mut acc_t = 0i32;
         let mut acc_b = 0i32;
         for k in 0..n_bands {
@@ -492,10 +508,7 @@ mod tests {
 }
 
 /// Compute envelope time-border vector tE (§4.6.18.3.3).
-pub fn envelope_time_borders(
-    data: &SbrChannelData,
-    num_time_slots: i32,
-) -> [i32; 6] {
+pub fn envelope_time_borders(data: &SbrChannelData, num_time_slots: i32) -> [i32; 6] {
     use super::bitstream::FrameClass;
     let mut t_e = [0i32; 6];
     let le = data.bs_num_env as usize;
@@ -505,9 +518,7 @@ pub fn envelope_time_borders(
     };
     let abs_bord_trail = match data.frame_class {
         FrameClass::FixFix | FrameClass::VarFix => num_time_slots,
-        FrameClass::VarVar | FrameClass::FixVar => {
-            data.bs_var_bord_1 as i32 + num_time_slots
-        }
+        FrameClass::VarVar | FrameClass::FixVar => data.bs_var_bord_1 as i32 + num_time_slots,
     };
     let n_rel_lead = match data.frame_class {
         FrameClass::FixFix => le.saturating_sub(1),

@@ -9,10 +9,9 @@
 //! into 2048 output PCM samples at twice the sample rate.
 
 use super::bitstream::{
-    parse_channel_pair_element, parse_sbr_header, parse_single_channel_element_ext,
-    SbrChannelData, SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
+    parse_channel_pair_element, parse_sbr_header, parse_single_channel_element_ext, SbrChannelData,
+    SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
 };
-use super::ps::{apply_ps_qmf, PsFrame, PsState};
 use super::freq::FreqTables;
 use super::hf_adjust::{
     apply_envelope_coupled_with_limiter, apply_envelope_with_limiter, build_limiter_bands,
@@ -21,6 +20,7 @@ use super::hf_adjust::{
 use super::hf_gen::{
     apply_hf_generation, build_patches, compute_hf_lpc, update_bw, BwArray, PatchInfo,
 };
+use super::ps::{apply_ps_qmf, PsFrame, PsState};
 use super::qmf::{QmfAnalysis, QmfSynthesis, ANALYSIS_BANDS};
 use super::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024, RATE};
 
@@ -169,9 +169,10 @@ pub fn try_parse_sbr_extension_ext(
         }
         return Ok(None);
     }
-    let ft = state.freq.as_ref().ok_or_else(|| {
-        Error::invalid("SBR: missing freq tables when decoding SBR data")
-    })?;
+    let ft = state
+        .freq
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: missing freq tables when decoding SBR data"))?;
     let (num_env_bands_lo, num_env_bands_hi) = (ft.n_low, ft.n_high);
     let num_noise_bands = ft.nq;
     let num_high_res = ft.n_high;
@@ -236,12 +237,14 @@ pub fn decode_sbr_frame(
     state: &mut SbrChannelState,
     output: &mut [f32],
 ) -> Result<()> {
-    let ft = state.freq.as_ref().ok_or_else(|| {
-        Error::invalid("SBR: decode_sbr_frame called before header parse")
-    })?;
-    let patches = state.patches.as_ref().ok_or_else(|| {
-        Error::invalid("SBR: decode_sbr_frame called before patch construction")
-    })?;
+    let ft = state
+        .freq
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: decode_sbr_frame called before header parse"))?;
+    let patches = state
+        .patches
+        .as_ref()
+        .ok_or_else(|| Error::invalid("SBR: decode_sbr_frame called before patch construction"))?;
     if pcm_in.len() < 1024 || output.len() < 2048 {
         return Err(Error::invalid(
             "SBR: decode_sbr_frame requires 1024 input / 2048 output PCM",
@@ -253,10 +256,8 @@ pub fn decode_sbr_frame(
     // 1) Analysis QMF — 32 time samples produce one column of 32 subbands.
     //    Build x_low: [subsample][subband]. We need tail from previous
     //    frame for HF generator lookahead (needs l-2 and l-1).
-    let mut x_low: Vec<[Complex32; ANALYSIS_BANDS]> = vec![
-        [Complex32::default(); ANALYSIS_BANDS];
-        state.x_low_tail.len() + num_slots
-    ];
+    let mut x_low: Vec<[Complex32; ANALYSIS_BANDS]> =
+        vec![[Complex32::default(); ANALYSIS_BANDS]; state.x_low_tail.len() + num_slots];
     for (i, row) in state.x_low_tail.iter().enumerate() {
         x_low[i] = *row;
     }
@@ -285,10 +286,8 @@ pub fn decode_sbr_frame(
     let mut alpha0 = [Complex32::default(); 32];
     let mut alpha1 = [Complex32::default(); 32];
     compute_hf_lpc(&x_low, num_slots, super::T_HF_ADJ, &mut alpha0, &mut alpha1);
-    let mut x_high: Vec<[Complex32; NUM_QMF_BANDS]> = vec![
-        [Complex32::default(); NUM_QMF_BANDS];
-        x_low.len()
-    ];
+    let mut x_high: Vec<[Complex32; NUM_QMF_BANDS]> =
+        vec![[Complex32::default(); NUM_QMF_BANDS]; x_low.len()];
     apply_hf_generation(
         &x_low,
         &mut x_high,
@@ -519,11 +518,22 @@ pub fn decode_sbr_cpe_frame(
         }
         m
     };
-    let bw_l = update_bw(&state_l.bw_array, &state_l.prev_invf_modes, &cur_modes_l, ft_l.nq);
+    let bw_l = update_bw(
+        &state_l.bw_array,
+        &state_l.prev_invf_modes,
+        &cur_modes_l,
+        ft_l.nq,
+    );
 
     let mut alpha0_l = [Complex32::default(); 32];
     let mut alpha1_l = [Complex32::default(); 32];
-    compute_hf_lpc(&x_low_l, num_slots, super::T_HF_ADJ, &mut alpha0_l, &mut alpha1_l);
+    compute_hf_lpc(
+        &x_low_l,
+        num_slots,
+        super::T_HF_ADJ,
+        &mut alpha0_l,
+        &mut alpha1_l,
+    );
     let mut x_high_l: Vec<[Complex32; NUM_QMF_BANDS]> =
         vec![[Complex32::default(); NUM_QMF_BANDS]; x_low_l.len()];
     apply_hf_generation(
@@ -554,10 +564,21 @@ pub fn decode_sbr_cpe_frame(
         }
         m
     };
-    let bw_r = update_bw(&state_r.bw_array, &state_r.prev_invf_modes, &cur_modes_r, ft_r.nq);
+    let bw_r = update_bw(
+        &state_r.bw_array,
+        &state_r.prev_invf_modes,
+        &cur_modes_r,
+        ft_r.nq,
+    );
     let mut alpha0_r = [Complex32::default(); 32];
     let mut alpha1_r = [Complex32::default(); 32];
-    compute_hf_lpc(&x_low_r, num_slots, super::T_HF_ADJ, &mut alpha0_r, &mut alpha1_r);
+    compute_hf_lpc(
+        &x_low_r,
+        num_slots,
+        super::T_HF_ADJ,
+        &mut alpha0_r,
+        &mut alpha1_r,
+    );
     let mut x_high_r: Vec<[Complex32; NUM_QMF_BANDS]> =
         vec![[Complex32::default(); NUM_QMF_BANDS]; x_low_r.len()];
     apply_hf_generation(

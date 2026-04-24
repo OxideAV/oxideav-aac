@@ -231,9 +231,7 @@ fn build_master_bark(
     let k2_over_k0 = k2 as f32 / k0 as f32;
     let two_regions = k2_over_k0 > 2.2449;
     let k1 = if two_regions { 2 * k0 } else { k2 };
-    let num_bands0 = 2 * nint_i(
-        bands as f32 * (k1 as f32 / k0 as f32).ln() / (2.0 * 2.0f32.ln()),
-    );
+    let num_bands0 = 2 * nint_i(bands as f32 * (k1 as f32 / k0 as f32).ln() / (2.0 * 2.0f32.ln()));
     if num_bands0 <= 0 {
         return Err(Error::invalid("SBR: numBands0 <= 0 in bark fMaster"));
     }
@@ -255,9 +253,8 @@ fn build_master_bark(
         return Ok(vk0);
     }
     // Two-region case.
-    let num_bands1 = 2 * nint_i(
-        bands as f32 * (k2 as f32 / k1 as f32).ln() / (2.0 * 2.0f32.ln() * warp),
-    );
+    let num_bands1 =
+        2 * nint_i(bands as f32 * (k2 as f32 / k1 as f32).ln() / (2.0 * 2.0f32.ln() * warp));
     if num_bands1 <= 0 {
         return Err(Error::invalid("SBR: numBands1 <= 0"));
     }

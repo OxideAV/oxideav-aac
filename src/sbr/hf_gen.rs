@@ -145,8 +145,7 @@ pub fn apply_hf_generation(
     // Then patch high-band subbands.
     for i in 0..patches.num_patches {
         for x in 0..patches.patch_num_subbands[i] as usize {
-            let k_dst_i =
-                ft.kx as usize + patches.patch_borders[i] as usize - ft.kx as usize + x;
+            let k_dst_i = ft.kx as usize + patches.patch_borders[i] as usize - ft.kx as usize + x;
             let p = patches.patch_start_subband[i] as usize + x;
             if k_dst_i >= NUM_QMF_BANDS || p >= 32 {
                 continue;
@@ -170,8 +169,16 @@ pub fn apply_hf_generation(
                     continue;
                 }
                 let x0 = x_low[l_src][p];
-                let x1 = if l_src >= 1 { x_low[l_src - 1][p] } else { Complex32::default() };
-                let x2 = if l_src >= 2 { x_low[l_src - 2][p] } else { Complex32::default() };
+                let x1 = if l_src >= 1 {
+                    x_low[l_src - 1][p]
+                } else {
+                    Complex32::default()
+                };
+                let x2 = if l_src >= 2 {
+                    x_low[l_src - 2][p]
+                } else {
+                    Complex32::default()
+                };
                 let term1 = alpha0[p].scale(bw_g) * x1;
                 let term2 = alpha1[p].scale(bw_g2) * x2;
                 x_high[l_src][k_dst_i] = x0 + term1 + term2;
@@ -284,10 +291,10 @@ fn noise_band_index(ft: &FreqTables, k: i32) -> usize {
 pub fn new_bw(prev_mode: u8, cur_mode: u8) -> f32 {
     const TABLE: [[f32; 4]; 4] = [
         // prev \ cur = Off, Low, Intermediate, Strong
-        [0.0, 0.6, 0.9, 0.98],         // prev = Off
-        [0.6, 0.75, 0.9, 0.98],        // prev = Low
-        [0.0, 0.75, 0.9, 0.98],        // prev = Intermediate
-        [0.0, 0.75, 0.9, 0.98],        // prev = Strong
+        [0.0, 0.6, 0.9, 0.98],  // prev = Off
+        [0.6, 0.75, 0.9, 0.98], // prev = Low
+        [0.0, 0.75, 0.9, 0.98], // prev = Intermediate
+        [0.0, 0.75, 0.9, 0.98], // prev = Strong
     ];
     let p = (prev_mode as usize).min(3);
     let c = (cur_mode as usize).min(3);

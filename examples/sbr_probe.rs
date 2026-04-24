@@ -47,8 +47,12 @@ fn minmax_i16(data: &[u8]) -> (i16, i16) {
     let mut hi = i16::MIN;
     for c in data.chunks_exact(2) {
         let s = i16::from_le_bytes([c[0], c[1]]);
-        if s < lo { lo = s; }
-        if s > hi { hi = s; }
+        if s < lo {
+            lo = s;
+        }
+        if s > hi {
+            hi = s;
+        }
     }
     (lo, hi)
 }
@@ -84,8 +88,7 @@ fn main() {
     let mut out_ch: u16 = ch;
     let mut out_sr: u32 = core_sr;
     for (i, &(off, len)) in frames.iter().enumerate() {
-        let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec())
-            .with_pts(i as i64 * 1024);
+        let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec()).with_pts(i as i64 * 1024);
         dec.send_packet(&pkt).unwrap();
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
@@ -107,7 +110,13 @@ fn main() {
     );
     let our_peak = frame_peaks.iter().copied().max().unwrap_or(0);
     let (lo, hi) = minmax_i16(&all_pcm);
-    println!("our PCM peak: {} (min={} max={}, over {} frames)", our_peak, lo, hi, frame_peaks.len());
+    println!(
+        "our PCM peak: {} (min={} max={}, over {} frames)",
+        our_peak,
+        lo,
+        hi,
+        frame_peaks.len()
+    );
     // Skip first 2 frames (SBR transient) for a more representative peak.
     if frame_peaks.len() > 3 {
         let steady_peak = frame_peaks[2..].iter().copied().max().unwrap_or(0);
@@ -154,9 +163,5 @@ fn main() {
 
     // Print first few peaks so we can see transient vs steady
     let n = frame_peaks.len().min(12);
-    println!(
-        "first {} frame peaks: {:?}",
-        n,
-        &frame_peaks[..n]
-    );
+    println!("first {} frame peaks: {:?}", n, &frame_peaks[..n]);
 }

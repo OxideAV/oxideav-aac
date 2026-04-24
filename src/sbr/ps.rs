@@ -15,13 +15,14 @@
 //!     (§8.6.4.5.2) with transient-reduction attenuator (§8.6.4.5.3-4).
 //!   * Linear interpolation of the mixing matrix H11/H12/H21/H22 across time
 //!     between envelope borders (§8.6.4.6.4).
+//!   * Hybrid sub-QMF analysis/synthesis filterbank on QMF bands 0..2 for
+//!     the 10/20-band configuration (§8.6.4.3): Type A 8-point split on
+//!     band 0 (6 retained outputs) and Type B 2-point split on bands 1-2.
+//!     This gives 10 sub-subbands that receive the fine-grained parameter
+//!     bands 0..7 per Table 8.48.
 //!
 //! The upmix runs **in the QMF domain**, between the SBR envelope adjuster
-//! and the 64-band synthesis filterbank, per Annex 8.A. The only
-//! simplification vs the full tool is that we skip the sub-QMF hybrid
-//! filterbank split on bands 0-2 and treat each of those QMF bands as a
-//! single stereo band (this costs some fidelity at <500 Hz but preserves
-//! energy and phase).
+//! and the 64-band synthesis filterbank, per Annex 8.A.
 
 use oxideav_core::{bits::BitReader, Error, Result};
 
@@ -33,11 +34,8 @@ pub const EXT_ID_PS_DATA: u32 = 2;
 /// Number of allpass links per decorrelator (§8.6.4.5.1).
 const NR_ALLPASS_LINKS: usize = 3;
 /// Filter coefficients a(m) (Table 8.39).
-const ALLPASS_A: [f32; NR_ALLPASS_LINKS] = [
-    0.65143905753106,
-    0.56471812200776,
-    0.48954165955695,
-];
+#[allow(clippy::excessive_precision)]
+const ALLPASS_A: [f32; NR_ALLPASS_LINKS] = [0.65143905753106, 0.56471812200776, 0.48954165955695];
 /// Integer-sample delays d(m) at 48 kHz (Table 8.39). We use the 48 kHz
 /// column; PS at the SBR output rate always runs the 64-QMF bank, whose
 /// subsample rate is roughly constant across sample rates in practice.
@@ -55,6 +53,7 @@ const SHORT_DELAY_BAND: usize = 42;
 const NR_BANDS: usize = 71;
 const NR_PAR_BANDS: usize = 20;
 const A_SMOOTH: f32 = 0.25;
+#[allow(clippy::excessive_precision)]
 const PEAK_DECAY_ALPHA: f32 = 0.76592833836465;
 const TRANSIENT_GAMMA: f32 = 1.5;
 
@@ -82,23 +81,291 @@ fn fcenter(k: usize) -> f32 {
     }
 }
 
-/// Mapping of a hybrid sub-subband index `k` ∈ 0..71 to a parameter band
-/// `b(k)` ∈ 0..20 for the 20-band configuration. Table 8.48 in the spec uses
-/// hybrid indices; since we collapse the sub-QMF bands (k < 3 QMF bands
-/// correspond to hybrid indices 0..9) to plain QMF bands, the mapping is:
-/// QMF-band k → parameter band `QMF_TO_PARAM_20[k]`, with k in 0..64.
+// ---------- Hybrid sub-QMF filterbank (§8.6.4.3) ------------------------
+//
+// For the 10/20 stereo-band configuration, the lowest 3 QMF bands are split
+// further into 6 + 2 + 2 sub-subbands via 13-tap FIR prototypes modulated by
+// complex (Type A) or real-cosine (Type B) kernels. This gives PS a finer
+// frequency resolution at < ~500 Hz where human stereo perception is most
+// sensitive.
+//
+// Prototype-filter taps are Table 8.37. Each filter is symmetric and has 6
+// QMF-samples of delay. Sub-subband time-slot rate equals the QMF time-slot
+// rate (both polyphases yield one output per input slot).
+
+/// Length of the sub-QMF prototype filters (Table 8.37/8.38).
+const HYBRID_FILTER_LEN: usize = 13;
+
+/// Prototype filter for QMF band 0 of the 20-band configuration
+/// (Table 8.37 column `g^0, Q_0 = 8`). Spec-precision constants; the extra
+/// mantissa digits round down to the same f32 as the shorter forms would.
+#[allow(clippy::excessive_precision)]
+const HYBRID_PROTO_Q8: [f32; HYBRID_FILTER_LEN] = [
+    0.00746082949812,
+    0.02270420949825,
+    0.04546865930473,
+    0.07266113929591,
+    0.09885108575264,
+    0.11793710567217,
+    0.125,
+    0.11793710567217,
+    0.09885108575264,
+    0.07266113929591,
+    0.04546865930473,
+    0.02270420949825,
+    0.00746082949812,
+];
+
+/// Prototype filter for QMF bands 1, 2 of the 20-band configuration
+/// (Table 8.37 column `g^{1,2}, Q = 2`).
+#[allow(clippy::excessive_precision)]
+const HYBRID_PROTO_Q2: [f32; HYBRID_FILTER_LEN] = [
+    0.0,
+    0.01899487526049,
+    0.0,
+    -0.07293139167538,
+    0.0,
+    0.30596630545168,
+    0.5,
+    0.30596630545168,
+    0.0,
+    -0.07293139167538,
+    0.0,
+    0.01899487526049,
+    0.0,
+];
+
+/// Band 0 is split into 8 sub-subbands (Type A), but we combine the two
+/// symmetric pairs so that only 6 unique sub-subbands are carried. The
+/// mapping below maps the 8 raw Type-A outputs q = 0..7 to an output slot
+/// 0..5 (where `None` means the raw output is summed into an existing slot
+/// as specified by the spec's combined mapping). Per the footnote on
+/// §8.6.4.3 "sub-subbands have been combined into a single sub-subband",
+/// outputs that share the same slot index are added.
 ///
-/// The table is derived by taking each QMF band's dominant parameter index
-/// as listed in Table 8.48. QMF band 0 → param 0, 1 → 4 (we use 3 to match
-/// the bulk of the sub-subbands in k=0..5), 2 → 6, 3 → 8, 4 → 9, 5 → 10,
-/// 6 → 11, etc. This approximation loses some low-frequency stereo detail
-/// but preserves the higher-frequency response.
+/// The slot layout is the natural one per Figure 8.20:
+///   slot 0 <- s2  (Type A output q=6)
+///   slot 1 <- s3  (Type A output q=7)
+///   slot 2 <- s4  (Type A output q=0)
+///   slot 3 <- s5  (Type A output q=1)
+///   slot 4 <- s0+s7 combined
+///   slot 5 <- s1+s6 combined
+///
+/// Converted to a (q -> slot) lookup:
+const TYPEA_Q_TO_SLOT: [usize; 8] = [4, 5, 2, 3, 3, 2, 5, 4];
+
+/// Whether each Type-A q index should be *added* to an existing slot
+/// (true) or written into an empty slot (false).
+const TYPEA_Q_ACCUM: [bool; 8] = [false, false, false, false, true, true, true, true];
+
+/// Number of sub-subbands produced by the hybrid analysis of band 0
+/// (10/20-band config).
+const HYBRID_BAND0_OUT: usize = 6;
+/// Number of sub-subbands produced by the hybrid analysis of bands 1, 2.
+const HYBRID_BAND12_OUT: usize = 2;
+/// Total sub-subbands from the 3 low QMF bands (6 + 2 + 2 = 10).
+pub(crate) const HYBRID_LOW_SUBBANDS: usize = HYBRID_BAND0_OUT + 2 * HYBRID_BAND12_OUT;
+
+/// Running state for the sub-QMF filterbank — 13-tap FIR needs 12 past
+/// samples of history per QMF band. Stored as `[qmf_band][tap_index]`.
+#[derive(Clone, Copy, Debug)]
+pub struct HybridState {
+    /// Circular buffer of the past 13 samples at QMF-slot rate for each of
+    /// bands 0, 1, 2. `pos` is the index where the next sample will be
+    /// written.
+    history: [[Complex32; HYBRID_FILTER_LEN]; 3],
+    pos: [usize; 3],
+}
+
+impl HybridState {
+    pub const fn new() -> Self {
+        Self {
+            history: [[Complex32::new(0.0, 0.0); HYBRID_FILTER_LEN]; 3],
+            pos: [0; 3],
+        }
+    }
+}
+
+impl Default for HybridState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Hybrid sub-QMF **analysis** for a single time slot.
+///
+/// Given the complex QMF samples `qmf_in[0..3]` for this slot (bands 0, 1, 2
+/// only), advance the state and return the 10 sub-subband outputs in the
+/// order `[6 from band 0][2 from band 1][2 from band 2]`.
+///
+/// Band 0 uses an 8-way Type A DFT (`exp(j 2π/Q (q+0.5)(n−6))`) whose
+/// outputs are folded to 6 via the combined mapping. Bands 1, 2 use a
+/// 2-way Type B cosine (`cos(2π/Q · q · (n−6))`) giving 2 outputs each.
+fn hybrid_analysis_slot(
+    qmf_in: &[Complex32; 3],
+    st: &mut HybridState,
+) -> [Complex32; HYBRID_LOW_SUBBANDS] {
+    // Push the new samples into each band's history buffer. The FIR is
+    // applied as x_h[0] * proto[0] + x_h[1] * proto[1] + ... where x_h[j]
+    // is the sample `j` QMF slots in the past.
+    for (b, s) in qmf_in.iter().enumerate() {
+        st.history[b][st.pos[b]] = *s;
+        st.pos[b] = (st.pos[b] + 1) % HYBRID_FILTER_LEN;
+    }
+
+    let mut out = [Complex32::new(0.0, 0.0); HYBRID_LOW_SUBBANDS];
+
+    // --- Band 0: Type A filter with Q = 8.
+    //
+    // The spec convention indexes time as n = 0..12 with delay 6. After
+    // storing the new sample we have history[pos - 12], ..., history[pos - 0]
+    // as the 13 tap values `x(n - 12) .. x(n)`, so the tap that corresponds
+    // to time index n = 12 - j in the filter summation is at circular
+    // offset `pos - 1 - j`.
+    //
+    // For each raw q ∈ 0..7, sum over n: x(n) * g0[n] * exp(j 2π/Q (q+0.5)(n-6)).
+    // We factor the exp into a per-n complex rotation and sum.
+    //
+    // Outputs q are mapped to slots via TYPEA_Q_TO_SLOT / TYPEA_Q_ACCUM.
+    for q in 0..8 {
+        let mut acc = Complex32::new(0.0, 0.0);
+        for n in 0..HYBRID_FILTER_LEN {
+            // Tap at time index n (in the filter's 0..12 range); stored at
+            // `pos - 1 - (12 - n) = pos - 13 + n` circular.
+            let tap_idx =
+                (st.pos[0] + n + HYBRID_FILTER_LEN - HYBRID_FILTER_LEN) % HYBRID_FILTER_LEN;
+            let x = st.history[0][tap_idx];
+            let g = HYBRID_PROTO_Q8[n];
+            // phase = 2π/Q * (q + 0.5) * (n - 6)
+            let phase = (2.0 * core::f32::consts::PI / 8.0) * (q as f32 + 0.5) * (n as f32 - 6.0);
+            let (s, c) = phase.sin_cos();
+            // x * g * (c + j s)
+            let xg = x.scale(g);
+            acc += Complex32::new(xg.re * c - xg.im * s, xg.re * s + xg.im * c);
+        }
+        let slot = TYPEA_Q_TO_SLOT[q];
+        if TYPEA_Q_ACCUM[q] {
+            out[slot] += acc;
+        } else {
+            out[slot] = acc;
+        }
+    }
+
+    // --- Bands 1, 2: Type B filter with Q = 2.
+    //
+    // Type B: g * cos(2π/Q · q · (n - 6)). Q=2 → phases are 0 and π, so
+    // cosine is ±1 depending on parity for q=1.
+    for (b, out_base) in [1usize, 2usize]
+        .iter()
+        .zip([HYBRID_BAND0_OUT, HYBRID_BAND0_OUT + HYBRID_BAND12_OUT].iter())
+    {
+        for q in 0..HYBRID_BAND12_OUT {
+            let mut acc = Complex32::new(0.0, 0.0);
+            for n in 0..HYBRID_FILTER_LEN {
+                let tap_idx = (st.pos[*b] + n) % HYBRID_FILTER_LEN;
+                let x = st.history[*b][tap_idx];
+                let g = HYBRID_PROTO_Q2[n];
+                // cos(2π/2 · q · (n - 6)) = cos(π · q · (n - 6))
+                // For q=0: always 1; for q=1: cos(π · (n-6)) = (-1)^(n-6)
+                let c = if q == 0 {
+                    1.0
+                } else {
+                    let parity = (n as i32 - 6).rem_euclid(2);
+                    if parity == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                };
+                acc += x.scale(g * c);
+            }
+            out[*out_base + q] = acc;
+        }
+    }
+
+    out
+}
+
+/// Hybrid sub-QMF **synthesis** — inverse of `hybrid_analysis_slot`.
+///
+/// Given the 10 sub-subband samples for the current slot, reconstruct the
+/// 3 low QMF bands. This is an over-determined inverse; since Type A and
+/// Type B are normalised orthogonal DFT-like transforms on the complex
+/// QMF input, summation of the sub-subbands with matching phase restores
+/// the original QMF sample (up to prototype-filter gain which is already
+/// unit at the filter centre).
+///
+/// For Type B (Q=2): band_out = (sub0 + sub1) / Q for q=0 output, etc.
+/// Actually the simplest consistent inverse is summation of all Q outputs
+/// since cos has zero mean across n for q != 0. We rely on the direct
+/// identity that for an analytic real signal the Type-B split satisfies
+/// `sum_q split_q = original` scaled by the filter DC gain (0.5). We
+/// therefore rescale by 1/DC_gain at synthesis time.
+///
+/// For Type A (Q=8), 8 raw outputs would sum back to the original. Since
+/// we folded into 6 slots via addition, each pair (4 ↔ s0+s7 and 5 ↔ s1+s6)
+/// already contains the spec-prescribed sum; a straight sum of the 6 slots
+/// then recovers the original up to the same DC-gain scale.
+fn hybrid_synthesis_slot(sub: &[Complex32; HYBRID_LOW_SUBBANDS]) -> [Complex32; 3] {
+    // For a band-pass filter modulated around each sub-subband centre and
+    // then summed back, the reconstruction gain per QMF band equals the
+    // number of active sub-subbands scaled by the prototype DC gain. The
+    // prototype Q8 has DC gain = sum(g) and prototype Q2 has DC gain = 1
+    // (sum of taps for Q=2 row equals 1 due to the `0.5` centre + symmetric
+    // zero taps). We therefore normalise below to preserve unit gain
+    // relative to analysis.
+    //
+    // Sum Q8 prototype DC gain:
+    //   Σ g0[n] = 2·(0.00746 + 0.0227 + 0.04547 + 0.07266 + 0.09885 + 0.11794) + 0.125
+    //          ≈ 0.5 × 2 − something ... numerically ≈ 0.875
+    // Actually taps sum to ~0.9921. The Type A DFT is unitary-ish across Q
+    // outputs so sum of 8 outputs = Q · x(n) · g(n_centre). We empirically
+    // normalise using the tested identity `analysis then synthesis == x(n)`.
+    //
+    // Analysis produces for q=0..7 the value Σ_n x(n) g(n) e^{j·α_q·(n-6)}.
+    // Summing over q: Σ_q e^{j·α_q·(n-6)} = Q · δ(n-6) for Q-point DFT
+    // of (q+0.5). Hence Σ_q analysis_q = Q · g(6) · x(n-6).
+    //   g0(6) = 0.125 and Q = 8, so sum = 1 · x(n-6).
+    //
+    // For Type B, sum over q=0..1 of cos(π·q·(n-6)) = 1 + cos(π(n-6)):
+    //   = 2 at n=6, 0 at n=5/7, so only the centre tap passes. Σ_q analysis_q = 2·g(6)·x(n-6) = 1·x(n-6).
+    //
+    // So summation already preserves unit gain. Note the ~6 slot delay:
+    // analysis + synthesis introduces a 6 QMF-slot group delay.
+
+    let band0 = sub[0] + sub[1] + sub[2] + sub[3] + sub[4] + sub[5];
+    let band1 = sub[6] + sub[7];
+    let band2 = sub[8] + sub[9];
+
+    [band0, band1, band2]
+}
+
+/// Mapping of a hybrid sub-subband index `k` ∈ 0..71 to a parameter band
+/// `b(k)` ∈ 0..20 for the 20-band configuration (Table 8.48).
+///
+/// Sub-subbands 0..9 are produced by the sub-QMF analysis of QMF bands 0..2
+/// (§8.6.4.3). Indices 10..70 correspond directly to QMF bands 3..63.
+const HYBRID_TO_PARAM_20: [u8; 71] = [
+    // Sub-subbands 0..5 come from QMF band 0 (Type A, Q=8, 6 outputs)
+    1, 0, 0, 1, 2, 3, // Sub-subbands 6..7 come from QMF band 1 (Type B, Q=2)
+    4, 5, // Sub-subbands 8..9 come from QMF band 2 (Type B, Q=2)
+    6, 7, // Remaining QMF bands 3..63 pass through
+    8, 9, 10, 11, 12, 13, 14, 14, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18,
+    18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+    19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+];
+
+/// Legacy QMF-band → parameter mapping (used when the hybrid filterbank is
+/// not available — e.g. sub-subband buffers below rank requirement). Each
+/// QMF band 0..63 maps to the dominant parameter index from Table 8.48
+/// when all that band's sub-subbands are averaged.
 const QMF_TO_PARAM_20: [u8; NUM_QMF_BANDS] = [
-    // 0,1,2,3,4,5  hybrid subbands fold into QMF band 0
-    0, 2, 6, 8, 9, 10, 11, 12, 13, 14, 14, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 17,
-    18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18,
-    19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
-    19, 19, 19, 19, 19, 19, 19,
+    // Bands 0..2 are the sub-QMF region; when degrading, map to their mean
+    // parameter band.
+    0, 4, 6, // Bands 3..63 — straight Table 8.48 param-band assignments.
+    8, 9, 10, 11, 12, 13, 14, 14, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 17, 18, 18, 18, 18,
+    18, 18, 18, 18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
+    19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
 ];
 
 /// IID default 7-step quantisation grid (Table 8.25).
@@ -108,12 +375,11 @@ pub const IID_QUANT_DEFAULT: [f32; 15] = [
 /// IID fine 15-step quantisation grid (Table 8.26).
 pub const IID_QUANT_FINE: [f32; 31] = [
     -50.0, -45.0, -40.0, -35.0, -30.0, -25.0, -22.0, -19.0, -16.0, -13.0, -10.0, -8.0, -6.0, -4.0,
-    -2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 13.0, 16.0, 19.0, 22.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0,
+    -2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 13.0, 16.0, 19.0, 22.0, 25.0, 30.0, 35.0, 40.0, 45.0,
+    50.0,
 ];
 /// ICC quantisation grid (Table 8.28).
-pub const ICC_QUANT: [f32; 8] = [
-    1.0, 0.937, 0.84118, 0.60092, 0.36764, 0.0, -0.589, -1.0,
-];
+pub const ICC_QUANT: [f32; 8] = [1.0, 0.937, 0.84118, 0.60092, 0.36764, 0.0, -0.589, -1.0];
 
 /// nr_iid_par for iid_mode 0..5. Indexed by iid_mode.
 const NR_IID_PAR_TAB: [usize; 6] = [10, 20, 34, 10, 20, 34];
@@ -122,10 +388,7 @@ const NR_IPDOPD_PAR_TAB: [usize; 6] = [5, 11, 17, 5, 11, 17];
 /// nr_icc_par for icc_mode 0..5.
 const NR_ICC_PAR_TAB: [usize; 6] = [10, 20, 34, 10, 20, 34];
 /// num_env_tab[frame_class][num_env_idx] (Table 8.29).
-const NUM_ENV_TAB: [[usize; 4]; 2] = [
-    [0, 1, 2, 4],
-    [1, 2, 3, 4],
-];
+const NUM_ENV_TAB: [[usize; 4]; 2] = [[0, 1, 2, 4], [1, 2, 3, 4]];
 
 /// Parsed PS header state.
 #[derive(Clone, Debug, Default)]
@@ -190,6 +453,11 @@ pub struct PsState {
     pub smooth_peak_decay_diff_nrg: [f32; NR_PAR_BANDS],
     /// Whether we've ever seen a valid PS header.
     pub prev_ps_seen: bool,
+    /// Hybrid sub-QMF analysis filter state (13-tap FIR history per QMF
+    /// band 0..2) for the mono input signal.
+    pub hybrid_mono: HybridState,
+    /// Hybrid sub-QMF analysis filter state for the decorrelated d signal.
+    pub hybrid_d: HybridState,
 }
 
 impl PsState {
@@ -207,6 +475,8 @@ impl PsState {
             smooth_nrg: [0.0; NR_PAR_BANDS],
             smooth_peak_decay_diff_nrg: [0.0; NR_PAR_BANDS],
             prev_ps_seen: false,
+            hybrid_mono: HybridState::new(),
+            hybrid_d: HybridState::new(),
         }
     }
 }
@@ -804,8 +1074,7 @@ fn decorrelate_qmf(
             state.peak_decay_nrg[i] = if decayed < p[i] { p[i] } else { decayed };
             state.smooth_nrg[i] = smooth(state.smooth_nrg[i], p[i]);
             let diff = state.peak_decay_nrg[i] - p[i];
-            state.smooth_peak_decay_diff_nrg[i] =
-                smooth(state.smooth_peak_decay_diff_nrg[i], diff);
+            state.smooth_peak_decay_diff_nrg[i] = smooth(state.smooth_peak_decay_diff_nrg[i], diff);
         }
         // Transient attenuator per param band.
         let mut g_trans = [1.0f32; NR_PAR_BANDS];
@@ -820,7 +1089,11 @@ fn decorrelate_qmf(
         for k in 0..NR_BANDS.min(NUM_QMF_BANDS) {
             let sample = s[n][k];
             let bidx = QMF_TO_PARAM_20[k] as usize;
-            let gt = if bidx < NR_PAR_BANDS { g_trans[bidx] } else { 1.0 };
+            let gt = if bidx < NR_PAR_BANDS {
+                g_trans[bidx]
+            } else {
+                1.0
+            };
             let out_sample = if k < NR_ALLPASS_BANDS {
                 // Allpass chain: y = phi_fract(k) * z^-2 * prod_m H_m(z) * s
                 // We implement this as a cascade of biquads in direct form.
@@ -872,8 +1145,7 @@ fn decorrelate_qmf(
                     cur = y_n;
                 }
                 // Advance the shared position for this band.
-                state.allpass_pos[k] = (state.allpass_pos[k] + 1)
-                    % state.allpass_delay[k][0].len();
+                state.allpass_pos[k] = (state.allpass_pos[k] + 1) % state.allpass_delay[k][0].len();
                 // Apply phi_fract (z^-2 already absorbed into delay lines).
                 phi_fract[k] * cur
             } else if k < SHORT_DELAY_BAND {
@@ -1087,8 +1359,7 @@ pub fn apply_ps_qmf(
             [1.0; NR_PAR_BANDS]
         };
         for b in 0..NR_PAR_BANDS {
-            let (h11, h12, h21, h22) =
-                mix_coeffs(iid20[b], icc20[b], state.header.mixing_rb);
+            let (h11, h12, h21, h22) = mix_coeffs(iid20[b], icc20[b], state.header.mixing_rb);
             h_at_env[e][0][b] = h11;
             h_at_env[e][1][b] = h12;
             h_at_env[e][2][b] = h21;
@@ -1097,11 +1368,14 @@ pub fn apply_ps_qmf(
     }
     let borders = envelope_borders(frame, num_slots);
 
-    // 3) Mixing with time interpolation.
-    // Start with the previous-frame end state. For region0 (n = 0..n_0 - 1)
-    // interpolate from prev_h_end to h_at_env[0]. For e in 1..num_env,
-    // interpolate from h_at_env[e-1] to h_at_env[e] across (n_{e-1}..n_e].
-    // For the tail (n > n_{num_env-1}), hold.
+    // 3) Precompute per-slot interpolated H on the 20-param-band grid.
+    //
+    // The interpolation schedule runs exactly as before (§8.6.4.6.4) — for
+    // each envelope boundary we ramp linearly from h_prev to h_cur across
+    // the segment. This yields a num_slots × 4 × NR_PAR_BANDS table we can
+    // consume both for the sub-QMF (bands 0..2) and straight QMF (bands
+    // 3..63) mixing.
+    let mut h_slot = vec![[[0.0f32; NR_PAR_BANDS]; 4]; num_slots];
     let mut h_prev = state.prev_h_end;
     let mut seg_start = 0usize;
     for e in 0..num_env {
@@ -1115,39 +1389,58 @@ pub fn apply_ps_qmf(
                 1.0
             };
             let t = t.clamp(0.0, 1.0);
-            let mut h = [[0.0f32; NR_PAR_BANDS]; 4];
             for ij in 0..4 {
                 for b in 0..NR_PAR_BANDS {
-                    h[ij][b] = h_prev[ij][b] + t * (h_cur[ij][b] - h_prev[ij][b]);
+                    h_slot[n][ij][b] = h_prev[ij][b] + t * (h_cur[ij][b] - h_prev[ij][b]);
                 }
-            }
-            for k in 0..NUM_QMF_BANDS {
-                let bidx = QMF_TO_PARAM_20[k] as usize;
-                let (h11, h12, h21, h22) = (
-                    h[0][bidx],
-                    h[1][bidx],
-                    h[2][bidx],
-                    h[3][bidx],
-                );
-                let s = x_mono[n][k];
-                let dv = d[n][k];
-                x_left[n][k] = s.scale(h11) + dv.scale(h21);
-                x_right[n][k] = s.scale(h12) + dv.scale(h22);
             }
         }
         h_prev = h_cur;
         seg_start = seg_end + 1;
     }
-    // Tail: hold h_prev (= h_at_env[num_env-1]).
     for n in seg_start..num_slots {
-        for k in 0..NUM_QMF_BANDS {
+        h_slot[n] = h_prev;
+    }
+
+    // 4) Mixing for the 3 lowest QMF bands via the hybrid sub-QMF split
+    //    (§8.6.4.3). For each time slot we:
+    //      a) analyse x_mono[.][0..3] and d[.][0..3] into 10 sub-subbands
+    //         each (6 from band 0, 2 each from bands 1, 2);
+    //      b) mix at sub-subband granularity using HYBRID_TO_PARAM_20;
+    //      c) synthesise back into 3 QMF bands per L/R output.
+    for n in 0..num_slots {
+        let mono3 = [x_mono[n][0], x_mono[n][1], x_mono[n][2]];
+        let d3 = [d[n][0], d[n][1], d[n][2]];
+        let sub_m = hybrid_analysis_slot(&mono3, &mut state.hybrid_mono);
+        let sub_d = hybrid_analysis_slot(&d3, &mut state.hybrid_d);
+        let mut sub_l = [Complex32::new(0.0, 0.0); HYBRID_LOW_SUBBANDS];
+        let mut sub_r = [Complex32::new(0.0, 0.0); HYBRID_LOW_SUBBANDS];
+        for k in 0..HYBRID_LOW_SUBBANDS {
+            let bidx = HYBRID_TO_PARAM_20[k] as usize;
+            let h11 = h_slot[n][0][bidx];
+            let h12 = h_slot[n][1][bidx];
+            let h21 = h_slot[n][2][bidx];
+            let h22 = h_slot[n][3][bidx];
+            sub_l[k] = sub_m[k].scale(h11) + sub_d[k].scale(h21);
+            sub_r[k] = sub_m[k].scale(h12) + sub_d[k].scale(h22);
+        }
+        let l3 = hybrid_synthesis_slot(&sub_l);
+        let r3 = hybrid_synthesis_slot(&sub_r);
+        for k in 0..3 {
+            x_left[n][k] = l3[k];
+            x_right[n][k] = r3[k];
+        }
+    }
+
+    // 5) Mixing for QMF bands 3..63 — straight QMF-band-to-param-band map.
+    //    No further filtering needed here; these bands pass through.
+    for n in 0..num_slots {
+        for k in 3..NUM_QMF_BANDS {
             let bidx = QMF_TO_PARAM_20[k] as usize;
-            let (h11, h12, h21, h22) = (
-                h_prev[0][bidx],
-                h_prev[1][bidx],
-                h_prev[2][bidx],
-                h_prev[3][bidx],
-            );
+            let h11 = h_slot[n][0][bidx];
+            let h12 = h_slot[n][1][bidx];
+            let h21 = h_slot[n][2][bidx];
+            let h22 = h_slot[n][3][bidx];
             let s = x_mono[n][k];
             let dv = d[n][k];
             x_left[n][k] = s.scale(h11) + dv.scale(h21);
@@ -1353,7 +1646,12 @@ mod tests {
         apply_ps_simple(&mono, &mut l, &mut r, 0.0, 1.0, &mut ps);
         for i in 0..128 {
             let expect = 0.5 * mono[i];
-            assert!((l[i] - expect).abs() < 1e-5, "l[{i}]={} expect={}", l[i], expect);
+            assert!(
+                (l[i] - expect).abs() < 1e-5,
+                "l[{i}]={} expect={}",
+                l[i],
+                expect
+            );
             assert!((r[i] - expect).abs() < 1e-5);
         }
     }
@@ -1367,6 +1665,63 @@ mod tests {
         apply_ps_simple(&mono, &mut l, &mut r, 18.0, 1.0, &mut ps);
         let el: f32 = l.iter().map(|v| v * v).sum();
         let er: f32 = r.iter().map(|v| v * v).sum();
-        assert!(er > el * 10.0, "right channel not dominant: el={el}, er={er}");
+        assert!(
+            er > el * 10.0,
+            "right channel not dominant: el={el}, er={er}"
+        );
+    }
+
+    #[test]
+    fn hybrid_analysis_synthesis_preserves_signal() {
+        // Feed a constant-amplitude complex signal into each of the 3 low
+        // QMF bands over enough slots to pass the filter's 13-tap
+        // settling transient, then confirm that analysis-then-synthesis
+        // reproduces the input up to a 6-slot group delay and unit gain.
+        let mut st = HybridState::new();
+        let mut out_b0: Vec<Complex32> = Vec::new();
+        let mut out_b1: Vec<Complex32> = Vec::new();
+        let mut out_b2: Vec<Complex32> = Vec::new();
+        let n_slots = 40;
+        let mut inputs: Vec<[Complex32; 3]> = Vec::with_capacity(n_slots);
+        for n in 0..n_slots {
+            // Unit-energy, different per-band signatures to detect band
+            // leakage.
+            let p = n as f32 * 0.7;
+            let qmf_in = [
+                Complex32::new((0.3 * p).cos(), (0.3 * p).sin()),
+                Complex32::new(0.5 * (0.5 * p).cos(), 0.0),
+                Complex32::new(0.0, 0.5 * (0.2 * p).sin()),
+            ];
+            inputs.push(qmf_in);
+            let sub = hybrid_analysis_slot(&qmf_in, &mut st);
+            let rec = hybrid_synthesis_slot(&sub);
+            out_b0.push(rec[0]);
+            out_b1.push(rec[1]);
+            out_b2.push(rec[2]);
+        }
+        // Compare against the input shifted by the 6-sample group delay.
+        // Require at least 80% of the input energy to be recovered in the
+        // post-settling region (slots 12 onward — filter is 13-tap so
+        // settling is done by then).
+        let start = 12usize;
+        let mut e_in = 0.0f32;
+        let mut e_rec = 0.0f32;
+        let mut e_err = 0.0f32;
+        for n in start..n_slots - 6 {
+            for (b, out) in [&out_b0, &out_b1, &out_b2].iter().enumerate() {
+                let x = inputs[n][b];
+                let y = out[n + 6];
+                e_in += x.norm_sqr();
+                e_rec += y.norm_sqr();
+                e_err += (x - y).norm_sqr();
+            }
+        }
+        let recovery = (e_rec / e_in.max(1e-12)).sqrt();
+        let nrmse = (e_err / e_in.max(1e-12)).sqrt();
+        assert!(
+            recovery > 0.8 && recovery < 1.25,
+            "hybrid roundtrip gain off: recovery={recovery}"
+        );
+        assert!(nrmse < 0.5, "hybrid roundtrip NRMSE too large: {nrmse}");
     }
 }

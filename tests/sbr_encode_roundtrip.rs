@@ -130,8 +130,7 @@ fn he_aac_self_roundtrip_1khz_48k_to_24k_core_and_back() {
     let mag = (s0 * s0 + s1 * s1 - coeff * s0 * s1).sqrt();
 
     // Total energy for ratio.
-    let total_rms: f32 =
-        (out_pcm.iter().map(|v| v * v).sum::<f32>() / out_pcm.len() as f32).sqrt();
+    let total_rms: f32 = (out_pcm.iter().map(|v| v * v).sum::<f32>() / out_pcm.len() as f32).sqrt();
     let n = (out_pcm.len() - analysis_start) as f32;
     let tone_rms = mag / (n / 2.0).max(1.0).sqrt();
     let snr_db = 20.0 * (tone_rms / total_rms.max(1e-9)).log10();
@@ -141,7 +140,10 @@ fn he_aac_self_roundtrip_1khz_48k_to_24k_core_and_back() {
         "self round-trip: samples={} max_abs={:.4} clipped={}/{} total_rms={:.4} tone_rms={:.4} ratio_db={:.2}",
         out_pcm.len(), max_abs, n_clip, out_pcm.len(), total_rms, tone_rms, snr_db,
     );
-    assert!(total_rms > 1e-3, "decoded output is silent, rms={total_rms}");
+    assert!(
+        total_rms > 1e-3,
+        "decoded output is silent, rms={total_rms}"
+    );
     // Tone energy concentrated at the source frequency — we expect the
     // Goertzel magnitude to be far above the per-sample RMS times a
     // constant (the exact threshold depends on the window size).

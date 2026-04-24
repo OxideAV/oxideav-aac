@@ -50,12 +50,37 @@ pub fn downsample_by_two(input: &[f32], output: &mut [f32]) {
     // 31-tap half-band FIR (windowed-sinc). Coefficients designed by
     // sinc(0.5n/π) * Hann window; precomputed.
     const KERNEL: [f32; 31] = [
-        -0.000000000e+00, -1.7e-3,  0.000000e+00,  4.2e-3,  0.000000e+00, -8.7e-3,
-         0.000000e+00,  1.60e-2,  0.000000e+00, -2.75e-2,  0.000000e+00,  4.58e-2,
-         0.000000e+00, -7.75e-2,  0.000000e+00,  3.0631e-1,
-         5.00000e-1,  3.0631e-1,  0.000000e+00, -7.75e-2,  0.000000e+00,  4.58e-2,
-         0.000000e+00, -2.75e-2,  0.000000e+00,  1.60e-2,  0.000000e+00, -8.7e-3,
-         0.000000e+00,  4.2e-3, -1.7e-3,
+        -0.000000000e+00,
+        -1.7e-3,
+        0.000000e+00,
+        4.2e-3,
+        0.000000e+00,
+        -8.7e-3,
+        0.000000e+00,
+        1.60e-2,
+        0.000000e+00,
+        -2.75e-2,
+        0.000000e+00,
+        4.58e-2,
+        0.000000e+00,
+        -7.75e-2,
+        0.000000e+00,
+        3.0631e-1,
+        5.00000e-1,
+        3.0631e-1,
+        0.000000e+00,
+        -7.75e-2,
+        0.000000e+00,
+        4.58e-2,
+        0.000000e+00,
+        -2.75e-2,
+        0.000000e+00,
+        1.60e-2,
+        0.000000e+00,
+        -8.7e-3,
+        0.000000e+00,
+        4.2e-3,
+        -1.7e-3,
     ];
     const HALF: isize = (KERNEL.len() / 2) as isize;
     let n_in = input.len() as isize;
@@ -82,7 +107,9 @@ pub struct Downsampler {
 
 impl Downsampler {
     pub fn new() -> Self {
-        Self { tail: vec![0.0f32; 30] }
+        Self {
+            tail: vec![0.0f32; 30],
+        }
     }
 
     /// Process `input` (length `2 * output.len()`) producing a downsampled
@@ -99,12 +126,37 @@ impl Downsampler {
         // kernel centred at tail.len() + 2i.
         let n_out = output.len();
         const KERNEL: [f32; 31] = [
-            -0.000000000e+00, -1.7e-3,  0.000000e+00,  4.2e-3,  0.000000e+00, -8.7e-3,
-             0.000000e+00,  1.60e-2,  0.000000e+00, -2.75e-2,  0.000000e+00,  4.58e-2,
-             0.000000e+00, -7.75e-2,  0.000000e+00,  3.0631e-1,
-             5.00000e-1,  3.0631e-1,  0.000000e+00, -7.75e-2,  0.000000e+00,  4.58e-2,
-             0.000000e+00, -2.75e-2,  0.000000e+00,  1.60e-2,  0.000000e+00, -8.7e-3,
-             0.000000e+00,  4.2e-3, -1.7e-3,
+            -0.000000000e+00,
+            -1.7e-3,
+            0.000000e+00,
+            4.2e-3,
+            0.000000e+00,
+            -8.7e-3,
+            0.000000e+00,
+            1.60e-2,
+            0.000000e+00,
+            -2.75e-2,
+            0.000000e+00,
+            4.58e-2,
+            0.000000e+00,
+            -7.75e-2,
+            0.000000e+00,
+            3.0631e-1,
+            5.00000e-1,
+            3.0631e-1,
+            0.000000e+00,
+            -7.75e-2,
+            0.000000e+00,
+            4.58e-2,
+            0.000000e+00,
+            -2.75e-2,
+            0.000000e+00,
+            1.60e-2,
+            0.000000e+00,
+            -8.7e-3,
+            0.000000e+00,
+            4.2e-3,
+            -1.7e-3,
         ];
         const HALF: isize = (KERNEL.len() / 2) as isize;
         let base = self.tail.len() as isize;
@@ -411,17 +463,17 @@ pub fn write_single_channel_element_mono(
     sf: &SbrFrameScalefactors,
 ) {
     bw.write_bit(false); // bs_data_extra
-    // sbr_grid — FIXFIX, bs_num_env=1, freq_res=1.
+                         // sbr_grid — FIXFIX, bs_num_env=1, freq_res=1.
     bw.write_u32(FrameClass::FixFix as u32, 2);
     bw.write_u32(0, 2); // bs_num_env = 2^0 = 1
-    // Spec: when FIXFIX && bs_num_env == 1, bs_amp_res is forced to 0.
-    // We MUST encode at amp_res=0 (1.5 dB tables) to match. Choose
-    // amp_res=0 explicitly by re-quantising below.
+                        // Spec: when FIXFIX && bs_num_env == 1, bs_amp_res is forced to 0.
+                        // We MUST encode at amp_res=0 (1.5 dB tables) to match. Choose
+                        // amp_res=0 explicitly by re-quantising below.
     bw.write_u32(1, 1); // bs_freq_res[0] = 1 (high-res)
-    // sbr_dtdf for 1 envelope + 1 noise floor.
+                        // sbr_dtdf for 1 envelope + 1 noise floor.
     bw.write_u32(0, 1); // bs_df_env[0] = 0 (freq-direction)
     bw.write_u32(0, 1); // bs_df_noise[0] = 0 (freq-direction)
-    // sbr_invf — one value per noise band (bw mode 0 = off).
+                        // sbr_invf — one value per noise band (bw mode 0 = off).
     for _ in 0..freq.nq {
         bw.write_u32(0, 2);
     }
@@ -500,7 +552,13 @@ pub fn write_noise_3_0db_freq_delta(bw: &mut BitWriter, noise: &[i32], nq: usize
 /// code 0 of the table (equivalent to the smallest legal delta), which
 /// keeps the bitstream well-formed even on surprise inputs.
 fn write_huffman_sym(bw: &mut BitWriter, idx: i32, table: &[(u8, u32)]) {
-    let i = if idx < 0 { 0usize } else if (idx as usize) >= table.len() { table.len() - 1 } else { idx as usize };
+    let i = if idx < 0 {
+        0usize
+    } else if (idx as usize) >= table.len() {
+        table.len() - 1
+    } else {
+        idx as usize
+    };
     let (len, code) = table[i];
     bw.write_u32(code, len as u32);
 }
@@ -517,7 +575,11 @@ fn write_huffman_sym(bw: &mut BitWriter, idx: i32, table: &[(u8, u32)]) {
 ///   cnt           4 bits  (or 4+8 if the payload is >= 15 bytes)
 ///   extension_id  4 bits  = EXT_SBR_DATA (0xD)
 ///   [sbr payload bits]
-pub fn write_fil_body_with_sbr(bw: &mut BitWriter, sbr_payload_bits: &[u8], sbr_payload_nbits: u32) {
+pub fn write_fil_body_with_sbr(
+    bw: &mut BitWriter,
+    sbr_payload_bits: &[u8],
+    sbr_payload_nbits: u32,
+) {
     // The FIL element has a byte-granular count that includes the 4-bit
     // extension_id. Round-up bits.
     let total_bits = 4 + sbr_payload_nbits;
@@ -550,10 +612,7 @@ pub fn write_fil_body_with_sbr(bw: &mut BitWriter, sbr_payload_bits: &[u8], sbr_
 /// Convenience: emit SBR-bearing FIL bytes (ready to be written as the
 /// `sbr_extension_data()` portion of the raw_data_block) given the byte
 /// payload from [`SbrEncoder::emit_sbr_payload`] and its bit count.
-pub fn encode_fil_sbr_element(
-    payload_bits: &[u8],
-    payload_nbits: u32,
-) -> Vec<u8> {
+pub fn encode_fil_sbr_element(payload_bits: &[u8], payload_nbits: u32) -> Vec<u8> {
     let mut bw = BitWriter::with_capacity(4 + payload_bits.len() + 2);
     // Element ID = 6 (Fil), 3 bits.
     bw.write_u32(crate::syntax::ElementType::Fil as u32, 3);
@@ -649,8 +708,9 @@ mod tests {
         let mut br = BitReader::new(&framed);
         let num_payload_bits = 4 + bits;
         let mut state = SbrChannelState::new();
-        let parsed = try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
-            .expect("parse ok");
+        let parsed =
+            try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
+                .expect("parse ok");
         match parsed {
             Some(SbrPayload::Single { data, .. }) => {
                 assert_eq!(data.bs_num_env, 1);
