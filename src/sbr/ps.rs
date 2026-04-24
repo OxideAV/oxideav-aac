@@ -29,12 +29,59 @@
 //! The upmix runs **in the QMF domain**, between the SBR envelope adjuster
 //! and the 64-band synthesis filterbank, per Annex 8.A.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use oxideav_core::{bits::BitReader, Error, Result};
 
 use super::{Complex32, NUM_QMF_BANDS};
 
 /// PS bitstream extension ID inside an SBR extended_data block.
 pub const EXT_ID_PS_DATA: u32 = 2;
+
+/// Diagnostic counter: number of PS frames since process start that carried
+/// `enable_ipdopd = 1`. Incremented inside `parse_ps_data` right after the
+/// extension flag is decoded. Test-only — used by the HE-AACv2 fixture hunt
+/// to determine whether a given encoder configuration actually emits IPD/OPD
+/// signalling. Never cleared automatically; tests that need a clean baseline
+/// should read `ipdopd_frames_seen()` once before and once after decoding
+/// and subtract.
+static IPDOPD_FRAMES_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Companion counter: number of `ps_extension(ext_id=0)` blocks seen,
+/// regardless of `enable_ipdopd`. Used by fixture-hunt diagnostics to
+/// distinguish "encoder never sends the extension at all" from "encoder
+/// sends the extension but with `enable_ipdopd = 0`".
+static PS_EXT_V0_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Companion counter: number of PS frames parsed where `enable_ext = 1` in
+/// the header. A prerequisite for any ps_extension block to be sent.
+static PS_HDR_ENABLE_EXT: AtomicUsize = AtomicUsize::new(0);
+/// Total PS frames parsed.
+static PS_FRAMES_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Return the total number of PS frames decoded so far whose extension bit
+/// `enable_ipdopd` was 1. Monotonically non-decreasing across the process.
+pub fn ipdopd_frames_seen() -> usize {
+    IPDOPD_FRAMES_SEEN.load(Ordering::Relaxed)
+}
+
+/// Return the total number of `ps_extension(ext_id=0)` blocks parsed so far.
+/// Monotonically non-decreasing across the process.
+pub fn ps_ext_v0_seen() -> usize {
+    PS_EXT_V0_SEEN.load(Ordering::Relaxed)
+}
+
+/// Return the total number of PS frames parsed so far whose header set
+/// `enable_ext = 1`. Monotonically non-decreasing.
+pub fn ps_hdr_enable_ext_seen() -> usize {
+    PS_HDR_ENABLE_EXT.load(Ordering::Relaxed)
+}
+
+/// Return the total number of PS frames parsed so far.
+/// Monotonically non-decreasing.
+pub fn ps_frames_total() -> usize {
+    PS_FRAMES_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Number of allpass links per decorrelator (§8.6.4.5.1).
 const NR_ALLPASS_LINKS: usize = 3;
@@ -874,6 +921,7 @@ static HUFF_IPD_DT: &[HuffEntry] = huff_table![
 /// the parsed frame data.
 pub fn parse_ps_data(br: &mut BitReader<'_>, state: &mut PsState) -> Result<PsFrame> {
     let mut out = PsFrame::default();
+    PS_FRAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
 
     // ---- Header ----
     let enable_ps_header = br.read_bit()?;
@@ -1010,6 +1058,7 @@ pub fn parse_ps_data(br: &mut BitReader<'_>, state: &mut PsState) -> Result<PsFr
     // §8.6.4.4.3 / §8.6.4.4.4.
     out.nr_ipdopd_par = state.header.nr_ipdopd_par;
     if state.header.enable_ext {
+        PS_HDR_ENABLE_EXT.fetch_add(1, Ordering::Relaxed);
         let mut cnt = br.read_u32(4)?;
         if cnt == 15 {
             cnt += br.read_u32(8)?;
@@ -1020,9 +1069,11 @@ pub fn parse_ps_data(br: &mut BitReader<'_>, state: &mut PsState) -> Result<PsFr
             let ext_id = br.read_u32(2)?;
             if ext_id == 0 {
                 // ps_extension v0: optional IPD/OPD.
+                PS_EXT_V0_SEEN.fetch_add(1, Ordering::Relaxed);
                 let enable_ipdopd = br.read_bit()?;
                 if enable_ipdopd {
                     out.has_ipdopd = true;
+                    IPDOPD_FRAMES_SEEN.fetch_add(1, Ordering::Relaxed);
                     let nbands = state.header.nr_ipdopd_par.min(17);
                     out.ipd = vec![Vec::new(); num_env];
                     out.opd = vec![Vec::new(); num_env];

@@ -589,7 +589,13 @@ impl AacDecoder {
                 ElementType::Fil => {
                     let mut count = br.read_u32(4)?;
                     if count == 15 {
-                        count += br.read_u32(8)? - 1;
+                        // Per §4.4.2.7: extended count `esc_count` is added
+                        // verbatim; the stored count is `esc_count + 15 - 1`.
+                        // Use saturating_sub so a malformed `esc_count = 0`
+                        // stream doesn't overflow — we simply yield
+                        // `count = 14` which matches the reconstructed
+                        // extended count convention.
+                        count += br.read_u32(8)?.saturating_sub(1);
                     }
                     if count > 0 {
                         let total_bits = 8 * count;
