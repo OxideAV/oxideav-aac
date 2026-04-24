@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- IPD/OPD phase-correction in the HE-AACv2 PS mixing matrix
+  (§8.6.4.6.3.2). Previously the baseline decoder decoded the IPD/OPD
+  Huffman indices but threw them away (§8.A.4 "Baseline PS" profile).
+  Now the mixing coefficients `h11, h12, h21, h22` are complex-valued
+  vectors of shape `h_ij(b) = h_ij_real(b) · exp(j·phi_ij(b))`, with
+  `phi1 = phi_opd`, `phi2 = phi_opd − phi_ipd`, and each phi smoothed
+  over `(e-1, e, e+1)` via the spec's
+  `angle(0.25·e^{jp-1} + 0.5·e^{jp} + 0.25·e^{jp+1})`. Sub-subband
+  indices 0 and 1 (Table 8.48 "*") take the complex conjugate of
+  `h_ij`, matching the spec's second equation block. Interpolation
+  across envelope borders runs componentwise on the complex plane and
+  is carried over between frames via `prev_h_end` (now complex).
+  `PsFrame` gains `has_ipdopd`, `ipd`, `opd` fields; `PsState` gains
+  `prev_ipd_idx / prev_opd_idx / prev_ipd_last / prev_opd_last` for
+  modulo-8 differential decoding and cross-frame smoothing.
+- `tests/sbr_he_aac_v2_ps.rs::decode_he_aac_v2_ps_preserves_inter_channel_phase`
+  — regression that drives a phase-coherent coherent-stereo fixture
+  through our decoder and ffmpeg's, then compares the inter-channel
+  phase magnitude.
 - Hybrid sub-QMF analysis/synthesis filterbank for the HE-AACv2 PS
   upmix (§8.6.4.3). QMF band 0 is split into 6 sub-subbands via a 13-tap
   Type A (8-way complex) filter; bands 1 and 2 are split into 2 each via

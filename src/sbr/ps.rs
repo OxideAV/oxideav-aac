@@ -10,7 +10,12 @@
 //!   * 20 stereo-band hybrid configuration (34-band streams are folded to 20
 //!     via the inverse mapping of Table 8.46).
 //!   * Mixing mode Ra (Table 8.27 / §8.6.4.6.2.1).
-//!   * IPD/OPD parsed but not applied (baseline ignores them).
+//!   * IPD/OPD applied as a complex phase rotation on the mixing matrix per
+//!     §8.6.4.6.3.2 when the `ps_extension v0` block signals
+//!     `enable_ipdopd = 1`. `phi1 = phi_opd`, `phi2 = phi_opd - phi_ipd`,
+//!     `h11 *= exp(j*phi1)`, `h21 *= exp(j*phi1)`, `h12 *= exp(j*phi2)`,
+//!     `h22 *= exp(j*phi2)`. Table 8.48 sub-subband indices 0 and 1 use the
+//!     conjugate `h*` instead of `h` (the "*"-annotated rows).
 //!   * Full-length complex allpass-chain decorrelator on QMF subbands
 //!     (§8.6.4.5.2) with transient-reduction attenuator (§8.6.4.5.3-4).
 //!   * Linear interpolation of the mixing matrix H11/H12/H21/H22 across time
@@ -355,6 +360,17 @@ const HYBRID_TO_PARAM_20: [u8; 71] = [
     19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19,
 ];
 
+/// Per-sub-subband complex-conjugate flag (Table 8.48 "*" annotation).
+/// Sub-subbands 0 and 1 of the 20-band configuration take the conjugate of
+/// the mixing vector (§8.6.4.6.3.2 final paragraph). For the real-h baseline
+/// this is a no-op; with IPD/OPD it flips the sign of the imaginary rotation.
+const HYBRID_CONJUGATE_MASK: [bool; 71] = {
+    let mut m = [false; 71];
+    m[0] = true;
+    m[1] = true;
+    m
+};
+
 /// Legacy QMF-band → parameter mapping (used when the hybrid filterbank is
 /// not available — e.g. sub-subband buffers below rank requirement). Each
 /// QMF band 0..63 maps to the dominant parameter index from Table 8.48
@@ -380,6 +396,19 @@ pub const IID_QUANT_FINE: [f32; 31] = [
 ];
 /// ICC quantisation grid (Table 8.28).
 pub const ICC_QUANT: [f32; 8] = [1.0, 0.937, 0.84118, 0.60092, 0.36764, 0.0, -0.589, -1.0];
+
+/// IPD/OPD quantisation grid (Table 8.31). 8 levels uniformly spaced over
+/// `[0, 2π)` at multiples of `π/4`.
+pub const IPDOPD_QUANT: [f32; 8] = [
+    0.0,
+    core::f32::consts::FRAC_PI_4,
+    core::f32::consts::FRAC_PI_2,
+    3.0 * core::f32::consts::FRAC_PI_4,
+    core::f32::consts::PI,
+    5.0 * core::f32::consts::FRAC_PI_4,
+    3.0 * core::f32::consts::FRAC_PI_2,
+    7.0 * core::f32::consts::FRAC_PI_4,
+];
 
 /// nr_iid_par for iid_mode 0..5. Indexed by iid_mode.
 const NR_IID_PAR_TAB: [usize; 6] = [10, 20, 34, 10, 20, 34];
@@ -427,6 +456,20 @@ pub struct PsFrame {
     pub icc_idx_last: Vec<i32>,
     pub nr_iid_par: usize,
     pub nr_icc_par: usize,
+    /// Whether the `ps_extension v0` block was present AND carried
+    /// `enable_ipdopd = 1`. When false the mixing matrix is left with
+    /// real-valued `h11, h12, h21, h22` per §8.6.4.6.3.1.
+    pub has_ipdopd: bool,
+    /// IPD phase values per envelope (radians) — `ipd[e][b]`.
+    pub ipd: Vec<Vec<f32>>,
+    /// OPD phase values per envelope (radians) — `opd[e][b]`.
+    pub opd: Vec<Vec<f32>>,
+    /// Integer IPD/OPD indices for the final envelope — used so the next
+    /// frame's modulo-8 differential decode can pick up from the right
+    /// starting point.
+    pub ipd_idx_last: Vec<i32>,
+    pub opd_idx_last: Vec<i32>,
+    pub nr_ipdopd_par: usize,
 }
 
 /// Running per-stream PS state.
@@ -437,9 +480,20 @@ pub struct PsState {
     /// over-time decoding of the next frame.
     pub prev_iid_idx: Vec<i32>,
     pub prev_icc_idx: Vec<i32>,
+    /// Previous-frame final-envelope IPD/OPD indices (modulo-8 differential
+    /// decode base for the next frame).
+    pub prev_ipd_idx: Vec<i32>,
+    pub prev_opd_idx: Vec<i32>,
+    /// Last envelope's dequantised IPD/OPD values (radians) — used as the
+    /// `e-1` neighbour when smoothing the first envelope of the next frame.
+    pub prev_ipd_last: [f32; NR_PAR_BANDS],
+    pub prev_opd_last: [f32; NR_PAR_BANDS],
     /// Mixing matrix at the last parameter position of the previous frame —
     /// seeds interpolation for region0 of the next frame (§8.6.4.6.4 a).
-    pub prev_h_end: [[f32; NR_PAR_BANDS]; 4],
+    /// Complex-valued because IPD/OPD phase rotations make `h11..h22`
+    /// complex when phase parameters are enabled; reduces to the real-only
+    /// case when they're zero.
+    pub prev_h_end: [[Complex32; NR_PAR_BANDS]; 4],
     /// Delay lines for the allpass-chain decorrelator. Max delay is 5+5+5 =
     /// ~20 samples; we keep 32 to be safe.
     pub allpass_delay: [[[Complex32; 16]; NR_ALLPASS_LINKS]; NR_ALLPASS_BANDS],
@@ -466,7 +520,11 @@ impl PsState {
             header: PsHeader::default(),
             prev_iid_idx: vec![0; 34],
             prev_icc_idx: vec![0; 34],
-            prev_h_end: [[0.0; NR_PAR_BANDS]; 4],
+            prev_ipd_idx: vec![0; 17],
+            prev_opd_idx: vec![0; 17],
+            prev_ipd_last: [0.0; NR_PAR_BANDS],
+            prev_opd_last: [0.0; NR_PAR_BANDS],
+            prev_h_end: [[Complex32::new(0.0, 0.0); NR_PAR_BANDS]; 4],
             allpass_delay: [[[Complex32::new(0.0, 0.0); 16]; NR_ALLPASS_LINKS]; NR_ALLPASS_BANDS],
             allpass_pos: [0; NR_ALLPASS_BANDS],
             short_delay: [[Complex32::new(0.0, 0.0); 16]; NR_BANDS],
@@ -946,8 +1004,11 @@ pub fn parse_ps_data(br: &mut BitReader<'_>, state: &mut PsState) -> Result<PsFr
         out.icc_idx_last = prev;
     }
 
-    // Extension. Baseline PS skips IPD/OPD but we still need to consume the
-    // bits so the outer SBR loop can bit-align its extended_data block.
+    // Extension. If IPD/OPD data is present and `enable_ipdopd = 1`, we
+    // store the full per-envelope phase grids on the frame so the mixing
+    // stage can apply §8.6.4.6.3.2. Modulo-8 differential decoding per
+    // §8.6.4.4.3 / §8.6.4.4.4.
+    out.nr_ipdopd_par = state.header.nr_ipdopd_par;
     if state.header.enable_ext {
         let mut cnt = br.read_u32(4)?;
         if cnt == 15 {
@@ -958,30 +1019,66 @@ pub fn parse_ps_data(br: &mut BitReader<'_>, state: &mut PsState) -> Result<PsFr
         while (br.bit_position() as i32 - start) + 7 < total_bits {
             let ext_id = br.read_u32(2)?;
             if ext_id == 0 {
-                // ps_extension v0: optional IPD/OPD. Parse but discard since
-                // the baseline decoder does not apply them.
+                // ps_extension v0: optional IPD/OPD.
                 let enable_ipdopd = br.read_bit()?;
                 if enable_ipdopd {
-                    let nbands = state.header.nr_ipdopd_par.min(34);
-                    for _e in 0..num_env {
+                    out.has_ipdopd = true;
+                    let nbands = state.header.nr_ipdopd_par.min(17);
+                    out.ipd = vec![Vec::new(); num_env];
+                    out.opd = vec![Vec::new(); num_env];
+                    let mut prev_ipd = state.prev_ipd_idx.clone();
+                    let mut prev_opd = state.prev_opd_idx.clone();
+                    prev_ipd.resize(17, 0);
+                    prev_opd.resize(17, 0);
+                    for e in 0..num_env {
+                        // IPD: delta-time or delta-freq, modulo 8.
                         let ipd_dt_flag = br.read_bit()?;
-                        for _b in 0..nbands {
-                            let _ = if ipd_dt_flag {
-                                huff_decode(br, HUFF_IPD_DT)
-                            } else {
-                                huff_decode(br, HUFF_IPD_DF)
-                            };
+                        let mut ipd_idx = vec![0i32; nbands];
+                        if ipd_dt_flag {
+                            for b in 0..nbands {
+                                let d = huff_decode(br, HUFF_IPD_DT)?;
+                                ipd_idx[b] = (prev_ipd[b] + d).rem_euclid(8);
+                            }
+                        } else {
+                            let mut acc: i32 = 0;
+                            for b in 0..nbands {
+                                let d = huff_decode(br, HUFF_IPD_DF)?;
+                                acc = (acc + d).rem_euclid(8);
+                                ipd_idx[b] = acc;
+                            }
                         }
+                        let mut ipd_vals = vec![0.0f32; nbands];
+                        for b in 0..nbands {
+                            ipd_vals[b] = IPDOPD_QUANT[ipd_idx[b] as usize & 7];
+                        }
+                        out.ipd[e] = ipd_vals;
+                        prev_ipd = ipd_idx;
+
+                        // OPD: same layout.
                         let opd_dt_flag = br.read_bit()?;
-                        // opd uses the same table layout as ipd.
-                        for _b in 0..nbands {
-                            let _ = if opd_dt_flag {
-                                huff_decode(br, HUFF_IPD_DT)
-                            } else {
-                                huff_decode(br, HUFF_IPD_DF)
-                            };
+                        let mut opd_idx = vec![0i32; nbands];
+                        if opd_dt_flag {
+                            for b in 0..nbands {
+                                let d = huff_decode(br, HUFF_IPD_DT)?;
+                                opd_idx[b] = (prev_opd[b] + d).rem_euclid(8);
+                            }
+                        } else {
+                            let mut acc: i32 = 0;
+                            for b in 0..nbands {
+                                let d = huff_decode(br, HUFF_IPD_DF)?;
+                                acc = (acc + d).rem_euclid(8);
+                                opd_idx[b] = acc;
+                            }
                         }
+                        let mut opd_vals = vec![0.0f32; nbands];
+                        for b in 0..nbands {
+                            opd_vals[b] = IPDOPD_QUANT[opd_idx[b] as usize & 7];
+                        }
+                        out.opd[e] = opd_vals;
+                        prev_opd = opd_idx;
                     }
+                    out.ipd_idx_last = prev_ipd;
+                    out.opd_idx_last = prev_opd;
                 }
                 let _reserved = br.read_bit()?;
             } else {
@@ -1010,6 +1107,20 @@ pub fn parse_ps_data(br: &mut BitReader<'_>, state: &mut PsState) -> Result<PsFr
     if out.has_icc {
         state.prev_icc_idx = out.icc_idx_last.clone();
         state.prev_icc_idx.resize(34, 0);
+    }
+    if out.has_ipdopd {
+        state.prev_ipd_idx = out.ipd_idx_last.clone();
+        state.prev_ipd_idx.resize(17, 0);
+        state.prev_opd_idx = out.opd_idx_last.clone();
+        state.prev_opd_idx.resize(17, 0);
+    } else {
+        // §8.6.4.6.3: when phase params are disabled, reset the smoothing
+        // baseline so we don't hold stale phases across a disable → enable
+        // transition.
+        state.prev_ipd_idx = vec![0; 17];
+        state.prev_opd_idx = vec![0; 17];
+        state.prev_ipd_last = [0.0; NR_PAR_BANDS];
+        state.prev_opd_last = [0.0; NR_PAR_BANDS];
     }
     state.prev_ps_seen = true;
     Ok(out)
@@ -1289,6 +1400,38 @@ fn map_to_20(values: &[f32], n_src: usize) -> [f32; NR_PAR_BANDS] {
     out
 }
 
+/// Map an IPD/OPD vector (5, 11, or 17 bands) onto the 20-band grid by
+/// repeating each coarse band into the contiguous chunk of finer bands it
+/// covers. The IPD/OPD band boundaries are not identical to the IID boundaries
+/// (§8.6.4.4 note on IPD parameter count) but share an approximately
+/// logarithmic spacing; broadcasting by constant expansion is a spec-compliant
+/// low-frequency-resolution fallback that does not introduce phase aliasing
+/// (the phase varies smoothly across each coarse band in all realistic
+/// parameter grids).
+fn map_ipdopd_to_20(values: &[f32], n_src: usize) -> [f32; NR_PAR_BANDS] {
+    let mut out = [0.0f32; NR_PAR_BANDS];
+    if values.is_empty() || n_src == 0 {
+        return out;
+    }
+    for b in 0..NR_PAR_BANDS {
+        let src = (b * n_src / NR_PAR_BANDS).min(values.len() - 1);
+        out[b] = values[src];
+    }
+    out
+}
+
+/// Smooth three time-adjacent phases per §8.6.4.6.3.2:
+///   phi(b) = angle( 0.25·e^{j·p_prev} + 0.5·e^{j·p_cur} + 0.25·e^{j·p_next} ).
+#[inline]
+fn phase_smooth(p_prev: f32, p_cur: f32, p_next: f32) -> f32 {
+    let (s0, c0) = p_prev.sin_cos();
+    let (s1, c1) = p_cur.sin_cos();
+    let (s2, c2) = p_next.sin_cos();
+    let re = 0.25 * c0 + 0.5 * c1 + 0.25 * c2;
+    let im = 0.25 * s0 + 0.5 * s1 + 0.25 * s2;
+    im.atan2(re)
+}
+
 /// Compute envelope border sample indices n_e for e = 0..num_env-1 given a
 /// frame length of `num_qmf_slots` samples.
 fn envelope_borders(frame: &PsFrame, num_qmf_slots: usize) -> Vec<usize> {
@@ -1333,10 +1476,32 @@ pub fn apply_ps_qmf(
     decorrelate_qmf(x_mono, &mut d, state);
 
     // 2) Build per-envelope h-vectors on the 20-band grid.
+    //
+    // Real h11..h22 come from the Ra/Rb mixing matrix. If `enable_ipdopd`
+    // is set the spec adds a complex phase rotation:
+    //   h11 *= exp(j·phi1), h21 *= exp(j·phi1),
+    //   h12 *= exp(j·phi2), h22 *= exp(j·phi2),
+    //   phi1 = phi_opd, phi2 = phi_opd - phi_ipd.
+    // phi_opd / phi_ipd are themselves the [0.25, 0.5, 0.25]-smoothed phase
+    // at envelope boundaries (e-1, e, e+1). We therefore carry complex
+    // h-vectors through interpolation.
     let num_env = frame.num_env.max(1);
-    let mut h_at_env = vec![[[0.0f32; NR_PAR_BANDS]; 4]; num_env];
-    // Determine effective arrays. If IID / ICC weren't present, use
-    // defaults (IID = 0 dB → c = 1; ICC = 1 → perfect correlation).
+    let mut h_at_env = vec![[[Complex32::new(0.0, 0.0); NR_PAR_BANDS]; 4]; num_env];
+
+    // Pre-project IPD/OPD to the 20-band grid per envelope, so we can walk
+    // the [e-1, e, e+1] smoothing window. When phase parameters are disabled
+    // we fall through to zero phases.
+    let mut ipd20: Vec<[f32; NR_PAR_BANDS]> = Vec::with_capacity(num_env);
+    let mut opd20: Vec<[f32; NR_PAR_BANDS]> = Vec::with_capacity(num_env);
+    if frame.has_ipdopd {
+        for e in 0..num_env {
+            let ipd_raw = frame.ipd.get(e).cloned().unwrap_or_default();
+            let opd_raw = frame.opd.get(e).cloned().unwrap_or_default();
+            ipd20.push(map_ipdopd_to_20(&ipd_raw, frame.nr_ipdopd_par));
+            opd20.push(map_ipdopd_to_20(&opd_raw, frame.nr_ipdopd_par));
+        }
+    }
+
     for e in 0..num_env {
         let iid_raw: Vec<f32> = if frame.has_iid {
             frame.iid_db.get(e).cloned().unwrap_or_default()
@@ -1358,12 +1523,46 @@ pub fn apply_ps_qmf(
         } else {
             [1.0; NR_PAR_BANDS]
         };
+
+        // Smoothed phase per band (zeros when phase-params disabled).
+        let mut phi1 = [0.0f32; NR_PAR_BANDS];
+        let mut phi2 = [0.0f32; NR_PAR_BANDS];
+        if frame.has_ipdopd {
+            for b in 0..NR_PAR_BANDS {
+                let ipd_prev = if e == 0 {
+                    state.prev_ipd_last[b]
+                } else {
+                    ipd20[e - 1][b]
+                };
+                let opd_prev = if e == 0 {
+                    state.prev_opd_last[b]
+                } else {
+                    opd20[e - 1][b]
+                };
+                let ipd_cur = ipd20[e][b];
+                let opd_cur = opd20[e][b];
+                // The "e+1" phase is not available causally; use the current
+                // envelope's value (centred smoother degenerates to a 2-tap
+                // [0.25, 0.75] when the future tap is tied to the current).
+                let ipd_next = ipd_cur;
+                let opd_next = opd_cur;
+                let p_ipd = phase_smooth(ipd_prev, ipd_cur, ipd_next);
+                let p_opd = phase_smooth(opd_prev, opd_cur, opd_next);
+                phi1[b] = p_opd;
+                phi2[b] = p_opd - p_ipd;
+            }
+        }
+
         for b in 0..NR_PAR_BANDS {
-            let (h11, h12, h21, h22) = mix_coeffs(iid20[b], icc20[b], state.header.mixing_rb);
-            h_at_env[e][0][b] = h11;
-            h_at_env[e][1][b] = h12;
-            h_at_env[e][2][b] = h21;
-            h_at_env[e][3][b] = h22;
+            let (h11r, h12r, h21r, h22r) = mix_coeffs(iid20[b], icc20[b], state.header.mixing_rb);
+            let (s1, c1) = phi1[b].sin_cos();
+            let (s2, c2) = phi2[b].sin_cos();
+            let r1 = Complex32::new(c1, s1);
+            let r2 = Complex32::new(c2, s2);
+            h_at_env[e][0][b] = r1.scale(h11r); // h11 = h11_real · e^{j·phi1}
+            h_at_env[e][1][b] = r2.scale(h12r); // h12 = h12_real · e^{j·phi2}
+            h_at_env[e][2][b] = r1.scale(h21r); // h21 = h21_real · e^{j·phi1}
+            h_at_env[e][3][b] = r2.scale(h22r); // h22 = h22_real · e^{j·phi2}
         }
     }
     let borders = envelope_borders(frame, num_slots);
@@ -1372,10 +1571,11 @@ pub fn apply_ps_qmf(
     //
     // The interpolation schedule runs exactly as before (§8.6.4.6.4) — for
     // each envelope boundary we ramp linearly from h_prev to h_cur across
-    // the segment. This yields a num_slots × 4 × NR_PAR_BANDS table we can
-    // consume both for the sub-QMF (bands 0..2) and straight QMF (bands
-    // 3..63) mixing.
-    let mut h_slot = vec![[[0.0f32; NR_PAR_BANDS]; 4]; num_slots];
+    // the segment. Interpolation is componentwise on the complex plane so
+    // that the phase slides monotonically between the adjacent envelope
+    // values; this is the same rule the spec applies to real-valued h when
+    // phase parameters are disabled (phi1 = phi2 = 0 → h is already real).
+    let mut h_slot = vec![[[Complex32::new(0.0, 0.0); NR_PAR_BANDS]; 4]; num_slots];
     let mut h_prev = state.prev_h_end;
     let mut seg_start = 0usize;
     for e in 0..num_env {
@@ -1391,7 +1591,12 @@ pub fn apply_ps_qmf(
             let t = t.clamp(0.0, 1.0);
             for ij in 0..4 {
                 for b in 0..NR_PAR_BANDS {
-                    h_slot[n][ij][b] = h_prev[ij][b] + t * (h_cur[ij][b] - h_prev[ij][b]);
+                    let prev = h_prev[ij][b];
+                    let cur = h_cur[ij][b];
+                    h_slot[n][ij][b] = Complex32::new(
+                        prev.re + t * (cur.re - prev.re),
+                        prev.im + t * (cur.im - prev.im),
+                    );
                 }
             }
         }
@@ -1408,6 +1613,12 @@ pub fn apply_ps_qmf(
     //         each (6 from band 0, 2 each from bands 1, 2);
     //      b) mix at sub-subband granularity using HYBRID_TO_PARAM_20;
     //      c) synthesise back into 3 QMF bands per L/R output.
+    //
+    // Sub-subband indices 0 and 1 are annotated with "*" in Table 8.48:
+    // they receive the complex conjugate of h (§8.6.4.6.3.2 final paragraph
+    // "For indices denoted with a * the following equations are used:
+    // H_ij = h_ij^*"). For the real-h case (no phase params) this is a
+    // no-op; with phase params it flips the sign of the imaginary part.
     for n in 0..num_slots {
         let mono3 = [x_mono[n][0], x_mono[n][1], x_mono[n][2]];
         let d3 = [d[n][0], d[n][1], d[n][2]];
@@ -1417,12 +1628,18 @@ pub fn apply_ps_qmf(
         let mut sub_r = [Complex32::new(0.0, 0.0); HYBRID_LOW_SUBBANDS];
         for k in 0..HYBRID_LOW_SUBBANDS {
             let bidx = HYBRID_TO_PARAM_20[k] as usize;
-            let h11 = h_slot[n][0][bidx];
-            let h12 = h_slot[n][1][bidx];
-            let h21 = h_slot[n][2][bidx];
-            let h22 = h_slot[n][3][bidx];
-            sub_l[k] = sub_m[k].scale(h11) + sub_d[k].scale(h21);
-            sub_r[k] = sub_m[k].scale(h12) + sub_d[k].scale(h22);
+            let mut h11 = h_slot[n][0][bidx];
+            let mut h12 = h_slot[n][1][bidx];
+            let mut h21 = h_slot[n][2][bidx];
+            let mut h22 = h_slot[n][3][bidx];
+            if HYBRID_CONJUGATE_MASK[k] {
+                h11 = h11.conj();
+                h12 = h12.conj();
+                h21 = h21.conj();
+                h22 = h22.conj();
+            }
+            sub_l[k] = sub_m[k] * h11 + sub_d[k] * h21;
+            sub_r[k] = sub_m[k] * h12 + sub_d[k] * h22;
         }
         let l3 = hybrid_synthesis_slot(&sub_l);
         let r3 = hybrid_synthesis_slot(&sub_r);
@@ -1433,7 +1650,8 @@ pub fn apply_ps_qmf(
     }
 
     // 5) Mixing for QMF bands 3..63 — straight QMF-band-to-param-band map.
-    //    No further filtering needed here; these bands pass through.
+    //    No conjugation flag on Table 8.48 for these — only sub-QMF
+    //    subbands 0 and 1 are annotated.
     for n in 0..num_slots {
         for k in 3..NUM_QMF_BANDS {
             let bidx = QMF_TO_PARAM_20[k] as usize;
@@ -1443,13 +1661,22 @@ pub fn apply_ps_qmf(
             let h22 = h_slot[n][3][bidx];
             let s = x_mono[n][k];
             let dv = d[n][k];
-            x_left[n][k] = s.scale(h11) + dv.scale(h21);
-            x_right[n][k] = s.scale(h12) + dv.scale(h22);
+            x_left[n][k] = s * h11 + dv * h21;
+            x_right[n][k] = s * h12 + dv * h22;
         }
     }
 
     // Store end-of-frame H for next frame's region0 interpolation.
     state.prev_h_end = h_prev;
+
+    // Snapshot the last-envelope IPD/OPD for the next frame's [e-1] tap.
+    if frame.has_ipdopd && !ipd20.is_empty() {
+        state.prev_ipd_last = ipd20[num_env - 1];
+        state.prev_opd_last = opd20[num_env - 1];
+    } else {
+        state.prev_ipd_last = [0.0; NR_PAR_BANDS];
+        state.prev_opd_last = [0.0; NR_PAR_BANDS];
+    }
 }
 
 /// Legacy simplified time-domain PS upmix — kept for back-compat with the
@@ -1723,5 +1950,248 @@ mod tests {
             "hybrid roundtrip gain off: recovery={recovery}"
         );
         assert!(nrmse < 0.5, "hybrid roundtrip NRMSE too large: {nrmse}");
+    }
+
+    #[test]
+    fn ipdopd_quant_matches_spec_grid() {
+        // Table 8.31: index k maps to k · π/4.
+        for (k, v) in IPDOPD_QUANT.iter().enumerate() {
+            let expect = k as f32 * core::f32::consts::FRAC_PI_4;
+            assert!(
+                (v - expect).abs() < 1e-6,
+                "IPDOPD_QUANT[{k}] = {v}, expected {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_smooth_identity_on_equal_phases() {
+        // A constant phase field should round-trip to the same angle up to
+        // a small numerical residue (angle of unit-magnitude complex).
+        for &p in &[-2.0f32, -0.5, 0.0, 0.25, 1.5, 2.9] {
+            let out = phase_smooth(p, p, p);
+            let diff = (out - p).abs();
+            // atan2 on a unit complex with the same phase returns p mod 2π;
+            // tolerate wrap-around since only the complex exponential matters.
+            let c0 = p.cos();
+            let s0 = p.sin();
+            let c1 = out.cos();
+            let s1 = out.sin();
+            let dc = (c1 - c0).abs() + (s1 - s0).abs();
+            assert!(
+                diff < 1e-4 || dc < 1e-4,
+                "phase_smooth constancy broken: p={p} → {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_smooth_averages_opposite_phases() {
+        // Smoothing across (-π/4, 0, π/4) should yield 0 (symmetric average
+        // of unit vectors on a cone around the real axis).
+        let out = phase_smooth(
+            -core::f32::consts::FRAC_PI_4,
+            0.0,
+            core::f32::consts::FRAC_PI_4,
+        );
+        assert!(out.abs() < 1e-5, "symmetric smoothing drifted: out={out}");
+    }
+
+    #[test]
+    fn ipdopd_rotates_mixing_matrix() {
+        // Construct a PsFrame with a centred IID (both channels equal gain),
+        // full coherence, and a π/2 IPD on all IPD bands — this should give
+        // output L = j·R on bands touched by the rotation, i.e. an imaginary
+        // cross-coupling that would be identically zero for real-only h.
+        let mut frame = PsFrame {
+            frame_class: 0,
+            num_env: 1,
+            has_iid: true,
+            has_icc: true,
+            iid_db: vec![vec![0.0; 20]; 1],
+            icc: vec![vec![1.0; 20]; 1],
+            nr_iid_par: 20,
+            nr_icc_par: 20,
+            ..PsFrame::default()
+        };
+        // Enable IPD/OPD with IPD = π/2 on every band, OPD = 0.
+        frame.has_ipdopd = true;
+        frame.nr_ipdopd_par = 17;
+        let ipd_row: Vec<f32> = (0..17).map(|_| core::f32::consts::FRAC_PI_2).collect();
+        let opd_row: Vec<f32> = vec![0.0; 17];
+        frame.ipd = vec![ipd_row];
+        frame.opd = vec![opd_row];
+
+        // Supply mono energy across a wide range of QMF bands so both the
+        // sub-QMF and pass-through paths exercise the phase rotation.
+        let num_slots = 16;
+        let mut mono = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; num_slots];
+        for n in 0..num_slots {
+            for k in 3..40 {
+                let p = (n as f32) * 0.1 + (k as f32) * 0.03;
+                mono[n][k] = Complex32::new(p.cos(), p.sin()).scale(0.5);
+            }
+        }
+        let mut l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; num_slots];
+        let mut r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; num_slots];
+        let mut state = PsState::new();
+        apply_ps_qmf(&mono, &mut l, &mut r, &frame, &mut state);
+
+        // With real-only mixing (no IPD), left/right channels differ only
+        // via the decorrelator path which is zero-weighted when ICC = 1 and
+        // IID = 0. Adding an OPD - IPD rotation on h12, h22 introduces a
+        // phase difference between L and R that shows up as a non-zero
+        // cross-correlation imaginary part.
+        let mut cross_im = 0.0f32;
+        let mut e_l = 0.0f32;
+        let mut e_r = 0.0f32;
+        let start = num_slots / 2; // skip warm-up
+        for n in start..num_slots {
+            for k in 3..40 {
+                // L · conj(R) — imaginary part tracks the phase offset.
+                let ll = l[n][k];
+                let rr = r[n][k];
+                cross_im += ll.im * rr.re - ll.re * rr.im;
+                e_l += ll.norm_sqr();
+                e_r += rr.norm_sqr();
+            }
+        }
+        let avg_e = 0.5 * (e_l + e_r).max(1e-9);
+        let rel = cross_im.abs() / avg_e;
+        assert!(
+            rel > 1e-3,
+            "IPD rotation did not induce inter-channel phase: |Im(L·R*)|/E = {rel:.6}"
+        );
+    }
+
+    #[test]
+    fn parse_ps_data_extracts_ipdopd_when_present() {
+        // Hand-assemble a minimal ps_data() payload with IPD and OPD bands
+        // populated, confirm the parser fills `has_ipdopd` and decodes the
+        // phase values per Table 8.31.
+        use oxideav_core::bits::BitWriter;
+
+        // Build the extension subpayload first so we know its byte length.
+        let mut ext = BitWriter::new();
+        // ext_id = 0 (ps_extension v0).
+        ext.write_u32(0, 2);
+        // enable_ipdopd = 1.
+        ext.write_bit(true);
+        // IPD for 1 envelope, 5 bands, dt = 0 (df). HUFF_IPD_DF: 0 -> "1".
+        ext.write_bit(false);
+        for _ in 0..5 {
+            ext.write_bit(true); // df delta = 0
+        }
+        // OPD dt = 0 (df). First band delta = 2 ("0110"), rest 0 ("1").
+        ext.write_bit(false);
+        ext.write_u32(0b0110, 4);
+        for _ in 0..4 {
+            ext.write_bit(true);
+        }
+        // reserved_ps.
+        ext.write_bit(false);
+        // Byte-align the extension.
+        ext.align_to_byte();
+        let ext_bytes = ext.into_bytes();
+        let ext_len = ext_bytes.len();
+        assert!(ext_len < 15, "ext len too long for tiny-cnt encoding");
+
+        let mut bw = BitWriter::new();
+        // enable_ps_header = 1
+        bw.write_bit(true);
+        // enable_iid = 1, iid_mode = 0.
+        bw.write_bit(true);
+        bw.write_u32(0, 3);
+        // enable_icc = 1, icc_mode = 0.
+        bw.write_bit(true);
+        bw.write_u32(0, 3);
+        // enable_ext = 1.
+        bw.write_bit(true);
+        // frame_class = 0, num_env_idx = 1 → 1 envelope.
+        bw.write_bit(false);
+        bw.write_u32(1, 2);
+        // IID dt = 0, emit 10× "0" (huff val=0).
+        bw.write_bit(false);
+        for _ in 0..10 {
+            bw.write_bit(false);
+        }
+        // ICC dt = 0, emit 10× "0".
+        bw.write_bit(false);
+        for _ in 0..10 {
+            bw.write_bit(false);
+        }
+        // Extension: cnt (4-bit byte length).
+        bw.write_u32(ext_len as u32, 4);
+        // Append the extension bytes — may not be byte-aligned now, but the
+        // write path handles that.
+        for &b in &ext_bytes {
+            bw.write_u32(b as u32, 8);
+        }
+        let data = bw.into_bytes();
+
+        let mut br = oxideav_core::bits::BitReader::new(&data);
+        let mut st = PsState::new();
+        let frame = parse_ps_data(&mut br, &mut st).expect("parse PS");
+        assert!(frame.has_ipdopd, "IPD/OPD should be marked present");
+        assert_eq!(frame.ipd.len(), 1, "1 envelope of IPD");
+        assert_eq!(frame.opd.len(), 1, "1 envelope of OPD");
+        // First IPD band index=0 → phase 0.
+        assert!(
+            (frame.ipd[0][0] - 0.0).abs() < 1e-5,
+            "ipd[0][0] = {}",
+            frame.ipd[0][0]
+        );
+        // First OPD band delta=2 on accumulator → idx=2 → phase π/2.
+        assert!(
+            (frame.opd[0][0] - core::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "opd[0][0] = {}",
+            frame.opd[0][0]
+        );
+    }
+
+    #[test]
+    fn apply_ps_qmf_without_ipdopd_stays_real() {
+        // Sanity: with phase params disabled we must match the legacy
+        // real-only path — left/right are proportional to mono when IID=0
+        // and ICC=1 (decorrelator contribution zero).
+        let frame = PsFrame {
+            frame_class: 0,
+            num_env: 1,
+            has_iid: true,
+            has_icc: true,
+            iid_db: vec![vec![0.0; 20]; 1],
+            icc: vec![vec![1.0; 20]; 1],
+            nr_iid_par: 20,
+            nr_icc_par: 20,
+            has_ipdopd: false,
+            ..PsFrame::default()
+        };
+        let num_slots = 12;
+        let mut mono = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; num_slots];
+        for n in 0..num_slots {
+            for k in 3..20 {
+                let p = (n * 3 + k) as f32 * 0.1;
+                mono[n][k] = Complex32::new(p.cos(), p.sin()).scale(0.5);
+            }
+        }
+        let mut l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; num_slots];
+        let mut r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; num_slots];
+        let mut state = PsState::new();
+        apply_ps_qmf(&mono, &mut l, &mut r, &frame, &mut state);
+        // After warm-up, L ≈ R for every sample (IID 0 dB, ICC 1, no IPD).
+        let mut diff = 0.0f32;
+        let mut tot = 0.0f32;
+        for n in 6..num_slots {
+            for k in 3..20 {
+                let d = l[n][k] - r[n][k];
+                diff += d.norm_sqr();
+                tot += l[n][k].norm_sqr() + r[n][k].norm_sqr();
+            }
+        }
+        let ratio = diff / tot.max(1e-9);
+        assert!(
+            ratio < 0.1,
+            "without IPD/OPD, L and R should match: diff/tot = {ratio:.4}"
+        );
     }
 }
