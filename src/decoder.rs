@@ -20,8 +20,8 @@ use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
 use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
 use crate::sbr::bitstream::SbrChannelData;
 use crate::sbr::decode::{
-    decode_sbr_cpe_frame, decode_sbr_frame, try_parse_sbr_extension_ext, SbrChannelState,
-    SbrPayload,
+    decode_sbr_cpe_frame, decode_sbr_frame, decode_sbr_frame_ps, try_parse_sbr_extension_ext,
+    SbrChannelState, SbrPayload,
 };
 use crate::sbr::ps::{apply_ps_simple, PsFrame};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
@@ -732,6 +732,40 @@ impl AacDecoder {
                         }
                     }
                 }
+            } else if channels_out == 1 && ps_active && self.sbr_ps[0].is_some()
+                && self.sbr_data[0].is_some()
+            {
+                // HE-AACv2: mono + PS. Route through the QMF-domain upmix —
+                // one analysis QMF → HF generate/adjust → PS → two synthesis
+                // QMFs producing stereo. This replaces the prior time-domain
+                // duplicate-and-pan approach.
+                let sbr = self.sbr_data[0].take().unwrap();
+                let ps_frame = self.sbr_ps[0].take().unwrap();
+                // Split the channel state so we can borrow `ps_right_qmf`
+                // mutably alongside `state` (they live in the same struct).
+                let state = &mut self.sbr_state[0];
+                let mut l = vec![0.0f32; out_samples];
+                let mut r = vec![0.0f32; out_samples];
+                // SAFETY-LIKE: we need two disjoint mut borrows into the same
+                // struct. Use a single mutable borrow and a raw pointer
+                // trick via split: call the function with the struct and
+                // then its right-qmf field. Easiest: temporarily move the
+                // field out via std::mem::take, call, and restore.
+                let mut right_qmf = std::mem::take(&mut state.ps_right_qmf);
+                let decode_ok =
+                    decode_sbr_frame_ps(&pcm[0], &sbr, &ps_frame, state, &mut right_qmf, &mut l, &mut r)
+                        .is_ok();
+                state.ps_right_qmf = right_qmf;
+                if !decode_ok {
+                    // Fallback: duplicate LBR.
+                    for i in 0..FRAME_LEN {
+                        l[2 * i] = pcm[0][i];
+                        l[2 * i + 1] = pcm[0][i];
+                        r[2 * i] = pcm[0][i];
+                        r[2 * i + 1] = pcm[0][i];
+                    }
+                }
+                sbr_pcm = vec![l, r];
             } else {
                 for ch in 0..channels_out {
                     let mut this = std::mem::take(&mut sbr_pcm[ch]);
@@ -753,32 +787,19 @@ impl AacDecoder {
                 }
             }
 
-            // HE-AACv2 PS upmix: mono SBR + PS → stereo.
-            let (out_channels, final_pcm) = if channels_out == 1 && ps_active {
-                let ps_frame = self.sbr_ps[0].take();
-                // Compute average IID/ICC across parameter bands.
-                let (iid_avg_db, icc_avg) = match ps_frame {
-                    Some(p) => {
-                        let iid = if !p.iid_db.is_empty() {
-                            p.iid_db.iter().sum::<f32>() / p.iid_db.len() as f32
-                        } else {
-                            0.0
-                        };
-                        let icc = if !p.icc.is_empty() {
-                            p.icc.iter().sum::<f32>() / p.icc.len() as f32
-                        } else {
-                            1.0
-                        };
-                        (iid, icc)
-                    }
-                    None => (0.0, 1.0),
-                };
+            // HE-AACv2 PS upmix fallback: if PS is active but the QMF-domain
+            // path wasn't taken (no PS frame this packet, or mono SBR
+            // produced), fall back to the simple time-domain duplication.
+            let (out_channels, final_pcm) = if channels_out == 1 && ps_active && sbr_pcm.len() == 1 {
                 let mono = std::mem::take(&mut sbr_pcm[0]);
                 let mut l = vec![0.0f32; out_samples];
                 let mut r = vec![0.0f32; out_samples];
                 let ps_state = &mut self.sbr_state[0].ps;
-                apply_ps_simple(&mono, &mut l, &mut r, iid_avg_db, icc_avg, ps_state);
+                apply_ps_simple(&mono, &mut l, &mut r, 0.0, 1.0, ps_state);
                 (2usize, vec![l, r])
+            } else if channels_out == 1 && ps_active {
+                // Stereo already produced above.
+                (2usize, sbr_pcm)
             } else {
                 (channels_out, sbr_pcm)
             };

@@ -12,7 +12,7 @@ use super::bitstream::{
     parse_channel_pair_element, parse_sbr_header, parse_single_channel_element_ext,
     SbrChannelData, SbrHeader, EXT_SBR_DATA, EXT_SBR_DATA_CRC,
 };
-use super::ps::{PsFrame, PsState};
+use super::ps::{apply_ps_qmf, PsFrame, PsState};
 use super::freq::FreqTables;
 use super::hf_adjust::{
     apply_envelope_coupled_with_limiter, apply_envelope_with_limiter, build_limiter_bands,
@@ -42,6 +42,9 @@ pub struct SbrChannelState {
     pub frame_count: u64,
     /// Running PS state (header + delay line for the decorrelator).
     pub ps: PsState,
+    /// Right-channel 64-band synthesis QMF — only used when PS is active.
+    /// The left channel reuses `qmf_synthesis`.
+    pub ps_right_qmf: QmfSynthesis,
 }
 
 impl SbrChannelState {
@@ -58,6 +61,7 @@ impl SbrChannelState {
             header_seen: false,
             frame_count: 0,
             ps: PsState::new(),
+            ps_right_qmf: QmfSynthesis::new(),
         }
     }
 }
@@ -326,6 +330,139 @@ pub fn decode_sbr_frame(
     }
 
     // 6) Carry forward for next frame.
+    for (i, row) in x_low.iter().rev().take(tail_len).rev().enumerate() {
+        state.x_low_tail[i] = *row;
+    }
+    state.bw_array = bw;
+    state.prev_invf_modes = cur_modes;
+    state.frame_count = state.frame_count.wrapping_add(1);
+    Ok(())
+}
+
+/// Run the full HE-AACv2 decode path for a mono-with-PS frame.
+///
+/// Identical to [`decode_sbr_frame`] up through HF generation + envelope
+/// adjustment, but instead of running one synthesis QMF the mono `X_high`
+/// matrix is first fed into [`apply_ps_qmf`], which upmixes to stereo in
+/// the QMF domain (§8.6.4.6 + Annex 8.A). Two 64-band synthesis QMF banks
+/// (left / right, held inside the PS sibling state) then produce
+/// `out_l` / `out_r` at 2× the core sample rate.
+///
+/// The PS decorrelator and mixing matrix state lives in `state.ps`; the
+/// right-channel synthesis QMF lives in `state_right_qmf` which the caller
+/// owns so the decoder can carry filterbank history across frames.
+pub fn decode_sbr_frame_ps(
+    pcm_in: &[f32],
+    sbr_data: &SbrChannelData,
+    ps_frame: &PsFrame,
+    state: &mut SbrChannelState,
+    state_right_qmf: &mut super::qmf::QmfSynthesis,
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) -> Result<()> {
+    if state.freq.is_none() {
+        return Err(Error::invalid(
+            "SBR: decode_sbr_frame_ps called before header parse",
+        ));
+    }
+    if state.patches.is_none() {
+        return Err(Error::invalid(
+            "SBR: decode_sbr_frame_ps called before patch construction",
+        ));
+    }
+    if pcm_in.len() < 1024 || out_l.len() < 2048 || out_r.len() < 2048 {
+        return Err(Error::invalid(
+            "SBR+PS: decode_sbr_frame_ps requires 1024 input / 2048 output per channel",
+        ));
+    }
+    let num_time_slots = NUM_TIME_SLOTS_1024 as i32;
+    let num_slots = NUM_TIME_SLOTS_1024 * RATE;
+
+    // 1) Analysis QMF.
+    let (x_low, tail_len) = run_analysis(state, pcm_in, num_slots);
+
+    // 2) Update bwArray. Snapshot `nq` before re-borrowing state mutably.
+    let nq = state.freq.as_ref().unwrap().nq;
+    let cur_modes: [u8; 5] = {
+        let mut m = [0u8; 5];
+        for i in 0..nq.min(5) {
+            m[i] = sbr_data.bs_invf_mode[i];
+        }
+        m
+    };
+    let bw = update_bw(&state.bw_array, &state.prev_invf_modes, &cur_modes, nq);
+
+    // 3) HF generator.
+    let mut alpha0 = [Complex32::default(); 32];
+    let mut alpha1 = [Complex32::default(); 32];
+    compute_hf_lpc(&x_low, num_slots, super::T_HF_ADJ, &mut alpha0, &mut alpha1);
+    let mut x_high: Vec<[Complex32; NUM_QMF_BANDS]> =
+        vec![[Complex32::default(); NUM_QMF_BANDS]; x_low.len()];
+    {
+        let ft = state.freq.as_ref().unwrap();
+        let patches = state.patches.as_ref().unwrap();
+        apply_hf_generation(
+            &x_low,
+            &mut x_high,
+            patches,
+            ft,
+            &bw,
+            &alpha0,
+            &alpha1,
+            super::T_HF_ADJ,
+            0,
+            num_time_slots as usize,
+        );
+    }
+
+    // 4) HF adjuster.
+    let t_e = envelope_time_borders(sbr_data, num_time_slots);
+    let lim = {
+        let ft = state.freq.as_ref().unwrap();
+        let patches = state.patches.as_ref().unwrap();
+        build_limiter_bands(ft, patches, state.header.bs_limiter_bands)
+    };
+    let seed = (state.frame_count as u32)
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(0x9E37_79B9);
+    {
+        let ft = state.freq.as_ref().unwrap();
+        apply_envelope_with_limiter(
+            &mut x_high,
+            sbr_data,
+            ft,
+            &t_e,
+            super::T_HF_ADJ,
+            Some(&lim),
+            seed,
+        );
+    }
+
+    // 5) PS upmix — x_high → (x_left, x_right) at QMF granularity. We feed
+    //    only the newly-decoded range (skip the leading tail used as HF-gen
+    //    look-back). PS is applied over num_slots rows.
+    let mut x_left: Vec<[Complex32; NUM_QMF_BANDS]> =
+        vec![[Complex32::default(); NUM_QMF_BANDS]; num_slots];
+    let mut x_right: Vec<[Complex32; NUM_QMF_BANDS]> =
+        vec![[Complex32::default(); NUM_QMF_BANDS]; num_slots];
+    // Slice x_high[tail_len..tail_len+num_slots] as the mono input.
+    let x_mono = &x_high[tail_len..tail_len + num_slots];
+    apply_ps_qmf(x_mono, &mut x_left, &mut x_right, ps_frame, &mut state.ps);
+
+    // 6) Synthesis QMF — left reuses the mono-channel bank already in state,
+    //    right uses the caller-supplied bank. This gives each output channel
+    //    its own polyphase history.
+    let mut out64 = [0.0f32; 64];
+    for l in 0..num_slots {
+        state.qmf_synthesis.process(&x_left[l], &mut out64);
+        out_l[l * 64..l * 64 + 64].copy_from_slice(&out64);
+    }
+    for l in 0..num_slots {
+        state_right_qmf.process(&x_right[l], &mut out64);
+        out_r[l * 64..l * 64 + 64].copy_from_slice(&out64);
+    }
+
+    // 7) Carry forward.
     for (i, row) in x_low.iter().rev().take(tail_len).rev().enumerate() {
         state.x_low_tail[i] = *row;
     }
