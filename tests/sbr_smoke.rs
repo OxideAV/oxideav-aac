@@ -102,11 +102,13 @@ fn sbr_decode_frame_doubles_length() {
         .expect("freq tables"),
     );
     state.patches = Some(build_patches(state.freq.as_ref().unwrap(), sr_sbr).expect("patches"));
-    let mut data = SbrChannelData::default();
-    data.bs_amp_res = 1;
-    data.bs_num_env = 1;
-    data.bs_num_noise = 1;
-    data.frame_class = FrameClass::FixFix;
+    let mut data = SbrChannelData {
+        bs_amp_res: 1,
+        bs_num_env: 1,
+        bs_num_noise: 1,
+        frame_class: FrameClass::FixFix,
+        ..SbrChannelData::default()
+    };
     for b in 0..10 {
         data.env_sf[0][b] = 10;
     }

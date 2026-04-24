@@ -1,3 +1,9 @@
+// Normative numeric tables from ISO/IEC 14496-3 Annex 4.A (SBR).
+// The literal precision below matches the spec's printed coefficients byte-for-byte;
+// truncating to f32-representable digits would change the literal form the spec pins.
+// The module-level `#![allow(clippy::excessive_precision)]` lives in `tables.rs`
+// (this file is `include!`-ed, so inner attributes here don't reach the module).
+
 // ISO/IEC 14496-3 Table 4.A.89 — QMF bank window coefficients
 pub const QMF_C: [f32; 640] = [
     0.0000000000e+00,

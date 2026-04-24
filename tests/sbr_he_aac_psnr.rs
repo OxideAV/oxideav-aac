@@ -46,7 +46,7 @@ fn write_sine_wav(path: &Path, sr: u32, freq: f32, secs: f32, channels: u16) {
         }
     }
     let byte_rate = sr * 2 * channels as u32;
-    let block_align = 2 * channels as u16;
+    let block_align = 2 * channels;
     let mut wav = Vec::with_capacity(pcm.len() + 44);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&((pcm.len() + 36) as u32).to_le_bytes());

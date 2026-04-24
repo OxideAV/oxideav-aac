@@ -2,6 +2,13 @@
 //!
 //! All data transcribed from ISO/IEC 14496-3:2009 annex 4.A.6.
 
+// The generated normative Annex D / Annex 4.A float tables included below keep
+// the exact literal precision printed in the spec. The f32 values the compiler
+// materializes are identical to a shorter form, but we preserve the spec's
+// printed digits as a traceability aid, so clippy's excessive_precision lint
+// is silenced for the included data.
+#![allow(clippy::excessive_precision)]
+
 include!("tables_data.rs");
 
 /// Largest Absolute Value for each SBR Huffman table. A decoded Huffman
