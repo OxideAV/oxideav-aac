@@ -259,19 +259,34 @@ pub struct SbrFrameScalefactors {
 /// of complex QMF subbands on the high-rate PCM. Returns one envelope
 /// (bs_num_env=1) covering the full frame.
 ///
-/// The decoder dequantises with `E_orig = 64 · 2^(acc_e / amp_res_bits)`.
-/// At amp_res=0 (1.5 dB step) `amp_res_bits=2`; at amp_res=1 (3.0 dB)
-/// `amp_res_bits=1`. We target the 1.5 dB path (FIXFIX num_env=1 forces
-/// amp_res=0) so the quantised integer is `round(log2(E/64) * 2)`.
+/// The decoder dequantises with `E_orig = 64 · 2^(acc_e / amp_res_bits)`
+/// (§4.6.18.7.1, ISO/IEC 14496-3:2009). At amp_res=0 (1.5 dB step)
+/// `amp_res_bits=2`; at amp_res=1 (3.0 dB) `amp_res_bits=1`. The decoder
+/// then applies `gain = sqrt(E_orig / E_curr)` (§4.6.18.7.5) where
+/// `E_curr` is computed from its own internal QMF on the AAC core PCM
+/// output.
 ///
-/// To avoid blow-up in the decoder's `gain = sqrt(E_orig / E_curr)` step
-/// when E_curr is tiny (near-silent high band from a low-frequency tone
-/// LPC-extrapolated into high subbands), we apply a modest clamp that
-/// keeps envelopes within a sensible dynamic range.
+/// **Scale convention (round 15)**: the AAC core decoder in this crate
+/// (and ffmpeg / afconvert) outputs PCM at native int16 amplitude scale
+/// (~32768 peak — see `decoder.rs` line 825-833 and §4.6.11.3.1 IMDCT
+/// scaling). Its QMF analysis therefore produces `|X|²` in int16-PCM
+/// scale². But our SBR encoder's QMF here runs on input PCM in
+/// normalised `[-1, 1]` float scale (see `he_aac_encoder.rs` line 122-124
+/// where i16 input is divided by 32768). To make the encoded `acc_e`
+/// values match the decoder-side `E_curr` units (so the gain formula
+/// reproduces the intended envelope), we multiply the squared QMF
+/// magnitudes by `INT16_SCALE_SQ = 2^30` before quantising. Without this
+/// scale, every band's `e` was tiny → `v_15 < 0` → clamped to 0 by the
+/// 7-bit unsigned writer → decoder synthesised `E_orig = 64` (the
+/// minimum representable) → `gain ≈ sqrt(64 / E_curr) ≫ 1` → spurious
+/// noise just above the SBR crossover.
 pub fn estimate_envelope(
     x_high: &[[Complex32; NUM_QMF_BANDS]],
     ft: &FreqTables,
 ) -> SbrFrameScalefactors {
+    // 32768² = 2^30 ≈ 1.0737e9. Brings `[-1, 1]` PCM-float QMF energies
+    // up to int16-PCM scale² so the encoder and decoder formulas line up.
+    const INT16_SCALE_SQ: f32 = (32768.0 * 32768.0) as f32;
     let n = x_high.len().max(1) as f32;
     let mut env = vec![0i32; ft.n_high];
     for band in 0..ft.n_high {
@@ -288,10 +303,13 @@ pub fn estimate_envelope(
             }
         }
         let bands = (k1 - k0) as f32;
-        let e = acc / (n * bands + 1e-30);
+        let e = (acc * INT16_SCALE_SQ) / (n * bands + 1e-30);
         // Quantised value at amp_res=0 (1.5 dB step): E = 64 * 2^(v/2)
-        // => v = round(log2(E/64) * 2). Allow negative values so
-        // silent / near-silent bands don't get a 64-unit energy floor.
+        // => v = round(log2(E/64) * 2). With INT16_SCALE_SQ baked in,
+        // typical signals land in [0, 100]; truly silent bands land at the
+        // clamp floor and the writer encodes 0 (decoder synthesises the
+        // spec's minimum E_orig = 64, which is then small relative to the
+        // decoder's int16-scale E_curr → gain ≈ 0).
         let v_15 = if e > 0.0 {
             ((e / 64.0).log2() * 2.0).round() as i32
         } else {
