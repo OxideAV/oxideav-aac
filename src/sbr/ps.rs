@@ -630,6 +630,151 @@ pub fn analyse_ps_params_10(
     out
 }
 
+/// Multi-envelope PS parameter set for one AAC frame (round-14).
+///
+/// Per ISO/IEC 14496-3 §8.6.4.6.2 (Table 8.29), one AAC frame may carry
+/// `num_env ∈ {0, 1, 2, 4}` PS envelopes — independent IID/ICC parameter
+/// sets that linearly interpolate across the frame's QMF time slots
+/// (envelope borders fall at slot indices `n_env[e] = num_qmf_slots * (e+1)
+/// / num_env`). For `num_env > 1` the encoder partitions the frame into
+/// equal-size sub-blocks and quantises each sub-block independently — this
+/// matches `frame_class = 0` (FIX_BORDERS) on the decoder side, which
+/// reconstructs the same uniform border grid.
+///
+/// `num_env = 1` collapses back to round-13 single-envelope behaviour.
+#[derive(Clone, Debug)]
+pub struct PsParamsFrame {
+    /// Per-envelope 10-band IID/ICC parameter sets.
+    pub envs: Vec<PsParams10>,
+}
+
+impl PsParamsFrame {
+    /// Single-envelope frame holding the given parameter set — backwards-
+    /// compatible wrapper for round-13 callers that only had one envelope.
+    pub fn single(p: PsParams10) -> Self {
+        Self { envs: vec![p] }
+    }
+
+    /// Identity-stereo single-envelope frame (IID = 0 dB, ICC index = 0
+    /// in every band). Useful as the fallback when no analyser staged a
+    /// real parameter set.
+    pub fn identity() -> Self {
+        Self::single(PsParams10::identity())
+    }
+
+    pub fn num_env(&self) -> usize {
+        self.envs.len()
+    }
+}
+
+impl Default for PsParamsFrame {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+/// Multi-envelope variant of [`analyse_ps_params_10`]. Splits the
+/// `num_qmf_slots` time slots into `num_env` equal-size sub-blocks (the
+/// decoder's FIX_BORDERS uniform grid, §8.6.4.6.2 / Table 8.29) and runs
+/// the same `(P_L, P_R, P_LR)` accumulation on each sub-block.
+///
+/// `num_env` must be in `{1, 2, 4}` (Table 8.29 row for `frame_class = 0`,
+/// `num_env_idx ∈ {1, 2, 3}`). Other values are clamped to 1.
+pub fn analyse_ps_params_10_multi_env(
+    x_l: &[[Complex32; NUM_QMF_BANDS]],
+    x_r: &[[Complex32; NUM_QMF_BANDS]],
+    num_env: usize,
+) -> PsParamsFrame {
+    let n_env = match num_env {
+        2 => 2,
+        4 => 4,
+        _ => 1,
+    };
+    let n_slots = x_l.len().min(x_r.len());
+    if n_env == 1 {
+        return PsParamsFrame::single(analyse_ps_params_10(x_l, x_r));
+    }
+    let mut envs = Vec::with_capacity(n_env);
+    for e in 0..n_env {
+        // Equal-size partition on `n_slots` — per §8.6.4.6.2 the decoder
+        // reconstructs FIX_BORDERS as `n_e = num_qmf_slots * (e+1) / num_env`,
+        // so envelope `e` covers slots `[start_e, end_e)` matching the
+        // decoder's grid exactly.
+        let start = n_slots * e / n_env;
+        let end = n_slots * (e + 1) / n_env;
+        envs.push(analyse_ps_params_10(&x_l[start..end], &x_r[start..end]));
+    }
+    PsParamsFrame { envs }
+}
+
+/// Detect transients in the input QMF energy profile — used to decide
+/// whether to split the AAC frame into 1, 2, or 4 PS envelopes
+/// (§8.6.4.6.2). Returns the recommended `num_env` value.
+///
+/// We compute the per-channel power summed over all 64 QMF bands for each
+/// of `n_subblocks` equal-size sub-blocks of the frame, then look at the
+/// maximum-to-mean ratio. If any sub-block exceeds the mean by `transient_db`
+/// dB or more, the energy profile is considered non-stationary and we
+/// recommend a finer split. Two thresholds are checked in order:
+///   * 6 dB jump → recommend `num_env = 4` (max temporal resolution)
+///   * 3 dB jump → recommend `num_env = 2`
+///   * otherwise → `num_env = 1`
+///
+/// Spec rationale: the IID/ICC interpolation across the envelope is linear
+/// (§8.6.4.6.4), so a sharp energy change inside one envelope smears the
+/// spatial cue. Splitting captures the transient on its own envelope.
+pub fn detect_num_env(
+    x_l: &[[Complex32; NUM_QMF_BANDS]],
+    x_r: &[[Complex32; NUM_QMF_BANDS]],
+) -> usize {
+    let n_slots = x_l.len().min(x_r.len());
+    if n_slots < 4 {
+        return 1;
+    }
+    // Use 4 sub-blocks for transient detection — matching the maximum
+    // `num_env` choice. If 4-block analysis flags a transient, we promote
+    // to 4-env; if only the 2-block view does, we use 2-env.
+    let block_pow = |n_blocks: usize| -> Vec<f64> {
+        (0..n_blocks)
+            .map(|e| {
+                let start = n_slots * e / n_blocks;
+                let end = n_slots * (e + 1) / n_blocks;
+                let mut p = 0.0f64;
+                for t in start..end {
+                    for k in 0..NUM_QMF_BANDS {
+                        let l = x_l[t][k];
+                        let r = x_r[t][k];
+                        p += (l.re as f64) * (l.re as f64)
+                            + (l.im as f64) * (l.im as f64)
+                            + (r.re as f64) * (r.re as f64)
+                            + (r.im as f64) * (r.im as f64);
+                    }
+                }
+                p
+            })
+            .collect()
+    };
+    let max_to_mean_db = |blocks: &[f64]| -> f64 {
+        let mean = blocks.iter().sum::<f64>() / blocks.len() as f64;
+        if mean < 1e-12 {
+            return 0.0;
+        }
+        let mx = blocks.iter().cloned().fold(0.0_f64, f64::max);
+        10.0 * (mx / mean).log10()
+    };
+    let blocks_4 = block_pow(4);
+    let blocks_2 = block_pow(2);
+    let r4 = max_to_mean_db(&blocks_4);
+    let r2 = max_to_mean_db(&blocks_2);
+    if r4 >= 6.0 {
+        4
+    } else if r2 >= 3.0 || r4 >= 3.0 {
+        2
+    } else {
+        1
+    }
+}
+
 /// nr_iid_par for iid_mode 0..5. Indexed by iid_mode.
 const NR_IID_PAR_TAB: [usize; 6] = [10, 20, 34, 10, 20, 34];
 /// nr_ipdopd_par for iid_mode 0..5.
@@ -793,6 +938,19 @@ pub fn huff_encode_icc_df(bw: &mut oxideav_core::bits::BitWriter, value: i32) {
     huff_encode(bw, value, HUFF_ICC_DF);
 }
 
+/// Encode one IID delta on the time-direction Huffman table 8.B.18
+/// (`huff_iid_dt[0]`). Used when the encoder picks `iid_dt = 1` for an
+/// envelope (per-band delta against the same band of the previous envelope).
+pub fn huff_encode_iid_dt0(bw: &mut oxideav_core::bits::BitWriter, value: i32) {
+    huff_encode(bw, value, HUFF_IID_DT0);
+}
+
+/// Encode one ICC delta on the time-direction Huffman table 8.B.19
+/// (`huff_icc_dt`). Used when the encoder picks `icc_dt = 1` for an envelope.
+pub fn huff_encode_icc_dt(bw: &mut oxideav_core::bits::BitWriter, value: i32) {
+    huff_encode(bw, value, HUFF_ICC_DT);
+}
+
 fn huff_encode(bw: &mut oxideav_core::bits::BitWriter, value: i32, table: &[HuffEntry]) {
     let entry = table
         .iter()
@@ -800,6 +958,39 @@ fn huff_encode(bw: &mut oxideav_core::bits::BitWriter, value: i32, table: &[Huff
         .or_else(|| table.iter().find(|e| e.value == 0))
         .expect("PS Huffman table must contain a `0` symbol");
     bw.write_u32(entry.code, entry.bits as u32);
+}
+
+/// Codeword length in bits for `value` in `table`, falling back to the `0`
+/// symbol if `value` is out of range. Used by the encoder to pick between
+/// freq-direction and time-direction differential coding (§8.6.4.6.2): the
+/// representation with the smaller total bit cost wins per envelope.
+fn huff_bits(value: i32, table: &[HuffEntry]) -> u32 {
+    let entry = table
+        .iter()
+        .find(|e| e.value == value)
+        .or_else(|| table.iter().find(|e| e.value == 0))
+        .expect("PS Huffman table must contain a `0` symbol");
+    entry.bits as u32
+}
+
+/// Bits required to encode an IID freq-direction delta (Table 8.B.18 df).
+pub fn huff_bits_iid_df0(value: i32) -> u32 {
+    huff_bits(value, HUFF_IID_DF0)
+}
+
+/// Bits required to encode an IID time-direction delta (Table 8.B.18 dt).
+pub fn huff_bits_iid_dt0(value: i32) -> u32 {
+    huff_bits(value, HUFF_IID_DT0)
+}
+
+/// Bits required to encode an ICC freq-direction delta (Table 8.B.19 df).
+pub fn huff_bits_icc_df(value: i32) -> u32 {
+    huff_bits(value, HUFF_ICC_DF)
+}
+
+/// Bits required to encode an ICC time-direction delta (Table 8.B.19 dt).
+pub fn huff_bits_icc_dt(value: i32) -> u32 {
+    huff_bits(value, HUFF_ICC_DT)
 }
 
 /// Decode one Huffman code from the bitstream.
@@ -2558,5 +2749,99 @@ mod tests {
             assert_eq!(p.iid_idx[b], 0);
             assert_eq!(p.icc_idx[b], 7, "anti-corr band {b} ICC = {}", p.icc_idx[b]);
         }
+    }
+
+    /// Round-14 — `analyse_ps_params_10_multi_env` with `num_env = 2`
+    /// returns a frame whose two envelopes capture different per-half
+    /// energies. We synthesise a stereo signal whose first half is L-only
+    /// and second half is R-only — the resulting per-envelope IID indices
+    /// must lie at opposite extremes of Table 8.25 for QMF bands carrying
+    /// energy.
+    #[test]
+    fn analyse_ps_multi_env_two_captures_temporal_variation() {
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        // First half: L only (IID very positive). Second half: R only (IID
+        // very negative). Stick to band 5 so the QMF→param mapping puts
+        // the energy in a single 10-band slot.
+        for slot in 0..n_slots / 2 {
+            for k in 0..NUM_QMF_BANDS {
+                x_l[slot][k] = Complex32::new(1.0, 0.0);
+            }
+        }
+        for slot in n_slots / 2..n_slots {
+            for k in 0..NUM_QMF_BANDS {
+                x_r[slot][k] = Complex32::new(1.0, 0.0);
+            }
+        }
+        let frame = analyse_ps_params_10_multi_env(&x_l, &x_r, 2);
+        assert_eq!(frame.envs.len(), 2);
+        // Env 0: L is dominant → IID = +∞ → quantised to +7.
+        // Env 1: R is dominant → IID = -∞ → quantised to -7.
+        for b in 0..10 {
+            assert_eq!(
+                frame.envs[0].iid_idx[b], 7,
+                "env0 band {b} IID = {} (want +7)",
+                frame.envs[0].iid_idx[b]
+            );
+            assert_eq!(
+                frame.envs[1].iid_idx[b], -7,
+                "env1 band {b} IID = {} (want -7)",
+                frame.envs[1].iid_idx[b]
+            );
+        }
+    }
+
+    /// Stationary input: every sub-block carries equal energy, so
+    /// `detect_num_env` must return 1 (no envelope split needed).
+    #[test]
+    fn detect_num_env_stationary_returns_one() {
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in 0..n_slots {
+            for k in 0..NUM_QMF_BANDS {
+                x_l[slot][k] = Complex32::new(1.0, 0.0);
+                x_r[slot][k] = Complex32::new(1.0, 0.0);
+            }
+        }
+        assert_eq!(detect_num_env(&x_l, &x_r), 1);
+    }
+
+    /// Transient input: ¾ of the frame silent, last quarter loud → the
+    /// 4-block max-to-mean ratio is 6 dB+ (one bin holds 4× mean) so
+    /// `detect_num_env` returns 4.
+    #[test]
+    fn detect_num_env_transient_returns_four() {
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in (3 * n_slots / 4)..n_slots {
+            for k in 0..NUM_QMF_BANDS {
+                x_l[slot][k] = Complex32::new(2.0, 0.0);
+                x_r[slot][k] = Complex32::new(2.0, 0.0);
+            }
+        }
+        assert_eq!(detect_num_env(&x_l, &x_r), 4);
+    }
+
+    /// Mid-strength asymmetry — first half silent, second half loud.
+    /// Per-sub-block energies: `[0, 0, 1, 1]` (4-block view) → max/mean
+    /// = 2.0 → 3.01 dB → just at the 3 dB threshold for `num_env = 2`,
+    /// well under 6 dB so no escalation to `num_env = 4`.
+    #[test]
+    fn detect_num_env_mid_asymmetry_returns_two() {
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in n_slots / 2..n_slots {
+            for k in 0..NUM_QMF_BANDS {
+                x_l[slot][k] = Complex32::new(1.0, 0.0);
+                x_r[slot][k] = Complex32::new(1.0, 0.0);
+            }
+        }
+        let n = detect_num_env(&x_l, &x_r);
+        assert_eq!(n, 2, "expected num_env = 2, got {n}");
     }
 }

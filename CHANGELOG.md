@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 14)
+- HE-AACv2 PS encoder picks **time-direction** vs frequency-direction
+  differential coding per envelope (`iid_dt[e]`, `icc_dt[e]`) by comparing
+  Huffman-coded bit cost (§8.6.4.6.2). On a stationary input, frame N's
+  per-band IID/ICC indices match frame N-1, so every band's DT delta is 0
+  → 1-bit-per-band codeword (Table 8.B.18 / 8.B.19), which beats DF for
+  any non-trivial parameter set. `SbrEncoder` now tracks last-envelope
+  `prev_iid_idx` / `prev_icc_idx` per stream to seed the DT baseline.
+- **Multi-envelope PS** (`num_env ∈ {1, 2, 4}`, Table 8.29): new
+  `PsParamsFrame` / `analyse_ps_params_10_multi_env` analyser splits the
+  AAC frame into equal-size sub-blocks, quantises each independently, and
+  emits `num_env_idx` per §8.6.4.6.2. `detect_num_env` picks the count
+  from the per-channel QMF energy profile — 6 dB max-to-mean ratio →
+  `num_env = 4`, 3 dB → `num_env = 2`, else 1. `HeAacV2Encoder` is wired
+  to the multi-envelope path; transients now ride a per-quarter-frame
+  envelope grid instead of being smeared across one whole-frame envelope.
+- `huff_bits_iid_df0` / `huff_bits_iid_dt0` / `huff_bits_icc_df` /
+  `huff_bits_icc_dt` — public Huffman cost functions on Tables 8.B.18 /
+  8.B.19, used by the encoder's df-vs-dt selector.
+- `tests/he_aac_v2_multi_env.rs` — interop tests: transient stereo (silent
+  → tone) decodes through ffmpeg with the silent→loud energy step ≥ 6 dB
+  preserved; stationary L=1 kHz / R=2 kHz panned input keeps ≥ 20 % of
+  samples differing |L−R| > 32 after the DT-encoded warmup.
+- `tests/he_aac_v2_psnr_afconvert.rs` — round-14 plan C: encode the same
+  mixed-content stereo through `HeAacV2Encoder` and Apple `afconvert
+  -d aacp` (HE-AACv2), decode both via ffmpeg, report per-channel PSNR.
+  Current gap: ours ≈ 7-9 dB vs afconvert's 15-19 dB on the chosen test
+  signal, so still room to tighten.
+
 ### Fixed
 - HE-AACv1 stereo CPE bitstream ordering (Table 4.66, `bs_coupling = 0`):
   the **independent**-coupling branch transmits `envelope(L)`,

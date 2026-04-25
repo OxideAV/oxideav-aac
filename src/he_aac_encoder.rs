@@ -30,7 +30,7 @@ use oxideav_core::{
 
 use crate::encoder::{AacEncoder, SbrFilBits};
 use crate::sbr::encode::{Downsampler, QmfAnalysis64, SbrEncoder, SbrStereoEncoder};
-use crate::sbr::ps::analyse_ps_params_10;
+use crate::sbr::ps::{analyse_ps_params_10_multi_env, detect_num_env};
 use crate::sbr::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024};
 
 /// Number of high-rate input samples per encoded frame — one AAC core
@@ -708,10 +708,14 @@ impl HeAacV2Encoder {
         self.high_pcm_l.drain(..to_take);
         self.high_pcm_r.drain(..to_take);
 
-        // 1) Per-channel QMF analysis → real PS parameters (10-band IID + ICC).
+        // 1) Per-channel QMF analysis → real PS parameters.
+        //    Round-14: detect transients on the QMF energy profile to pick
+        //    `num_env ∈ {1, 2, 4}` (§8.6.4.6.2 / Table 8.29). Stationary
+        //    content stays at the round-13 single-envelope path.
         let (x_l, x_r) = self.analyse_lr(&block_l, &block_r);
-        let ps_params = analyse_ps_params_10(&x_l, &x_r);
-        self.sbr.set_pending_ps(ps_params);
+        let num_env = detect_num_env(&x_l, &x_r);
+        let ps_frame = analyse_ps_params_10_multi_env(&x_l, &x_r, num_env);
+        self.sbr.set_pending_ps_frame(ps_frame);
 
         // 2) Downmix to mono (L+R averaged with 0.5 attenuation) for the
         //    SBR mono analysis path. The SBR scalefactors describe the

@@ -37,7 +37,11 @@ use oxideav_core::bits::BitWriter;
 
 use super::bitstream::{FrameClass, SbrHeader, EXT_SBR_DATA};
 use super::freq::FreqTables;
-use super::ps::{huff_encode_icc_df, huff_encode_iid_df0, PsParams10, EXT_ID_PS_DATA};
+use super::ps::{
+    huff_bits_icc_df, huff_bits_icc_dt, huff_bits_iid_df0, huff_bits_iid_dt0, huff_encode_icc_df,
+    huff_encode_icc_dt, huff_encode_iid_df0, huff_encode_iid_dt0, PsParams10, PsParamsFrame,
+    EXT_ID_PS_DATA,
+};
 use super::tables::{LAV_ENV_3_0DB, LAV_NOISE_3_0DB};
 use super::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024};
 
@@ -338,10 +342,21 @@ pub struct SbrEncoder {
     /// every band, equivalent to [`write_ps_data_noop`].
     pub emit_ps: bool,
     /// PS parameters to emit on the next frame. Set by an external PS
-    /// analyser via [`Self::set_pending_ps`]; consumed-and-cleared on each
-    /// `emit_sbr_payload` call so a missing `set_pending_ps` always falls
-    /// back to identity stereo (rather than reusing stale parameters).
-    pub pending_ps: Option<PsParams10>,
+    /// analyser via [`Self::set_pending_ps`] / [`Self::set_pending_ps_frame`];
+    /// consumed-and-cleared on each `emit_sbr_payload` call so a missing
+    /// staged value always falls back to identity stereo (rather than
+    /// reusing stale parameters).
+    pub pending_ps: Option<PsParamsFrame>,
+    /// IID indices of the **last** envelope of the previously-emitted PS
+    /// frame, per parameter band (10 entries). Used by
+    /// [`write_ps_data_real`] as the time-direction differential baseline
+    /// per §8.6.4.6.2: when the encoder sets `iid_dt[0] = 1`, the first
+    /// envelope of this frame is decoded as `idx[b] = prev_iid_idx[b] + delta`.
+    /// Initialised to all-zero (matches the decoder's [`PsState`] reset).
+    pub prev_iid_idx: [i32; 10],
+    /// Companion to `prev_iid_idx` for ICC. Same role as in the decoder
+    /// state — last envelope's per-band ICC index from the previous frame.
+    pub prev_icc_idx: [i32; 10],
 }
 
 impl SbrEncoder {
@@ -390,15 +405,28 @@ impl SbrEncoder {
             frame_count: 0,
             emit_ps: false,
             pending_ps: None,
+            prev_iid_idx: [0; 10],
+            prev_icc_idx: [0; 10],
         })
     }
 
-    /// Stage a [`PsParams10`] set to be emitted with the next
-    /// [`Self::emit_sbr_payload`] call. The pending params are consumed
-    /// (set back to `None`) on emission, so each frame's PS payload comes
-    /// from a fresh analysis pass.
+    /// Stage a [`PsParams10`] set to be emitted as a single-envelope PS
+    /// frame on the next [`Self::emit_sbr_payload`] call. The pending
+    /// params are consumed (set back to `None`) on emission, so each
+    /// frame's PS payload comes from a fresh analysis pass.
+    ///
+    /// Backwards-compatible round-13 entry point — equivalent to calling
+    /// [`Self::set_pending_ps_frame`] with `PsParamsFrame::single(params)`.
     pub fn set_pending_ps(&mut self, params: PsParams10) {
-        self.pending_ps = Some(params);
+        self.pending_ps = Some(PsParamsFrame::single(params));
+    }
+
+    /// Stage a multi-envelope [`PsParamsFrame`] (round-14) for the next
+    /// payload. Pass `PsParamsFrame::single` for `num_env = 1` (round-13
+    /// behaviour); a frame with 2 or 4 envelopes triggers the `num_env > 1`
+    /// PS bitstream layout per §8.6.4.6.2 (Table 8.29).
+    pub fn set_pending_ps_frame(&mut self, frame: PsParamsFrame) {
+        self.pending_ps = Some(frame);
     }
 
     /// Enable / disable Parametric Stereo emission. When enabled, every
@@ -455,17 +483,25 @@ impl SbrEncoder {
         // extension inside `bs_extended_data` so the stream is
         // HE-AACv2-compatible.
         if self.emit_ps {
-            // Use pending real PS params if staged this frame; otherwise
-            // fall back to the identity (no-op) payload so the bitstream
+            // Use pending real PS frame if staged; otherwise fall back to
+            // the identity (no-op) single-envelope payload so the bitstream
             // remains structurally valid.
-            let ps = self.pending_ps.take().unwrap_or_else(PsParams10::identity);
-            write_single_channel_element_mono_with_ps_real(
+            let ps_frame = self.pending_ps.take().unwrap_or_default();
+            let (last_iid, last_icc) = write_single_channel_element_mono_with_ps_real(
                 &mut bw,
                 &self.header,
                 &self.freq,
                 &sf,
-                &ps,
+                &ps_frame,
+                &self.prev_iid_idx,
+                &self.prev_icc_idx,
             );
+            // Update prev-frame state for the next call's time-direction
+            // differential baseline. The decoder's PsState updates in the
+            // exact same way (§8.6.4.6.2 — "after parsing the last
+            // envelope, prev = idxs of last envelope").
+            self.prev_iid_idx = last_iid;
+            self.prev_icc_idx = last_icc;
         } else {
             write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
         }
@@ -845,7 +881,65 @@ pub fn write_single_channel_element_mono_with_ps(
 ///
 /// Returns the exact bit-count written (variable, since Huffman
 /// codewords vary in length 1..17 bits).
-pub fn write_ps_data_real(bw: &mut BitWriter, params: &PsParams10) -> u32 {
+/// Cost (in bits) and payload-write closure for one envelope's IID coding,
+/// in either freq-direction or time-direction. The encoder picks whichever
+/// representation is cheaper (§8.6.4.6.2: each envelope independently sets
+/// `iid_dt[e]` to 0 or 1).
+fn iid_envelope_costs(env_idx: &[i32; 10], prev: &[i32; 10]) -> (u32, u32) {
+    // df: delta[0] = idx[0] - 0, delta[b] = idx[b] - idx[b-1]. Range ±14.
+    let mut df_bits = 0u32;
+    let mut prev_band = 0i32;
+    for b in 0..10 {
+        let cur = env_idx[b].clamp(-7, 7);
+        let delta = (cur - prev_band).clamp(-14, 14);
+        df_bits += huff_bits_iid_df0(delta);
+        prev_band += delta;
+    }
+    // dt: delta[b] = idx[b] - prev_frame_idx[b]. Range ±14.
+    let mut dt_bits = 0u32;
+    for b in 0..10 {
+        let cur = env_idx[b].clamp(-7, 7);
+        let delta = (cur - prev[b]).clamp(-14, 14);
+        dt_bits += huff_bits_iid_dt0(delta);
+    }
+    (df_bits, dt_bits)
+}
+
+fn icc_envelope_costs(env_idx: &[i32; 10], prev: &[i32; 10]) -> (u32, u32) {
+    let mut df_bits = 0u32;
+    let mut prev_band = 0i32;
+    for b in 0..10 {
+        let cur = env_idx[b].clamp(0, 7);
+        let delta = (cur - prev_band).clamp(-7, 7);
+        df_bits += huff_bits_icc_df(delta);
+        prev_band += delta;
+    }
+    let mut dt_bits = 0u32;
+    for b in 0..10 {
+        let cur = env_idx[b].clamp(0, 7);
+        let delta = (cur - prev[b]).clamp(-7, 7);
+        dt_bits += huff_bits_icc_dt(delta);
+    }
+    (df_bits, dt_bits)
+}
+
+/// Write the PS extension payload (`ps_data()`, §8.6.4.6.2) for a multi-
+/// envelope frame. For each envelope picks freq-direction or time-direction
+/// differential coding per parameter (`iid_dt[e]`, `icc_dt[e]`) by comparing
+/// Huffman-coded bit cost; emits the cheaper one. Returns `(bits_written,
+/// last_iid_idx, last_icc_idx)` — the last-envelope per-band indices feed
+/// the next frame's time-direction baseline (matches `PsState` update on
+/// the decoder side).
+///
+/// `prev_iid_idx` / `prev_icc_idx` hold the last envelope's per-band indices
+/// from the **previous** PS frame; they must be the same values the
+/// decoder's `PsState.prev_*_idx` holds at frame boundary.
+pub fn write_ps_data_real(
+    bw: &mut BitWriter,
+    frame: &PsParamsFrame,
+    prev_iid_idx: &[i32; 10],
+    prev_icc_idx: &[i32; 10],
+) -> (u32, [i32; 10], [i32; 10]) {
     let start = bw.bit_position();
     // ---- Header (same as the no-op variant). ----
     bw.write_bit(true); // enable_ps_header
@@ -855,34 +949,92 @@ pub fn write_ps_data_real(bw: &mut BitWriter, params: &PsParams10) -> u32 {
     bw.write_u32(0, 3); // icc_mode = 0
     bw.write_bit(false); // enable_ext = 0
 
-    // ---- Frame ----
+    // ---- Frame ---- §8.6.4.6.2 (Table 8.29): frame_class = 0 → uniform
+    // FIX_BORDERS grid; num_env ∈ {0, 1, 2, 4} via num_env_idx ∈ {0, 1, 2, 3}.
+    let num_env = frame.envs.len().max(1);
+    let num_env_idx: u32 = match num_env {
+        1 => 1,
+        2 => 2,
+        4 => 3,
+        _ => 1, // unsupported → coerce to 1
+    };
     bw.write_bit(false); // frame_class = 0 (FIX_BORDERS)
-    bw.write_u32(1, 2); // num_env_idx = 1 → num_env = 1
+    bw.write_u32(num_env_idx, 2);
 
-    // IID, freq-direction differential. delta[0] = idx[0] - 0,
-    // delta[b] = idx[b] - idx[b-1]. Index range from `quantise_iid_default`
-    // is -7..=7, so deltas are bounded by ±14 — within huff_iid_df[0] table
-    // range (which covers -14..14).
-    bw.write_bit(false); // iid_dt[0] = 0 (freq-direction)
-    let mut prev = 0i32;
-    for b in 0..10 {
-        let cur = params.iid_idx[b].clamp(-7, 7);
-        let delta = (cur - prev).clamp(-14, 14);
-        huff_encode_iid_df0(bw, delta);
-        prev += delta;
+    // IID per envelope — pick df vs dt independently per envelope. The
+    // dt baseline for envelope 0 is `prev_iid_idx` from the previous frame;
+    // for envelope e>0 it is the previous envelope's indices in this frame
+    // (see §8.6.4.6.2 — "differential coding always references the
+    // immediately preceding envelope, regardless of frame boundary").
+    let mut prev = *prev_iid_idx;
+    let mut last_iid = *prev_iid_idx;
+    for env in &frame.envs {
+        let env_idx = clamp_iid_10(&env.iid_idx);
+        let (df_bits, dt_bits) = iid_envelope_costs(&env_idx, &prev);
+        let use_dt = dt_bits < df_bits;
+        bw.write_bit(use_dt); // iid_dt[e]
+        if use_dt {
+            for b in 0..10 {
+                let delta = (env_idx[b] - prev[b]).clamp(-14, 14);
+                huff_encode_iid_dt0(bw, delta);
+            }
+        } else {
+            let mut prev_band = 0i32;
+            for b in 0..10 {
+                let delta = (env_idx[b] - prev_band).clamp(-14, 14);
+                huff_encode_iid_df0(bw, delta);
+                prev_band += delta;
+            }
+        }
+        prev = env_idx;
+        last_iid = env_idx;
     }
 
-    // ICC, freq-direction differential. ICC index range is 0..=7, so
-    // deltas are bounded by ±7 — within huff_icc_df table range.
-    bw.write_bit(false); // icc_dt[0] = 0 (freq-direction)
-    let mut prev = 0i32;
-    for b in 0..10 {
-        let cur = params.icc_idx[b].clamp(0, 7);
-        let delta = (cur - prev).clamp(-7, 7);
-        huff_encode_icc_df(bw, delta);
-        prev += delta;
+    // ICC per envelope — same df-vs-dt selection.
+    let mut prev = *prev_icc_idx;
+    let mut last_icc = *prev_icc_idx;
+    for env in &frame.envs {
+        let env_idx = clamp_icc_10(&env.icc_idx);
+        let (df_bits, dt_bits) = icc_envelope_costs(&env_idx, &prev);
+        let use_dt = dt_bits < df_bits;
+        bw.write_bit(use_dt); // icc_dt[e]
+        if use_dt {
+            for b in 0..10 {
+                let delta = (env_idx[b] - prev[b]).clamp(-7, 7);
+                huff_encode_icc_dt(bw, delta);
+            }
+        } else {
+            let mut prev_band = 0i32;
+            for b in 0..10 {
+                let delta = (env_idx[b] - prev_band).clamp(-7, 7);
+                huff_encode_icc_df(bw, delta);
+                prev_band += delta;
+            }
+        }
+        prev = env_idx;
+        last_icc = env_idx;
     }
-    (bw.bit_position() - start) as u32
+    let bits = (bw.bit_position() - start) as u32;
+    (bits, last_iid, last_icc)
+}
+
+/// Per-band clamp of an IID parameter envelope to the default-quant range
+/// `-7..=7` used by `iid_mode = 0`.
+fn clamp_iid_10(src: &[i32; 10]) -> [i32; 10] {
+    let mut out = [0i32; 10];
+    for b in 0..10 {
+        out[b] = src[b].clamp(-7, 7);
+    }
+    out
+}
+
+/// Per-band clamp of an ICC parameter envelope to `0..=7`.
+fn clamp_icc_10(src: &[i32; 10]) -> [i32; 10] {
+    let mut out = [0i32; 10];
+    for b in 0..10 {
+        out[b] = src[b].clamp(0, 7);
+    }
+    out
 }
 
 /// Write the SBR SCE element with a Parametric Stereo extension carrying
@@ -899,8 +1051,10 @@ pub fn write_single_channel_element_mono_with_ps_real(
     _header: &SbrHeader,
     freq: &FreqTables,
     sf: &SbrFrameScalefactors,
-    params: &PsParams10,
-) {
+    frame: &PsParamsFrame,
+    prev_iid_idx: &[i32; 10],
+    prev_icc_idx: &[i32; 10],
+) -> ([i32; 10], [i32; 10]) {
     // ---- Same body as write_single_channel_element_mono. ----
     bw.write_bit(false); // bs_data_extra
     bw.write_u32(FrameClass::FixFix as u32, 2);
@@ -920,7 +1074,8 @@ pub fn write_single_channel_element_mono_with_ps_real(
     // ps_data() (variable). Total content bits round up to bytes; any
     // slack is filled with zero bits.
     let mut sub = BitWriter::with_capacity(16);
-    let ps_bits = write_ps_data_real(&mut sub, params);
+    let (ps_bits, last_iid, last_icc) =
+        write_ps_data_real(&mut sub, frame, prev_iid_idx, prev_icc_idx);
     sub.align_to_byte();
     let ps_bytes = sub.finish();
 
@@ -933,9 +1088,11 @@ pub fn write_single_channel_element_mono_with_ps_real(
     if cnt_bytes < 15 {
         bw.write_u32(cnt_bytes, 4); // bs_extension_size
     } else {
+        // Escape mechanism (Table 4.65 / §4.6.18): bs_extension_size = 15
+        // means "use bs_esc_count", and the decoder computes
+        // total = 15 + bs_esc_count. So we emit `cnt_bytes - 15`.
         bw.write_u32(15, 4);
-        // bs_esc_count is "extension_size - 14" per Table 4.65.
-        bw.write_u32(cnt_bytes + 1 - 15, 8);
+        bw.write_u32(cnt_bytes - 15, 8);
     }
     bw.write_u32(EXT_ID_PS_DATA, 2); // bs_extension_id = 2
 
@@ -953,6 +1110,7 @@ pub fn write_single_channel_element_mono_with_ps_real(
     if fill_bits > 0 {
         bw.write_u32(0, fill_bits);
     }
+    (last_iid, last_icc)
 }
 
 /// Write an `sbr_channel_pair_element()` in **independent** coupling mode
@@ -1439,6 +1597,245 @@ mod tests {
                         want_icc,
                     );
                 }
+            }
+            other => panic!("expected Single SCE payload, got {other:?}"),
+        }
+    }
+
+    /// Round-14 — when the same parameter set is emitted on two
+    /// consecutive frames, the second frame's prev-baseline matches the
+    /// current values exactly: every band's time-direction delta is 0.
+    /// Since `huff_iid_dt[0]` symbol 0 is 1 bit (Table 8.B.18), 10 bands ×
+    /// 1 bit = 10 bits for the DT branch — much cheaper than DF (which
+    /// needs at least one wider codeword for the absolute first band when
+    /// the parameters are non-zero). The encoder must therefore pick
+    /// `iid_dt[0] = 1` (and likewise for ICC) on frame 2.
+    #[test]
+    fn ps_payload_picks_time_direction_when_stable() {
+        use crate::sbr::ps::PsParams10;
+
+        let mut enc = SbrEncoder::new(24_000).expect("construct");
+        enc.set_emit_ps(true);
+        // Non-zero params so DF coding pays for at least one wide codeword.
+        let mut params = PsParams10::default();
+        for b in 0..10 {
+            params.iid_idx[b] = if b % 2 == 0 { 4 } else { -4 };
+            params.icc_idx[b] = 3;
+        }
+        let pcm: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        // Frame 1 — primes the prev-baseline. Encoder's prev is all-zero
+        // so DF wins (DF[0] = signed-bias absolute → cheap; DT delta vs 0
+        // is also cheap, but DF tends to tie or beat for first frame).
+        enc.set_pending_ps(params.clone());
+        let x = enc.analyse(&pcm);
+        let (_, bits1) = enc.emit_sbr_payload(&x);
+        // Sanity: frame 1 published the staged params verbatim into the
+        // running prev-baseline.
+        for b in 0..10 {
+            assert_eq!(enc.prev_iid_idx[b], params.iid_idx[b]);
+            assert_eq!(enc.prev_icc_idx[b], params.icc_idx[b]);
+        }
+        // Frame 2 — same params, the prev-baseline now matches exactly so
+        // every band's DT delta is 0. The DT branch costs 10 bits per
+        // envelope (10 × 1-bit-zero-codeword). DF requires 0..6 bits per
+        // delta; for this alternating-sign pattern it pays multiple
+        // multi-bit deltas. So frame 2 must be strictly smaller than
+        // frame 1 — proof that the encoder picked DT over DF.
+        enc.set_pending_ps(params.clone());
+        let x = enc.analyse(&pcm);
+        let (_, bits2) = enc.emit_sbr_payload(&x);
+        assert!(
+            bits2 < bits1,
+            "expected DT to shrink frame 2 (bits1={bits1}, bits2={bits2}) — \
+             encoder did not pick time-direction differential coding",
+        );
+    }
+
+    /// Cost-only test: when the encoder's running prev exactly matches
+    /// the staged parameters, the DT representation costs `10 × 1 = 10`
+    /// bits (every per-band delta is 0, encoded as the single-bit "0"
+    /// codeword in `huff_iid_dt[0]` / `huff_icc_dt`). The DF path's first
+    /// delta is the absolute IID/ICC value, which costs more for any
+    /// non-zero parameter set.
+    #[test]
+    fn ps_dt_costs_less_than_df_for_repeated_params() {
+        use crate::sbr::ps::{
+            huff_bits_icc_df, huff_bits_icc_dt, huff_bits_iid_df0, huff_bits_iid_dt0,
+        };
+        let iid = [4, -4, 4, -4, 4, -4, 4, -4, 4, -4];
+        let icc = [3i32; 10];
+        // DF cost when prev = [0; 10] (frame-start baseline).
+        let mut df_iid = 0u32;
+        let mut p = 0i32;
+        for b in 0..10 {
+            let delta = iid[b] - p;
+            df_iid += huff_bits_iid_df0(delta);
+            p += delta;
+        }
+        let mut df_icc = 0u32;
+        let mut p = 0i32;
+        for b in 0..10 {
+            let delta = icc[b] - p;
+            df_icc += huff_bits_icc_df(delta);
+            p += delta;
+        }
+        // DT cost when prev = same as current (perfect prediction).
+        let mut dt_iid = 0u32;
+        for b in 0..10 {
+            dt_iid += huff_bits_iid_dt0(iid[b] - iid[b]);
+        }
+        let mut dt_icc = 0u32;
+        for b in 0..10 {
+            dt_icc += huff_bits_icc_dt(icc[b] - icc[b]);
+        }
+        assert_eq!(dt_iid, 10, "10 bands × 1-bit-zero-codeword == 10");
+        assert_eq!(dt_icc, 10, "10 bands × 1-bit-zero-codeword == 10");
+        assert!(
+            dt_iid < df_iid,
+            "DT IID ({dt_iid}b) should beat DF ({df_iid}b)"
+        );
+        assert!(
+            dt_icc < df_icc,
+            "DT ICC ({dt_icc}b) should beat DF ({df_icc}b)"
+        );
+    }
+
+    /// Multi-envelope payload (`num_env = 2`) round-trips through the
+    /// parser with both envelopes' IID/ICC values intact and the correct
+    /// `num_env` advertised in the bitstream.
+    #[test]
+    fn ps_payload_multi_env_two_round_trips() {
+        use crate::sbr::decode::{try_parse_sbr_extension_ext, SbrChannelState, SbrPayload};
+        use crate::sbr::ps::{PsParams10, PsParamsFrame, ICC_QUANT, IID_QUANT_DEFAULT};
+        use oxideav_core::bits::BitReader;
+
+        let mut enc = SbrEncoder::new(24_000).expect("construct");
+        enc.set_emit_ps(true);
+        // Envelope 0: IID +4 dB across the board, ICC index 1.
+        // Envelope 1: IID -4 dB, ICC index 4. Distinct enough that a
+        // collapse to a single envelope would be detectable.
+        let mut e0 = PsParams10::default();
+        let mut e1 = PsParams10::default();
+        for b in 0..10 {
+            e0.iid_idx[b] = 2;
+            e0.icc_idx[b] = 1;
+            e1.iid_idx[b] = -2;
+            e1.icc_idx[b] = 4;
+        }
+        enc.set_pending_ps_frame(PsParamsFrame { envs: vec![e0, e1] });
+        let pcm: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let x = enc.analyse(&pcm);
+        let (bytes, bits) = enc.emit_sbr_payload(&x);
+
+        let mut bw = BitWriter::with_capacity(bytes.len() + 1);
+        bw.write_u32(EXT_SBR_DATA, 4);
+        let full = (bits / 8) as usize;
+        for b in &bytes[..full] {
+            bw.write_u32(*b as u32, 8);
+        }
+        let tail = bits - full as u32 * 8;
+        if tail > 0 {
+            bw.write_u32((bytes[full] >> (8 - tail)) as u32, tail);
+        }
+        bw.align_to_byte();
+        let framed = bw.finish();
+        let mut br = BitReader::new(&framed);
+        let num_payload_bits = 4 + bits;
+        let mut state = SbrChannelState::new();
+        let parsed =
+            try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
+                .expect("parse multi-env ok");
+        match parsed {
+            Some(SbrPayload::Single { ps, .. }) => {
+                let ps = ps.expect("PS frame present");
+                assert_eq!(ps.num_env, 2, "expected num_env = 2");
+                assert_eq!(ps.iid_db.len(), 2);
+                assert_eq!(ps.icc.len(), 2);
+                // Verify env 0 and env 1 are dequantised correctly per
+                // band — proves the encoder/decoder grid agrees.
+                let want_iid_e0 = IID_QUANT_DEFAULT[(2 + 7) as usize];
+                let want_iid_e1 = IID_QUANT_DEFAULT[(-2 + 7) as usize];
+                let want_icc_e0 = ICC_QUANT[1];
+                let want_icc_e1 = ICC_QUANT[4];
+                for b in 0..10 {
+                    assert!(
+                        (ps.iid_db[0][b] - want_iid_e0).abs() < 1e-4,
+                        "env0 IID b={b}: got {}, want {want_iid_e0}",
+                        ps.iid_db[0][b]
+                    );
+                    assert!(
+                        (ps.iid_db[1][b] - want_iid_e1).abs() < 1e-4,
+                        "env1 IID b={b}: got {}, want {want_iid_e1}",
+                        ps.iid_db[1][b]
+                    );
+                    assert!(
+                        (ps.icc[0][b] - want_icc_e0).abs() < 1e-4,
+                        "env0 ICC b={b}: got {}, want {want_icc_e0}",
+                        ps.icc[0][b]
+                    );
+                    assert!(
+                        (ps.icc[1][b] - want_icc_e1).abs() < 1e-4,
+                        "env1 ICC b={b}: got {}, want {want_icc_e1}",
+                        ps.icc[1][b]
+                    );
+                }
+            }
+            other => panic!("expected Single SCE payload, got {other:?}"),
+        }
+    }
+
+    /// Multi-envelope payload (`num_env = 4`) round-trips through the
+    /// parser carrying all four distinct envelopes.
+    #[test]
+    fn ps_payload_multi_env_four_round_trips() {
+        use crate::sbr::decode::{try_parse_sbr_extension_ext, SbrChannelState, SbrPayload};
+        use crate::sbr::ps::{PsParams10, PsParamsFrame};
+        use oxideav_core::bits::BitReader;
+
+        let mut enc = SbrEncoder::new(24_000).expect("construct");
+        enc.set_emit_ps(true);
+        let mut envs = Vec::with_capacity(4);
+        for e in 0..4 {
+            let mut p = PsParams10::default();
+            for b in 0..10 {
+                p.iid_idx[b] = (e as i32) - 2; // -2, -1, 0, 1
+                p.icc_idx[b] = e as i32;
+            }
+            envs.push(p);
+        }
+        enc.set_pending_ps_frame(PsParamsFrame { envs });
+        let pcm: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let x = enc.analyse(&pcm);
+        let (bytes, bits) = enc.emit_sbr_payload(&x);
+
+        let mut bw = BitWriter::with_capacity(bytes.len() + 1);
+        bw.write_u32(EXT_SBR_DATA, 4);
+        let full = (bits / 8) as usize;
+        for b in &bytes[..full] {
+            bw.write_u32(*b as u32, 8);
+        }
+        let tail = bits - full as u32 * 8;
+        if tail > 0 {
+            bw.write_u32((bytes[full] >> (8 - tail)) as u32, tail);
+        }
+        bw.align_to_byte();
+        let framed = bw.finish();
+        let mut br = BitReader::new(&framed);
+        let num_payload_bits = 4 + bits;
+        let mut state = SbrChannelState::new();
+        let parsed =
+            try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
+                .expect("parse 4-env ok");
+        match parsed {
+            Some(SbrPayload::Single { ps, .. }) => {
+                let ps = ps.expect("PS frame present");
+                assert_eq!(ps.num_env, 4, "expected num_env = 4");
             }
             other => panic!("expected Single SCE payload, got {other:?}"),
         }
