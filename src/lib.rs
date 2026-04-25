@@ -83,6 +83,17 @@
 //!   pairs (coupled and independent) both decode to 2× rate stereo.
 //!
 //! HE-AACv2 (Parametric Stereo):
+//! - **Encoder**: `he_aac_encoder::HeAacV2Encoder` produces a mono SBR
+//!   SCE stream with a no-op PS extension (`bs_extension_id =
+//!   EXTENSION_ID_PS = 2`, §4.6.18 Table 4.112) carrying the identity-
+//!   stereo `ps_data()` payload (IID = 0 dB, ICC = 1 in all 10 bands,
+//!   §8.6.4 Table 8.9). `SbrEncoder::set_emit_ps(true)` lights up the PS
+//!   payload on existing mono SBR pipelines without other changes. The
+//!   bitstream is HE-AACv2-shaped: ffmpeg accepts it, recognises PS,
+//!   upmixes the mono SBR back to stereo at 2× the core sample rate,
+//!   and reconstructs `L = R = downmix(input)`. Real per-band IID/ICC
+//!   analysis (i.e. preserving the original stereo image rather than
+//!   collapsing it to mono) is the next layer above this scaffolding.
 //! - `sbr::ps` module parses ps_data() carried in the SBR extended_data
 //!   block (bs_extension_id = 2) — IID + ICC envelopes with coarse /
 //!   fine resolution.

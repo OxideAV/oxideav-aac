@@ -37,6 +37,7 @@ use oxideav_core::bits::BitWriter;
 
 use super::bitstream::{FrameClass, SbrHeader, EXT_SBR_DATA};
 use super::freq::FreqTables;
+use super::ps::EXT_ID_PS_DATA;
 use super::tables::{LAV_ENV_3_0DB, LAV_NOISE_3_0DB};
 use super::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024};
 
@@ -323,6 +324,15 @@ pub struct SbrEncoder {
     pub prev_env: Vec<i32>,
     /// Previously-emitted (absolute) noise scalefactors.
     pub prev_noise: Vec<i32>,
+    /// When `true`, every emitted SCE SBR payload also carries a
+    /// Parametric Stereo extension (`bs_extension_id = EXTENSION_ID_PS`,
+    /// see Table 4.112) inside the SBR `bs_extended_data` block. Used by
+    /// [`crate::he_aac_encoder::HeAacV2Encoder`] to produce a
+    /// HE-AACv2-compatible mono-SBR + PS bitstream that decoders such as
+    /// ffmpeg upmix to stereo. The PS payload is the no-op identity
+    /// payload from [`write_ps_data_noop`] — IID = 0 dB, ICC = 1 in all
+    /// bands — so the PS upmix reconstructs `L = R = mono` exactly.
+    pub emit_ps: bool,
 }
 
 impl SbrEncoder {
@@ -369,7 +379,20 @@ impl SbrEncoder {
             qmf: QmfAnalysis64::new(),
             downsampler: Downsampler::new(),
             frame_count: 0,
+            emit_ps: false,
         })
+    }
+
+    /// Enable / disable Parametric Stereo emission. When enabled, every
+    /// SCE SBR payload from [`Self::emit_sbr_payload`] embeds a no-op PS
+    /// extension so the bitstream is ffmpeg-decodable as HE-AACv2 (mono
+    /// SBR upmixed to stereo by the decoder). The PS parameters are all
+    /// zero (IID = 0 dB, ICC = 1) so the reconstructed `L = R = mono`.
+    ///
+    /// This is the round-12 "scaffolding" path: it lights up the
+    /// HE-AACv2 wire format without yet doing real PS analysis.
+    pub fn set_emit_ps(&mut self, on: bool) {
+        self.emit_ps = on;
     }
 
     /// Produce a `[num_slots * RATE][64]` high-rate QMF matrix from
@@ -409,8 +432,15 @@ impl SbrEncoder {
         if emit_header {
             write_sbr_header(&mut bw, &self.header);
         }
-        // sbr_data() for SCE: sbr_single_channel_element()
-        write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
+        // sbr_data() for SCE: sbr_single_channel_element(). When
+        // `emit_ps` is on, the SCE writer additionally emits the PS
+        // extension inside `bs_extended_data` so the stream is
+        // HE-AACv2-compatible.
+        if self.emit_ps {
+            write_single_channel_element_mono_with_ps(&mut bw, &self.header, &self.freq, &sf);
+        } else {
+            write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
+        }
         let bits_written = (bw.bit_position() - start) as u32;
         bw.align_to_byte();
 
@@ -632,6 +662,134 @@ pub fn write_single_channel_element_mono(
     bw.write_bit(false);
     // bs_extended_data = 0
     bw.write_bit(false);
+}
+
+/// Write a no-op `ps_data()` element — IID = 0 dB, ICC = 1, no IPD/OPD —
+/// per ISO/IEC 14496-3 §8.6.4 (Table 8.9). The header sets `iid_mode = 0`
+/// (10 IID bands, default 7-step quantisation grid, Table 8.24) and
+/// `icc_mode = 0` (10 ICC bands). One envelope (`num_env = 1`) carries
+/// `iid_index = 0` and `icc_index = 0` for every band.
+///
+/// Decoder semantics (Table 8.25 / 8.28): IID index 0 → 0 dB
+/// inter-channel level difference (centred), ICC index 0 → ρ = 1 (fully
+/// coherent). The PS mixing matrix at IID = 0, ICC = 1 reduces to
+/// `H = [[1, 0], [1, 0]]` (Ra mode, §8.6.4.6.2.1) so the upmix
+/// reconstructs `L = R = mono` from the SBR-decoded mono input — the
+/// "identity stereo" target for the round-1 PS encode.
+///
+/// Bit layout (35 bits):
+///
+/// ```text
+///   enable_ps_header  1   = 1
+///     enable_iid      1   = 1
+///       iid_mode      3   = 0  (10 bands, default quant)
+///     enable_icc      1   = 1
+///       icc_mode      3   = 0  (10 bands)
+///     enable_ext      1   = 0
+///   frame_class       1   = 0  (FIX_BORDERS)
+///   num_env_idx       2   = 1  → num_env = 1
+///   iid_dt[0]         1   = 0  (freq-direction)
+///   iid_data[0..10]  10   = ten "0" Huffman codewords (HUFF_IID_DF[0]
+///                            value 0 maps to the 1-bit code "0")
+///   icc_dt[0]         1   = 0
+///   icc_data[0..10]  10   = ten "0" Huffman codewords (HUFF_ICC_DF
+///                            value 0 maps to "0")
+/// ```
+///
+/// Per Table 8.29 the FIX_BORDERS column maps `num_env_idx = {0,1,2,3}`
+/// → `num_env = {0,1,2,4}`. We use index 1 so the very first frame
+/// already carries one envelope of parameters; index 0 (`num_env = 0`)
+/// would mean "reuse previous parameters" — which is undefined on the
+/// first frame.
+pub fn write_ps_data_noop(bw: &mut BitWriter) {
+    // ---- Header ----
+    bw.write_bit(true); // enable_ps_header
+    bw.write_bit(true); // enable_iid
+    bw.write_u32(0, 3); // iid_mode = 0  → 10 IID bands, default 7-step grid
+    bw.write_bit(true); // enable_icc
+    bw.write_u32(0, 3); // icc_mode = 0  → 10 ICC bands
+    bw.write_bit(false); // enable_ext = 0 (no IPD/OPD)
+
+    // ---- Frame ----
+    bw.write_bit(false); // frame_class = 0  (FIX_BORDERS)
+    bw.write_u32(1, 2); // num_env_idx = 1  → num_env = 1 (Table 8.29
+                        // FIX_BORDERS column).
+
+    // IID — 1 envelope × 10 bands of value 0.
+    // Per §8.6.4.4.1 / Table 8.B.18 huff_iid_df[0]: value 0 has codeword "0"
+    // (1 bit). bs_df_env-style flag: iid_dt[0] = 0 selects freq-diff.
+    bw.write_bit(false); // iid_dt[0] = 0 (freq-diff)
+    for _ in 0..10 {
+        bw.write_bit(false); // huff_iid_df[0] codeword for value 0 is "0"
+    }
+
+    // ICC — 1 envelope × 10 bands of value 0.
+    // Per §8.6.4.4.2 / Table 8.B.19 huff_icc_df: value 0 codeword is "0".
+    bw.write_bit(false); // icc_dt[0] = 0
+    for _ in 0..10 {
+        bw.write_bit(false); // huff_icc_df codeword for value 0 is "0"
+    }
+}
+
+/// Write the SBR SCE element with a Parametric Stereo extension embedded
+/// inside `bs_extended_data` (Table 4.65). Identical to
+/// [`write_single_channel_element_mono`] except the trailing
+/// `bs_extended_data` flag is set and the extended_data block carries
+/// one `bs_extension_id == EXTENSION_ID_PS` (= 2) element holding the
+/// no-op [`write_ps_data_noop`] payload.
+///
+/// Layout of the appended extended_data block:
+///
+/// ```text
+///   bs_extended_data       1 bit   = 1
+///   bs_extension_size      4 bits  = N  (or 15 + esc_count if N >= 15)
+///   --- N bytes of content ---
+///     bs_extension_id      2 bits  = 2  (EXTENSION_ID_PS)
+///     ps_data()           35 bits  (no-op payload above)
+///     fill_bits             p bits = 0  (pad to N · 8 bits)
+/// ```
+///
+/// With the no-op payload `2 + 35 = 37` content bits → `N = 5` bytes
+/// (40 bits) with 3 fill bits.
+pub fn write_single_channel_element_mono_with_ps(
+    bw: &mut BitWriter,
+    _header: &SbrHeader,
+    freq: &FreqTables,
+    sf: &SbrFrameScalefactors,
+) {
+    // ---- Same body as write_single_channel_element_mono up to the
+    //      bs_extended_data flag.
+    bw.write_bit(false); // bs_data_extra
+    bw.write_u32(FrameClass::FixFix as u32, 2);
+    bw.write_u32(0, 2); // bs_num_env = 1
+    bw.write_u32(1, 1); // bs_freq_res[0] = 1
+    bw.write_u32(0, 1); // bs_df_env[0] = 0
+    bw.write_u32(0, 1); // bs_df_noise[0] = 0
+    for _ in 0..freq.nq {
+        bw.write_u32(0, 2); // bs_invf_mode = 0 (off)
+    }
+    write_envelope_1_5db_freq_delta(bw, &sf.env, freq.n_high);
+    write_noise_3_0db_freq_delta(bw, &sf.noise, freq.nq);
+    bw.write_bit(false); // bs_add_harmonic_flag = 0
+
+    // ---- bs_extended_data = 1 + EXT_ID_PS extension.
+    bw.write_bit(true); // bs_extended_data = 1
+                        // Pre-compute content bytes: bs_extension_id (2) + ps_data (35) = 37 bits
+                        // → 5 bytes with 3 fill bits.
+    const PS_CONTENT_BITS: u32 = 2 + 35;
+    let cnt_bytes = PS_CONTENT_BITS.div_ceil(8); // = 5
+    let fill_bits = cnt_bytes * 8 - PS_CONTENT_BITS;
+    if cnt_bytes < 15 {
+        bw.write_u32(cnt_bytes, 4); // bs_extension_size
+    } else {
+        bw.write_u32(15, 4);
+        bw.write_u32(cnt_bytes + 1 - 15, 8); // bs_esc_count
+    }
+    bw.write_u32(EXT_ID_PS_DATA, 2); // bs_extension_id = 2
+    write_ps_data_noop(bw);
+    if fill_bits > 0 {
+        bw.write_u32(0, fill_bits);
+    }
 }
 
 /// Write an `sbr_channel_pair_element()` in **independent** coupling mode
@@ -988,6 +1146,61 @@ mod tests {
         match parsed {
             Some(SbrPayload::Single { data, .. }) => {
                 assert_eq!(data.bs_num_env, 1);
+            }
+            other => panic!("expected Single SCE payload, got {other:?}"),
+        }
+    }
+
+    /// PS-enabled SBR payload should round-trip through the parser and
+    /// surface a [`SbrPayload::Single`] with a populated `ps` frame whose
+    /// no-op IID/ICC parameters dequantise to identity stereo.
+    #[test]
+    fn emit_payload_with_ps_round_trips_and_carries_ps_frame() {
+        use crate::sbr::decode::{try_parse_sbr_extension_ext, SbrChannelState, SbrPayload};
+        use oxideav_core::bits::BitReader;
+        let mut enc = SbrEncoder::new(24_000).expect("construct");
+        enc.set_emit_ps(true);
+        let pcm: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let x = enc.analyse(&pcm);
+        let (bytes, bits) = enc.emit_sbr_payload(&x);
+        // Re-frame as a FIL inner payload: EXT_SBR_DATA + N bits of SBR.
+        let mut bw = BitWriter::with_capacity(bytes.len() + 1);
+        bw.write_u32(EXT_SBR_DATA, 4);
+        let full = (bits / 8) as usize;
+        for b in &bytes[..full] {
+            bw.write_u32(*b as u32, 8);
+        }
+        let tail = bits - full as u32 * 8;
+        if tail > 0 {
+            bw.write_u32((bytes[full] >> (8 - tail)) as u32, tail);
+        }
+        bw.align_to_byte();
+        let framed = bw.finish();
+        let mut br = BitReader::new(&framed);
+        let num_payload_bits = 4 + bits;
+        let mut state = SbrChannelState::new();
+        let parsed =
+            try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
+                .expect("parse ok");
+        match parsed {
+            Some(SbrPayload::Single { data, ps }) => {
+                assert_eq!(data.bs_num_env, 1);
+                let ps = ps.expect("PS frame should be present when emit_ps=true");
+                assert_eq!(ps.num_env, 1);
+                assert!(ps.has_iid, "no-op PS payload should set enable_iid");
+                assert!(ps.has_icc, "no-op PS payload should set enable_icc");
+                // IID = 0 dB, ICC = 1 (fully coherent) per Tables 8.25, 8.28.
+                for v in &ps.iid_db[0] {
+                    assert!(v.abs() < 1e-5, "IID should be 0 dB, got {v}");
+                }
+                for v in &ps.icc[0] {
+                    assert!(
+                        (*v - 1.0).abs() < 1e-5,
+                        "ICC should be 1 (fully coherent), got {v}"
+                    );
+                }
             }
             other => panic!("expected Single SCE payload, got {other:?}"),
         }

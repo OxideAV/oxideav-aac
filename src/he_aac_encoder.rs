@@ -491,6 +491,251 @@ impl Encoder for HeAacStereoEncoder {
     }
 }
 
+/// HE-AACv2 (mono SBR + Parametric Stereo) encoder — round-1 scaffolding.
+///
+/// Pipeline (ISO/IEC 14496-3 §1.6.5 / §8.6.4):
+///
+/// ```text
+///   2x-rate stereo PCM in
+///       ↓ downmix L+R → mono
+///   2x-rate mono PCM
+///       ↓ HeAacMonoEncoder pipeline (downsample + AAC-LC core SCE
+///       ↓                            + SBR analysis + envelope payload)
+///       ↓ SBR FIL element with EXT_ID_PS extension carrying a no-op
+///       ↓ ps_data() (IID = 0 dB, ICC = 1 in all 10 bands)
+///   ADTS frames out — decoder upmixes the mono SBR back to stereo
+///   with `L = R = mono` (identity stereo)
+/// ```
+///
+/// **Round-12 scope:** the PS payload is a fixed no-op — every frame
+/// emits the same identity-stereo header + envelope. This is *worse*
+/// than [`HeAacStereoEncoder`] for real stereo content (the spatial
+/// image collapses to mono) but it's a HE-AACv2-shaped bitstream that
+/// ffmpeg accepts and routes through its full PS decoder. Real PS
+/// analysis — extracting per-band IID and ICC from the input stereo
+/// signal — is the next step (out of round-12 scope).
+///
+/// `params.sample_rate` must be the *high* rate (2x core rate, e.g.
+/// 44 100 or 48 000 Hz). `params.channels` must be 2 (stereo input);
+/// the wrapper downmixes to mono before encoding.
+pub struct HeAacV2Encoder {
+    inner: AacEncoder,
+    sbr: SbrEncoder,
+    downsampler: Downsampler,
+    /// Buffer of 2x-rate mono samples (L+R averaged) pending encode.
+    high_pcm: Vec<f32>,
+    flushed: bool,
+    core_rate: u32,
+    out_rate: u32,
+    out_params: CodecParameters,
+}
+
+impl HeAacV2Encoder {
+    /// Build an HE-AACv2 encoder. The encoder takes 2-channel PCM at
+    /// `params.sample_rate` (the high rate, 2x the AAC-LC core),
+    /// downmixes to mono, runs the SBR + PS bitstream path, and emits
+    /// ADTS frames whose decoder output is stereo at the high rate.
+    pub fn new(params: &CodecParameters) -> Result<Self> {
+        let channels = params.channels.unwrap_or(2);
+        if channels != 2 {
+            return Err(Error::unsupported(
+                "HE-AACv2 encoder: input must be 2 channels (downmixed to mono internally)",
+            ));
+        }
+        let out_rate = params
+            .sample_rate
+            .ok_or_else(|| Error::invalid("HE-AAC encoder: sample_rate required"))?;
+        if out_rate % 2 != 0 {
+            return Err(Error::invalid(
+                "HE-AAC encoder: input sample rate must be even (2x core)",
+            ));
+        }
+        let core_rate = out_rate / 2;
+        // The inner AAC-LC core is **mono** SCE — PS upmixes the single
+        // SBR channel to two output channels at the decoder. ADTS
+        // therefore advertises channel_configuration = 1.
+        let mut inner_params = params.clone();
+        inner_params.sample_rate = Some(core_rate);
+        inner_params.channels = Some(1);
+        let inner = AacEncoder::new(&inner_params)?;
+        let mut sbr = SbrEncoder::new(core_rate)?;
+        sbr.set_emit_ps(true);
+        // Output params — we advertise 2 output channels even though the
+        // ADTS stream is mono SCE, because the decoder upmixes via PS.
+        let mut out_params = params.clone();
+        out_params.media_type = MediaType::Audio;
+        out_params.sample_format = Some(SampleFormat::S16);
+        out_params.channels = Some(2);
+        out_params.sample_rate = Some(out_rate);
+        Ok(Self {
+            inner,
+            sbr,
+            downsampler: Downsampler::new(),
+            high_pcm: Vec::with_capacity(HIGH_RATE_FRAME * 2),
+            flushed: false,
+            core_rate,
+            out_rate,
+            out_params,
+        })
+    }
+
+    fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
+        if frame.channels != 2 {
+            return Err(Error::invalid("HE-AACv2 encoder: expected 2-channel input"));
+        }
+        let n = frame.samples as usize;
+        if n == 0 {
+            return Ok(());
+        }
+        let plane = frame
+            .data
+            .first()
+            .ok_or_else(|| Error::invalid("HE-AAC encoder: missing data plane"))?;
+        match frame.format {
+            SampleFormat::S16 => {
+                let stride = 4usize; // 2 channels * 2 bytes
+                if plane.len() < n * stride {
+                    return Err(Error::invalid("HE-AAC encoder: S16 frame too short"));
+                }
+                for i in 0..n {
+                    let off = i * stride;
+                    let l = i16::from_le_bytes([plane[off], plane[off + 1]]) as f32 / 32768.0;
+                    let r = i16::from_le_bytes([plane[off + 2], plane[off + 3]]) as f32 / 32768.0;
+                    // Downmix: L+R averaged. (Sum-to-mono with a 0.5
+                    // attenuation to avoid clipping.)
+                    self.high_pcm.push(0.5 * (l + r));
+                }
+            }
+            SampleFormat::F32 => {
+                let stride = 8usize;
+                if plane.len() < n * stride {
+                    return Err(Error::invalid("HE-AAC encoder: F32 frame too short"));
+                }
+                for i in 0..n {
+                    let off = i * stride;
+                    let l = f32::from_le_bytes([
+                        plane[off],
+                        plane[off + 1],
+                        plane[off + 2],
+                        plane[off + 3],
+                    ]);
+                    let r = f32::from_le_bytes([
+                        plane[off + 4],
+                        plane[off + 5],
+                        plane[off + 6],
+                        plane[off + 7],
+                    ]);
+                    self.high_pcm.push(0.5 * (l + r));
+                }
+            }
+            other => {
+                return Err(Error::unsupported(format!(
+                    "HE-AACv2 encoder: sample format {other:?} not supported"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_frames(&mut self) -> Result<()> {
+        while self.high_pcm.len() >= HIGH_RATE_FRAME {
+            self.emit_frame(false)?;
+        }
+        Ok(())
+    }
+
+    fn emit_frame(&mut self, flush: bool) -> Result<()> {
+        let have = self.high_pcm.len();
+        if have == 0 {
+            return Ok(());
+        }
+        let to_take = have.min(HIGH_RATE_FRAME);
+        let mut block = vec![0.0f32; HIGH_RATE_FRAME];
+        block[..to_take].copy_from_slice(&self.high_pcm[..to_take]);
+        self.high_pcm.drain(..to_take);
+
+        // 1) SBR analysis on the mono signal + emit SCE+PS payload.
+        let x_high = self.sbr.analyse(&block);
+        let (sbr_bytes, bits) = self.sbr.emit_sbr_payload(&x_high);
+        self.inner.stage_sbr_fil(SbrFilBits {
+            bytes: sbr_bytes,
+            bits,
+        });
+
+        // 2) Downsample 2x → 1x for the AAC-LC core (mono SCE).
+        let mut low = vec![0.0f32; HIGH_RATE_FRAME / 2];
+        self.downsampler.process(&block, &mut low);
+        let mut bytes = Vec::with_capacity(low.len() * 4);
+        for v in &low {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let af = AudioFrame {
+            format: SampleFormat::F32,
+            channels: 1,
+            sample_rate: self.core_rate,
+            samples: low.len() as u32,
+            pts: None,
+            time_base: oxideav_core::TimeBase::new(1, self.core_rate as i64),
+            data: vec![bytes],
+        };
+        self.inner.send_frame(&Frame::Audio(af))?;
+        if flush {
+            self.inner.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Output sample rate (= 2 × core rate).
+    pub fn output_sample_rate(&self) -> u32 {
+        self.out_rate
+    }
+}
+
+impl Encoder for HeAacV2Encoder {
+    fn codec_id(&self) -> &CodecId {
+        self.inner.codec_id()
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.out_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        if self.flushed {
+            return Err(Error::other(
+                "HE-AACv2 encoder: flushed, cannot accept more frames",
+            ));
+        }
+        match frame {
+            Frame::Audio(af) => {
+                self.push_audio(af)?;
+                self.drain_frames()
+            }
+            _ => Err(Error::invalid("HE-AACv2 encoder: expected audio frame")),
+        }
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        self.inner.receive_packet()
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.flushed {
+            return Ok(());
+        }
+        if !self.high_pcm.is_empty() {
+            if self.high_pcm.len() < HIGH_RATE_FRAME {
+                self.high_pcm.resize(HIGH_RATE_FRAME, 0.0);
+            }
+            self.emit_frame(true)?;
+        } else {
+            self.inner.flush()?;
+        }
+        self.flushed = true;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
