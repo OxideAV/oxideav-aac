@@ -429,6 +429,151 @@ impl SbrEncoder {
     }
 }
 
+/// Stereo SBR encoder for HE-AACv1 CPE streams (§4.6.18.3.5,
+/// `sbr_channel_pair_element` independent / `bs_coupling = 0`).
+///
+/// Holds a shared `SbrHeader` + `FreqTables` (since both channels MUST
+/// agree on the SBR setup) plus per-channel analysis QMF banks,
+/// downsamplers, and previous-frame scalefactor state. Each call to
+/// [`Self::analyse`] / [`Self::emit_sbr_payload_pair`] processes one
+/// stereo frame.
+///
+/// The emitted CPE payload uses **independent** coupling — both channels
+/// carry their own grid, dtdf, invf, envelope, and noise. We choose
+/// independent over coupled because:
+///   1. It's a strict superset: every signal that can be coupled-encoded
+///      can be independently encoded.
+///   2. Round 1 doesn't need to estimate an L/R energy ratio for the
+///      balance Huffman path.
+///   3. The decoder side already supports both paths (parser tested).
+#[derive(Clone, Debug)]
+pub struct SbrStereoEncoder {
+    pub header: SbrHeader,
+    pub freq: FreqTables,
+    pub qmf_l: QmfAnalysis64,
+    pub qmf_r: QmfAnalysis64,
+    pub downsampler_l: Downsampler,
+    pub downsampler_r: Downsampler,
+    pub frame_count: u64,
+    /// Previously-emitted (absolute) per-channel envelope scalefactors.
+    /// Currently unused — freq-direction delta coding doesn't need
+    /// previous-frame state. Kept so a future time-delta encoder can
+    /// switch to bs_df_env=1 without reshaping the public type.
+    pub prev_env_l: Vec<i32>,
+    pub prev_env_r: Vec<i32>,
+    pub prev_noise_l: Vec<i32>,
+    pub prev_noise_r: Vec<i32>,
+}
+
+impl SbrStereoEncoder {
+    /// Build a stereo SBR encoder for the given AAC-LC core sample rate.
+    /// Defaults match [`SbrEncoder::new`] so a stereo HE-AAC stream is
+    /// header-compatible with a mono one.
+    pub fn new(core_rate: u32) -> oxideav_core::Result<Self> {
+        // Re-use the mono encoder's header + freq table choice by building
+        // a throwaway mono encoder. This guarantees both encoders make the
+        // same SBR-band decisions.
+        let mono = SbrEncoder::new(core_rate)?;
+        Ok(Self {
+            header: mono.header.clone(),
+            prev_env_l: vec![0; mono.freq.n_high],
+            prev_env_r: vec![0; mono.freq.n_high],
+            prev_noise_l: vec![0; mono.freq.nq],
+            prev_noise_r: vec![0; mono.freq.nq],
+            freq: mono.freq,
+            qmf_l: QmfAnalysis64::new(),
+            qmf_r: QmfAnalysis64::new(),
+            downsampler_l: Downsampler::new(),
+            downsampler_r: Downsampler::new(),
+            frame_count: 0,
+        })
+    }
+
+    /// Run the per-channel analysis QMF on one stereo high-rate block.
+    /// `high_pcm_l` and `high_pcm_r` are each 2048 samples (one core
+    /// frame at 2× rate). Returns the two `[32][64]` complex matrices.
+    pub fn analyse(
+        &mut self,
+        high_pcm_l: &[f32],
+        high_pcm_r: &[f32],
+    ) -> (
+        Vec<[Complex32; NUM_QMF_BANDS]>,
+        Vec<[Complex32; NUM_QMF_BANDS]>,
+    ) {
+        let num_slots = NUM_TIME_SLOTS_1024 * super::RATE; // 32
+        let mut x_l = vec![[Complex32::default(); NUM_QMF_BANDS]; num_slots];
+        let mut x_r = vec![[Complex32::default(); NUM_QMF_BANDS]; num_slots];
+        let mut tmp = [0.0f32; 64];
+        for l in 0..num_slots {
+            tmp.copy_from_slice(&high_pcm_l[l * 64..l * 64 + 64]);
+            self.qmf_l.process(&tmp, &mut x_l[l]);
+            tmp.copy_from_slice(&high_pcm_r[l * 64..l * 64 + 64]);
+            self.qmf_r.process(&tmp, &mut x_r[l]);
+        }
+        (x_l, x_r)
+    }
+
+    /// Emit one stereo SBR payload (CPE, independent coupling). Returns
+    /// the byte-aligned bytes and the exact meaningful-bit count.
+    ///
+    /// Layout follows Table 4.66 with `bs_data_extra=0` and `bs_coupling=0`:
+    ///
+    /// ```text
+    /// bs_data_extra      1 bit  = 0
+    /// bs_coupling        1 bit  = 0
+    /// sbr_grid(L)
+    /// sbr_grid(R)
+    /// sbr_dtdf(L)
+    /// sbr_dtdf(R)
+    /// sbr_invf(L)        2 * Nq bits
+    /// sbr_invf(R)        2 * Nq bits
+    /// sbr_envelope(L, df=0)
+    /// sbr_noise(L,    df=0)
+    /// sbr_envelope(R, df=0)
+    /// sbr_noise(R,    df=0)
+    /// bs_add_harmonic_flag(L)  = 0
+    /// bs_add_harmonic_flag(R)  = 0
+    /// bs_extended_data         = 0
+    /// ```
+    pub fn emit_sbr_payload_pair(
+        &mut self,
+        x_l: &[[Complex32; NUM_QMF_BANDS]],
+        x_r: &[[Complex32; NUM_QMF_BANDS]],
+    ) -> (Vec<u8>, u32) {
+        let sf_l = estimate_envelope(x_l, &self.freq);
+        let sf_r = estimate_envelope(x_r, &self.freq);
+        let mut bw = BitWriter::with_capacity(128);
+        let start = bw.bit_position();
+        let emit_header = self.frame_count == 0 || (self.frame_count % 8) == 0;
+        bw.write_bit(emit_header);
+        if emit_header {
+            write_sbr_header(&mut bw, &self.header);
+        }
+        // sbr_data() for CPE: sbr_channel_pair_element() in independent
+        // mode (bs_coupling = 0).
+        write_channel_pair_element_independent(&mut bw, &self.freq, &sf_l, &sf_r);
+        let bits_written = (bw.bit_position() - start) as u32;
+        bw.align_to_byte();
+
+        self.prev_env_l.clone_from(&sf_l.env);
+        self.prev_env_r.clone_from(&sf_r.env);
+        self.prev_noise_l.clone_from(&sf_l.noise);
+        self.prev_noise_r.clone_from(&sf_r.noise);
+        self.frame_count = self.frame_count.wrapping_add(1);
+        (bw.finish(), bits_written)
+    }
+
+    /// Convenience wrapper for `analyse` + `emit_sbr_payload_pair`.
+    pub fn encode_frame_fil_pair(
+        &mut self,
+        high_pcm_l: &[f32],
+        high_pcm_r: &[f32],
+    ) -> (Vec<u8>, u32) {
+        let (xl, xr) = self.analyse(high_pcm_l, high_pcm_r);
+        self.emit_sbr_payload_pair(&xl, &xr)
+    }
+}
+
 /// Write an sbr_header() element. Matches the inverse of
 /// [`crate::sbr::bitstream::parse_sbr_header`] exactly.
 pub fn write_sbr_header(bw: &mut BitWriter, h: &SbrHeader) {
@@ -484,6 +629,64 @@ pub fn write_single_channel_element_mono(
     // Noise — always uses the 3.0 dB noise tables (no 1.5 dB variant).
     write_noise_3_0db_freq_delta(bw, &sf.noise, freq.nq);
     // bs_add_harmonic_flag = 0
+    bw.write_bit(false);
+    // bs_extended_data = 0
+    bw.write_bit(false);
+}
+
+/// Write an `sbr_channel_pair_element()` in **independent** coupling mode
+/// (Table 4.66 with `bs_data_extra=0` and `bs_coupling=0`). Each channel
+/// gets its own minimal FIXFIX `bs_num_env=1` grid (matching the mono
+/// SCE writer above) plus envelope / noise data quantised at amp_res=0
+/// (1.5 dB envelope, 3.0 dB noise). No sinusoids, no extended data.
+///
+/// The decoder side uses the inherited `bs_amp_res` from the SBR header
+/// — but FIXFIX with `bs_num_env == 1` overrides it to 0 inside
+/// `parse_sbr_grid` (§4.6.18.3.3). So our 1.5 dB envelope tables are
+/// the right pick regardless of `header.bs_amp_res`.
+pub fn write_channel_pair_element_independent(
+    bw: &mut BitWriter,
+    freq: &FreqTables,
+    sf_l: &SbrFrameScalefactors,
+    sf_r: &SbrFrameScalefactors,
+) {
+    bw.write_bit(false); // bs_data_extra = 0
+    bw.write_bit(false); // bs_coupling  = 0 (independent)
+
+    // sbr_grid for L — FIXFIX, bs_num_env=1, freq_res=1.
+    bw.write_u32(FrameClass::FixFix as u32, 2);
+    bw.write_u32(0, 2); // bs_num_env = 1
+    bw.write_u32(1, 1); // bs_freq_res[0] = 1 (high-res)
+
+    // sbr_grid for R — same shape.
+    bw.write_u32(FrameClass::FixFix as u32, 2);
+    bw.write_u32(0, 2); // bs_num_env = 1
+    bw.write_u32(1, 1); // bs_freq_res[0] = 1 (high-res)
+
+    // sbr_dtdf for L (1 envelope + 1 noise) and R (same).
+    bw.write_u32(0, 1); // bs_df_env[L][0] = 0 (freq-direction)
+    bw.write_u32(0, 1); // bs_df_noise[L][0] = 0
+    bw.write_u32(0, 1); // bs_df_env[R][0] = 0
+    bw.write_u32(0, 1); // bs_df_noise[R][0] = 0
+
+    // sbr_invf for L then R (bw mode 0 = filtering off, per noise band).
+    for _ in 0..freq.nq {
+        bw.write_u32(0, 2);
+    }
+    for _ in 0..freq.nq {
+        bw.write_u32(0, 2);
+    }
+
+    // L envelope + noise.
+    write_envelope_1_5db_freq_delta(bw, &sf_l.env, freq.n_high);
+    write_noise_3_0db_freq_delta(bw, &sf_l.noise, freq.nq);
+    // R envelope + noise.
+    write_envelope_1_5db_freq_delta(bw, &sf_r.env, freq.n_high);
+    write_noise_3_0db_freq_delta(bw, &sf_r.noise, freq.nq);
+
+    // bs_add_harmonic_flag(L) = 0
+    bw.write_bit(false);
+    // bs_add_harmonic_flag(R) = 0
     bw.write_bit(false);
     // bs_extended_data = 0
     bw.write_bit(false);
@@ -675,6 +878,76 @@ mod tests {
         let (bytes, bits) = enc.encode_frame_fil(&pcm);
         assert!(!bytes.is_empty());
         assert!(bits > 0);
+    }
+
+    #[test]
+    fn stereo_encoder_constructs() {
+        let enc = SbrStereoEncoder::new(24_000).expect("construct");
+        assert!(enc.freq.n_high > 0);
+        assert!(enc.freq.kx > 0);
+    }
+
+    #[test]
+    fn stereo_emit_payload_produces_bytes() {
+        let mut enc = SbrStereoEncoder::new(24_000).expect("construct");
+        let pcm_l: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let pcm_r: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1500.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let (bytes, bits) = enc.encode_frame_fil_pair(&pcm_l, &pcm_r);
+        assert!(!bytes.is_empty());
+        assert!(bits > 0);
+    }
+
+    /// Produce a CPE SBR payload and parse it back via the decoder's CPE
+    /// branch — the round trip exercises both writer and
+    /// `parse_channel_pair_element` in independent mode.
+    #[test]
+    fn stereo_emit_payload_round_trips_through_parser() {
+        use crate::sbr::decode::{try_parse_sbr_extension_ext, SbrChannelState, SbrPayload};
+        use oxideav_core::bits::BitReader;
+
+        let mut enc = SbrStereoEncoder::new(24_000).expect("construct");
+        let pcm_l: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let pcm_r: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1500.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let (xl, xr) = enc.analyse(&pcm_l, &pcm_r);
+        let (bytes, bits) = enc.emit_sbr_payload_pair(&xl, &xr);
+        let mut bw = BitWriter::with_capacity(bytes.len() + 1);
+        bw.write_u32(EXT_SBR_DATA, 4);
+        let full = (bits / 8) as usize;
+        for b in &bytes[..full] {
+            bw.write_u32(*b as u32, 8);
+        }
+        let tail = bits - full as u32 * 8;
+        if tail > 0 {
+            bw.write_u32((bytes[full] >> (8 - tail)) as u32, tail);
+        }
+        bw.align_to_byte();
+        let framed = bw.finish();
+        let mut br = BitReader::new(&framed);
+        let num_payload_bits = 4 + bits;
+        let mut state = SbrChannelState::new();
+        // is_sce = false to drive the CPE parser branch.
+        let parsed =
+            try_parse_sbr_extension_ext(&mut br, num_payload_bits, false, &mut state, 24_000)
+                .expect("parse ok");
+        match parsed {
+            Some(SbrPayload::Pair { l, r, coupled }) => {
+                assert_eq!(l.bs_num_env, 1);
+                assert_eq!(r.bs_num_env, 1);
+                assert!(
+                    !coupled,
+                    "CPE encoded as independent should parse coupled=false"
+                );
+            }
+            other => panic!("expected Pair CPE payload, got {other:?}"),
+        }
     }
 
     /// Produce an SBR payload, then parse it back through the decoder's

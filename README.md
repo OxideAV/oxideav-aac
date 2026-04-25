@@ -73,7 +73,8 @@ read it instead of looking for an ADTS sync word on the first packet.
 | PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
 | Gain control / SSR / Main / LTP        | Refused (`Error::Unsupported`)          |
 | CCE elements                           | Refused (`Error::Unsupported`)          |
-| HE-AAC v1 (SBR) / v2 (PS)              | Refused at ASC parse and on FIL ext     |
+| HE-AAC v1 (SBR) decode (mono + CPE)    | Yes (independent + coupled CPE)         |
+| HE-AAC v2 (PS) decode                  | Yes (QMF-domain upmix incl. IPD/OPD)    |
 
 The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 `CodecCapabilities`. PCM output is interleaved in AAC element order
@@ -101,6 +102,7 @@ The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 | Intensity stereo encode (§4.6.8.1.4)   | Yes (long windows; L/R correlation + energy ratio above 4 kHz in CPE common-window path) |
 | Pulse data encode (§4.6.10)            | Yes (up to 4 per frame; sign-preserving outlier extraction, amp capped at `\|residual\| - 1`) |
 | Short blocks (building blocks)         | `TransientDetector`, `mdct_short_eightshort`, `analyse_and_quantise_short`, `write_single_ics_short` — all tested; `emit_block` state-machine integration pending |
+| HE-AACv1 (SBR) encode                  | Mono via `HeAacMonoEncoder`; stereo CPE (`HeAacStereoEncoder`, independent coupling, §4.6.18.3.5) |
 | Gain control                           | Not implemented                         |
 | CBR / VBR                              | Bit_rate accepted but currently advisory; no rate control loop |
 
@@ -144,8 +146,9 @@ sample rate, 1024 samples per frame.
 
 ## Caveats
 
-- HE-AAC (SBR / PS) is detected at parse time and rejected. There is no
-  high-frequency reconstruction path.
+- HE-AAC (SBR / PS) decode is supported (mono + stereo CPE, optional
+  parametric stereo upmix). HE-AAC encode is mono + stereo only — no
+  PS encoder yet, no SBR support for ≥3-channel CPE configurations.
 - Bit_rate on the encoder is informational. The encoder picks scalefactors
   based on a fixed target quantisation magnitude; emitted frame size depends
   on signal complexity, not directly on the requested rate.

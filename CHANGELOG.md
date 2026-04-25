@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `sbr::encode::SbrStereoEncoder` and `he_aac_encoder::HeAacStereoEncoder`
+  — HE-AACv1 stereo encoder. Emits a CPE with an SBR FIL payload in
+  **independent coupling** mode (§4.6.18.3.5, `bs_coupling = 0`):
+  shared SBR header, per-channel FIXFIX `bs_num_env=1` grid, freq-delta
+  Huffman-coded envelope (1.5 dB) + noise (3.0 dB). One core AAC-LC
+  CPE + one CPE-shaped FIL element per frame.
+  `write_channel_pair_element_independent` is the new bitstream writer
+  that mirrors `parse_channel_pair_element` in independent mode.
+- `tests/sbr_encode_stereo_roundtrip.rs` — self round-trip: encode 1
+  kHz / 2 kHz stereo at 48 kHz, decode through the in-crate decoder,
+  confirm both channels recover their source tone with a Goertzel
+  ratio above the per-channel RMS floor.
+- `tests/sbr_he_aac_stereo_ffmpeg.rs` — ffmpeg interop: encode 1 kHz
+  / 2 kHz stereo, hand the ADTS to ffmpeg's native AAC decoder, and
+  assert per-channel SNR ≥ 5 dB at 48 kHz / stereo output. Skips
+  cleanly when ffmpeg isn't available.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-aac/compare/v0.0.7...v0.0.8) - 2026-04-25
 
 ### Other

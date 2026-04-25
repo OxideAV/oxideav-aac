@@ -47,15 +47,21 @@
 //!   transient-driven path has higher bitrate on tonal content.
 //!
 //! HE-AACv1 (SBR):
-//! - **Encoder** (mono only): `sbr::encode::SbrEncoder` +
-//!   `he_aac_encoder::HeAacMonoEncoder` produce a core AAC-LC +
-//!   FIL/EXT_SBR_DATA stream from 2×-rate PCM input. Pipeline:
-//!   downsample (31-tap half-band FIR), 64-band complex analysis QMF,
-//!   per-high-res-band envelope energy → 1.5 dB scalefactor, flat
-//!   noise floor, FIXFIX-num_env=1 grid, freq-delta Huffman-coded
-//!   envelope + noise. FIL element spliced before ID_END inside the
-//!   raw_data_block; ffmpeg 7.1 accepts the stream and decodes to 2×
-//!   sample rate.
+//! - **Encoder** (mono and stereo): `sbr::encode::SbrEncoder` +
+//!   `he_aac_encoder::HeAacMonoEncoder` produce a core AAC-LC SCE +
+//!   FIL/EXT_SBR_DATA stream from 2×-rate mono PCM. The stereo path
+//!   (`sbr::encode::SbrStereoEncoder` + `HeAacStereoEncoder`) emits a
+//!   CPE in **independent coupling** (`bs_coupling=0`, §4.6.18.3.5)
+//!   with one envelope+noise block per channel sharing the same SBR
+//!   header. Pipeline (per channel for stereo): downsample (31-tap
+//!   half-band FIR), 64-band complex analysis QMF, per-high-res-band
+//!   envelope energy → 1.5 dB scalefactor, flat noise floor, FIXFIX-
+//!   num_env=1 grid, freq-delta Huffman-coded envelope + noise. FIL
+//!   element spliced before ID_END inside the raw_data_block; ffmpeg
+//!   accepts both mono and stereo streams and decodes to 2× sample
+//!   rate. Independent coupling is a strict superset of coupled mode
+//!   so we always emit it on round 1; balance-mode encoding can land
+//!   later without breaking the bitstream.
 //! - SBR bitstream parsing (§4.6.18, Tables 4.62-4.74) — sbr_header,
 //!   sbr_single_channel_element, sbr_channel_pair_element (both
 //!   bs_coupling modes), sbr_grid, sbr_dtdf, sbr_invf, sbr_envelope,
