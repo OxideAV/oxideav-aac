@@ -386,9 +386,13 @@ impl SbrEncoder {
     /// output.
     pub fn new(core_rate: u32) -> oxideav_core::Result<Self> {
         let mut header = SbrHeader::defaults();
-        // Conservative defaults — 5, 9 are reasonable for 24 kHz core
-        // (kx ~ 15, stop ~ 32). amp_res=1 picks the 3.0 dB tables.
-        header.bs_amp_res = 1;
+        // Conservative defaults that mirror afconvert's choice for
+        // 24 kHz core / 48 kHz output. amp_res=0 (1.5 dB tables) matches
+        // the implicit per-frame override applied by sbr_grid() FIXFIX
+        // with bs_num_env == 1 (§4.6.18.3.3) — keeping the header value
+        // the same as the effective frame value avoids any parser
+        // inconsistency on decoders that read amp_res before the grid.
+        header.bs_amp_res = 0;
         header.bs_start_freq = 5;
         header.bs_stop_freq = 9;
         header.bs_xover_band = 0;
@@ -399,7 +403,13 @@ impl SbrEncoder {
         header.bs_limiter_gains = 2;
         header.bs_interpol_freq = true;
         header.bs_smoothing_mode = true;
-        header.bs_header_extra_1 = false;
+        // Set header_extra_1=true so we explicitly write our chosen
+        // bs_freq_scale / bs_alter_scale / bs_noise_bands instead of
+        // letting the decoder fall back to the bits-saving defaults.
+        // ffmpeg's HE-AAC parser treats `bs_header_extra_1=0` as a
+        // hint that the header is degenerate; explicit values are
+        // safer for cross-decoder interop.
+        header.bs_header_extra_1 = true;
         header.bs_header_extra_2 = false;
 
         let fs_sbr = core_rate * 2;
