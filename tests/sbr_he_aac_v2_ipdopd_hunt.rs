@@ -23,7 +23,7 @@ use oxideav_aac::sbr::ps::{
     ipdopd_frames_seen, ps_ext_v0_seen, ps_frames_total, ps_hdr_enable_ext_seen,
 };
 #[allow(unused_imports)]
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn which(name: &str) -> Option<PathBuf> {

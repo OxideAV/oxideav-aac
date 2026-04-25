@@ -7,9 +7,9 @@ use std::path::Path;
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
 // Trait imports needed for `enc.send_frame` / `dec.send_packet` resolution.
-#[allow(unused_imports)]
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+#[allow(unused_imports)]
+use oxideav_core::{Decoder, Encoder};
 
 fn goertzel(samples: &[f32], sample_rate: f32, target_freq: f32) -> f32 {
     let n = samples.len();

@@ -12,9 +12,9 @@
 //! through encode → decode must remain stable (covered by the main
 //! `encode_roundtrip` suite).
 
-#[allow(unused_imports)]
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+#[allow(unused_imports)]
+use oxideav_core::{Decoder, Encoder};
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
 use oxideav_aac::ics::SPEC_LEN;

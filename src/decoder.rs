@@ -1,10 +1,10 @@
 //! Top-level AAC-LC packet decoder. Wires the ADTS / ASC parser, the SCE /
 //! CPE element decoders, and the IMDCT/overlap state into a single
-//! `oxideav_codec::Decoder` impl.
+//! `oxideav_core::Decoder` impl.
 //!
 //! ISO/IEC 14496-3 §4.5.2.1 (raw_data_block) and §4.6.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };

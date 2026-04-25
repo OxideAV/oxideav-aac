@@ -8,10 +8,10 @@
 use oxideav_aac::adts::parse_adts_header;
 use oxideav_aac::ics::{parse_ics_info, parse_section_data, INTENSITY_HCB, NOISE_HCB};
 use oxideav_aac::syntax::ElementType;
-#[allow(unused_imports)]
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::bits::BitReader;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+#[allow(unused_imports)]
+use oxideav_core::{Decoder, Encoder};
 
 const SR: u32 = 44_100;
 

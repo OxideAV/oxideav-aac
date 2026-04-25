@@ -6,7 +6,7 @@
 //!   ffmpeg -hide_banner -i /tmp/oxideav_he_aac.wav -af astats=measure=rms:measure_overall=Overall_RMS_level -f null - 2>&1
 
 use oxideav_aac::he_aac_encoder::HeAacMonoEncoder;
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
 use std::fs::File;
 use std::io::Write;

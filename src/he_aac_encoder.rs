@@ -22,7 +22,7 @@
 //! supported (typically 24 kHz → 48 kHz doubled output, or 22.05 kHz →
 //! 44.1 kHz).
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat,
 };

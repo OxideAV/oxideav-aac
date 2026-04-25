@@ -22,7 +22,7 @@ use std::process::Command;
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
 #[allow(unused_imports)]
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn which(name: &str) -> Option<PathBuf> {

@@ -11,9 +11,9 @@ use oxideav_aac::sbr::freq::FreqTables;
 use oxideav_aac::sbr::hf_gen::build_patches;
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
-#[allow(unused_imports)]
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+#[allow(unused_imports)]
+use oxideav_core::{Decoder, Encoder};
 
 fn pcm_sine_mono_bytes(freq: f32, sr: u32, secs: f32, amp: f32) -> Vec<u8> {
     let total = (sr as f32 * secs) as usize;

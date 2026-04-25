@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn decoder_for(codec_id: &str, sr: u32, channels: u16) -> Box<dyn Decoder> {

@@ -36,7 +36,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat,
     TimeBase,
@@ -2393,7 +2393,7 @@ mod tests {
         use crate::adts::parse_adts_header;
         use crate::syntax::ElementType;
         #[allow(unused_imports)]
-        use oxideav_codec::Decoder;
+        use oxideav_core::Decoder;
         use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
         // Build a spectrum with content in sub-windows 2 and 5.
@@ -2705,9 +2705,9 @@ mod tests {
     /// samples.
     #[test]
     fn short_block_percussive_round_trip() {
-        #[allow(unused_imports)]
-        use oxideav_codec::Decoder;
         use oxideav_core::bits::BitReader;
+        #[allow(unused_imports)]
+        use oxideav_core::Decoder;
         use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
         let sr = 44_100u32;
