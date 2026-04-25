@@ -162,15 +162,18 @@ fn ffmpeg_decodes_our_he_aac_stereo() {
         mag_r > 1.0,
         "R tone not present after ffmpeg decode: mag={mag_r}",
     );
-    // Independent coupling: per-channel SNR should be substantial. We
-    // pick 5 dB as a conservative floor — a clean stereo encode through
-    // libfdk_aac runs ~30 dB; we just need to confirm signal landed.
+    // Independent coupling: per-channel SNR should match the per-channel
+    // mono HE-AAC baseline. After fixing the Table 4.66 channel-pair
+    // ordering bug (envelope L+R, then noise L+R — not interleaved per
+    // channel), R now reconstructs through ffmpeg at ~23 dB SNR for a
+    // 2 kHz tone, matching the mono baseline within rounding. L is
+    // ~34 dB for the 1 kHz tone. Lock these in conservatively.
     assert!(
-        snr_l > 5.0,
+        snr_l > 30.0,
         "L SNR after ffmpeg decode too low: {snr_l:.2} dB",
     );
     assert!(
-        snr_r > 5.0,
+        snr_r > 20.0,
         "R SNR after ffmpeg decode too low: {snr_r:.2} dB",
     );
 }

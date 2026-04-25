@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- HE-AACv1 stereo CPE bitstream ordering (Table 4.66, `bs_coupling = 0`):
+  the **independent**-coupling branch transmits `envelope(L)`,
+  `envelope(R)`, then `noise(L)`, `noise(R)` — both envelopes first,
+  then both noise floors. Round 10 wrote and parsed the four blocks
+  interleaved per-channel (`env(L), noise(L), env(R), noise(R)`),
+  which is the **coupled** branch's layout. Round 11 fixes both the
+  `write_channel_pair_element_independent` writer and the matching
+  branch in `parse_channel_pair_element`. The bug caused ffmpeg to
+  read our R-channel envelope bits as R-channel noise: ffmpeg-decoded
+  R-channel SNR jumps from **5.9 dB → 22.8 dB** for a 2 kHz tone,
+  matching the mono HE-AAC baseline at the same content.
+  `sbr_he_aac_stereo_ffmpeg.rs` thresholds raised from 5 dB to 30 dB
+  (L) / 20 dB (R) to lock in the fix.
+
 ### Added
 - `sbr::encode::SbrStereoEncoder` and `he_aac_encoder::HeAacStereoEncoder`
   — HE-AACv1 stereo encoder. Emits a CPE with an SBR FIL payload in

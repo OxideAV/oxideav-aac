@@ -544,9 +544,13 @@ pub fn parse_channel_pair_element(
         parse_sbr_invf(br, data_r, num_noise_bands)?;
         data_l.bs_coupling_balance = false;
         data_r.bs_coupling_balance = false;
+        // Per Table 4.66, in the independent (bs_coupling=0) branch the
+        // bitstream order is: env(L), env(R), noise(L), noise(R) — both
+        // envelopes first, then both noise floors. The coupled branch
+        // interleaves env+noise per channel; this branch does NOT.
         parse_sbr_envelope(br, data_l, num_env_bands)?;
-        parse_sbr_noise(br, data_l, num_noise_bands)?;
         parse_sbr_envelope(br, data_r, num_env_bands)?;
+        parse_sbr_noise(br, data_l, num_noise_bands)?;
         parse_sbr_noise(br, data_r, num_noise_bands)?;
         data_l.bs_add_harmonic_flag = br.read_bit()?;
         if data_l.bs_add_harmonic_flag {

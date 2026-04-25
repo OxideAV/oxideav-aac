@@ -528,8 +528,8 @@ impl SbrStereoEncoder {
     /// sbr_invf(L)        2 * Nq bits
     /// sbr_invf(R)        2 * Nq bits
     /// sbr_envelope(L, df=0)
-    /// sbr_noise(L,    df=0)
     /// sbr_envelope(R, df=0)
+    /// sbr_noise(L,    df=0)
     /// sbr_noise(R,    df=0)
     /// bs_add_harmonic_flag(L)  = 0
     /// bs_add_harmonic_flag(R)  = 0
@@ -677,11 +677,12 @@ pub fn write_channel_pair_element_independent(
         bw.write_u32(0, 2);
     }
 
-    // L envelope + noise.
+    // Independent coupling — per Table 4.66 the order is envelope(L),
+    // envelope(R), noise(L), noise(R). Do NOT interleave env+noise per
+    // channel here; that's the layout of the coupled branch.
     write_envelope_1_5db_freq_delta(bw, &sf_l.env, freq.n_high);
-    write_noise_3_0db_freq_delta(bw, &sf_l.noise, freq.nq);
-    // R envelope + noise.
     write_envelope_1_5db_freq_delta(bw, &sf_r.env, freq.n_high);
+    write_noise_3_0db_freq_delta(bw, &sf_l.noise, freq.nq);
     write_noise_3_0db_freq_delta(bw, &sf_r.noise, freq.nq);
 
     // bs_add_harmonic_flag(L) = 0
