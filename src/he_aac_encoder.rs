@@ -29,7 +29,9 @@ use oxideav_core::{
 };
 
 use crate::encoder::{AacEncoder, SbrFilBits};
-use crate::sbr::encode::{Downsampler, SbrEncoder, SbrStereoEncoder};
+use crate::sbr::encode::{Downsampler, QmfAnalysis64, SbrEncoder, SbrStereoEncoder};
+use crate::sbr::ps::analyse_ps_params_10;
+use crate::sbr::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024};
 
 /// Number of high-rate input samples per encoded frame — one AAC core
 /// frame of 1024 core samples corresponds to 2048 high-rate samples.
@@ -491,39 +493,61 @@ impl Encoder for HeAacStereoEncoder {
     }
 }
 
-/// HE-AACv2 (mono SBR + Parametric Stereo) encoder — round-1 scaffolding.
+/// HE-AACv2 (mono SBR + Parametric Stereo) encoder.
 ///
 /// Pipeline (ISO/IEC 14496-3 §1.6.5 / §8.6.4):
 ///
 /// ```text
 ///   2x-rate stereo PCM in
-///       ↓ downmix L+R → mono
-///   2x-rate mono PCM
-///       ↓ HeAacMonoEncoder pipeline (downsample + AAC-LC core SCE
-///       ↓                            + SBR analysis + envelope payload)
-///       ↓ SBR FIL element with EXT_ID_PS extension carrying a no-op
-///       ↓ ps_data() (IID = 0 dB, ICC = 1 in all 10 bands)
-///   ADTS frames out — decoder upmixes the mono SBR back to stereo
-///   with `L = R = mono` (identity stereo)
+///       ↓ keep L, R separate
+///   ┌─────────────┬───────────────────────────────────┐
+///   │             │                                   │
+///   │             ↓ per-channel 64-band complex QMF   │
+///   │           Xl[t,k], Xr[t,k]  (32 × 64)           │
+///   │             ↓ analyse_ps_params_10              │
+///   │           PsParams10 (IID + ICC, 10 bands)      │
+///   │             ↓ stage on SbrEncoder               │
+///   │                                                 │
+///   ↓ downmix L+R → mono                              │
+///   2x-rate mono PCM                                  │
+///       ↓ HeAacMonoEncoder pipeline                   │
+///       ↓   - downsample 2x → 1x for AAC-LC core SCE  │
+///       ↓   - SBR mono analysis + envelope payload    │
+///       ↓   - SBR FIL element with EXT_ID_PS carrying │
+///       ↓     the real PsParams10 IID/ICC bands       │
+///   ADTS frames out — decoder runs SBR on the single  │
+///   core channel, then PS upmixes to stereo using the │
+///   per-band IID (level) and ICC (coherence) hints.   │
 /// ```
 ///
-/// **Round-12 scope:** the PS payload is a fixed no-op — every frame
-/// emits the same identity-stereo header + envelope. This is *worse*
-/// than [`HeAacStereoEncoder`] for real stereo content (the spatial
-/// image collapses to mono) but it's a HE-AACv2-shaped bitstream that
-/// ffmpeg accepts and routes through its full PS decoder. Real PS
-/// analysis — extracting per-band IID and ICC from the input stereo
-/// signal — is the next step (out of round-12 scope).
+/// **Real PS analysis (round 13):** per QMF band b, we compute over each
+/// frame's worth of QMF samples:
+/// ```text
+///   P_L  = Σ |L(t,k)|^2,  P_R = Σ |R(t,k)|^2,  P_LR = Σ L · conj(R)
+///   IID_dB(b) = 10·log10(P_L / P_R)               → quant. Table 8.25
+///   ICC(b)    = |P_LR| / sqrt(P_L · P_R)          → quant. Table 8.28
+/// ```
+/// QMF bands are aggregated to 10 PS parameter bands per Table 8.45 /
+/// 8.48 (folded from the 20-band default mapping). This preserves the
+/// stereo image — a 1 kHz tone on L only / 2 kHz on R only emerges from
+/// the decoder with the correct per-band level split, instead of
+/// collapsing to mono as in the round-12 identity-stereo path.
 ///
 /// `params.sample_rate` must be the *high* rate (2x core rate, e.g.
-/// 44 100 or 48 000 Hz). `params.channels` must be 2 (stereo input);
-/// the wrapper downmixes to mono before encoding.
+/// 44 100 or 48 000 Hz). `params.channels` must be 2 (stereo input).
 pub struct HeAacV2Encoder {
     inner: AacEncoder,
     sbr: SbrEncoder,
     downsampler: Downsampler,
-    /// Buffer of 2x-rate mono samples (L+R averaged) pending encode.
-    high_pcm: Vec<f32>,
+    /// Per-channel QMF analysis banks for PS parameter extraction. The
+    /// SBR mono encoder (`sbr`) maintains its own QMF bank for the
+    /// downmixed signal — these are L/R-specific and do NOT feed the
+    /// SBR envelope.
+    qmf_l: QmfAnalysis64,
+    qmf_r: QmfAnalysis64,
+    /// Per-channel buffers of 2x-rate PCM samples pending encode.
+    high_pcm_l: Vec<f32>,
+    high_pcm_r: Vec<f32>,
     flushed: bool,
     core_rate: u32,
     out_rate: u32,
@@ -571,7 +595,10 @@ impl HeAacV2Encoder {
             inner,
             sbr,
             downsampler: Downsampler::new(),
-            high_pcm: Vec::with_capacity(HIGH_RATE_FRAME * 2),
+            qmf_l: QmfAnalysis64::new(),
+            qmf_r: QmfAnalysis64::new(),
+            high_pcm_l: Vec::with_capacity(HIGH_RATE_FRAME * 2),
+            high_pcm_r: Vec::with_capacity(HIGH_RATE_FRAME * 2),
             flushed: false,
             core_rate,
             out_rate,
@@ -601,9 +628,8 @@ impl HeAacV2Encoder {
                     let off = i * stride;
                     let l = i16::from_le_bytes([plane[off], plane[off + 1]]) as f32 / 32768.0;
                     let r = i16::from_le_bytes([plane[off + 2], plane[off + 3]]) as f32 / 32768.0;
-                    // Downmix: L+R averaged. (Sum-to-mono with a 0.5
-                    // attenuation to avoid clipping.)
-                    self.high_pcm.push(0.5 * (l + r));
+                    self.high_pcm_l.push(l);
+                    self.high_pcm_r.push(r);
                 }
             }
             SampleFormat::F32 => {
@@ -625,7 +651,8 @@ impl HeAacV2Encoder {
                         plane[off + 6],
                         plane[off + 7],
                     ]);
-                    self.high_pcm.push(0.5 * (l + r));
+                    self.high_pcm_l.push(l);
+                    self.high_pcm_r.push(r);
                 }
             }
             other => {
@@ -638,33 +665,75 @@ impl HeAacV2Encoder {
     }
 
     fn drain_frames(&mut self) -> Result<()> {
-        while self.high_pcm.len() >= HIGH_RATE_FRAME {
+        while self.high_pcm_l.len() >= HIGH_RATE_FRAME && self.high_pcm_r.len() >= HIGH_RATE_FRAME {
             self.emit_frame(false)?;
         }
         Ok(())
     }
 
+    /// Run the per-channel high-rate QMF analysis on one frame's worth of
+    /// L / R PCM. Returns the two `[NUM_TIME_SLOTS_1024 * RATE][64]`
+    /// complex matrices used for PS analysis.
+    fn analyse_lr(
+        &mut self,
+        l: &[f32],
+        r: &[f32],
+    ) -> (
+        Vec<[Complex32; NUM_QMF_BANDS]>,
+        Vec<[Complex32; NUM_QMF_BANDS]>,
+    ) {
+        let num_slots = NUM_TIME_SLOTS_1024 * crate::sbr::RATE; // 32
+        let mut x_l = vec![[Complex32::default(); NUM_QMF_BANDS]; num_slots];
+        let mut x_r = vec![[Complex32::default(); NUM_QMF_BANDS]; num_slots];
+        let mut tmp = [0.0f32; 64];
+        for slot in 0..num_slots {
+            tmp.copy_from_slice(&l[slot * 64..slot * 64 + 64]);
+            self.qmf_l.process(&tmp, &mut x_l[slot]);
+            tmp.copy_from_slice(&r[slot * 64..slot * 64 + 64]);
+            self.qmf_r.process(&tmp, &mut x_r[slot]);
+        }
+        (x_l, x_r)
+    }
+
     fn emit_frame(&mut self, flush: bool) -> Result<()> {
-        let have = self.high_pcm.len();
+        let have = self.high_pcm_l.len().min(self.high_pcm_r.len());
         if have == 0 {
             return Ok(());
         }
         let to_take = have.min(HIGH_RATE_FRAME);
-        let mut block = vec![0.0f32; HIGH_RATE_FRAME];
-        block[..to_take].copy_from_slice(&self.high_pcm[..to_take]);
-        self.high_pcm.drain(..to_take);
+        let mut block_l = vec![0.0f32; HIGH_RATE_FRAME];
+        let mut block_r = vec![0.0f32; HIGH_RATE_FRAME];
+        block_l[..to_take].copy_from_slice(&self.high_pcm_l[..to_take]);
+        block_r[..to_take].copy_from_slice(&self.high_pcm_r[..to_take]);
+        self.high_pcm_l.drain(..to_take);
+        self.high_pcm_r.drain(..to_take);
 
-        // 1) SBR analysis on the mono signal + emit SCE+PS payload.
-        let x_high = self.sbr.analyse(&block);
+        // 1) Per-channel QMF analysis → real PS parameters (10-band IID + ICC).
+        let (x_l, x_r) = self.analyse_lr(&block_l, &block_r);
+        let ps_params = analyse_ps_params_10(&x_l, &x_r);
+        self.sbr.set_pending_ps(ps_params);
+
+        // 2) Downmix to mono (L+R averaged with 0.5 attenuation) for the
+        //    SBR mono analysis path. The SBR scalefactors describe the
+        //    high-band energy of the *mono* signal; the PS upmix at the
+        //    decoder then redistributes that energy to L vs R according
+        //    to IID and adjusts coherence according to ICC.
+        let mut block_mono = vec![0.0f32; HIGH_RATE_FRAME];
+        for i in 0..HIGH_RATE_FRAME {
+            block_mono[i] = 0.5 * (block_l[i] + block_r[i]);
+        }
+
+        // 3) SBR analysis on the mono signal + emit SCE+PS payload.
+        let x_high = self.sbr.analyse(&block_mono);
         let (sbr_bytes, bits) = self.sbr.emit_sbr_payload(&x_high);
         self.inner.stage_sbr_fil(SbrFilBits {
             bytes: sbr_bytes,
             bits,
         });
 
-        // 2) Downsample 2x → 1x for the AAC-LC core (mono SCE).
+        // 4) Downsample 2x → 1x for the AAC-LC core (mono SCE).
         let mut low = vec![0.0f32; HIGH_RATE_FRAME / 2];
-        self.downsampler.process(&block, &mut low);
+        self.downsampler.process(&block_mono, &mut low);
         let mut bytes = Vec::with_capacity(low.len() * 4);
         for v in &low {
             bytes.extend_from_slice(&v.to_le_bytes());
@@ -723,9 +792,13 @@ impl Encoder for HeAacV2Encoder {
         if self.flushed {
             return Ok(());
         }
-        if !self.high_pcm.is_empty() {
-            if self.high_pcm.len() < HIGH_RATE_FRAME {
-                self.high_pcm.resize(HIGH_RATE_FRAME, 0.0);
+        let have = self.high_pcm_l.len().min(self.high_pcm_r.len());
+        if have > 0 {
+            if self.high_pcm_l.len() < HIGH_RATE_FRAME {
+                self.high_pcm_l.resize(HIGH_RATE_FRAME, 0.0);
+            }
+            if self.high_pcm_r.len() < HIGH_RATE_FRAME {
+                self.high_pcm_r.resize(HIGH_RATE_FRAME, 0.0);
             }
             self.emit_frame(true)?;
         } else {

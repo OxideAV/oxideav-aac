@@ -457,6 +457,179 @@ pub const IPDOPD_QUANT: [f32; 8] = [
     7.0 * core::f32::consts::FRAC_PI_4,
 ];
 
+/// Quantise an IID value (in dB) to the closest index of the IID default
+/// grid (Table 8.25, 15 levels). Returned index is in `0..=14`; the
+/// signed-bias value used in the bitstream is `index - 7` so it lies in
+/// `-7..=7`. (Mode 0 / 3 use the default grid; mode 1 / 4 use the fine
+/// 31-level grid in [`IID_QUANT_FINE`].)
+pub fn quantise_iid_default(iid_db: f32) -> i32 {
+    let mut best_idx = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (i, q) in IID_QUANT_DEFAULT.iter().enumerate() {
+        let e = (iid_db - q).abs();
+        if e < best_err {
+            best_err = e;
+            best_idx = i;
+        }
+    }
+    // Map [0..14] → signed [-7..7] for use in the bitstream.
+    best_idx as i32 - 7
+}
+
+/// Quantise an ICC value in [-1, 1] to the closest index of the ICC grid
+/// (Table 8.28, 8 levels). Returned index is `0..=7` (already the bit-
+/// stream symbol — no bias subtraction).
+pub fn quantise_icc(icc: f32) -> i32 {
+    let mut best_idx = 0usize;
+    let mut best_err = f32::INFINITY;
+    for (i, q) in ICC_QUANT.iter().enumerate() {
+        let e = (icc - q).abs();
+        if e < best_err {
+            best_err = e;
+            best_idx = i;
+        }
+    }
+    best_idx as i32
+}
+
+/// 10-band PS parameter set for one frame at `iid_mode = 0` and
+/// `icc_mode = 0`. Indices are signed:
+///   * `iid_idx[b]` ∈ -7..=7 (Table 8.B.18 huff_iid_df[0] symbol range).
+///   * `icc_idx[b]` ∈ 0..=7  (Table 8.B.19 huff_icc_df symbol range; the
+///     ICC table is asymmetric and has no signed-bias).
+#[derive(Clone, Debug, Default)]
+pub struct PsParams10 {
+    pub iid_idx: [i32; 10],
+    pub icc_idx: [i32; 10],
+}
+
+impl PsParams10 {
+    /// Identity-stereo defaults: IID = 0 dB, ICC index = 0 (ρ = 1.0).
+    pub fn identity() -> Self {
+        Self {
+            iid_idx: [0; 10],
+            icc_idx: [0; 10],
+        }
+    }
+}
+
+/// QMF-band → 10-band PS index table used by the encoder. For QMF bands
+/// 3..63 we use `QMF_TO_PARAM_20[k] / 2` — exactly matching the decoder's
+/// 10→20→QMF reconstruction path (10-band b is mapped onto 20-band slots
+/// 2b and 2b+1 by `map_to_20`, which the decoder then applies at the
+/// QMF-band level via `QMF_TO_PARAM_20[k]`). For sub-QMF region bands
+/// 0..2 — where the decoder would normally hybrid-split into 10
+/// sub-subbands per Table 8.48 — we fold each whole QMF band into its
+/// **dominant** 10-band slot (bands {0, 2, 3} respectively, derived from
+/// the centre frequencies of the sub-subbands those QMF bands feed). The
+/// missing 10-band slots (1) are post-filled below from their neighbours
+/// after analysis; see [`fill_unreachable_param_10_bands`].
+const QMF_TO_PARAM_10: [u8; NUM_QMF_BANDS] = {
+    let mut out = [0u8; NUM_QMF_BANDS];
+    out[0] = 0;
+    out[1] = 2;
+    out[2] = 3;
+    let mut k = 3;
+    while k < NUM_QMF_BANDS {
+        out[k] = QMF_TO_PARAM_20[k] / 2;
+        k += 1;
+    }
+    out
+};
+
+/// Bands that no QMF index in [`QMF_TO_PARAM_10`] writes to. For the
+/// 10-band default config the only such slot is 1. After analysis, fill
+/// it from its lower neighbour (10-band 0) so the decoder receives a
+/// sensible IID/ICC value for that frequency range rather than an
+/// identity-stereo default that would suppress the perceptual cue.
+const UNREACHABLE_PARAM_10_BANDS: &[(u8, u8)] = &[
+    (1, 0), // band 1 ← copy from band 0
+];
+
+/// Fill in the unreachable 10-band slots in `iid_idx` / `icc_idx` from
+/// their neighbour band (per [`UNREACHABLE_PARAM_10_BANDS`]).
+fn fill_unreachable_param_10_bands(iid_idx: &mut [i32; 10], icc_idx: &mut [i32; 10]) {
+    for &(target, source) in UNREACHABLE_PARAM_10_BANDS {
+        iid_idx[target as usize] = iid_idx[source as usize];
+        icc_idx[target as usize] = icc_idx[source as usize];
+    }
+}
+
+/// Analyse one frame's worth of L/R QMF-domain matrices into a 10-band
+/// PS parameter set (IID + ICC) per ISO/IEC 14496-3 §8.6.4 + Annex 8.A.
+///
+/// Per parameter band `b` we accumulate over all time-slots in the frame
+/// and over all QMF subbands `k` whose `QMF_TO_PARAM_10[k] == b`:
+///
+/// ```text
+///   P_L  = sum_{t,k} |L(t,k)|^2
+///   P_R  = sum_{t,k} |R(t,k)|^2
+///   P_LR = sum_{t,k} L(t,k) * conj(R(t,k))      (complex)
+///
+///   IID_dB(b) = 10 * log10(P_L / P_R)            → quantise_iid_default
+///   ICC(b)    = |P_LR| / sqrt(P_L * P_R)         → quantise_icc
+/// ```
+///
+/// `x_l` / `x_r` are the 32-time-slot × 64-band complex QMF outputs from
+/// [`crate::sbr::encode::QmfAnalysis64`]. We only sum bands 0..63 — the
+/// hybrid sub-QMF split (§8.6.4.3) gives finer-grained sub-subbands for
+/// bands 0..2 in the 20-band configuration, but the 10-band grid merges
+/// those four sub-subbands of band 0 into one parameter band, so plain
+/// QMF-band averaging matches the 10-band aggregate identity exactly.
+///
+/// **Bands with no signal** (P_L + P_R ≈ 0) get IID = 0 dB and ICC = 1.0.
+pub fn analyse_ps_params_10(
+    x_l: &[[Complex32; NUM_QMF_BANDS]],
+    x_r: &[[Complex32; NUM_QMF_BANDS]],
+) -> PsParams10 {
+    let mut p_l = [0.0f64; 10];
+    let mut p_r = [0.0f64; 10];
+    let mut p_lr_re = [0.0f64; 10];
+    let mut p_lr_im = [0.0f64; 10];
+    let n_slots = x_l.len().min(x_r.len());
+    for t in 0..n_slots {
+        for k in 0..NUM_QMF_BANDS {
+            let b = QMF_TO_PARAM_10[k] as usize;
+            let l = x_l[t][k];
+            let r = x_r[t][k];
+            p_l[b] += (l.re as f64) * (l.re as f64) + (l.im as f64) * (l.im as f64);
+            p_r[b] += (r.re as f64) * (r.re as f64) + (r.im as f64) * (r.im as f64);
+            // L * conj(R) = (l.re + j*l.im) * (r.re - j*r.im)
+            //             = (l.re*r.re + l.im*r.im) + j*(l.im*r.re - l.re*r.im)
+            p_lr_re[b] += (l.re as f64) * (r.re as f64) + (l.im as f64) * (r.im as f64);
+            p_lr_im[b] += (l.im as f64) * (r.re as f64) - (l.re as f64) * (r.im as f64);
+        }
+    }
+    // Energy floor: bands with ≤ EPS power are treated as silent (centred,
+    // fully coherent). The threshold is well below decoder noise floor for
+    // 16-bit content (ε² ≈ 2^-30 corresponds to ≈ -90 dBFS per band).
+    const POWER_EPS: f64 = 1e-12;
+    let mut out = PsParams10::default();
+    for b in 0..10 {
+        let pl = p_l[b];
+        let pr = p_r[b];
+        if pl < POWER_EPS && pr < POWER_EPS {
+            out.iid_idx[b] = 0;
+            out.icc_idx[b] = 0; // ρ = 1.0
+            continue;
+        }
+        let iid_db = 10.0_f64 * ((pl + 1e-30) / (pr + 1e-30)).log10();
+        out.iid_idx[b] = quantise_iid_default(iid_db as f32);
+        // ICC = |P_LR| / sqrt(P_L * P_R), clamped to [-1, 1].
+        let denom = (pl * pr).sqrt().max(1e-30);
+        let mag = (p_lr_re[b] * p_lr_re[b] + p_lr_im[b] * p_lr_im[b]).sqrt();
+        // Sign: take the real part's sign of P_LR — a negative real cross
+        // power means the channels are anti-correlated (ρ < 0).
+        let sign = if p_lr_re[b] < 0.0 { -1.0_f64 } else { 1.0 };
+        let icc = (sign * mag / denom).clamp(-1.0, 1.0);
+        out.icc_idx[b] = quantise_icc(icc as f32);
+    }
+    // Fill in any 10-band slots that no QMF band maps to (band 1 only,
+    // for the encoder's coarse QMF-only mapping).
+    fill_unreachable_param_10_bands(&mut out.iid_idx, &mut out.icc_idx);
+    out
+}
+
 /// nr_iid_par for iid_mode 0..5. Indexed by iid_mode.
 const NR_IID_PAR_TAB: [usize; 6] = [10, 20, 34, 10, 20, 34];
 /// nr_ipdopd_par for iid_mode 0..5.
@@ -604,6 +777,29 @@ struct HuffEntry {
     value: i32,
     code: u32,
     bits: u8,
+}
+
+/// Encode one PS Huffman symbol — finds the entry matching `value` and
+/// writes its `(code, bits)` MSB-first into `bw`. Out-of-range values
+/// fall back to the `0` symbol (which is the shortest codeword in every
+/// PS Huffman table — see Tables 8.B.17 / 8.B.18 / 8.B.19 / 8.B.20).
+///
+/// Used by the encoder paths in [`crate::sbr::encode`].
+pub fn huff_encode_iid_df0(bw: &mut oxideav_core::bits::BitWriter, value: i32) {
+    huff_encode(bw, value, HUFF_IID_DF0);
+}
+
+pub fn huff_encode_icc_df(bw: &mut oxideav_core::bits::BitWriter, value: i32) {
+    huff_encode(bw, value, HUFF_ICC_DF);
+}
+
+fn huff_encode(bw: &mut oxideav_core::bits::BitWriter, value: i32, table: &[HuffEntry]) {
+    let entry = table
+        .iter()
+        .find(|e| e.value == value)
+        .or_else(|| table.iter().find(|e| e.value == 0))
+        .expect("PS Huffman table must contain a `0` symbol");
+    bw.write_u32(entry.code, entry.bits as u32);
 }
 
 /// Decode one Huffman code from the bitstream.
@@ -2244,5 +2440,123 @@ mod tests {
             ratio < 0.1,
             "without IPD/OPD, L and R should match: diff/tot = {ratio:.4}"
         );
+    }
+
+    #[test]
+    fn quantise_iid_default_centred() {
+        // 0 dB → centre of the 15-level grid → signed-bias index 0.
+        assert_eq!(quantise_iid_default(0.0), 0);
+        // +25 dB → top of grid (index 14) → +7.
+        assert_eq!(quantise_iid_default(25.0), 7);
+        // Way past +25 dB still saturates at +7.
+        assert_eq!(quantise_iid_default(1e6), 7);
+        // -25 dB → bottom (index 0) → -7.
+        assert_eq!(quantise_iid_default(-25.0), -7);
+        // Round-to-nearest behaviour: +3 dB lies between +2 and +4 dB
+        // (table levels). Either is acceptable; both fall within ±1 of 0.
+        let q = quantise_iid_default(3.0);
+        assert!(q == 1 || q == 2, "got {q}");
+    }
+
+    #[test]
+    fn quantise_icc_extremes() {
+        // ρ = 1 → index 0 (the most-coherent grid entry).
+        assert_eq!(quantise_icc(1.0), 0);
+        // ρ = -1 → index 7 (the most-anti-coherent grid entry).
+        assert_eq!(quantise_icc(-1.0), 7);
+        // ρ = 0 → closest to ICC_QUANT[5] = 0.0 → index 5.
+        assert_eq!(quantise_icc(0.0), 5);
+    }
+
+    #[test]
+    fn analyse_ps_params_10_silent_input() {
+        // All-zero L/R QMF matrices should produce identity PS params:
+        // IID = 0 dB everywhere, ICC = 1.0 (index 0).
+        let n_slots = 32usize;
+        let x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let p = analyse_ps_params_10(&x_l, &x_r);
+        assert_eq!(p.iid_idx, [0; 10]);
+        assert_eq!(p.icc_idx, [0; 10]);
+    }
+
+    #[test]
+    fn analyse_ps_params_10_left_only() {
+        // L carries unit-power QMF samples in every band; R is silent.
+        // IID should max out at +25 dB (index +7) for every band.
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in x_l.iter_mut() {
+            for k in 0..NUM_QMF_BANDS {
+                slot[k] = Complex32::new(1.0, 0.0);
+            }
+        }
+        let p = analyse_ps_params_10(&x_l, &x_r);
+        for b in 0..10 {
+            assert_eq!(
+                p.iid_idx[b], 7,
+                "L-only band {b}: expected IID +7, got {}",
+                p.iid_idx[b]
+            );
+        }
+    }
+
+    #[test]
+    fn analyse_ps_params_10_right_only() {
+        // Mirror of left_only — IID should be -7 (full right) everywhere.
+        let n_slots = 32usize;
+        let x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in x_r.iter_mut() {
+            for k in 0..NUM_QMF_BANDS {
+                slot[k] = Complex32::new(1.0, 0.0);
+            }
+        }
+        let p = analyse_ps_params_10(&x_l, &x_r);
+        for b in 0..10 {
+            assert_eq!(p.iid_idx[b], -7, "R-only band {b}: got {}", p.iid_idx[b]);
+        }
+    }
+
+    #[test]
+    fn analyse_ps_params_10_identical_lr() {
+        // L == R per slot, per band → IID = 0 dB, ICC = 1.0 → both
+        // indices = 0 in every band.
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in 0..n_slots {
+            for k in 0..NUM_QMF_BANDS {
+                let v = Complex32::new(0.5, -0.25);
+                x_l[slot][k] = v;
+                x_r[slot][k] = v;
+            }
+        }
+        let p = analyse_ps_params_10(&x_l, &x_r);
+        for b in 0..10 {
+            assert_eq!(p.iid_idx[b], 0, "L=R band {b} IID = {}", p.iid_idx[b]);
+            assert_eq!(p.icc_idx[b], 0, "L=R band {b} ICC = {}", p.icc_idx[b]);
+        }
+    }
+
+    #[test]
+    fn analyse_ps_params_10_anti_correlated() {
+        // L = +1, R = -1 (perfectly anti-correlated, equal power) →
+        // IID = 0 dB, ICC = -1 → IID index 0, ICC index 7.
+        let n_slots = 32usize;
+        let mut x_l = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        let mut x_r = vec![[Complex32::new(0.0, 0.0); NUM_QMF_BANDS]; n_slots];
+        for slot in 0..n_slots {
+            for k in 0..NUM_QMF_BANDS {
+                x_l[slot][k] = Complex32::new(1.0, 0.0);
+                x_r[slot][k] = Complex32::new(-1.0, 0.0);
+            }
+        }
+        let p = analyse_ps_params_10(&x_l, &x_r);
+        for b in 0..10 {
+            assert_eq!(p.iid_idx[b], 0);
+            assert_eq!(p.icc_idx[b], 7, "anti-corr band {b} ICC = {}", p.icc_idx[b]);
+        }
     }
 }

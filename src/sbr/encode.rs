@@ -37,7 +37,7 @@ use oxideav_core::bits::BitWriter;
 
 use super::bitstream::{FrameClass, SbrHeader, EXT_SBR_DATA};
 use super::freq::FreqTables;
-use super::ps::EXT_ID_PS_DATA;
+use super::ps::{huff_encode_icc_df, huff_encode_iid_df0, PsParams10, EXT_ID_PS_DATA};
 use super::tables::{LAV_ENV_3_0DB, LAV_NOISE_3_0DB};
 use super::{Complex32, NUM_QMF_BANDS, NUM_TIME_SLOTS_1024};
 
@@ -329,10 +329,19 @@ pub struct SbrEncoder {
     /// see Table 4.112) inside the SBR `bs_extended_data` block. Used by
     /// [`crate::he_aac_encoder::HeAacV2Encoder`] to produce a
     /// HE-AACv2-compatible mono-SBR + PS bitstream that decoders such as
-    /// ffmpeg upmix to stereo. The PS payload is the no-op identity
-    /// payload from [`write_ps_data_noop`] — IID = 0 dB, ICC = 1 in all
-    /// bands — so the PS upmix reconstructs `L = R = mono` exactly.
+    /// ffmpeg upmix to stereo.
+    ///
+    /// When `pending_ps` is `Some`, that parameter set is consumed by the
+    /// next [`Self::emit_sbr_payload`] call and reset to `None`. When
+    /// `pending_ps` is `None` and `emit_ps == true`, the encoder falls
+    /// back to the identity (no-op) PS payload — IID = 0 dB, ICC = 1 in
+    /// every band, equivalent to [`write_ps_data_noop`].
     pub emit_ps: bool,
+    /// PS parameters to emit on the next frame. Set by an external PS
+    /// analyser via [`Self::set_pending_ps`]; consumed-and-cleared on each
+    /// `emit_sbr_payload` call so a missing `set_pending_ps` always falls
+    /// back to identity stereo (rather than reusing stale parameters).
+    pub pending_ps: Option<PsParams10>,
 }
 
 impl SbrEncoder {
@@ -380,7 +389,16 @@ impl SbrEncoder {
             downsampler: Downsampler::new(),
             frame_count: 0,
             emit_ps: false,
+            pending_ps: None,
         })
+    }
+
+    /// Stage a [`PsParams10`] set to be emitted with the next
+    /// [`Self::emit_sbr_payload`] call. The pending params are consumed
+    /// (set back to `None`) on emission, so each frame's PS payload comes
+    /// from a fresh analysis pass.
+    pub fn set_pending_ps(&mut self, params: PsParams10) {
+        self.pending_ps = Some(params);
     }
 
     /// Enable / disable Parametric Stereo emission. When enabled, every
@@ -437,7 +455,17 @@ impl SbrEncoder {
         // extension inside `bs_extended_data` so the stream is
         // HE-AACv2-compatible.
         if self.emit_ps {
-            write_single_channel_element_mono_with_ps(&mut bw, &self.header, &self.freq, &sf);
+            // Use pending real PS params if staged this frame; otherwise
+            // fall back to the identity (no-op) payload so the bitstream
+            // remains structurally valid.
+            let ps = self.pending_ps.take().unwrap_or_else(PsParams10::identity);
+            write_single_channel_element_mono_with_ps_real(
+                &mut bw,
+                &self.header,
+                &self.freq,
+                &sf,
+                &ps,
+            );
         } else {
             write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
         }
@@ -787,6 +815,141 @@ pub fn write_single_channel_element_mono_with_ps(
     }
     bw.write_u32(EXT_ID_PS_DATA, 2); // bs_extension_id = 2
     write_ps_data_noop(bw);
+    if fill_bits > 0 {
+        bw.write_u32(0, fill_bits);
+    }
+}
+
+/// Write a `ps_data()` payload carrying real per-band IID (default grid,
+/// 7-step) and ICC parameters in the 10-band configuration
+/// (`iid_mode = 0`, `icc_mode = 0`). Per ISO/IEC 14496-3 §8.6.4.4.1 /
+/// §8.6.4.4.2 with frame_class = 0 (FIX_BORDERS), num_env = 1 and
+/// freq-direction differential coding (iid_dt[0] = icc_dt[0] = 0).
+///
+/// Bit layout (header 11 bits + grid 3 bits + per-envelope IID/ICC):
+///
+/// ```text
+///   enable_ps_header  1   = 1
+///     enable_iid      1   = 1
+///       iid_mode      3   = 0  (10 bands, default 7-step quant)
+///     enable_icc      1   = 1
+///       icc_mode      3   = 0  (10 bands)
+///     enable_ext      1   = 0
+///   frame_class       1   = 0  (FIX_BORDERS)
+///   num_env_idx       2   = 1  → num_env = 1
+///   iid_dt[0]         1   = 0  (freq-direction)
+///   for b in 0..10: huff_iid_df[0](delta_iid[b])
+///   icc_dt[0]         1   = 0
+///   for b in 0..10: huff_icc_df  (delta_icc[b])
+/// ```
+///
+/// Returns the exact bit-count written (variable, since Huffman
+/// codewords vary in length 1..17 bits).
+pub fn write_ps_data_real(bw: &mut BitWriter, params: &PsParams10) -> u32 {
+    let start = bw.bit_position();
+    // ---- Header (same as the no-op variant). ----
+    bw.write_bit(true); // enable_ps_header
+    bw.write_bit(true); // enable_iid
+    bw.write_u32(0, 3); // iid_mode = 0
+    bw.write_bit(true); // enable_icc
+    bw.write_u32(0, 3); // icc_mode = 0
+    bw.write_bit(false); // enable_ext = 0
+
+    // ---- Frame ----
+    bw.write_bit(false); // frame_class = 0 (FIX_BORDERS)
+    bw.write_u32(1, 2); // num_env_idx = 1 → num_env = 1
+
+    // IID, freq-direction differential. delta[0] = idx[0] - 0,
+    // delta[b] = idx[b] - idx[b-1]. Index range from `quantise_iid_default`
+    // is -7..=7, so deltas are bounded by ±14 — within huff_iid_df[0] table
+    // range (which covers -14..14).
+    bw.write_bit(false); // iid_dt[0] = 0 (freq-direction)
+    let mut prev = 0i32;
+    for b in 0..10 {
+        let cur = params.iid_idx[b].clamp(-7, 7);
+        let delta = (cur - prev).clamp(-14, 14);
+        huff_encode_iid_df0(bw, delta);
+        prev += delta;
+    }
+
+    // ICC, freq-direction differential. ICC index range is 0..=7, so
+    // deltas are bounded by ±7 — within huff_icc_df table range.
+    bw.write_bit(false); // icc_dt[0] = 0 (freq-direction)
+    let mut prev = 0i32;
+    for b in 0..10 {
+        let cur = params.icc_idx[b].clamp(0, 7);
+        let delta = (cur - prev).clamp(-7, 7);
+        huff_encode_icc_df(bw, delta);
+        prev += delta;
+    }
+    (bw.bit_position() - start) as u32
+}
+
+/// Write the SBR SCE element with a Parametric Stereo extension carrying
+/// real (variable-length) IID/ICC parameters. The PS payload is encoded
+/// into a temporary [`BitWriter`] first so that `bs_extension_size` can be
+/// set correctly before the content is appended.
+///
+/// Same outer layout as [`write_single_channel_element_mono_with_ps`]:
+/// SBR SCE body, then `bs_extended_data = 1`, then a PS extension
+/// (`bs_extension_id = 2`) sized to fit the variable PS payload. Trailing
+/// fill bits pad to a byte boundary inside the extension block.
+pub fn write_single_channel_element_mono_with_ps_real(
+    bw: &mut BitWriter,
+    _header: &SbrHeader,
+    freq: &FreqTables,
+    sf: &SbrFrameScalefactors,
+    params: &PsParams10,
+) {
+    // ---- Same body as write_single_channel_element_mono. ----
+    bw.write_bit(false); // bs_data_extra
+    bw.write_u32(FrameClass::FixFix as u32, 2);
+    bw.write_u32(0, 2); // bs_num_env = 1
+    bw.write_u32(1, 1); // bs_freq_res[0] = 1
+    bw.write_u32(0, 1); // bs_df_env[0] = 0
+    bw.write_u32(0, 1); // bs_df_noise[0] = 0
+    for _ in 0..freq.nq {
+        bw.write_u32(0, 2); // bs_invf_mode = 0
+    }
+    write_envelope_1_5db_freq_delta(bw, &sf.env, freq.n_high);
+    write_noise_3_0db_freq_delta(bw, &sf.noise, freq.nq);
+    bw.write_bit(false); // bs_add_harmonic_flag = 0
+
+    // ---- Pre-compute the PS payload into a side buffer. ----
+    // Layout inside the extension block: bs_extension_id (2 bits) +
+    // ps_data() (variable). Total content bits round up to bytes; any
+    // slack is filled with zero bits.
+    let mut sub = BitWriter::with_capacity(16);
+    let ps_bits = write_ps_data_real(&mut sub, params);
+    sub.align_to_byte();
+    let ps_bytes = sub.finish();
+
+    let content_bits = 2 + ps_bits; // bs_extension_id (2) + ps_data
+    let cnt_bytes = content_bits.div_ceil(8);
+    let fill_bits = cnt_bytes * 8 - content_bits;
+
+    // ---- bs_extended_data = 1 + EXT_ID_PS extension. ----
+    bw.write_bit(true); // bs_extended_data = 1
+    if cnt_bytes < 15 {
+        bw.write_u32(cnt_bytes, 4); // bs_extension_size
+    } else {
+        bw.write_u32(15, 4);
+        // bs_esc_count is "extension_size - 14" per Table 4.65.
+        bw.write_u32(cnt_bytes + 1 - 15, 8);
+    }
+    bw.write_u32(EXT_ID_PS_DATA, 2); // bs_extension_id = 2
+
+    // Splice the pre-built PS payload bits back in. We re-write `ps_bits`
+    // bits MSB-first from `ps_bytes`.
+    let full = (ps_bits / 8) as usize;
+    for byte in &ps_bytes[..full] {
+        bw.write_u32(*byte as u32, 8);
+    }
+    let tail = ps_bits - (full as u32) * 8;
+    if tail > 0 {
+        let last = ps_bytes[full] >> (8 - tail);
+        bw.write_u32(last as u32, tail);
+    }
     if fill_bits > 0 {
         bw.write_u32(0, fill_bits);
     }
@@ -1199,6 +1362,81 @@ mod tests {
                     assert!(
                         (*v - 1.0).abs() < 1e-5,
                         "ICC should be 1 (fully coherent), got {v}"
+                    );
+                }
+            }
+            other => panic!("expected Single SCE payload, got {other:?}"),
+        }
+    }
+
+    /// PS-enabled SBR payload with **real** per-band IID/ICC parameters
+    /// should round-trip through the parser and surface a
+    /// [`SbrPayload::Single`] whose dequantised PS frame matches the
+    /// quantised input parameters band-by-band.
+    #[test]
+    fn emit_payload_with_real_ps_round_trips() {
+        use crate::sbr::decode::{try_parse_sbr_extension_ext, SbrChannelState, SbrPayload};
+        use crate::sbr::ps::{PsParams10, ICC_QUANT, IID_QUANT_DEFAULT};
+        use oxideav_core::bits::BitReader;
+
+        let mut enc = SbrEncoder::new(24_000).expect("construct");
+        enc.set_emit_ps(true);
+        // Stage a fixed parameter set: alternating +4 dB / -4 dB IID per
+        // band, and ICC 0.937 / 0.84118 alternating.
+        let mut params = PsParams10::default();
+        for b in 0..10 {
+            params.iid_idx[b] = if b % 2 == 0 { 2 } else { -2 };
+            params.icc_idx[b] = if b % 2 == 0 { 1 } else { 2 };
+        }
+        enc.set_pending_ps(params.clone());
+        let pcm: Vec<f32> = (0..2048)
+            .map(|n| (2.0 * std::f32::consts::PI * 1000.0 * n as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let x = enc.analyse(&pcm);
+        let (bytes, bits) = enc.emit_sbr_payload(&x);
+
+        // Re-frame as a FIL inner payload: EXT_SBR_DATA + N bits of SBR.
+        let mut bw = BitWriter::with_capacity(bytes.len() + 1);
+        bw.write_u32(EXT_SBR_DATA, 4);
+        let full = (bits / 8) as usize;
+        for b in &bytes[..full] {
+            bw.write_u32(*b as u32, 8);
+        }
+        let tail = bits - full as u32 * 8;
+        if tail > 0 {
+            bw.write_u32((bytes[full] >> (8 - tail)) as u32, tail);
+        }
+        bw.align_to_byte();
+        let framed = bw.finish();
+        let mut br = BitReader::new(&framed);
+        let num_payload_bits = 4 + bits;
+        let mut state = SbrChannelState::new();
+        let parsed =
+            try_parse_sbr_extension_ext(&mut br, num_payload_bits, true, &mut state, 24_000)
+                .expect("parse real PS ok");
+        match parsed {
+            Some(SbrPayload::Single { ps, .. }) => {
+                let ps = ps.expect("PS frame present");
+                assert_eq!(ps.iid_db.len(), 1);
+                assert_eq!(ps.icc.len(), 1);
+                let iid = &ps.iid_db[0];
+                let icc = &ps.icc[0];
+                assert_eq!(iid.len(), 10);
+                assert_eq!(icc.len(), 10);
+                for b in 0..10 {
+                    let want_iid = IID_QUANT_DEFAULT[(params.iid_idx[b] + 7) as usize];
+                    let want_icc = ICC_QUANT[params.icc_idx[b] as usize];
+                    assert!(
+                        (iid[b] - want_iid).abs() < 1e-4,
+                        "IID band {b}: got {} want {}",
+                        iid[b],
+                        want_iid,
+                    );
+                    assert!(
+                        (icc[b] - want_icc).abs() < 1e-4,
+                        "ICC band {b}: got {} want {}",
+                        icc[b],
+                        want_icc,
                     );
                 }
             }
