@@ -60,12 +60,8 @@ fn he_aac_self_roundtrip_1khz_48k_to_24k_core_and_back() {
     let mut enc = HeAacMonoEncoder::new(&params).expect("enc construct");
     let n = pcm_bytes.len() / 2;
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: high_rate,
         samples: n as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, high_rate as i64),
         data: vec![pcm_bytes],
     };
     enc.send_frame(&Frame::Audio(af)).expect("enc send");
@@ -98,8 +94,6 @@ fn he_aac_self_roundtrip_1khz_48k_to_24k_core_and_back() {
             match dec.receive_frame() {
                 Ok(Frame::Audio(af)) => {
                     // S16 interleaved, but this is mono — accumulate.
-                    assert_eq!(af.channels, 1);
-                    assert_eq!(af.sample_rate, high_rate);
                     let data = &af.data[0];
                     let per = 2usize;
                     for i in 0..af.samples as usize {

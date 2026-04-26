@@ -155,8 +155,8 @@ fn our_decode_pcm(adts: &[u8]) -> Option<Vec<i16>> {
         }
         if let Ok(Frame::Audio(af)) = dec.receive_frame() {
             // The decoder always emits 2-channel S16LE for HE-AACv2 (PS
-            // upmix). We trust whatever channel count it reports.
-            let stride = af.channels as usize;
+            // upmix); per-frame metadata is gone, hardcode the upmix.
+            let stride = 2usize;
             for ch in af.data[0].chunks_exact(2 * stride) {
                 for c in 0..stride {
                     decoded.push(i16::from_le_bytes([ch[c * 2], ch[c * 2 + 1]]));
@@ -230,12 +230,8 @@ fn he_aac_v2_psnr_versus_afconvert_reference() {
     params.bit_rate = Some(32_000);
     let mut enc = HeAacV2Encoder::new(&params).expect("HeAacV2Encoder::new");
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: in_sr,
         samples: n_samples,
         pts: Some(0),
-        time_base: TimeBase::new(1, in_sr as i64),
         data: vec![pcm.clone()],
     };
     enc.send_frame(&Frame::Audio(af)).expect("send_frame");

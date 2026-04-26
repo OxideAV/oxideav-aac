@@ -115,6 +115,10 @@ pub struct AacEncoder {
     sample_rate: u32,
     sf_index: u8,
     bitrate: u64,
+    /// Input PCM sample format expected on incoming frames. Defaults to
+    /// `S16` when the input params don't specify one (matches the
+    /// historical default). The encoder accepts `S16` and `F32`.
+    input_sample_format: SampleFormat,
     /// Per-channel running PCM buffer (float in [-1, 1]).
     input_buf: Vec<Vec<f32>>,
     /// Per-channel overlap from the previous block's right half.
@@ -201,6 +205,7 @@ impl AacEncoder {
         out_params.bit_rate = Some(bitrate);
 
         let n_ch = channels as usize;
+        let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
         Ok(AacEncoder {
             codec_id: CodecId::new(crate::CODEC_ID_STR),
             out_params,
@@ -210,6 +215,7 @@ impl AacEncoder {
             sample_rate,
             sf_index,
             bitrate,
+            input_sample_format,
             input_buf: vec![Vec::with_capacity(BLOCK_LEN * 2); n_ch],
             overlap: vec![vec![0.0f32; FRAME_LEN]; n_ch],
             output_queue: VecDeque::new(),
@@ -255,12 +261,6 @@ impl AacEncoder {
     }
 
     fn push_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != self.channels {
-            return Err(Error::invalid(format!(
-                "AAC encoder: expected {} channels, got {}",
-                self.channels, frame.channels
-            )));
-        }
         let n = frame.samples as usize;
         if n == 0 {
             return Ok(());
@@ -269,7 +269,7 @@ impl AacEncoder {
             .data
             .first()
             .ok_or_else(|| Error::invalid("AAC encoder: frame missing data plane"))?;
-        match frame.format {
+        match self.input_sample_format {
             SampleFormat::S16 => {
                 let stride = self.channels as usize * 2;
                 if plane.len() < n * stride {
@@ -2433,7 +2433,6 @@ mod tests {
         dec.send_packet(&pkt).expect("send_packet");
         match dec.receive_frame() {
             Ok(oxideav_core::Frame::Audio(af)) => {
-                assert_eq!(af.channels, 1);
                 assert_eq!(af.samples, 1024);
             }
             Ok(other) => panic!("unexpected frame variant: {other:?}"),
@@ -2502,7 +2501,6 @@ mod tests {
         dec.send_packet(&pkt).expect("send_packet");
         match dec.receive_frame() {
             Ok(oxideav_core::Frame::Audio(af)) => {
-                assert_eq!(af.channels, 1);
                 assert_eq!(af.samples, 1024);
             }
             Ok(other) => panic!("unexpected frame variant: {other:?}"),
@@ -2743,12 +2741,8 @@ mod tests {
         enc.set_enable_short_blocks(true);
 
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: sr,
             samples: total_samples as u32,
             pts: None,
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![pcm_s16],
         });
         enc.send_frame(&frame).unwrap();
@@ -2830,7 +2824,6 @@ mod tests {
             loop {
                 match dec.receive_frame() {
                     Ok(oxideav_core::Frame::Audio(af)) => {
-                        assert_eq!(af.channels, 1);
                         assert_eq!(af.samples, 1024);
                         // Grab the first plane (S16 interleaved — 1 ch
                         // so 2 bytes per sample). Append to decoded.
@@ -2899,12 +2892,8 @@ mod tests {
             pcm.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 44_100,
             samples: 2048,
             pts: None,
-            time_base: TimeBase::new(1, 44_100),
             data: vec![pcm],
         });
         enc.send_frame(&frame).unwrap();

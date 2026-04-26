@@ -75,12 +75,8 @@ fn ffmpeg_decodes_our_he_aac_with_zero_decode_errors() {
     params.bit_rate = Some(64_000);
     let mut enc = HeAacStereoEncoder::new(&params).expect("enc construct");
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: high_rate,
         samples: total as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, high_rate as i64),
         data: vec![bytes],
     };
     enc.send_frame(&Frame::Audio(af)).expect("send_frame");

@@ -839,14 +839,9 @@ impl AacDecoder {
                     out_bytes.extend_from_slice(&s.to_le_bytes());
                 }
             }
-            let output_rate = core_rate.saturating_mul(2);
             return Ok(Frame::Audio(AudioFrame {
-                format: SampleFormat::S16,
-                channels: out_channels as u16,
-                sample_rate: output_rate,
                 samples: out_samples as u32,
                 pts: pkt.pts,
-                time_base: TimeBase::new(1, output_rate as i64),
                 data: vec![out_bytes],
             }));
         }
@@ -875,14 +870,9 @@ impl AacDecoder {
             *slot = None;
         }
 
-        let sample_rate = core_rate;
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: channels_out as u16,
-            sample_rate,
             samples: FRAME_LEN as u32,
             pts: pkt.pts,
-            time_base: self.time_base,
             data: vec![out_bytes],
         }))
     }

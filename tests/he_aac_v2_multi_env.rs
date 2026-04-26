@@ -137,12 +137,8 @@ fn encode_he_aac_v2(pcm: &[u8], sr: u32, n_samples: u32) -> Vec<u8> {
     params.bit_rate = Some(32_000);
     let mut enc = HeAacV2Encoder::new(&params).expect("HeAacV2Encoder::new");
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: sr,
         samples: n_samples,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![pcm.to_vec()],
     };
     enc.send_frame(&Frame::Audio(af)).expect("send_frame");

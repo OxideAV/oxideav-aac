@@ -131,12 +131,8 @@ fn he_aac_v2_noop_ps_decodes_to_identity_stereo() {
     // Push the whole PCM in one frame.
     let n_samples = (in_sr as f32 * secs) as u32;
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: in_sr,
         samples: n_samples,
         pts: Some(0),
-        time_base: TimeBase::new(1, in_sr as i64),
         data: vec![pcm_bytes],
     };
     enc.send_frame(&Frame::Audio(af)).expect("send_frame");

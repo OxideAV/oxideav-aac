@@ -72,12 +72,8 @@ fn he_aac_stereo_self_roundtrip_two_tones_48k_to_24k_core_and_back() {
     let mut enc = HeAacStereoEncoder::new(&params).expect("enc construct");
     let n = pcm_bytes.len() / 4;
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: high_rate,
         samples: n as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, high_rate as i64),
         data: vec![pcm_bytes],
     };
     enc.send_frame(&Frame::Audio(af)).expect("enc send");
@@ -113,8 +109,6 @@ fn he_aac_stereo_self_roundtrip_two_tones_48k_to_24k_core_and_back() {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(af)) => {
-                    assert_eq!(af.channels, 2);
-                    assert_eq!(af.sample_rate, high_rate);
                     let data = &af.data[0];
                     let stride = 4usize; // 2 ch * 2 bytes (S16 interleaved)
                     for i in 0..af.samples as usize {

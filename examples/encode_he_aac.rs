@@ -7,7 +7,7 @@
 
 use oxideav_aac::he_aac_encoder::HeAacMonoEncoder;
 use oxideav_core::Encoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame};
 use std::fs::File;
 use std::io::Write;
 
@@ -29,12 +29,8 @@ fn main() {
     params.bit_rate = Some(32_000);
     let mut enc = HeAacMonoEncoder::new(&params).expect("enc");
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: high_rate,
         samples: total as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, high_rate as i64),
         data: vec![bytes],
     };
     enc.send_frame(&Frame::Audio(af)).expect("send");

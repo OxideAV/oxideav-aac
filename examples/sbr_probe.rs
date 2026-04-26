@@ -85,15 +85,13 @@ fn main() {
 
     let mut all_pcm: Vec<u8> = Vec::new();
     let mut frame_peaks: Vec<i16> = Vec::new();
-    let mut out_ch: u16 = ch;
-    let mut out_sr: u32 = core_sr;
+    let out_ch: u16 = ch;
+    let out_sr: u32 = core_sr;
     for (i, &(off, len)) in frames.iter().enumerate() {
         let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec()).with_pts(i as i64 * 1024);
         dec.send_packet(&pkt).unwrap();
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
-                out_ch = af.channels;
-                out_sr = af.sample_rate;
                 let peak = peak_i16(&af.data[0]);
                 frame_peaks.push(peak);
                 all_pcm.extend_from_slice(&af.data[0]);

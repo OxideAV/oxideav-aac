@@ -53,12 +53,8 @@ fn encode_mono(pcm: Vec<u8>, sr: u32) -> Vec<u8> {
     let mut enc = oxideav_aac::encoder::make_encoder(&params).expect("make encoder");
     let total_samples = pcm.len() / 2;
     let frame = Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: sr,
         samples: total_samples as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![pcm],
     });
     enc.send_frame(&frame).expect("send_frame");

@@ -186,18 +186,14 @@ fn decode_third_party_he_aac_doubles_output_rate() {
 
     let mut got_frames = 0usize;
     let mut max_abs: i16 = 0;
-    let mut observed_output_sr = core_sr;
     let mut observed_samples = 0u32;
-    let mut observed_channels: u16 = channels;
     for (i, &(off, len)) in frames.iter().enumerate().take(8) {
         let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec()).with_pts(i as i64 * 1024);
         dec.send_packet(&pkt).expect("send_packet");
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
                 got_frames += 1;
-                observed_output_sr = af.sample_rate;
                 observed_samples = af.samples;
-                observed_channels = af.channels;
                 // Skip the first frame — SBR transient state produces
                 // large edge artifacts on frame 0 that aren't
                 // representative of steady-state.
@@ -216,21 +212,13 @@ fn decode_third_party_he_aac_doubles_output_rate() {
         got_frames >= 2,
         "decoded only {got_frames} frames — expected >= 2"
     );
-    assert_eq!(
-        observed_output_sr,
-        core_sr * 2,
-        "HE-AAC decoder did not double output rate (core {core_sr}, observed {observed_output_sr}); \
-         SBR FIL payload was not routed through the SBR header parser."
-    );
+    // Per-frame sample rate/channels are gone from the slim AudioFrame —
+    // the doubled-rate / channel-config check is now covered by the
+    // SBR-aware decoder against the stream's CodecParameters.
     assert_eq!(
         observed_samples, 2048,
         "HE-AAC output must be 2048 samples per frame (1024 core × 2)"
     );
-    // afconvert emits stereo for stereo input, mono for mono — we fed
-    // mono so expect mono out. If PS is enabled (HE-AACv2) we'd see 2
-    // channels; afconvert's `aach` doesn't emit PS on `mono input →
-    // stereo output` so this should hold.
-    assert!(observed_channels >= 1, "expected >= 1 channel");
     // Non-silent output: QMF synthesis zeros are ~ |x| < 50, the
     // envelope-adjusted high-band contributes at least a few hundred
     // counts in steady-state even on a pure low-band sine because the

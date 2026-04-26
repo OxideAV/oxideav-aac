@@ -23,12 +23,8 @@ fn encode(pcm: Vec<u8>, channels: u16, bitrate: u64) -> Vec<u8> {
     let mut enc = oxideav_aac::encoder::make_encoder(&params).expect("make encoder");
     let samples = pcm.len() / (2 * channels as usize);
     let frame = Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels,
-        sample_rate: SR,
         samples: samples as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, SR as i64),
         data: vec![pcm],
     });
     enc.send_frame(&frame).expect("send_frame");

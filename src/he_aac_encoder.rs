@@ -50,6 +50,8 @@ pub struct HeAacMonoEncoder {
     /// Output sample rate — 2 × core_rate, exposed via `output_params`
     /// so callers can route the downstream sink correctly.
     out_rate: u32,
+    /// Input PCM sample format. Defaults to `S16`. Accepts `S16` or `F32`.
+    input_sample_format: SampleFormat,
     out_params: CodecParameters,
 }
 
@@ -77,10 +79,13 @@ impl HeAacMonoEncoder {
             ));
         }
         let core_rate = out_rate / 2;
-        // Inner AAC-LC encoder runs at the core rate.
+        // Inner AAC-LC encoder runs at the core rate. We feed it F32 PCM
+        // (downsampler output), so its expected input format must be F32 —
+        // independent of what the user feeds us on the outer interface.
         let mut inner_params = params.clone();
         inner_params.sample_rate = Some(core_rate);
         inner_params.channels = Some(1);
+        inner_params.sample_format = Some(SampleFormat::F32);
         let inner = AacEncoder::new(&inner_params)?;
         let sbr = SbrEncoder::new(core_rate)?;
         let mut out_params = params.clone();
@@ -88,6 +93,7 @@ impl HeAacMonoEncoder {
         out_params.sample_format = Some(SampleFormat::S16);
         out_params.channels = Some(1);
         out_params.sample_rate = Some(out_rate);
+        let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
         Ok(Self {
             inner,
             sbr,
@@ -96,14 +102,12 @@ impl HeAacMonoEncoder {
             flushed: false,
             core_rate,
             out_rate,
+            input_sample_format,
             out_params,
         })
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != 1 {
-            return Err(Error::invalid("HE-AAC encoder: expected 1-channel input"));
-        }
         let n = frame.samples as usize;
         if n == 0 {
             return Ok(());
@@ -112,7 +116,7 @@ impl HeAacMonoEncoder {
             .data
             .first()
             .ok_or_else(|| Error::invalid("HE-AAC encoder: missing data plane"))?;
-        match frame.format {
+        match self.input_sample_format {
             SampleFormat::S16 => {
                 let stride = 2usize;
                 if plane.len() < n * stride {
@@ -182,12 +186,8 @@ impl HeAacMonoEncoder {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         let af = AudioFrame {
-            format: SampleFormat::F32,
-            channels: 1,
-            sample_rate: self.core_rate,
             samples: low.len() as u32,
             pts: None,
-            time_base: oxideav_core::TimeBase::new(1, self.core_rate as i64),
             data: vec![bytes],
         };
         self.inner.send_frame(&Frame::Audio(af))?;
@@ -273,6 +273,8 @@ pub struct HeAacStereoEncoder {
     flushed: bool,
     core_rate: u32,
     out_rate: u32,
+    /// Input PCM sample format. Defaults to `S16`. Accepts `S16` or `F32`.
+    input_sample_format: SampleFormat,
     out_params: CodecParameters,
 }
 
@@ -297,9 +299,13 @@ impl HeAacStereoEncoder {
             ));
         }
         let core_rate = out_rate / 2;
+        // Inner AAC-LC encoder runs at the core rate, fed F32 stereo (the
+        // downsampler emits floats), so force its expected input format to
+        // F32 regardless of what the outer interface advertises.
         let mut inner_params = params.clone();
         inner_params.sample_rate = Some(core_rate);
         inner_params.channels = Some(2);
+        inner_params.sample_format = Some(SampleFormat::F32);
         let inner = AacEncoder::new(&inner_params)?;
         let sbr = SbrStereoEncoder::new(core_rate)?;
         let mut out_params = params.clone();
@@ -307,6 +313,7 @@ impl HeAacStereoEncoder {
         out_params.sample_format = Some(SampleFormat::S16);
         out_params.channels = Some(2);
         out_params.sample_rate = Some(out_rate);
+        let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
         Ok(Self {
             inner,
             sbr,
@@ -317,16 +324,12 @@ impl HeAacStereoEncoder {
             flushed: false,
             core_rate,
             out_rate,
+            input_sample_format,
             out_params,
         })
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != 2 {
-            return Err(Error::invalid(
-                "HE-AACv1 stereo encoder: expected 2-channel input",
-            ));
-        }
         let n = frame.samples as usize;
         if n == 0 {
             return Ok(());
@@ -335,7 +338,7 @@ impl HeAacStereoEncoder {
             .data
             .first()
             .ok_or_else(|| Error::invalid("HE-AAC encoder: missing data plane"))?;
-        match frame.format {
+        match self.input_sample_format {
             SampleFormat::S16 => {
                 let stride = 4usize; // 2 channels * 2 bytes
                 if plane.len() < n * stride {
@@ -422,12 +425,8 @@ impl HeAacStereoEncoder {
             bytes.extend_from_slice(&low_r[i].to_le_bytes());
         }
         let af = AudioFrame {
-            format: SampleFormat::F32,
-            channels: 2,
-            sample_rate: self.core_rate,
             samples: n_low as u32,
             pts: None,
-            time_base: oxideav_core::TimeBase::new(1, self.core_rate as i64),
             data: vec![bytes],
         };
         self.inner.send_frame(&Frame::Audio(af))?;
@@ -551,6 +550,8 @@ pub struct HeAacV2Encoder {
     flushed: bool,
     core_rate: u32,
     out_rate: u32,
+    /// Input PCM sample format. Defaults to `S16`. Accepts `S16` or `F32`.
+    input_sample_format: SampleFormat,
     out_params: CodecParameters,
 }
 
@@ -581,6 +582,10 @@ impl HeAacV2Encoder {
         let mut inner_params = params.clone();
         inner_params.sample_rate = Some(core_rate);
         inner_params.channels = Some(1);
+        // Inner core receives F32 mono PCM from the down-mix/downsample
+        // pipeline — pin its expected input format so it doesn't fall back
+        // to the user-facing default (S16) and misinterpret bytes.
+        inner_params.sample_format = Some(SampleFormat::F32);
         let inner = AacEncoder::new(&inner_params)?;
         let mut sbr = SbrEncoder::new(core_rate)?;
         sbr.set_emit_ps(true);
@@ -591,6 +596,7 @@ impl HeAacV2Encoder {
         out_params.sample_format = Some(SampleFormat::S16);
         out_params.channels = Some(2);
         out_params.sample_rate = Some(out_rate);
+        let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
         Ok(Self {
             inner,
             sbr,
@@ -602,14 +608,12 @@ impl HeAacV2Encoder {
             flushed: false,
             core_rate,
             out_rate,
+            input_sample_format,
             out_params,
         })
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != 2 {
-            return Err(Error::invalid("HE-AACv2 encoder: expected 2-channel input"));
-        }
         let n = frame.samples as usize;
         if n == 0 {
             return Ok(());
@@ -618,7 +622,7 @@ impl HeAacV2Encoder {
             .data
             .first()
             .ok_or_else(|| Error::invalid("HE-AAC encoder: missing data plane"))?;
-        match frame.format {
+        match self.input_sample_format {
             SampleFormat::S16 => {
                 let stride = 4usize; // 2 channels * 2 bytes
                 if plane.len() < n * stride {
@@ -743,12 +747,8 @@ impl HeAacV2Encoder {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         let af = AudioFrame {
-            format: SampleFormat::F32,
-            channels: 1,
-            sample_rate: self.core_rate,
             samples: low.len() as u32,
             pts: None,
-            time_base: oxideav_core::TimeBase::new(1, self.core_rate as i64),
             data: vec![bytes],
         };
         self.inner.send_frame(&Frame::Audio(af))?;
@@ -837,12 +837,8 @@ mod tests {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         let af = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: sr,
             samples: n as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(af)).expect("send_frame");
@@ -880,12 +876,8 @@ mod tests {
             bytes.extend_from_slice(&sr_s.to_le_bytes());
         }
         let af = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: sr,
             samples: n as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(af)).expect("send_frame");

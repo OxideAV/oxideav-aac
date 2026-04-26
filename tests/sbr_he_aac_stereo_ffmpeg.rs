@@ -91,12 +91,8 @@ fn ffmpeg_decodes_our_he_aac_stereo() {
     let mut enc = HeAacStereoEncoder::new(&params).expect("enc construct");
     let n = pcm_bytes.len() / 4;
     let af = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: high_rate,
         samples: n as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, high_rate as i64),
         data: vec![pcm_bytes],
     };
     enc.send_frame(&Frame::Audio(af)).expect("enc send");

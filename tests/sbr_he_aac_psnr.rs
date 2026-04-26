@@ -152,19 +152,20 @@ fn decode_all(bytes: &[u8]) -> (Vec<u8>, u32, u16, usize) {
     let mut dec = oxideav_aac::decoder::make_decoder(&params).expect("make decoder");
     let tb = TimeBase::new(1, core_sr as i64);
     let mut pcm: Vec<u8> = Vec::new();
-    let mut out_sr = core_sr;
-    let mut out_ch = ch;
     let mut frame_count = 0;
     for (i, &(off, len)) in frames.iter().enumerate() {
         let pkt = Packet::new(0, tb, bytes[off..off + len].to_vec()).with_pts(i as i64 * 1024);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(af)) = dec.receive_frame() {
-            out_sr = af.sample_rate;
-            out_ch = af.channels;
             pcm.extend_from_slice(&af.data[0]);
             frame_count += 1;
         }
     }
+    // Per-frame output rate / channel count is no longer carried on
+    // AudioFrame — the SBR/PS decoder doubles the core rate and (for
+    // PS) upmixes to stereo, so report the implied stream-level values.
+    let out_sr = core_sr.saturating_mul(2);
+    let out_ch = if ch == 1 { 1 } else { ch };
     (pcm, out_sr, out_ch, frame_count)
 }
 

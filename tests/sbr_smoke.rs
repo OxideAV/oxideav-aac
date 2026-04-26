@@ -57,12 +57,8 @@ fn encode_mono(pcm_bytes: Vec<u8>, sr: u32, bitrate: u64) -> Vec<u8> {
     let mut enc = oxideav_aac::encoder::make_encoder(&params).expect("make encoder");
     let total_samples = pcm_bytes.len() / 2;
     let frame = Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: sr,
         samples: total_samples as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![pcm_bytes],
     });
     enc.send_frame(&frame).expect("send_frame");
@@ -157,9 +153,17 @@ fn decoder_with_ps_extradata_upmixes_to_stereo() {
     let frame = dec.receive_frame().expect("receive");
     match frame {
         Frame::Audio(af) => {
-            // PS upmixes mono to stereo; sample rate is still doubled.
-            assert_eq!(af.channels, 2, "PS did not upmix to stereo");
-            assert_eq!(af.sample_rate, sr_core * 2);
+            // PS upmixes mono to stereo; sample rate is still doubled
+            // (1024 core × 2 = 2048 per frame). With interleaved S16 stereo,
+            // data[0].len() == samples * 2 channels * 2 bytes.
+            assert_eq!(af.samples as usize, 2048, "expected 2048 doubled samples");
+            assert_eq!(
+                af.data[0].len(),
+                af.samples as usize * 2 * 2,
+                "PS did not upmix to stereo (expected stereo interleaved S16)"
+            );
+            // Avoid unused warning on sr_core in this test.
+            let _ = sr_core;
         }
         other => panic!("expected audio frame, got {other:?}"),
     }
@@ -203,14 +207,10 @@ fn decoder_with_sbr_extradata_doubles_rate() {
     let frame = dec.receive_frame().expect("receive");
     match frame {
         Frame::Audio(af) => {
-            assert_eq!(
-                af.sample_rate,
-                sr_core * 2,
-                "expected doubled output rate, got {}",
-                af.sample_rate
-            );
+            // Per-frame sample rate / channel count is no longer carried;
+            // doubling-to-2x-core is implicit in the sample count emitted
+            // by the SBR-aware path (1024 core × 2 = 2048 per frame).
             assert_eq!(af.samples as usize, 2048, "expected 2048 doubled samples");
-            assert_eq!(af.channels, 1);
         }
         other => panic!("expected audio frame, got {other:?}"),
     }
