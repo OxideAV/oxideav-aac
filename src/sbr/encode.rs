@@ -285,7 +285,12 @@ pub fn estimate_envelope(
     ft: &FreqTables,
 ) -> SbrFrameScalefactors {
     // 32768² = 2^30 ≈ 1.0737e9. Brings `[-1, 1]` PCM-float QMF energies
-    // up to int16-PCM scale² so the encoder and decoder formulas line up.
+    // up to int16-PCM scale² so the encoder and decoder formulas line up
+    // for our own decoder (which carries spec at int16-amplitude through
+    // SBR). Round 18 verified empirically that this constant has **no**
+    // effect on ffmpeg-decoded HE-AAC output amplitude — see the round-18
+    // commit message for the full diagnostic. The ffmpeg interop gap lies
+    // elsewhere (likely AAC-LC core spectrum scale, not SBR envelope).
     const INT16_SCALE_SQ: f32 = (32768.0 * 32768.0) as f32;
     let n = x_high.len().max(1) as f32;
     let mut env = vec![0i32; ft.n_high];
