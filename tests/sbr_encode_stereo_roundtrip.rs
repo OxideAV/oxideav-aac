@@ -9,7 +9,7 @@
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
 use oxideav_aac::he_aac_encoder::HeAacStereoEncoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, TimeBase};
 #[allow(unused_imports)]
 use oxideav_core::{Decoder, Encoder};
 

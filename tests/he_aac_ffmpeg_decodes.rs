@@ -28,7 +28,7 @@ use std::process::Command;
 
 use oxideav_aac::he_aac_encoder::HeAacStereoEncoder;
 use oxideav_core::Encoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame};
 
 fn which(name: &str) -> Option<PathBuf> {
     let out = Command::new("which").arg(name).output().ok()?;

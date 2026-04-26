@@ -9,7 +9,7 @@ use oxideav_aac::adts::parse_adts_header;
 use oxideav_aac::ics::{parse_ics_info, parse_section_data, INTENSITY_HCB, NOISE_HCB};
 use oxideav_aac::syntax::ElementType;
 use oxideav_core::bits::BitReader;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, TimeBase};
 #[allow(unused_imports)]
 use oxideav_core::{Decoder, Encoder};
 

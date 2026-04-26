@@ -89,6 +89,27 @@ pub fn build_limiter_bands(ft: &FreqTables, patches: &PatchInfo, bs_limiter_band
     refined
 }
 
+/// Map `bs_limiter_gains` (header field, 2 bits) to the per-band limiter
+/// gain cap `gain_max` per ISO/IEC 14496-3 §4.6.18.7.5 / Table 4.176:
+///
+/// | `bs_limiter_gains` | `limiter_gain` |
+/// |--------------------|----------------|
+/// | 0                  | 0.5            |
+/// | 1                  | 1.0            |
+/// | 2                  | 2.0 *(default)*|
+/// | 3                  | 1e10 *(effectively no limit)* |
+///
+/// `1e10` matches the spec's "infinity" value; capped to avoid f32
+/// numerical issues downstream.
+pub fn limiter_gain_cap(bs_limiter_gains: u8) -> f32 {
+    match bs_limiter_gains & 0b11 {
+        0 => 0.5,
+        1 => 1.0,
+        3 => 1.0e10,
+        _ => 2.0,
+    }
+}
+
 /// Apply envelope adjustment + noise + sinusoid synthesis + limiter pass
 /// to a single channel's XHigh matrix (§4.6.18.7).
 ///
@@ -102,7 +123,7 @@ pub fn apply_envelope(
     t_e: &[i32],
     t_hf_adj: usize,
 ) {
-    apply_envelope_with_limiter(x_high, data, ft, t_e, t_hf_adj, None, 0);
+    apply_envelope_with_limiter(x_high, data, ft, t_e, t_hf_adj, None, 0, 2);
 }
 
 /// Full envelope adjuster as described in §4.6.18.7.
@@ -112,6 +133,9 @@ pub fn apply_envelope(
 /// band` so narrow peaks don't blow up adjacent subbands.
 /// `noise_seed`: deterministic seed for the PRNG — typically the running
 /// frame counter. Pass 0 for a default seed.
+/// `bs_limiter_gains`: 2-bit header field selecting the gain cap (Table
+/// 4.176). See [`limiter_gain_cap`] for the mapping. Pass `2` (= 2.0×) to
+/// match pre-round-17 behaviour.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_envelope_with_limiter(
     x_high: &mut [[Complex32; NUM_QMF_BANDS]],
@@ -121,6 +145,7 @@ pub fn apply_envelope_with_limiter(
     t_hf_adj: usize,
     limiter_bands: Option<&[i32]>,
     noise_seed: u32,
+    bs_limiter_gains: u8,
 ) {
     let le = data.bs_num_env as usize;
     if le == 0 || t_e.len() < le + 1 {
@@ -128,11 +153,10 @@ pub fn apply_envelope_with_limiter(
     }
     let amp_res_bits = if data.bs_amp_res != 0 { 1 } else { 2 };
     let mut rng = SbrNoiseRng::new(noise_seed ^ 0xC0DE_BABE);
-    // Limiter-gain cap: spec Table 4.176 maps bs_limiter_gains {0..3} to
-    // {0.5, 1.0, 2.0, 1e10}. We fold bs_limiter_gains from the header via
-    // the `_unused_limiter_gains` arg the caller didn't wire yet (default
-    // = 2.0 per the most common choice).
-    let limiter_gain_cap = 2.0f32;
+    // Limiter-gain cap from Table 4.176 (§4.6.18.7.5). Round 17: now wired
+    // through from the parsed SBR header — pre-round-17 the value was
+    // hard-coded to 2.0×, ignoring `bs_limiter_gains` from the bitstream.
+    let limiter_gain_cap = limiter_gain_cap(bs_limiter_gains);
 
     for env in 0..le {
         let n_bands_idx = data.freq_res[env] as usize;
@@ -359,7 +383,7 @@ pub fn apply_envelope_coupled(
     t_hf_adj: usize,
 ) {
     apply_envelope_coupled_with_limiter(
-        x_high_l, x_high_r, data_l, data_r, ft, t_e, t_hf_adj, None, 0,
+        x_high_l, x_high_r, data_l, data_r, ft, t_e, t_hf_adj, None, 0, 2,
     );
 }
 
@@ -375,6 +399,7 @@ pub fn apply_envelope_coupled_with_limiter(
     t_hf_adj: usize,
     limiter_bands: Option<&[i32]>,
     noise_seed: u32,
+    bs_limiter_gains: u8,
 ) {
     // We delegate to apply_envelope_with_limiter per-channel — constructing
     // unpacked SbrChannelData copies that hold the decoupled E_orig / E_bal
@@ -386,6 +411,12 @@ pub fn apply_envelope_coupled_with_limiter(
     // subbands where the envelope left a gap (noise scalefactors >> 0).
     let _ = limiter_bands;
     let _ = noise_seed;
+    // Round 17: the coupled path still computes gains per-subband against
+    // the band-average `e_curr` and applies them directly without going
+    // through the per-band limiter pass — so `bs_limiter_gains` does not
+    // currently affect this path. Plumbed through for API consistency and
+    // future use.
+    let _ = bs_limiter_gains;
     let le = data_l.bs_num_env as usize;
     if le == 0 || t_e.len() < le + 1 {
         return;
@@ -534,6 +565,18 @@ mod tests {
             let v = rng.next_unit();
             assert!((-1.0..1.0).contains(&v));
         }
+    }
+
+    /// ISO/IEC 14496-3 Table 4.176 — `bs_limiter_gains` to limiter cap.
+    #[test]
+    fn limiter_gain_cap_matches_table_4_176() {
+        assert_eq!(limiter_gain_cap(0), 0.5);
+        assert_eq!(limiter_gain_cap(1), 1.0);
+        assert_eq!(limiter_gain_cap(2), 2.0);
+        assert_eq!(limiter_gain_cap(3), 1.0e10);
+        // Only the low 2 bits matter — high bits are masked off.
+        assert_eq!(limiter_gain_cap(0b0100_0010), 2.0);
+        assert_eq!(limiter_gain_cap(0xFF), 1.0e10);
     }
 
     #[test]

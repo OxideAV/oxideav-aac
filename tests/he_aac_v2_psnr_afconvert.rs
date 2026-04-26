@@ -21,9 +21,7 @@ use std::process::Command;
 
 use oxideav_aac::adts::{parse_adts_header, ADTS_HEADER_NO_CRC};
 use oxideav_aac::he_aac_encoder::HeAacV2Encoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Encoder, Frame, Packet, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Encoder, Frame, Packet, TimeBase};
 
 fn cmd_available(prog: &str) -> bool {
     // We don't actually care about exit status — `afconvert -h` and

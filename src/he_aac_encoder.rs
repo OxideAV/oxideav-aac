@@ -816,7 +816,6 @@ impl Encoder for HeAacV2Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::TimeBase;
 
     #[test]
     fn he_aac_encoder_emits_adts_frames() {

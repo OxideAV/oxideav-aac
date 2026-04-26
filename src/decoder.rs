@@ -694,7 +694,6 @@ impl AacDecoder {
         let ps_active = self.ps_explicit || self.sbr_ps.iter().any(|p| p.is_some());
         let sbr_active = (self.sbr_explicit || self.sbr_data.iter().any(|s| s.is_some()))
             && (1..=2).contains(&channels_out);
-        let core_rate = crate::syntax::sample_rate(self.sf_index).unwrap_or(44_100);
         if sbr_active {
             let out_samples = 2 * FRAME_LEN;
             // Allocate for the HE-AACv1 output (mono or stereo CPE). PS

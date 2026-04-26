@@ -321,6 +321,7 @@ pub fn decode_sbr_frame(
         super::T_HF_ADJ,
         Some(&lim),
         seed,
+        state.header.bs_limiter_gains,
     );
 
     // 5) Synthesis QMF — 64 complex subbands × one subsample → 64 PCM
@@ -440,6 +441,7 @@ pub fn decode_sbr_frame_ps(
             super::T_HF_ADJ,
             Some(&lim),
             seed,
+            state.header.bs_limiter_gains,
         );
     }
 
@@ -621,6 +623,7 @@ pub fn decode_sbr_cpe_frame(
             super::T_HF_ADJ,
             Some(&lim_l),
             seed_l,
+            state_l.header.bs_limiter_gains,
         );
     } else {
         apply_envelope_with_limiter(
@@ -631,6 +634,7 @@ pub fn decode_sbr_cpe_frame(
             super::T_HF_ADJ,
             Some(&lim_l),
             seed_l,
+            state_l.header.bs_limiter_gains,
         );
         let t_e_r = envelope_time_borders(data_r, num_time_slots);
         apply_envelope_with_limiter(
@@ -641,6 +645,7 @@ pub fn decode_sbr_cpe_frame(
             super::T_HF_ADJ,
             Some(&lim_r),
             seed_r,
+            state_r.header.bs_limiter_gains,
         );
     }
 

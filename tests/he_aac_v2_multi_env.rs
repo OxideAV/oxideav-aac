@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::Command;
 
 use oxideav_aac::he_aac_encoder::HeAacV2Encoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Encoder, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Encoder, Frame};
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")

@@ -12,7 +12,7 @@
 //! through encode → decode must remain stable (covered by the main
 //! `encode_roundtrip` suite).
 
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, TimeBase};
 #[allow(unused_imports)]
 use oxideav_core::{Decoder, Encoder};
 
