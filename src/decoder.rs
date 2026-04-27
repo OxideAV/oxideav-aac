@@ -969,19 +969,24 @@ fn apply_pns_long_ch1_leftover(
 
 /// Apply Intensity Stereo (IS) decoding in-place. Spec §4.6.8.2.3.
 ///
-/// For each scalefactor band where channel 1's codebook is `INTENSITY_HCB`
-/// (15) or `INTENSITY_HCB2` (14), synthesise channel-1 coefficients from
-/// channel-0 coefficients:
+/// For each scalefactor band where channel 1's (right-channel) codebook is
+/// `INTENSITY_HCB` (15) or `INTENSITY_HCB2` (14), synthesise channel-1
+/// coefficients from channel-0:
 /// ```text
-/// spec[1][k] = sign · 2^(-is_position/4) · spec[0][k]
+/// scale          = is_intensity * invert_intensity * 0.5^(0.25 * is_position)
+/// spec[1][k]     = scale * spec[0][k]
+/// is_intensity   = +1 (cb=15), -1 (cb=14)
+/// invert_intensity = (1 - 2*ms_used)   only if  ms_mask_present == 1
+///                  = +1                otherwise (mask=0 or mask=2)
 /// ```
-/// where:
-/// * `sign = +1` for codebook 15, `-1` for codebook 14.
-/// * `is_position` is the accumulated scalefactor value stored in
-///   `sfs[1][g·max_sfb + sfb]` (the IS-specific accumulator tracked by
-///   [`parse_scalefactors`]).
-/// * `ms_used[g·max_sfb + sfb]` on an IS band is repurposed as the sign
-///   toggle (per §4.6.8.2.3); when it's set, the sign flips.
+/// Note that per §4.6.8.2.3 the `ms_used` "phase-invert" only kicks in when
+/// `ms_mask_present == 1` — when the mask is "all zeros" (0) or
+/// "all ones" (2), `invert_intensity == +1` and the IS sign is taken
+/// purely from the codebook id.
+///
+/// `is_position` is the accumulated scalefactor value stored in
+/// `sfs[1][g·max_sfb + sfb]` (IS positions share the scalefactor codebook
+/// but use a separate accumulator — see [`parse_scalefactors`]).
 ///
 /// Must run BEFORE [`apply_ms_stereo`] — the M/S pass explicitly skips IS
 /// bands and depends on them already carrying the IS-synthesised channel-1
@@ -1011,17 +1016,20 @@ fn apply_intensity_stereo(
             if cb != INTENSITY_HCB && cb != INTENSITY_HCB2 {
                 continue;
             }
-            // cb 15 → sign +1, cb 14 → sign -1.
-            let mut sign: f32 = if cb == INTENSITY_HCB { 1.0 } else { -1.0 };
-            // ms_mask_present != 0 makes ms_used[] meaningful. On IS bands
-            // it's the sign-toggle bit rather than an MS flag (the MS pass
-            // already skips IS bands).
-            if ms_mask_present != 0 && ms_used[g * max_sfb + sfb] {
-                sign = -sign;
-            }
+            // cb 15 → is_intensity = +1, cb 14 → is_intensity = -1.
+            let is_intensity_sign: f32 = if cb == INTENSITY_HCB { 1.0 } else { -1.0 };
+            // §4.6.8.2.3 — invert_intensity is (1 - 2*ms_used) ONLY when
+            // ms_mask_present == 1. With mask = 0 (all zero) or mask = 2
+            // (all ones — which forces ms_used = true everywhere) it's +1.
+            let invert: f32 = if ms_mask_present == 1 && ms_used[g * max_sfb + sfb] {
+                -1.0
+            } else {
+                1.0
+            };
             let is_position = sfs[1][g * max_sfb + sfb];
+            // scale = sign · 2^(-is_position/4)  (== 0.5^(0.25*is_position))
             let scale = (2.0f32).powf(-(is_position as f32) * 0.25);
-            let coef = sign * scale;
+            let coef = is_intensity_sign * invert * scale;
             let band_start = swb[sfb] as usize;
             let band_end = swb[sfb + 1] as usize;
             if is_short {
@@ -1041,7 +1049,27 @@ fn apply_intensity_stereo(
     }
 }
 
-/// Apply M/S stereo decoding in-place. Spec §4.6.13.
+/// Apply M/S stereo decoding in-place. Spec §4.6.8.1.3 (decoding pseudo-code)
+/// + §4.6.8.2.3 (`is_intensity`) + §4.6.13.3 (`is_noise`).
+///
+/// Spec pseudo-code (§4.6.8.1.3):
+/// ```text
+///   for each band:
+///     if ((ms_used[g][sfb] || ms_mask_present == 2)
+///         && !is_intensity(g,sfb) && !is_noise(g,sfb)) {
+///        L = M + S; R = M - S;
+///     }
+/// ```
+/// Where:
+/// * `is_intensity` is determined by the **right channel's** codebook
+///   (`secs[1].sfb_cb`) being `INTENSITY_HCB` (15) or `INTENSITY_HCB2`
+///   (14) — **NOT** the left channel's codebook (§4.6.8.2.3).
+/// * `is_noise` is true if either channel's codebook is `NOISE_HCB` (13).
+///   Bug history: an earlier version checked only the left channel's
+///   codebook for IS, so a band with `(secs[0].cb = 1, secs[1].cb = 15)`
+///   wrongly went through M/S — the IS pass had already synthesised
+///   `spec[1] = scale * spec[0]`, and the subsequent `L+S, L-S` mix
+///   produced enormous spurious energy that overflowed the IMDCT to ±32k.
 fn apply_ms_stereo(
     info: &IcsInfo,
     secs: &[SectionData; 2],
@@ -1064,9 +1092,19 @@ fn apply_ms_stereo(
             if !ms_used[g * max_sfb + sfb] {
                 continue;
             }
-            let cb = secs[0].sfb_cb[g * max_sfb + sfb];
-            // M/S only applies to non-zero, non-IS, non-noise bands.
-            if cb == ZERO_HCB || cb == NOISE_HCB || cb == INTENSITY_HCB || cb == INTENSITY_HCB2 {
+            let cb0 = secs[0].sfb_cb[g * max_sfb + sfb];
+            let cb1 = secs[1].sfb_cb[g * max_sfb + sfb];
+            // is_intensity → check RIGHT channel codebook only.
+            if cb1 == INTENSITY_HCB || cb1 == INTENSITY_HCB2 {
+                continue;
+            }
+            // is_noise → if EITHER channel is PNS, skip (PNS owns the band).
+            if cb0 == NOISE_HCB || cb1 == NOISE_HCB {
+                continue;
+            }
+            // ZERO_HCB on both channels: M/S of (0, 0) is (0, 0) — harmless
+            // but skip for clarity / to avoid a tiny needless write.
+            if cb0 == ZERO_HCB && cb1 == ZERO_HCB {
                 continue;
             }
             let band_start = swb[sfb] as usize;
@@ -1221,6 +1259,112 @@ mod tests {
         apply_intensity_stereo(&info, &secs, &sfs, &ms_used, 0, &mut spec);
         for k in swb[0] as usize..swb[1] as usize {
             assert_eq!(spec[1][k], 3.0);
+        }
+    }
+
+    /// IS phase invert (`ms_used` re-purposed as sign toggle on IS bands)
+    /// must trigger ONLY when `ms_mask_present == 1`. With mask=2 (all-ones)
+    /// the spec sets `invert_intensity = +1` even though every `ms_used` bit
+    /// is implicitly true.
+    ///
+    /// Bug history (solana-ad.mp4 round 21): the IS pass flipped the sign
+    /// whenever `ms_mask_present != 0 && ms_used[sfb]`, which incorrectly
+    /// inverted IS phase on ms_mask=2 streams — combined with the M/S
+    /// codebook check looking at the wrong channel, this produced full
+    /// ±32k saturation on real-content frames with IS bands.
+    #[test]
+    fn intensity_stereo_no_phase_invert_on_mask2() {
+        let max_sfb = 2u8;
+        let info = long_info(4, max_sfb);
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        for k in swb[0] as usize..swb[1] as usize {
+            spec[0][k] = 1.0;
+        }
+        let secs = [
+            section_with_cb(max_sfb as usize, &[]),
+            section_with_cb(max_sfb as usize, &[(0, INTENSITY_HCB)]),
+        ];
+        let mut sfs: [Vec<i32>; 2] = [vec![0; max_sfb as usize], vec![0; max_sfb as usize]];
+        sfs[1][0] = 0; // is_position=0 → scale=1.0
+        let ms_used = vec![true; max_sfb as usize]; // mask=2 fills all with true
+        apply_intensity_stereo(&info, &secs, &sfs, &ms_used, 2, &mut spec);
+        // Mask=2: invert_intensity = +1, so r = +1 * 1.0 * spec[0] = +1.0.
+        // (If ms_used were honoured we'd erroneously get -1.0 here.)
+        for k in swb[0] as usize..swb[1] as usize {
+            assert!(
+                (spec[1][k] - 1.0).abs() < 1e-6,
+                "mask=2 should not flip IS phase, got {}",
+                spec[1][k]
+            );
+        }
+    }
+
+    /// `apply_ms_stereo` must consult the **right** channel's codebook when
+    /// deciding whether a band is intensity-stereo (per §4.6.8.2.3
+    /// `is_intensity()`). A band where `secs[0]` is a regular codebook but
+    /// `secs[1]` is `INTENSITY_HCB` / `INTENSITY_HCB2` MUST be skipped:
+    /// the IS pass already synthesised `spec[1] = scale * spec[0]`, and
+    /// running `(L+R, L-R)` on top of that produces enormous spurious
+    /// energy.
+    ///
+    /// Bug history: an earlier version checked only `secs[0]`, so bands
+    /// like `(secs[0]=1 regular, secs[1]=15 IS)` went through M/S and
+    /// blew up the IMDCT input.
+    #[test]
+    fn ms_stereo_skips_is_bands_indicated_by_right_channel() {
+        let max_sfb = 3u8;
+        let info = long_info(4, max_sfb);
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        // Band 1 (sfb=1) is the IS band. Pre-fill both channels' values to
+        // a known constant so we can assert M/S doesn't mutate them.
+        let band_start = swb[1] as usize;
+        let band_end = swb[2] as usize;
+        for k in band_start..band_end {
+            spec[0][k] = 7.0;
+            spec[1][k] = 11.0; // simulated IS-synthesised content
+        }
+        let secs = [
+            // Channel 0 codebook for sfb 1 is regular (1)
+            section_with_cb(max_sfb as usize, &[]),
+            // Channel 1 codebook for sfb 1 is IS (15)
+            section_with_cb(max_sfb as usize, &[(1, INTENSITY_HCB)]),
+        ];
+        let ms_used = vec![true; max_sfb as usize];
+        apply_ms_stereo(&info, &secs, &ms_used, &mut spec);
+        for k in band_start..band_end {
+            assert_eq!(spec[0][k], 7.0, "M/S should skip IS band on ch0");
+            assert_eq!(spec[1][k], 11.0, "M/S should skip IS band on ch1");
+        }
+    }
+
+    /// `apply_ms_stereo` must skip bands where EITHER channel uses
+    /// `NOISE_HCB`. The PNS pass already filled the band with shaped
+    /// noise; mixing left/right at this point would corrupt that fill.
+    /// Spec §4.6.8.1.3 (`!is_noise(g, sfb)`).
+    #[test]
+    fn ms_stereo_skips_noise_bands_on_either_channel() {
+        let max_sfb = 3u8;
+        let info = long_info(4, max_sfb);
+        let swb = SWB_LONG[info.sf_index as usize];
+        let mut spec: [[f32; SPEC_LEN]; 2] = [[0.0; SPEC_LEN]; 2];
+        let band_start = swb[1] as usize;
+        let band_end = swb[2] as usize;
+        for k in band_start..band_end {
+            spec[0][k] = 0.5;
+            spec[1][k] = 0.7;
+        }
+        // sfb 1: ch0 is regular, ch1 is NOISE_HCB → must skip.
+        let secs = [
+            section_with_cb(max_sfb as usize, &[]),
+            section_with_cb(max_sfb as usize, &[(1, NOISE_HCB)]),
+        ];
+        let ms_used = vec![true; max_sfb as usize];
+        apply_ms_stereo(&info, &secs, &ms_used, &mut spec);
+        for k in band_start..band_end {
+            assert_eq!(spec[0][k], 0.5);
+            assert_eq!(spec[1][k], 0.7);
         }
     }
 }

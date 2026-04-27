@@ -163,17 +163,34 @@ pub fn lpc_to_parcor(lpc: &[f32]) -> Vec<f32> {
 /// Quantise one parcor (reflection) coefficient into the raw code stored in
 /// the bitstream.
 ///
-/// Spec (§4.6.9.3): with `coef_res = 1` and `coef_compress = 0`, the raw code
-/// `iq` is a 4-bit signed integer in `[-8, 7]` and the dequantised value is
-/// `sin(iq * π / 17)`.
+/// Spec (§4.6.9.3, `tns_decode_coef`): with `coef_res = R ∈ {0,1}` and
+/// `coef_compress = 0`, the raw code `iq` is a `(R+3)`-bit signed integer.
+/// The dequantised parcor is asymmetric:
+/// ```text
+///   iqfac   = ((1<<(R+2)) - 0.5) / (π/2)     // used when iq ≥ 0
+///   iqfac_m = ((1<<(R+2)) + 0.5) / (π/2)     // used when iq <  0
+///   parcor  = sin( iq / (iq>=0 ? iqfac : iqfac_m) )
+/// ```
+/// We invert that here. The asymmetric divisor means the inverse must use
+/// `iqfac` for positive `p` and `iqfac_m` for negative `p`.
 pub fn quantise_parcor(p: f32, coef_res: u8) -> u8 {
-    let (denom, low, high) = if coef_res == 0 {
-        (9.0f32, -4i32, 3i32)
+    let (low, high) = if coef_res == 0 {
+        (-4i32, 3i32)
     } else {
-        (17.0f32, -8i32, 7i32)
+        (-8i32, 7i32)
     };
+    let two_pow = (1u32 << (coef_res as u32 + 2)) as f32; // 4 (R=0) or 8 (R=1)
+    let half_pi = std::f32::consts::FRAC_PI_2;
+    let iqfac = (two_pow - 0.5) / half_pi;
+    let iqfac_m = (two_pow + 0.5) / half_pi;
     let p_clamped = p.clamp(-0.999, 0.999);
-    let iq = (p_clamped.asin() * denom / std::f32::consts::PI).round() as i32;
+    let asin_p = p_clamped.asin();
+    let iq_f = if asin_p >= 0.0 {
+        asin_p * iqfac
+    } else {
+        asin_p * iqfac_m
+    };
+    let iq = iq_f.round() as i32;
     let iq_clamped = iq.clamp(low, high);
     // 2's-complement within `coef_bits = 3 + coef_res` bits.
     let coef_bits = 3 + coef_res as u32;
@@ -183,20 +200,21 @@ pub fn quantise_parcor(p: f32, coef_res: u8) -> u8 {
 
 /// Dequantise a raw parcor code back to a float — used by the encoder to
 /// re-align the forward filter with the decoder's view of the quantised
-/// filter.
+/// filter. Mirror of [`crate::tns`]'s `dequant_tns_coef` for `coef_compress = 0`.
 pub fn dequantise_parcor(code: u8, coef_res: u8) -> f32 {
-    let (denom, coef_bits) = if coef_res == 0 {
-        (9.0f32, 3u32)
-    } else {
-        (17.0f32, 4u32)
-    };
+    let coef_bits = (3 + coef_res) as u32;
     let sign_bit = 1u8 << (coef_bits - 1);
     let iq = if code & sign_bit != 0 {
         (code as i32) - (1i32 << coef_bits)
     } else {
         code as i32
     };
-    (iq as f32 * std::f32::consts::PI / denom).sin()
+    let two_pow = (1u32 << (coef_res as u32 + 2)) as f32; // 4 or 8
+    let half_pi = std::f32::consts::FRAC_PI_2;
+    let iqfac = (two_pow - 0.5) / half_pi;
+    let iqfac_m = (two_pow + 0.5) / half_pi;
+    let denom = if iq >= 0 { iqfac } else { iqfac_m };
+    (iq as f32 / denom).sin()
 }
 
 /// Given parcor values, produce the LPC coefficients in the decoder's
@@ -226,6 +244,10 @@ pub fn parcor_to_decoder_lpc(parcor: &[f32]) -> Vec<f32> {
 ///
 /// So feeding the encoder's output through the decoder yields the original
 /// spectrum (modulo quantisation of the parcors).
+///
+/// `direction` follows the spec convention (§4.6.9.3): 0 = upward (low →
+/// high), 1 = downward (high → low). MUST match the decoder convention in
+/// [`crate::tns::apply_tns_filter_range`].
 pub fn apply_forward_tns(
     spec: &mut [f32; SPEC_LEN],
     start: usize,
@@ -243,8 +265,8 @@ pub fn apply_forward_tns(
     }
     let n = end - start;
     let mut state = [0.0f32; TNS_MAX_ORDER_LONG as usize];
-    if direction == 0 {
-        // High to low: process top-down.
+    if direction == 1 {
+        // Downward: process top-down.
         for i in 0..n {
             let idx = end - 1 - i;
             let x = spec[idx];
@@ -260,6 +282,7 @@ pub fn apply_forward_tns(
             spec[idx] = y;
         }
     } else {
+        // Upward (direction == 0): low → high.
         for i in 0..n {
             let idx = start + i;
             let x = spec[idx];
