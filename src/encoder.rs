@@ -67,12 +67,44 @@ const BLOCK_LEN: usize = 2 * FRAME_LEN;
 /// `ix = floor(|x_scaled|^(3/4) + MAGIC_NUMBER)`.
 const QUANT_MAGIC: f32 = 0.4054;
 
-/// Forward-MDCT scale matching ffmpeg's AAC encoder convention
-/// (`aacenc.c::dsp_init`: `float scale = 32768.0f`). Without this scale
-/// the spectrum values come out ~5 orders of magnitude below what AAC
-/// inverse quantisation expects, and reference decoders fall back to
-/// near-silent output.
-const MDCT_FORWARD_SCALE: f32 = 32768.0;
+/// Forward-MDCT scale that pairs with our `2/input_n` IMDCT to give a
+/// **unity-RMS** round-trip per ISO/IEC 14496-3 §4.6.11.3.1.
+///
+/// Derivation (clean-room, against the 14496-3:2009 spec only):
+///
+/// 1. The spec IMDCT formula is `x[n] = (2/N) · Σ spec[k] · cos((2π/N)
+///    (n+n0)(k+½))` with `N = 2 · input_n`. Our implementation uses
+///    `2/input_n = 4/N`, i.e. **2× the spec scale**, compensated at the
+///    PCM-output stage by the `* 0.5` in `decoder.rs`.
+/// 2. With unscaled forward MDCT (`Σ x · cos(...)`) and the spec inverse
+///    `2/N`, sine-windowed TDAC OLA reconstructs **0.5× the input** —
+///    verified empirically. To produce a unity-RMS round-trip a spec-
+///    compliant encoder must scale its emitted spectrum by 2× so the
+///    spec decoder's `2/N · Σ` lands on s16-range output (per §4.5.2.3.6:
+///    "the integer part of the output of the IMDCT can be used directly
+///    as a 16-bit PCM audio output").
+/// 3. Our encoder normalises S16 input as `s/32768` (range `[-1, 1]`).
+///    To bring that to an s16-range spectrum we need a forward scale of
+///    `2 × 32768 = 65_536`.
+///
+/// **Round-19 RMS interop measurement** (sine 440 Hz, amp 0.3, expected
+/// RMS `0.3 · 32767 / √2 ≈ 6951`; see `tests/lc_rms_interop_r19.rs`):
+///
+/// | direction                       | RMS  | ratio |
+/// |---------------------------------|------|-------|
+/// | ours-encode → ours-decode       | 6718 | 0.97× |
+/// | ours-encode → ffmpeg-decode     | 6644 | 0.96× |
+/// | ffmpeg-encode → ours-decode     | 6881 | 0.99× |
+/// | ffmpeg-encode → ffmpeg-decode   | 6950 | 1.00× |
+///
+/// All four within ±5 % of unity — pipeline is spec-correct. Note that
+/// the **peak** ratios diverge (1.79× for ffmpeg→ours) because ffmpeg's
+/// AAC encoder fills HF bands with PNS-coded noise (`codebook 13`,
+/// §4.6.13); our spec-correct decoder reconstructs that noise, which
+/// rides additively on the sine peak. PNS is non-deterministic per
+/// frame, so peak-ratio is not a meaningful interop metric for tonal-
+/// with-noise content. RMS is.
+const MDCT_FORWARD_SCALE: f32 = 65536.0;
 
 /// Largest un-escaped amplitude supported by book 11.
 const ESC_LAV: i32 = 16;

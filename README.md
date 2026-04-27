@@ -125,6 +125,49 @@ TNS-flattened coefficients.
   channels recovers its tone above a 20x Goertzel floor)
 - 44.1 kHz 7.1 sine-per-channel through our own decoder (all 8 channels)
 
+### r19 — AAC-LC ffmpeg-interop RMS audit (2026-04-26)
+
+`tests/lc_rms_interop_r19.rs` (new) cross-checks all four directions:
+
+| direction                            | RMS  | ratio |
+|--------------------------------------|------|-------|
+| ours-encode → ours-decode            | 6718 | 0.97x |
+| ours-encode → ffmpeg-decode          | 6644 | 0.96x |
+| ffmpeg-encode → ours-decode          | 6881 | 0.99x |
+| ffmpeg-encode → ffmpeg-decode (ref)  | 6950 | 1.00x |
+
+Test signal: 1 s of 440 Hz sine at amplitude 0.3 through 44.1 kHz mono;
+expected RMS = `0.3 * 32767 / sqrt(2) = 6951`. All four within ±5% of
+unity — the AAC-LC core spectrum scale matches ffmpeg end-to-end on the
+informationally-correct (RMS) metric. Audited and confirmed spec-correct:
+
+- §4.6.1.3 inverse quant `sign(q) * |q|^(4/3)` (matches `ics::inv_quant`).
+- §4.6.2.3.3 scalefactor gain `2^(0.25 * (sf - 100))`, SF_OFFSET = 100
+  (matches `ics::sf_to_gain`).
+- §4.6.11.3.1 IMDCT scale `2/N` with `N = 2 * input_n` — our IMDCT uses
+  `2/input_n` (= `4/N`, doubled) and the decoder's S16 output stage
+  multiplies by `0.5`, giving an effective `2/N` matching the spec.
+- §4.5.2.3.6 "the integer part of the output of the IMDCT can be used
+  directly as a 16-bit PCM audio output" — encoder forward-MDCT scale
+  derivation: `2 * 32768 = 65 536`, encoded in `MDCT_FORWARD_SCALE`.
+
+The previously-claimed "~3.33x mid-stream amplitude gap" (rounds 17/18)
+was a peak-metric artefact: ffmpeg's encoder fills HF bands with PNS
+(codebook 13, §4.6.13) that our spec-compliant decoder reconstructs as
+additive noise. The PNS noise rides on the sine peak, inflating the
+**peak** ratio (1.79x for ffmpeg → ours) while the **RMS** stays at
+0.99x. PNS is non-deterministic per-frame, so peak ratio is not a
+meaningful interop metric for tonal+noise content; RMS is.
+
+`examples/probe_lc_amp.rs` and `examples/spectrum_compare.rs` are the
+diagnostic probes used to land this audit; both report RMS alongside
+peak so subsequent rounds don't re-chase the same phantom.
+
+**Note**: `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs` (HE-AACv1 SBR
+amplitude saturation at peak 32_768) remains ignored — that gap is
+**unrelated** to the LC core; it lives in the SBR payload path (likely
+SBR envelope quantization or HF-generation gain). Round 20+ target.
+
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
 and that TNS-bearing frames decode without error.

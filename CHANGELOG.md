@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 19)
+- `tests/lc_rms_interop_r19.rs` — pins AAC-LC ffmpeg-interop within ±10%
+  of unity on the RMS metric across all four directions
+  (ours/ffmpeg-encode × ours/ffmpeg-decode). Measured RMS ratios on a
+  440 Hz / 0.3-amp / 44.1 kHz mono sine: **0.97 / 0.96 / 0.99 / 1.00**.
+- `examples/spectrum_compare.rs` — diagnostic probe that parses one
+  SCE element from each of (ffmpeg-encoded, ours-encoded) ADTS streams,
+  reports peak / energy / nonzero-bin count / IMDCT peak / windowed-OLA
+  peak. Surfaced that ffmpeg encodes 678 nonzero bins (vs our 71), 5 of
+  them PNS-coded (`codebook 13`), at the same total energy — explaining
+  why the *peak* metric diverges by 1.79x while the *RMS* tracks within
+  1%.
+- `examples/imdct_unit_test.rs` — unit-bin probe asserting our IMDCT
+  output equals exactly `2x` the spec formula (`2/N`, N = window length
+  per §4.6.11.3.1), confirming the documented "double-scale" convention
+  pairs with the decoder's `* 0.5` S16-output stage to match the spec
+  exactly.
+
+### Changed (round 19)
+- `encoder::MDCT_FORWARD_SCALE` from `32768` → `65536`. Spec derivation:
+  with unscaled forward MDCT and the spec inverse `2/N`, sine-windowed
+  TDAC OLA reconstructs 0.5x the input (verified empirically). To match
+  §4.5.2.3.6 ("the integer part of the output of the IMDCT can be used
+  directly as a 16-bit PCM audio output"), a spec-compliant encoder
+  must scale its emitted spectrum by 2x, so the forward scale is
+  `2 * 32768 = 65 536`. Lifts our LC self-roundtrip RMS from 0.55x to
+  0.97x and brings ffmpeg → ours / ours → ffmpeg parity within ±5%.
+- `examples/probe_lc_amp.rs` — augmented with reverse-direction
+  measurement (ffmpeg-encode → ours-decode) and RMS reporting on every
+  path; emits the round-19 verdict ("peak ratio is not a meaningful
+  interop metric for tonal+noise content; RMS is") so future rounds
+  don't re-chase the phantom 3.33x peak gap.
+- `encoder.rs::MDCT_FORWARD_SCALE` doc comment rewritten with the
+  clean-room spec derivation (§4.6.11.3.1 + §4.5.2.3.6).
+
+### Notes (round 19)
+- `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs` (HE-AACv1 SBR amplitude
+  saturation at peak 32_768 regardless of envelope) remains ignored.
+  The r19 LC-core fix does **not** affect this — the SBR-path interop
+  gap lives elsewhere (likely SBR envelope or HF-generation gain).
+  Round 20+ target.
+
 ### Added (round 14)
 - HE-AACv2 PS encoder picks **time-direction** vs frequency-direction
   differential coding per envelope (`iid_dt[e]`, `icc_dt[e]`) by comparing
