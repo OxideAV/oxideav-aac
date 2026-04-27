@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-aac/compare/v0.0.8...v0.0.9) - 2026-04-27
+
+### Other
+
+- widen SpectralValues i16 → i32 for codebook-11 escape range
+- fix KBD window — rising half, not symmetric bell (ffmpeg interop)
+- round 19 — close LC ffmpeg-interop gap on RMS metric
+- round 18 — disprove SBR-envelope hypothesis for ffmpeg interop gap
+- round 17 — wire bs_limiter_gains through SBR envelope adjuster
+- adopt slim AudioFrame shape
+- confirm ffmpeg "sbr_dequant" warning is benign + spec-tighten header
+- SBR envelope int16-scale fix + dual-decoder PSNR test
+- HE-AACv2 PS encoder: time-direction differential + multi-envelope
+- HE-AACv2 PS encoder: real per-band IID/ICC analysis
+- HE-AACv2 encoder: no-op Parametric Stereo emission
+- SBR CPE: fix Table 4.66 independent-coupling bitstream order
+- HE-AACv1 stereo encoder via independent-coupling CPE
+- pin release-plz to patch-only bumps
+
 ### Added (round 19)
 - `tests/lc_rms_interop_r19.rs` — pins AAC-LC ffmpeg-interop within ±10%
   of unity on the RMS metric across all four directions
