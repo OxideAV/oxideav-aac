@@ -833,7 +833,11 @@ impl AacDecoder {
             let mut out_bytes = Vec::with_capacity(out_samples * out_channels * bytes_per_sample);
             for n in 0..out_samples {
                 for ch in 0..out_channels {
-                    let v = (final_pcm[ch][n] * 0.5).clamp(-32768.0, 32767.0);
+                    // Round-half-away-from-zero, then clamp + cast. ffmpeg's
+                    // av_clipf + lrintf path rounds; the previous `as i16`
+                    // truncated toward zero and produced a +1 bias on
+                    // every sample in (-1, 0).
+                    let v = (final_pcm[ch][n] * 0.5).round().clamp(-32768.0, 32767.0);
                     let s = v as i16;
                     out_bytes.extend_from_slice(&s.to_le_bytes());
                 }
@@ -851,7 +855,7 @@ impl AacDecoder {
         let mut out_bytes = Vec::with_capacity(FRAME_LEN * channels_out * bytes_per_sample);
         for n in 0..FRAME_LEN {
             for ch in 0..channels_out {
-                let v = (pcm[ch][n] * 0.5).clamp(-32768.0, 32767.0);
+                let v = (pcm[ch][n] * 0.5).round().clamp(-32768.0, 32767.0);
                 let s = v as i16;
                 out_bytes.extend_from_slice(&s.to_le_bytes());
             }

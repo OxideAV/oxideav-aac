@@ -1,14 +1,18 @@
 //! AAC windowing — sine and KBD (Kaiser-Bessel-Derived) windows.
 //!
 //! ISO/IEC 14496-3 §4.6.11 specifies two window shapes:
-//! - sine window (W=0): w(n) = sin( pi/N * (n + 0.5) ), 0 ≤ n < N
-//! - KBD window (W=1): derived from a Kaiser window of length N/2+1 with
-//!   alpha=4 for long (N=1024) and alpha=6 for short (N=128). The window
-//!   is constructed so that its squared overlap-add equals 1.
+//! - sine window (W=0): `w(n) = sin( π/(2N)·(n + 0.5) )` for `0 ≤ n < 2N`
+//! - KBD window (W=1): derived from a Kaiser window of length `N+1` with
+//!   alpha=4 for long (N=1024) and alpha=6 for short (N=128). The full
+//!   2N-long window is squared-OLA partition-of-unity.
 //!
-//! Both windows have length N (= 1024 long, 128 short). The first half is
-//! used for the prior block's right side, the second half for the new
-//! block's left side per §4.6.11 / §4.6.18.
+//! `sine_long`/`kbd_long`/`sine_short`/`kbd_short` each return the
+//! **rising half** (length N) of the spec's full 2N-long window. The full
+//! window is `[w, reverse(w)]` per the doubling scheme used by
+//! `build_long_window_full` / `synth.rs`. The half being monotonic-rising
+//! is what makes the doubling work: a symmetric "bell over N" half would
+//! produce a TWO-bell 2N-long window — a real bug fixed in r20 for KBD,
+//! which was using a symmetric bell where sine had always been correct.
 
 use std::f64::consts::PI;
 use std::sync::OnceLock;
@@ -55,34 +59,36 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// Build a KBD window of length `n` with parameter `alpha`.
+/// Build the **rising half** of a KBD window for AAC long/short blocks,
+/// per ISO/IEC 14496-3 §4.6.11.4.
+///
+/// `n` is the half-window length (= 1024 for long, 128 for short). The
+/// returned vector is monotonic-rising from `w[0]≈0` to `w[n-1]≈1` —
+/// the spec full-length-`2n` window is constructed downstream as
+/// `[w, reverse(w)]`, the same shape `sine_long`/`sine_short` use.
+///
+/// Uses a Kaiser window of length `n+1` indexed `0..=n` and the spec
+/// formula `W[i] = sqrt( sum_{k=0..=i} kaiser[k] / sum_{k=0..=n} kaiser[k] )`
+/// for `i in 0..n`.
 fn build_kbd(n: usize, alpha: f64) -> Vec<f32> {
-    let half = n / 2;
-    // Build Kaiser window of length half+1 (per AAC spec).
     let alpha_pi = alpha * PI;
     let denom = bessel_i0(alpha_pi);
-    let mut w = vec![0.0f64; half + 1];
-    for i in 0..=half {
-        let t = (2.0 * i as f64 / half as f64) - 1.0;
+    let mut kaiser = vec![0.0f64; n + 1];
+    for i in 0..=n {
+        let t = (2.0 * i as f64 / n as f64) - 1.0;
         let arg = alpha_pi * (1.0 - t * t).sqrt();
-        w[i] = bessel_i0(arg) / denom;
+        kaiser[i] = bessel_i0(arg) / denom;
     }
-    // Cumulative sum.
-    let mut cs = vec![0.0f64; half + 1];
+    let mut cs = vec![0.0f64; n + 1];
     let mut acc = 0.0;
-    for i in 0..=half {
-        acc += w[i];
+    for i in 0..=n {
+        acc += kaiser[i];
         cs[i] = acc;
     }
-    let total = cs[half];
-    // KBD[n] = sqrt( cs[n] / total ) for first half, mirror for second.
+    let total = cs[n];
     let mut out = vec![0.0f32; n];
-    for i in 0..half {
+    for i in 0..n {
         out[i] = (cs[i] / total).sqrt() as f32;
-    }
-    for i in 0..half {
-        // mirror — out[n - 1 - i] = out[i] in standard formulation
-        out[n - 1 - i] = out[i];
     }
     out
 }
@@ -286,15 +292,55 @@ mod tests {
 
     #[test]
     fn kbd_partition_of_unity() {
-        // KBD POU: w[n]^2 + w[n + N/2]^2 = 1 for n in 0..N/2.
+        // KBD POU on the rising-half-window pattern that the doubling
+        // scheme uses: w[i]² + w[N-1-i]² = 1 for i in 0..N (where N is
+        // the half-window length). This is the same POU sine_long
+        // satisfies — see `sine_partition_of_unity_full_window`.
         let w = kbd_long();
-        let n = LONG_LEN;
-        let half = n / 2;
-        for i in 0..half {
+        for i in 0..LONG_LEN {
             let a = w[i];
-            let b = w[i + half];
+            let b = w[LONG_LEN - 1 - i];
             let s = a * a + b * b;
             assert!((s - 1.0).abs() < 1e-3, "kbd POU off at {i}: {s}");
+        }
+    }
+
+    #[test]
+    fn kbd_long_is_monotonic_rising() {
+        // The half-window must rise monotonically from ~0 to ~1 for
+        // build_long_window_full to produce the spec single-bell
+        // 2N-long window. A symmetric "bell over N" instead of a
+        // monotonic rising "half over N" yields a TWO-bell 2N-long
+        // window — the exact bug that broke ffmpeg-interop on
+        // real-content AAC-LC streams before r20.
+        let w = kbd_long();
+        assert!(w[0] > 0.0 && w[0] < 0.01, "kbd_long[0] should be small");
+        assert!(w[LONG_LEN - 1] > 0.999, "kbd_long[N-1] should be ~1");
+        for i in 1..LONG_LEN {
+            assert!(
+                w[i] >= w[i - 1] - 1e-7,
+                "kbd_long not monotonic rising at {i}: {} < {}",
+                w[i],
+                w[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn kbd_only_long_tdac_with_itself() {
+        // Two consecutive OnlyLong KBD blocks must satisfy TDAC: the
+        // falling half of A summed with the rising half of B equals 1.
+        // (Counterpart to only_long_tdac_with_itself for SINE.) This
+        // is the test that would have caught the pre-r20 symmetric-
+        // bell KBD bug — it failed sample-by-sample then.
+        let wa =
+            build_long_window_full(WindowSequence::OnlyLong, WindowShape::Kbd, WindowShape::Kbd);
+        let wb =
+            build_long_window_full(WindowSequence::OnlyLong, WindowShape::Kbd, WindowShape::Kbd);
+        let n = LONG_LEN;
+        for i in 0..n {
+            let sum = wa[n + i] * wa[n + i] + wb[i] * wb[i];
+            assert!((sum - 1.0).abs() < 1e-3, "KBD TDAC at {i}: {sum}");
         }
     }
 }
