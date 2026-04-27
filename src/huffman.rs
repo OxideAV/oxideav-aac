@@ -128,7 +128,15 @@ impl SpectralBook {
 }
 
 /// Decoded spectral coefficients (up to 4 entries).
-pub type SpectralValues = [i16; 4];
+///
+/// Codebook-11 escape values can reach `(1 << 28) - 1` per ISO/IEC
+/// 14496-3 §4.6.3.3, so the storage type MUST be at least i32. The
+/// pre-fix `[i16; 4]` wrapped escape amplitudes ≥ 32768 to negative i16
+/// values, surfacing as full-frame ±32768 saturation on the rare
+/// frames where the encoder produced a large escape — audible as
+/// glitches on transients and peaks in real-content streams (e.g.
+/// solana-ad.mp4).
+pub type SpectralValues = [i32; 4];
 
 /// Decode one Huffman codeword from `book`, then unpack it into 2 or 4
 /// signed amplitudes per the codebook semantics. Returns `dim` valid
@@ -139,15 +147,15 @@ pub fn decode_spectral(
 ) -> Result<SpectralValues> {
     let idx = book.table().decode(br)?;
     let dim = book.dim as usize;
-    let lav = book.lav as i16;
-    let mut out = [0i16; 4];
+    let lav = book.lav as i32;
+    let mut out = [0i32; 4];
 
     if book.signed {
         // Signed: split idx into `dim` mod-(2*lav+1) digits, each in [-lav, lav].
         let modulo = (lav as u32 * 2 + 1) as u16;
         let mut v = idx;
         for i in (0..dim).rev() {
-            out[i] = (v % modulo) as i16 - lav;
+            out[i] = (v % modulo) as i32 - lav;
             v /= modulo;
         }
     } else {
@@ -155,7 +163,7 @@ pub fn decode_spectral(
         let modulo = (lav as u32 + 1) as u16;
         let mut v = idx;
         for i in (0..dim).rev() {
-            out[i] = (v % modulo) as i16;
+            out[i] = (v % modulo) as i32;
             v /= modulo;
         }
         // Then read sign bits for each non-zero coefficient.
@@ -181,8 +189,10 @@ pub fn decode_spectral(
 
 /// Read an escape-coded amplitude as used by codebook 11. The code is a
 /// unary-prefix `1...1 0` of length `prefix` ones followed by `prefix+4`
-/// raw bits — value is `(1 << (prefix+4)) | raw`.
-pub fn read_escape(br: &mut BitReader<'_>) -> Result<i16> {
+/// raw bits — value is `(1 << (prefix+4)) | raw`. Magnitude can reach
+/// `(1 << 28) - 1` so the return type is i32 (the previous i16 wrapped
+/// any value ≥ 32768 to a negative number, breaking IMDCT scale).
+pub fn read_escape(br: &mut BitReader<'_>) -> Result<i32> {
     let mut prefix: u32 = 0;
     while br.read_bit()? {
         prefix += 1;
@@ -191,7 +201,7 @@ pub fn read_escape(br: &mut BitReader<'_>) -> Result<i16> {
         }
     }
     let raw = br.read_u32(prefix + 4)?;
-    Ok((((1u32) << (prefix + 4)) | raw) as i16)
+    Ok((((1u32) << (prefix + 4)) | raw) as i32)
 }
 
 pub static BOOK1: SpectralBook = SpectralBook::new(4, 1, true, false, BOOK1_CODES, BOOK1_BITS);
