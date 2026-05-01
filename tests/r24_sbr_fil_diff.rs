@@ -24,7 +24,8 @@ use oxideav_aac::decoder::{decode_ics, fill_spectrum};
 use oxideav_aac::he_aac_encoder::HeAacMonoEncoder;
 use oxideav_aac::ics::SPEC_LEN;
 use oxideav_aac::sbr::bitstream::{
-    parse_sbr_header, parse_single_channel_element, SbrChannelData, SbrHeader, EXT_SBR_DATA,
+    parse_sbr_dtdf, parse_sbr_envelope, parse_sbr_grid, parse_sbr_header, parse_sbr_invf,
+    parse_sbr_noise, parse_sbr_sinusoidal, SbrChannelData, SbrHeader, EXT_SBR_DATA,
     EXT_SBR_DATA_CRC,
 };
 use oxideav_aac::sbr::freq::FreqTables;
@@ -139,7 +140,19 @@ struct FrameDiag {
     /// Total bit-length of the FIL payload (incl. the 4-bit ext_id).
     fil_payload_bits: u32,
     /// Bits actually consumed by the SBR parser (excluding fill alignment).
+    /// Counts only the SCE body — i.e. excludes `bs_header_flag` and the
+    /// `sbr_header()` block.
     sbr_bits_consumed: u32,
+    /// Bits consumed inside the FIL payload excluding the fill alignment
+    /// at the tail. Includes the 4-bit `ext_id`, the 1-bit
+    /// `bs_header_flag`, the `sbr_header()` block when present, and the
+    /// full SCE body. Equivalent to ffmpeg's `4 + num_sbr_bits` quantity
+    /// from §4.4.2.8 Table 4.62.
+    fil_consumed_bits: u32,
+    /// `bs_extended_data` flag (1 bit) at the tail of the SCE body.
+    /// Captured by walking the SCE in stages so the test harness can
+    /// compare ours-vs-fdkaac directly on this lead-3-relevant bit.
+    bs_extended_data: bool,
 }
 
 /// Parse one ADTS-framed AAC stream, walking each raw_data_block element
@@ -258,17 +271,42 @@ fn parse_stream(adts_bytes: &[u8]) -> Vec<FrameDiag> {
                         ..SbrChannelData::default()
                     };
                     let before_sce = br.bit_position();
-                    if parse_single_channel_element(
-                        &mut br,
-                        &mut data,
-                        ft.nq,
-                        [ft.n_low, ft.n_high],
-                        ft.n_high,
-                    )
-                    .is_err()
-                    {
-                        break;
-                    }
+                    // Walk the SCE in stages so we can capture
+                    // `bs_extended_data` for the lead-3 byte-compare
+                    // tests (the all-in-one
+                    // `parse_single_channel_element` swallows that bit
+                    // internally and discards it).
+                    let parse_ok = (|| -> Result<bool, ()> {
+                        let bs_data_extra = br.read_bit().map_err(|_| ())?;
+                        if bs_data_extra {
+                            br.read_u32(4).map_err(|_| ())?; // bs_reserved
+                        }
+                        parse_sbr_grid(&mut br, &mut data).map_err(|_| ())?;
+                        parse_sbr_dtdf(&mut br, &mut data).map_err(|_| ())?;
+                        parse_sbr_invf(&mut br, &mut data, ft.nq).map_err(|_| ())?;
+                        parse_sbr_envelope(&mut br, &mut data, [ft.n_low, ft.n_high])
+                            .map_err(|_| ())?;
+                        parse_sbr_noise(&mut br, &mut data, ft.nq).map_err(|_| ())?;
+                        data.bs_add_harmonic_flag = br.read_bit().map_err(|_| ())?;
+                        if data.bs_add_harmonic_flag {
+                            parse_sbr_sinusoidal(&mut br, &mut data, ft.n_high).map_err(|_| ())?;
+                        }
+                        let bs_extended_data = br.read_bit().map_err(|_| ())?;
+                        if bs_extended_data {
+                            let mut cnt = br.read_u32(4).map_err(|_| ())?;
+                            if cnt == 15 {
+                                cnt += br.read_u32(8).map_err(|_| ())?;
+                            }
+                            for _ in 0..(cnt * 8) {
+                                br.read_u32(1).map_err(|_| ())?;
+                            }
+                        }
+                        Ok(bs_extended_data)
+                    })();
+                    let bs_extended_data = match parse_ok {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
                     let sbr_consumed = (br.bit_position() - before_sce) as u32;
                     let consumed = (br.bit_position() - start_pos) as u32;
                     out.push(FrameDiag {
@@ -280,6 +318,8 @@ fn parse_stream(adts_bytes: &[u8]) -> Vec<FrameDiag> {
                         nq: ft.nq,
                         fil_payload_bits: total_bits,
                         sbr_bits_consumed: sbr_consumed,
+                        fil_consumed_bits: consumed,
+                        bs_extended_data,
                     });
                     for _ in 0..total_bits.saturating_sub(consumed) {
                         let _ = br.read_u32(1);
@@ -416,6 +456,10 @@ fn diff_sbr_fil_against_fdkaac() {
         return;
     }
 
+    let mut scope = SbrEnvScope::new();
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
     let ours_bytes = encode_ours();
     println!("ours: {} ADTS bytes", ours_bytes.len());
 
@@ -446,12 +490,19 @@ fn diff_sbr_fil_against_fdkaac() {
 /// the diff intentionally.
 #[test]
 fn ours_first_frame_sbr_pinned() {
+    let mut scope = SbrEnvScope::new();
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
     let bytes = encode_ours();
     let diag = parse_stream(&bytes);
     assert!(!diag.is_empty(), "no SBR FIL parsed");
     let f0 = &diag[0];
-    // Header — pinned snapshot of our current emitter (r23-era).
-    assert_eq!(f0.header.bs_amp_res, 0, "bs_amp_res in header");
+    // Header — pinned snapshot of our current emitter. r25 lead-1
+    // graduation (task #63) flipped the default to bs_amp_res = 1 to
+    // match fdkaac; the FIXFIX num_env==1 carve-out still forces the
+    // *effective* per-frame amp_res to 0 below.
+    assert_eq!(f0.header.bs_amp_res, 1, "bs_amp_res in header");
     assert_eq!(f0.header.bs_start_freq, 5, "bs_start_freq");
     assert_eq!(f0.header.bs_stop_freq, 9, "bs_stop_freq");
     assert_eq!(f0.header.bs_xover_band, 0, "bs_xover_band");
@@ -478,6 +529,10 @@ fn ours_first_frame_sbr_pinned() {
 /// so any future drift is loud.
 #[test]
 fn ours_invf_mode_always_off() {
+    let mut scope = SbrEnvScope::new();
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
     let bytes = encode_ours();
     let diag = parse_stream(&bytes);
     assert!(!diag.is_empty());
@@ -497,39 +552,125 @@ fn ours_invf_mode_always_off() {
     }
 }
 
+/// Process-wide mutex serialising tests that flip `OXIDEAV_AAC_SBR_*`
+/// env vars — cargo runs `#[test]` in parallel by default, and env-var
+/// state is shared across threads, so any two probes that don't hold
+/// this lock will race each other and produce nondeterministic
+/// header / dtdf bits in the output stream.
+static SBR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII bundle holding (a) the global env-lock and (b) a list of
+/// (name, prev) pairs to restore on drop. Each test acquires one of
+/// these via [`SbrEnvScope::new`], then sets one or more env vars
+/// inside the scope via [`SbrEnvScope::set`].
+struct SbrEnvScope {
+    saved: Vec<(&'static str, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl SbrEnvScope {
+    fn new() -> Self {
+        let lock = SBR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Self {
+            saved: Vec::new(),
+            _lock: lock,
+        }
+    }
+
+    fn set(&mut self, name: &'static str, value: &str) {
+        let prev = std::env::var(name).ok();
+        // SAFETY: we hold SBR_ENV_LOCK; no other lock-holder will read
+        // env state concurrently.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        self.saved.push((name, prev));
+    }
+
+    fn unset(&mut self, name: &'static str) {
+        let prev = std::env::var(name).ok();
+        // SAFETY: see set() comment.
+        unsafe {
+            std::env::remove_var(name);
+        }
+        self.saved.push((name, prev));
+    }
+}
+
+impl Drop for SbrEnvScope {
+    fn drop(&mut self) {
+        // Restore in reverse order so nested set/set/set chains
+        // unwind cleanly.
+        while let Some((name, prev)) = self.saved.pop() {
+            // SAFETY: lock is still held (field declaration order).
+            unsafe {
+                if let Some(p) = prev {
+                    std::env::set_var(name, p);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+}
+
+/// Run ffmpeg over the supplied ADTS bytes and return the steady-state
+/// peak / RMS amplitude of the decoded mono PCM. Returns `None` if
+/// ffmpeg is not available or fails.
+fn ffmpeg_decode_peak_rms(adts_bytes: &[u8]) -> Option<(i32, i32)> {
+    which("ffmpeg")?;
+    let scratch = std::env::temp_dir().join("oxideav_aac_r25_lead_probe");
+    std::fs::create_dir_all(&scratch).ok()?;
+    let adts_path = scratch.join("ours.aac");
+    let dec_path = scratch.join("dec.s16");
+    std::fs::write(&adts_path, adts_bytes).ok()?;
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "warning"])
+        .arg("-i")
+        .arg(&adts_path)
+        .args(["-f", "s16le", "-ar", "48000", "-ac", "1"])
+        .arg(&dec_path)
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !stderr.is_empty() {
+        eprintln!("ffmpeg stderr:\n{}", stderr);
+    }
+    if !out.status.success() {
+        return None;
+    }
+    let raw = std::fs::read(&dec_path).ok()?;
+    let samples: Vec<i16> = raw
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let warm = 5_000usize;
+    if samples.len() <= warm + 100 {
+        return None;
+    }
+    let mid = &samples[warm..(samples.len() - 100)];
+    let peak = mid
+        .iter()
+        .map(|&s| s.unsigned_abs() as i32)
+        .max()
+        .unwrap_or(0);
+    let mut acc = 0.0f64;
+    for &s in mid {
+        let f = s as f64;
+        acc += f * f;
+    }
+    let rms = (acc / mid.len() as f64).sqrt() as i32;
+    Some((peak, rms))
+}
+
 /// Pin: the `OXIDEAV_AAC_SBR_ENV_FORCE_ZERO` env-var probe (introduced in
 /// r24 to test the "envelope value drives saturation" hypothesis) actually
 /// zeros the envelope on every frame. Without this pin, regressing the
 /// override silently makes all subsequent r25+ probes meaningless.
 #[test]
 fn force_zero_env_var_actually_zeros_envelope() {
-    // Save then set the env var for the duration of this test.
-    // Tests in the same process share env state, so be defensive about
-    // restoring the original value at end of scope.
-    struct EnvGuard {
-        prev: Option<String>,
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: setting a process env var is unsafe in multi-threaded
-            // contexts, but this is a single-threaded test scope and we
-            // restore on drop. The std crate marks set_var unsafe as of
-            // edition 2024, so we mark this entire block unsafe.
-            unsafe {
-                if let Some(p) = self.prev.take() {
-                    std::env::set_var("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO", p);
-                } else {
-                    std::env::remove_var("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
-                }
-            }
-        }
-    }
-    let prev = std::env::var("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO").ok();
-    // SAFETY: see EnvGuard::drop comment; single-threaded test.
-    unsafe {
-        std::env::set_var("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO", "1");
-    }
-    let _g = EnvGuard { prev };
+    let mut scope = SbrEnvScope::new();
+    scope.set("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO", "1");
 
     let bytes = encode_ours();
     let diag = parse_stream(&bytes);
@@ -544,5 +685,388 @@ fn force_zero_env_var_actually_zeros_envelope() {
                 );
             }
         }
+    }
+}
+
+// ============================================================
+// r25 lead probes
+// ============================================================
+
+/// **Lead 1**: emit `bs_amp_res = 1` in the SBR header (mirroring
+/// fdkaac) while the grid carve-out keeps the *effective* amp_res for
+/// envelope decoding at 0 (1.5 dB tables, 7-bit start). If ffmpeg
+/// pre-reads the start-bit count from the raw header value before the
+/// FIXFIX `bs_num_env == 1` rule fires, this is the bit it would care
+/// about.
+#[test]
+fn lead1_header_amp_res_1() {
+    let mut scope = SbrEnvScope::new();
+    scope.set("OXIDEAV_AAC_SBR_HDR_AMP_RES_1", "1");
+    let bytes = encode_ours();
+    let diag = parse_stream(&bytes);
+    assert!(!diag.is_empty(), "no SBR FIL parsed under lead-1");
+    let f0 = &diag[0];
+    assert_eq!(
+        f0.header.bs_amp_res, 1,
+        "lead-1 must rewrite header bs_amp_res to 1"
+    );
+    // Grid carve-out should still force the *effective* amp_res to 0
+    // because bs_num_env == 1 in FIXFIX.
+    assert_eq!(
+        f0.data.bs_amp_res, 0,
+        "FIXFIX num_env==1 must override effective amp_res to 0 even with header=1"
+    );
+    if let Some((peak, rms)) = ffmpeg_decode_peak_rms(&bytes) {
+        eprintln!("lead-1 ffmpeg-decode: peak={peak} rms={rms} (input ~9830)");
+    } else {
+        eprintln!("lead-1: ffmpeg unavailable or decode failed — skipping amp probe");
+    }
+}
+
+/// **Lead 2**: emit `bs_df_env = 1` / `bs_df_noise = 1` (time-direction
+/// delta) from frame 1 onwards. Frame 0 stays freq-direction because no
+/// prior baseline exists. Mirrors fdkaac's choice in the diff harness.
+#[test]
+fn lead2_time_direction_delta() {
+    let mut scope = SbrEnvScope::new();
+    scope.set("OXIDEAV_AAC_SBR_DF_TIME", "1");
+    let bytes = encode_ours();
+    let diag = parse_stream(&bytes);
+    assert!(diag.len() >= 2, "need >= 2 frames to check time-direction");
+    // Frame 0 must remain freq-direction (no baseline available).
+    assert_eq!(
+        diag[0].data.bs_df_env[0], 0,
+        "frame 0 must stay freq-direction"
+    );
+    assert_eq!(diag[0].data.bs_df_noise[0], 0);
+    // Frame 1 onwards must switch to time-direction under the toggle.
+    for d in diag.iter().skip(1) {
+        assert_eq!(
+            d.data.bs_df_env[0], 1,
+            "frame {} bs_df_env should be 1 (time-dir) under DF_TIME",
+            d.frame_idx
+        );
+        assert_eq!(
+            d.data.bs_df_noise[0], 1,
+            "frame {} bs_df_noise should be 1 under DF_TIME",
+            d.frame_idx
+        );
+    }
+    if let Some((peak, rms)) = ffmpeg_decode_peak_rms(&bytes) {
+        eprintln!("lead-2 ffmpeg-decode: peak={peak} rms={rms} (input ~9830)");
+    } else {
+        eprintln!("lead-2: ffmpeg unavailable or decode failed — skipping amp probe");
+    }
+}
+
+/// **Lead 3 audit**: assert that every emitted FIL/SBR element satisfies
+/// the spec framing constraint
+/// `(8*cnt - 4 - num_sbr_bits) MOD 8 < 8` and equals the exact number
+/// of fill bits the encoder actually wrote. This rules out any
+/// subtle off-by-one that ffmpeg's `bs_fill_bits` reader would treat
+/// as leftover payload — the same kind of misalignment that produces
+/// "No quantized data read for sbr_dequant" downstream.
+///
+/// Validates against both ours and fdkaac so the same expectation holds
+/// across encoders.
+#[test]
+fn lead3_audit_extension_payload_framing() {
+    let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+    {
+        let _scope = SbrEnvScope::new();
+        cases.push(("ours-default", encode_ours()));
+    }
+    {
+        let mut scope = SbrEnvScope::new();
+        scope.set("OXIDEAV_AAC_SBR_HDR_AMP_RES_1", "1");
+        cases.push(("ours-lead1", encode_ours()));
+    }
+    {
+        let mut scope = SbrEnvScope::new();
+        scope.set("OXIDEAV_AAC_SBR_DF_TIME", "1");
+        cases.push(("ours-lead2", encode_ours()));
+    }
+    for (label, bytes) in &cases {
+        let diag = parse_stream(bytes);
+        assert!(
+            !diag.is_empty(),
+            "{label}: no SBR FIL parsed (framing audit cannot proceed)"
+        );
+        for d in &diag {
+            // Spec §4.4.2.8 Table 4.62: declared cnt covers
+            //   4-bit ext_id  + bs_header_flag  + (sbr_header if flag)
+            //   + sbr_data() + bs_fill_bits
+            // i.e. 8*cnt - fil_consumed_bits == bs_fill_bits, in [0, 8).
+            // ffmpeg computes num_align_bits = (8*cnt - 4 - num_sbr_bits) %
+            // 8, which assumes the over-fill is < 8 already; if it isn't,
+            // the parser leaves leftover bits that desync the next FIL
+            // element (or the ID_END).
+            let cnt_bits = d.fil_payload_bits as i64;
+            let consumed = d.fil_consumed_bits as i64;
+            let fill = cnt_bits - consumed;
+            assert!(
+                fill >= 0,
+                "{label} frame {}: declared cnt undershoots actual SBR consumption \
+                 ({cnt_bits} bits < {consumed} consumed)",
+                d.frame_idx
+            );
+            assert!(
+                fill < 8,
+                "{label} frame {}: extra fill bits {fill} >= 8 — cnt is over-rounded \
+                 (this WILL desync ffmpeg's bs_fill_bits parser)",
+                d.frame_idx
+            );
+        }
+    }
+}
+
+/// **Combined**: lead-1 + lead-2 stacked. If either lead alone closed
+/// the saturation, we'd see it in `lead1_*` / `lead2_*`; this case
+/// catches a multi-cause scenario.
+#[test]
+fn lead_combined_amp_res_and_time_delta() {
+    let mut scope = SbrEnvScope::new();
+    scope.set("OXIDEAV_AAC_SBR_HDR_AMP_RES_1", "1");
+    scope.set("OXIDEAV_AAC_SBR_DF_TIME", "1");
+    let bytes = encode_ours();
+    let diag = parse_stream(&bytes);
+    assert!(!diag.is_empty(), "no SBR FIL parsed under combined leads");
+    // Sanity-check both toggles took effect on the parsed bitstream.
+    assert_eq!(
+        diag[0].header.bs_amp_res, 1,
+        "combined: header bs_amp_res must be 1"
+    );
+    if diag.len() >= 2 {
+        assert_eq!(diag[1].data.bs_df_env[0], 1, "combined: frame-1 must be DT");
+        assert_eq!(diag[1].data.bs_df_noise[0], 1);
+    }
+    if let Some((peak, rms)) = ffmpeg_decode_peak_rms(&bytes) {
+        eprintln!("combined ffmpeg-decode: peak={peak} rms={rms} (input ~9830)");
+    } else {
+        eprintln!("combined: ffmpeg unavailable — skipping amp probe");
+    }
+}
+
+/// **Baseline ffmpeg measurement** — record the ffmpeg-decode peak/RMS
+/// for our *unmodified* mono encoder on the same fixture so the lead
+/// probes have a numeric anchor. Diagnostic-only: no assertion (the
+/// known-broken r18 saturation reproduces here).
+#[test]
+fn baseline_ffmpeg_amp_no_toggles() {
+    let mut scope = SbrEnvScope::new();
+    // Defensively clear any leaked toggles before measuring.
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
+    let bytes = encode_ours();
+    if let Some((peak, rms)) = ffmpeg_decode_peak_rms(&bytes) {
+        eprintln!("baseline ffmpeg-decode: peak={peak} rms={rms} (input ~9830)");
+    } else {
+        eprintln!("baseline: ffmpeg unavailable — skipping");
+    }
+}
+
+// ============================================================
+// r25 task #63: byte-compare each lead against the fdkaac
+// reference fixture. Each test asserts that our encoder's
+// emission of the lead-relevant field matches fdkaac's choice
+// for the same input. These run with the env-var probes
+// **cleared** so they exercise the production defaults — i.e.
+// they enforce that the r24 probes have been graduated into
+// real encoder behaviour.
+// ============================================================
+
+/// **r25 lead-1 byte-compare**: ours' SBR header `bs_amp_res` field
+/// must match fdkaac's choice on the same input. fdkaac always emits
+/// `bs_amp_res = 1` in the SBR header for the 48 kHz HE-AAC mono case
+/// (the FIXFIX `bs_num_env == 1` carve-out then forces the *effective*
+/// amp_res for envelope decoding to 0, so the per-frame
+/// `data.bs_amp_res` is still 0 — only the header bit differs).
+///
+/// This test fails if the encoder regresses to the r23-era
+/// `bs_amp_res = 0` header default.
+#[test]
+fn r25_lead1_byte_compare_amp_res_against_fdkaac() {
+    if which("fdkaac").is_none() {
+        eprintln!("fdkaac not on PATH — skipping");
+        return;
+    }
+    let mut scope = SbrEnvScope::new();
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
+
+    let ours = parse_stream(&encode_ours());
+    let fdk = match encode_fdkaac() {
+        Some(b) => parse_stream(&b),
+        None => {
+            eprintln!("fdkaac encode failed — skipping");
+            return;
+        }
+    };
+    assert!(!ours.is_empty() && !fdk.is_empty(), "no SBR FIL parsed");
+    let our_amp = ours[0].header.bs_amp_res;
+    let fdk_amp = fdk[0].header.bs_amp_res;
+    assert_eq!(
+        our_amp, fdk_amp,
+        "lead-1 byte-compare: ours' bs_amp_res = {our_amp}, fdkaac = {fdk_amp}; \
+         encoder default must match fdkaac (graduate the OXIDEAV_AAC_SBR_HDR_AMP_RES_1 probe)"
+    );
+    // The grid carve-out must still hold so envelope decoding stays at
+    // 1.5 dB tables (7-bit start). This invariant is independent of the
+    // header bit and is what allows the change to be safe.
+    assert_eq!(
+        ours[0].data.bs_amp_res, 0,
+        "FIXFIX num_env==1 must force effective amp_res to 0"
+    );
+    assert_eq!(
+        fdk[0].data.bs_amp_res, 0,
+        "fdkaac frame[0] effective amp_res should also be 0 (sanity)"
+    );
+}
+
+/// **r25 lead-2 byte-compare**: ours' `bs_df_env` / `bs_df_noise`
+/// pattern must match fdkaac's: frame 0 uses freq-direction (no prior
+/// baseline), frames 1+ use time-direction. fdkaac's actual `bs_df_env`
+/// totals come out around `[2, 4, 2, 1]` (mostly time-direction once
+/// the baseline is established), and `bs_df_noise` totals around
+/// `[9, 2]`. Our encoder must follow the same "frame 0 = freq, frames
+/// 1+ = time" rule by default.
+///
+/// This test asserts the structural pattern (frame 0 freq, frames 1+
+/// time), not the exact raw codes — fdkaac may also fall back to freq
+/// occasionally for rate-distortion reasons we don't model. The
+/// minimum bar is that our default behaviour switches to time-delta
+/// from frame 1+, matching fdkaac's *predominant* choice.
+#[test]
+fn r25_lead2_byte_compare_df_direction_against_fdkaac() {
+    if which("fdkaac").is_none() {
+        eprintln!("fdkaac not on PATH — skipping");
+        return;
+    }
+    let mut scope = SbrEnvScope::new();
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
+
+    let ours = parse_stream(&encode_ours());
+    let fdk = match encode_fdkaac() {
+        Some(b) => parse_stream(&b),
+        None => {
+            eprintln!("fdkaac encode failed — skipping");
+            return;
+        }
+    };
+    assert!(ours.len() >= 2 && fdk.len() >= 2, "need >= 2 frames");
+    // Frame 0 must be freq-direction for both (no previous baseline).
+    assert_eq!(ours[0].data.bs_df_env[0], 0, "frame 0: ours df_env != 0");
+    assert_eq!(fdk[0].data.bs_df_env[0], 0, "frame 0: fdk df_env != 0");
+    assert_eq!(
+        ours[0].data.bs_df_noise[0], 0,
+        "frame 0: ours df_noise != 0"
+    );
+    assert_eq!(fdk[0].data.bs_df_noise[0], 0, "frame 0: fdk df_noise != 0");
+    // Frames 1+: count how often fdkaac chose time-direction vs how
+    // often we did. Our encoder default must hit time-direction on
+    // *every* frame >= 1 (we don't yet model fdkaac's RD switching).
+    // fdkaac's pattern is mostly time but with occasional freq
+    // fallbacks; the bar is that we are not stuck on always-freq
+    // (which is what r23 did).
+    let mut our_time_env = 0usize;
+    let mut our_time_noise = 0usize;
+    for d in ours.iter().skip(1) {
+        if d.data.bs_df_env[0] == 1 {
+            our_time_env += 1;
+        }
+        if d.data.bs_df_noise[0] == 1 {
+            our_time_noise += 1;
+        }
+    }
+    let post_frame0 = ours.len() - 1;
+    assert_eq!(
+        our_time_env, post_frame0,
+        "lead-2 byte-compare: ours used time-direction on {} of {} post-frame-0 envelopes; \
+         expected {} (every frame >= 1). Encoder default must match fdkaac's \
+         time-direction-from-frame-1 behaviour (graduate the OXIDEAV_AAC_SBR_DF_TIME probe).",
+        our_time_env, post_frame0, post_frame0,
+    );
+    assert_eq!(
+        our_time_noise, post_frame0,
+        "lead-2 byte-compare: ours used time-direction on {} of {} post-frame-0 noise floors; \
+         expected {}.",
+        our_time_noise, post_frame0, post_frame0,
+    );
+    // Sanity: fdkaac is also predominantly time-direction post frame 0.
+    let mut fdk_time = 0usize;
+    for d in fdk.iter().skip(1) {
+        if d.data.bs_df_env[0] == 1 {
+            fdk_time += 1;
+        }
+    }
+    assert!(
+        fdk_time > 0,
+        "fdkaac reference also expected to use time-direction on >=1 post-frame-0 envelopes \
+         (sanity check; saw {fdk_time}/{} time-dir frames)",
+        fdk.len() - 1,
+    );
+}
+
+/// **r25 lead-3 byte-compare**: ours' `bs_extended_data` flag must
+/// match fdkaac's on every frame. For pure HE-AAC mono (no PS), both
+/// encoders MUST emit `bs_extended_data = 0` — there's no PS extension
+/// to carry, and ffmpeg's parser treats any leftover bits past the SCE
+/// body as fill (Table 4.65). Pinning this against fdkaac catches any
+/// regression that sets the flag spuriously (which would advance
+/// ffmpeg's reader into garbage and trigger the "No quantized data
+/// read for sbr_dequant" warning downstream).
+#[test]
+fn r25_lead3_byte_compare_extended_data_against_fdkaac() {
+    if which("fdkaac").is_none() {
+        eprintln!("fdkaac not on PATH — skipping");
+        return;
+    }
+    let mut scope = SbrEnvScope::new();
+    scope.unset("OXIDEAV_AAC_SBR_HDR_AMP_RES_1");
+    scope.unset("OXIDEAV_AAC_SBR_DF_TIME");
+    scope.unset("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO");
+
+    let ours = parse_stream(&encode_ours());
+    let fdk = match encode_fdkaac() {
+        Some(b) => parse_stream(&b),
+        None => {
+            eprintln!("fdkaac encode failed — skipping");
+            return;
+        }
+    };
+    assert!(!ours.is_empty() && !fdk.is_empty(), "no SBR FIL parsed");
+    // Every fdkaac mono frame must have bs_extended_data = 0 (HE-AAC
+    // without PS). Sanity-check the reference first.
+    for d in &fdk {
+        assert!(
+            !d.bs_extended_data,
+            "fdkaac reference frame {} has bs_extended_data = 1 (unexpected for HE-AAC mono)",
+            d.frame_idx,
+        );
+    }
+    // Ours must match.
+    for d in &ours {
+        assert!(
+            !d.bs_extended_data,
+            "lead-3 byte-compare: ours frame {} emits bs_extended_data = 1; \
+             fdkaac emits 0 for the same input. Setting the flag without a real \
+             extension payload desyncs ffmpeg's bs_fill_bits parser.",
+            d.frame_idx,
+        );
+    }
+    // Framing sanity (re-affirms lead3_audit's invariant): each frame
+    // satisfies (declared cnt - consumed) in [0, 8).
+    for d in &ours {
+        let fill = d.fil_payload_bits as i64 - d.fil_consumed_bits as i64;
+        assert!(
+            (0..8).contains(&fill),
+            "lead-3 byte-compare: ours frame {} fill = {} bits (must be in [0, 8))",
+            d.frame_idx,
+            fill,
+        );
     }
 }

@@ -236,15 +236,35 @@ impl Encoder for HeAacMonoEncoder {
             return Ok(());
         }
         if !self.high_pcm.is_empty() {
-            // Pad last partial frame with silence and emit.
+            // Pad last partial frame with silence and emit. We pass
+            // `flush=false` so the inner encoder is NOT flushed yet —
+            // the inner encoder always carries one frame of overlap
+            // latency (see [`AacEncoder::flush_final`]'s "silence-block
+            // tail" comment), and we need to stage one more SBR FIL for
+            // the held overlap before inner.flush() pushes it out.
             if self.high_pcm.len() < HIGH_RATE_FRAME {
                 self.high_pcm.resize(HIGH_RATE_FRAME, 0.0);
             }
-            self.emit_frame(true)?;
-        } else {
-            // Still flush the inner encoder.
-            self.inner.flush()?;
+            self.emit_frame(false)?;
         }
+        // Stage one silence SBR FIL for the inner encoder's held overlap
+        // frame, then flush. Without this the final AAC frame emitted by
+        // `inner.flush()` (the silence-block tail) has no SBR extension
+        // attached and ffmpeg's `ff_aac_sbr_apply` walks into the
+        // "No quantized data read for sbr_dequant" branch on that frame
+        // (`sbr->ready_for_dequant` is left at 0 from the previous
+        // frame's apply pass and `read_sbr_data` never runs because no
+        // FIL/EXT_SBR_DATA element was present). Encode silence through
+        // the QMF + envelope path so the silent SBR FIL is decoded the
+        // same way as any other in-band frame.
+        let silence = vec![0.0f32; HIGH_RATE_FRAME];
+        let x = self.sbr.analyse(&silence);
+        let (sbr_bytes, bits) = self.sbr.emit_sbr_payload(&x);
+        self.inner.stage_sbr_fil(crate::encoder::SbrFilBits {
+            bytes: sbr_bytes,
+            bits,
+        });
+        self.inner.flush()?;
         self.flushed = true;
         Ok(())
     }
@@ -476,17 +496,30 @@ impl Encoder for HeAacStereoEncoder {
         }
         let have = self.high_pcm_l.len().min(self.high_pcm_r.len());
         if have > 0 {
-            // Pad partial last frame with silence and emit.
+            // Pad partial last frame with silence and emit. We pass
+            // `flush=false` so the inner encoder is NOT flushed yet —
+            // see the round-26 comment on [`HeAacMonoEncoder::flush`]
+            // for the full rationale (silence-block tail needs its own
+            // staged SBR FIL or ffmpeg trips
+            // "No quantized data read for sbr_dequant").
             if self.high_pcm_l.len() < HIGH_RATE_FRAME {
                 self.high_pcm_l.resize(HIGH_RATE_FRAME, 0.0);
             }
             if self.high_pcm_r.len() < HIGH_RATE_FRAME {
                 self.high_pcm_r.resize(HIGH_RATE_FRAME, 0.0);
             }
-            self.emit_frame(true)?;
-        } else {
-            self.inner.flush()?;
+            self.emit_frame(false)?;
         }
+        // Stage one silence CPE-shaped SBR FIL so the inner encoder's
+        // held-overlap final frame carries an EXT_SBR_DATA element.
+        let silence = vec![0.0f32; HIGH_RATE_FRAME];
+        let (xl, xr) = self.sbr.analyse(&silence, &silence);
+        let (sbr_bytes, bits) = self.sbr.emit_sbr_payload_pair(&xl, &xr);
+        self.inner.stage_sbr_fil(crate::encoder::SbrFilBits {
+            bytes: sbr_bytes,
+            bits,
+        });
+        self.inner.flush()?;
         self.flushed = true;
         Ok(())
     }
@@ -804,10 +837,27 @@ impl Encoder for HeAacV2Encoder {
             if self.high_pcm_r.len() < HIGH_RATE_FRAME {
                 self.high_pcm_r.resize(HIGH_RATE_FRAME, 0.0);
             }
-            self.emit_frame(true)?;
-        } else {
-            self.inner.flush()?;
+            // See [`HeAacMonoEncoder::flush`] for the round-26 rationale —
+            // emit_frame(false) leaves the inner encoder unflushed so we
+            // can stage one more silence SBR FIL for the held-overlap
+            // tail frame before draining inner.
+            self.emit_frame(false)?;
         }
+        // Stage one silence SCE+PS SBR FIL so the inner encoder's
+        // held-overlap final frame carries an EXT_SBR_DATA element.
+        // PS analysis on silence yields IID=0/ICC=1 (centred mono),
+        // matching the no-op identity stereo upmix.
+        let silence = vec![0.0f32; HIGH_RATE_FRAME];
+        let (x_l_silence, x_r_silence) = self.analyse_lr(&silence, &silence);
+        let ps_frame_silence = analyse_ps_params_10_multi_env(&x_l_silence, &x_r_silence, 1);
+        self.sbr.set_pending_ps_frame(ps_frame_silence);
+        let x_high_silence = self.sbr.analyse(&silence);
+        let (sbr_bytes, bits) = self.sbr.emit_sbr_payload(&x_high_silence);
+        self.inner.stage_sbr_fil(SbrFilBits {
+            bytes: sbr_bytes,
+            bits,
+        });
+        self.inner.flush()?;
         self.flushed = true;
         Ok(())
     }

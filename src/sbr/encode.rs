@@ -225,15 +225,25 @@ impl QmfAnalysis64 {
         for n in 0..128 {
             u[n] = z[n] + z[n + 128] + z[n + 256] + z[n + 384] + z[n + 512];
         }
-        // W[k] = sum_{n=0..127} u[n] * 2 * exp(i * pi/128 * (k + 0.5) * (2n - 0.5))
+        // X[k] = sum_{n=0..127} u[n] * exp(i * pi/128 * (k + 0.5) * (2n + 1))
+        // Per ISO/IEC 14496-3 §4.B.18.2 (informative encoder analysis QMF
+        // bank, Figure 4.B.16). Note: the encoder modulation matrix uses
+        // (2n + 1) and **no factor of 2** — different from the decoder's
+        // 32-channel analysis matrix in §4.6.18.4.1 which uses (2n - 0.5)
+        // and has a factor of 2. Pre-r26 this branch was a copy-paste of
+        // the decoder's matrix scaled to 64 bands; that mismatch placed
+        // each subband at the wrong centre frequency, leaking a 1 kHz tone
+        // far up into the SBR-band region (env_sf[0][0] was 29 vs fdkaac's
+        // 0 on the r24 fixture) and tripping ffmpeg's
+        // "No quantized data read for sbr_dequant" warning.
         for k in 0..NUM_QMF_BANDS {
             let kf = k as f32 + 0.5;
             let mut re = 0.0f32;
             let mut im = 0.0f32;
             for n in 0..128 {
-                let ang = core::f32::consts::PI / 128.0 * kf * (2.0 * n as f32 - 0.5);
-                re += u[n] * 2.0 * ang.cos();
-                im += u[n] * 2.0 * ang.sin();
+                let ang = core::f32::consts::PI / 128.0 * kf * (2.0 * n as f32 + 1.0);
+                re += u[n] * ang.cos();
+                im += u[n] * ang.sin();
             }
             out[k] = Complex32::new(re, im);
         }
@@ -415,12 +425,19 @@ impl SbrEncoder {
     pub fn new(core_rate: u32) -> oxideav_core::Result<Self> {
         let mut header = SbrHeader::defaults();
         // Conservative defaults that mirror afconvert's choice for
-        // 24 kHz core / 48 kHz output. amp_res=0 (1.5 dB tables) matches
-        // the implicit per-frame override applied by sbr_grid() FIXFIX
-        // with bs_num_env == 1 (§4.6.18.3.3) — keeping the header value
-        // the same as the effective frame value avoids any parser
-        // inconsistency on decoders that read amp_res before the grid.
-        header.bs_amp_res = 0;
+        // 24 kHz core / 48 kHz output.
+        //
+        // **r25 lead-1 graduation (task #63)**: bs_amp_res = 1 matches
+        // fdkaac's HE-AAC mono header for the same input. The FIXFIX
+        // `bs_num_env == 1` carve-out (§4.6.18.3.3) still forces the
+        // *effective* per-frame amp_res to 0 inside `parse_sbr_grid`,
+        // so envelope decoding stays on the 1.5 dB tables (7-bit start)
+        // and our envelope writer is unaffected. Keeping the header at
+        // 0 was an r23 carry-over that diverged from fdkaac on this
+        // single bit; the byte-compare regression in
+        // `tests/r24_sbr_fil_diff.rs::r25_lead1_*` pins the new
+        // default.
+        header.bs_amp_res = 1;
         header.bs_start_freq = 5;
         header.bs_stop_freq = 9;
         header.bs_xover_band = 0;
@@ -559,13 +576,58 @@ impl SbrEncoder {
             self.prev_iid_idx = last_iid;
             self.prev_icc_idx = last_icc;
         } else {
-            write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
+            // r25 lead-2 graduation (task #63): emit time-direction
+            // delta from frame >= 1 by default, matching fdkaac's
+            // predominant choice. Frame 0 always stays freq-direction
+            // because there is no prior baseline. Set the opt-out
+            // env-var `OXIDEAV_AAC_SBR_DF_FREQ_ONLY=1` to force the
+            // r23-era always-freq behaviour for diagnostic purposes.
+            // (`OXIDEAV_AAC_SBR_DF_TIME` is now a no-op kept for
+            // backward-compat with existing test scaffolds.)
+            let force_freq = std::env::var("OXIDEAV_AAC_SBR_DF_FREQ_ONLY").is_ok();
+            let want_time_delta = self.frame_count > 0 && !force_freq;
+            if want_time_delta {
+                let opts = SceWriteOpts {
+                    prev_env_time_delta: Some(&self.prev_env),
+                    prev_noise_time_delta: Some(&self.prev_noise),
+                };
+                write_single_channel_element_mono_opts(
+                    &mut bw,
+                    &self.header,
+                    &self.freq,
+                    &sf,
+                    &opts,
+                );
+            } else {
+                write_single_channel_element_mono(&mut bw, &self.header, &self.freq, &sf);
+            }
         }
         let bits_written = (bw.bit_position() - start) as u32;
         bw.align_to_byte();
 
-        // Update state for next frame.
-        self.prev_env.clone_from(&sf.env);
+        // Update state for next frame using **reconstructed** envelope
+        // values that match what the decoder will see — re-run the writer
+        // logic on a throw-away bit sink to capture them. Storing raw
+        // (potentially negative or out-of-range) `sf.env` here would
+        // cause the next frame's time-delta to be computed against a
+        // baseline that disagrees with the decoder's accumulator,
+        // producing drift that ultimately trips the
+        // "env_facs_q 255 is invalid" / "No quantized data read for
+        // sbr_dequant" warning in ffmpeg's HE-AAC parser.
+        let mut recon = Vec::with_capacity(self.freq.n_high);
+        let mut sink = BitWriter::with_capacity(16);
+        if self.frame_count == 0 || std::env::var("OXIDEAV_AAC_SBR_DF_FREQ_ONLY").is_ok() {
+            write_envelope_1_5db_freq_delta_recon(&mut sink, &sf.env, self.freq.n_high, &mut recon);
+        } else {
+            write_envelope_1_5db_time_delta_recon(
+                &mut sink,
+                &sf.env,
+                &self.prev_env,
+                self.freq.n_high,
+                &mut recon,
+            );
+        }
+        self.prev_env = recon;
         self.prev_noise.clone_from(&sf.noise);
         self.frame_count = self.frame_count.wrapping_add(1);
         (bw.finish(), bits_written)
@@ -726,8 +788,21 @@ impl SbrStereoEncoder {
 
 /// Write an sbr_header() element. Matches the inverse of
 /// [`crate::sbr::bitstream::parse_sbr_header`] exactly.
+///
+/// **r25 lead-1 probe knob**: setting `OXIDEAV_AAC_SBR_HDR_AMP_RES_1`
+/// rewrites the emitted `bs_amp_res` field to `1` (matching fdkaac's
+/// header choice) regardless of `h.bs_amp_res`. The grid carve-out
+/// (`FIXFIX && bs_num_env == 1`) still forces the *effective* amp_res
+/// for envelope decoding to 0, so envelope start-bits remain 7 (1.5 dB
+/// tables). The probe lets us isolate whether ffmpeg pre-reads the
+/// header value before the carve-out fires.
 pub fn write_sbr_header(bw: &mut BitWriter, h: &SbrHeader) {
-    bw.write_u32(h.bs_amp_res as u32, 1);
+    let amp_res = if std::env::var("OXIDEAV_AAC_SBR_HDR_AMP_RES_1").is_ok() {
+        1u32
+    } else {
+        h.bs_amp_res as u32
+    };
+    bw.write_u32(amp_res, 1);
     bw.write_u32(h.bs_start_freq as u32, 4);
     bw.write_u32(h.bs_stop_freq as u32, 4);
     bw.write_u32(h.bs_xover_band as u32, 3);
@@ -757,6 +832,38 @@ pub fn write_single_channel_element_mono(
     freq: &FreqTables,
     sf: &SbrFrameScalefactors,
 ) {
+    write_single_channel_element_mono_opts(bw, _header, freq, sf, &SceWriteOpts::default());
+}
+
+/// Per-frame options for [`write_single_channel_element_mono_opts`] that
+/// drive the r25 lead probes. All defaults reproduce the round-23 baseline
+/// encoder output.
+#[derive(Clone, Debug, Default)]
+pub struct SceWriteOpts<'a> {
+    /// When `Some(prev)`, encode the envelope using time-direction delta
+    /// (`bs_df_env = 1`) against the supplied previous-frame absolute
+    /// envelope scalefactors. `prev.len()` MUST equal `freq.n_high`.
+    /// Set to `None` to keep the round-23 freq-direction default
+    /// (`bs_df_env = 0` + 7-bit absolute start value).
+    pub prev_env_time_delta: Option<&'a [i32]>,
+    /// When `Some(prev)`, encode the noise floor using time-direction
+    /// delta (`bs_df_noise = 1`) against the supplied previous-frame
+    /// absolute noise scalefactors. `prev.len()` MUST equal `freq.nq`.
+    pub prev_noise_time_delta: Option<&'a [i32]>,
+}
+
+/// Internal entry-point for [`write_single_channel_element_mono`] with
+/// the per-frame option struct exposed. Lets the encoder switch between
+/// the round-23 freq-direction default and the r25 lead-2 time-direction
+/// probe (controlled by [`SceWriteOpts::prev_env_time_delta`] /
+/// [`SceWriteOpts::prev_noise_time_delta`]).
+pub fn write_single_channel_element_mono_opts(
+    bw: &mut BitWriter,
+    _header: &SbrHeader,
+    freq: &FreqTables,
+    sf: &SbrFrameScalefactors,
+    opts: &SceWriteOpts<'_>,
+) {
     bw.write_bit(false); // bs_data_extra
                          // sbr_grid — FIXFIX, bs_num_env=1, freq_res=1.
     bw.write_u32(FrameClass::FixFix as u32, 2);
@@ -766,18 +873,28 @@ pub fn write_single_channel_element_mono(
                         // amp_res=0 explicitly by re-quantising below.
     bw.write_u32(1, 1); // bs_freq_res[0] = 1 (high-res)
                         // sbr_dtdf for 1 envelope + 1 noise floor.
-    bw.write_u32(0, 1); // bs_df_env[0] = 0 (freq-direction)
-    bw.write_u32(0, 1); // bs_df_noise[0] = 0 (freq-direction)
-                        // sbr_invf — one value per noise band (bw mode 0 = off).
+    let env_dt = opts.prev_env_time_delta.is_some();
+    let noise_dt = opts.prev_noise_time_delta.is_some();
+    bw.write_u32(env_dt as u32, 1); // bs_df_env[0]
+    bw.write_u32(noise_dt as u32, 1); // bs_df_noise[0]
+                                      // sbr_invf — one value per noise band (bw mode 0 = off).
     for _ in 0..freq.nq {
         bw.write_u32(0, 2);
     }
     // Envelope — FIXFIX num_env==1 => amp_res forced to 0 (1.5 dB tables).
     // We need to re-quantise the envelope with the 1.5 dB step so decoder
     // and encoder agree.
-    write_envelope_1_5db_freq_delta(bw, &sf.env, freq.n_high);
+    if let Some(prev) = opts.prev_env_time_delta {
+        write_envelope_1_5db_time_delta(bw, &sf.env, prev, freq.n_high);
+    } else {
+        write_envelope_1_5db_freq_delta(bw, &sf.env, freq.n_high);
+    }
     // Noise — always uses the 3.0 dB noise tables (no 1.5 dB variant).
-    write_noise_3_0db_freq_delta(bw, &sf.noise, freq.nq);
+    if let Some(prev) = opts.prev_noise_time_delta {
+        write_noise_3_0db_time_delta(bw, &sf.noise, prev, freq.nq);
+    } else {
+        write_noise_3_0db_freq_delta(bw, &sf.noise, freq.nq);
+    }
     // bs_add_harmonic_flag = 0
     bw.write_bit(false);
     // bs_extended_data = 0
@@ -1239,6 +1356,20 @@ pub fn write_channel_pair_element_independent(
 /// absolute field is unsigned (0..127), negative first-band values are
 /// clamped at 0; the Huffman-coded deltas cover the negative range.
 pub fn write_envelope_1_5db_freq_delta(bw: &mut BitWriter, env: &[i32], n_bands: usize) {
+    write_envelope_1_5db_freq_delta_recon(bw, env, n_bands, &mut Vec::new());
+}
+
+/// Variant of [`write_envelope_1_5db_freq_delta`] that records the
+/// reconstructed (i.e. decoder-side accumulated) envelope values into
+/// `recon`. Used by the encoder loop to update its time-delta baseline
+/// (`prev_env`) from what the decoder will *actually* see, not the raw
+/// (potentially negative or out-of-range) requested values.
+pub fn write_envelope_1_5db_freq_delta_recon(
+    bw: &mut BitWriter,
+    env: &[i32],
+    n_bands: usize,
+    recon: &mut Vec<i32>,
+) {
     use super::tables::{F_HUFFMAN_ENV_1_5DB, LAV_ENV_1_5DB};
     let n = n_bands.min(env.len());
     // Spec limit on the accumulated absolute scalefactor value at
@@ -1247,6 +1378,8 @@ pub fn write_envelope_1_5db_freq_delta(bw: &mut BitWriter, env: &[i32], n_bands:
     // inside [0, 127] at every band.
     const MAX_ACC: i32 = 127;
     let mut prev_abs = 0i32;
+    recon.clear();
+    recon.reserve(n);
     for i in 0..n {
         if i == 0 {
             let v = env[i].clamp(0, MAX_ACC);
@@ -1262,6 +1395,7 @@ pub fn write_envelope_1_5db_freq_delta(bw: &mut BitWriter, env: &[i32], n_bands:
             write_huffman_sym(bw, delta + LAV_ENV_1_5DB, &F_HUFFMAN_ENV_1_5DB);
             prev_abs = v;
         }
+        recon.push(prev_abs);
     }
 }
 
@@ -1283,6 +1417,86 @@ pub fn write_noise_3_0db_freq_delta(bw: &mut BitWriter, noise: &[i32], nq: usize
             write_huffman_sym(bw, delta + LAV_NOISE_3_0DB, &F_HUFFMAN_ENV_3_0DB);
             prev_abs = v;
         }
+    }
+}
+
+/// Time-direction envelope writer (1.5 dB tables, `bs_df_env = 1`).
+///
+/// Per §4.6.18.3.5 / Table 4.72, time-direction encoding emits one
+/// Huffman-coded delta per band — `delta[k] = env[k] - prev[k]` — using
+/// `T_HUFFMAN_ENV_1_5DB` and the lav offset of [`LAV_ENV_1_5DB`]. There
+/// is **no** absolute start value; the parser accumulates against the
+/// previous frame's reconstructed envelope (kept in
+/// [`SbrEncoder::prev_env`]).
+///
+/// Both `env` and `prev` are reconstructed-amplitude indices in the same
+/// units written by [`write_envelope_1_5db_freq_delta`]. The writer
+/// clamps each delta into the table's lav range before encoding so the
+/// resulting stream stays decodable; the matching reconstructed value
+/// (which the parser accumulates) is `prev[k] + clamped_delta`. Returns
+/// nothing — the caller is responsible for updating `prev_env` to the
+/// reconstructed values for the next frame.
+pub fn write_envelope_1_5db_time_delta(
+    bw: &mut BitWriter,
+    env: &[i32],
+    prev: &[i32],
+    n_bands: usize,
+) {
+    write_envelope_1_5db_time_delta_recon(bw, env, prev, n_bands, &mut Vec::new());
+}
+
+/// Variant of [`write_envelope_1_5db_time_delta`] that records the
+/// reconstructed (decoder-side) envelope values into `recon`. Use this
+/// in the encoder runtime so [`SbrEncoder::prev_env`] stays in sync with
+/// the bitstream the decoder is reading.
+pub fn write_envelope_1_5db_time_delta_recon(
+    bw: &mut BitWriter,
+    env: &[i32],
+    prev: &[i32],
+    n_bands: usize,
+    recon: &mut Vec<i32>,
+) {
+    use super::tables::{LAV_ENV_1_5DB, T_HUFFMAN_ENV_1_5DB};
+    let n = n_bands.min(env.len()).min(prev.len());
+    // Spec limit on the accumulated absolute scalefactor value at amp_res=0
+    // is 127 (7-bit unsigned start + signed deltas — but the parser
+    // accumulates into a 7-bit register at amp_res=0 / 6-bit at amp_res=1).
+    // ffmpeg stores `env_facs_q` as `uint8_t` and rejects values > 127 as
+    // "env_facs_q 255 is invalid" (the i8→u8 underflow signature of a
+    // negative accumulator) and aborts with "No quantized data read for
+    // sbr_dequant". Pre-r26 the freq-delta path already clamped the
+    // reconstructed sequence into [0, 127] but the time-delta path did
+    // not, so a frame whose raw env was lower than the previous frame's
+    // reconstructed env (typical for tonal input where the QMF bottom-
+    // band leakage decays after the cold-start transient) would emit a
+    // delta that decoded to a negative `env_facs_q`. Clamp the target to
+    // `[0, MAX_ACC]` before computing the delta so the decoder's
+    // accumulator never goes negative.
+    const MAX_ACC: i32 = 127;
+    recon.clear();
+    recon.reserve(n);
+    for i in 0..n {
+        let target = env[i]
+            .clamp(prev[i] - LAV_ENV_1_5DB, prev[i] + LAV_ENV_1_5DB)
+            .clamp(0, MAX_ACC);
+        let delta = target - prev[i];
+        write_huffman_sym(bw, delta + LAV_ENV_1_5DB, &T_HUFFMAN_ENV_1_5DB);
+        recon.push(target);
+    }
+}
+
+/// Time-direction noise writer (3.0 dB tables, `bs_df_noise = 1`).
+///
+/// Per Table 4.73 with `bs_df_noise = 1`, every band is a Huffman-coded
+/// delta against the matching previous-frame noise scalefactor using
+/// `T_HUFFMAN_NOISE_3_0DB`. No absolute start value.
+pub fn write_noise_3_0db_time_delta(bw: &mut BitWriter, noise: &[i32], prev: &[i32], nq: usize) {
+    use super::tables::T_HUFFMAN_NOISE_3_0DB;
+    let n = nq.min(noise.len()).min(prev.len());
+    for i in 0..n {
+        let target = noise[i].clamp(prev[i] - LAV_NOISE_3_0DB, prev[i] + LAV_NOISE_3_0DB);
+        let delta = target - prev[i];
+        write_huffman_sym(bw, delta + LAV_NOISE_3_0DB, &T_HUFFMAN_NOISE_3_0DB);
     }
 }
 
