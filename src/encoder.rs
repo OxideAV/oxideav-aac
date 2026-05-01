@@ -1131,11 +1131,12 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         .copied()
         .unwrap_or(44_100);
     let mut cbs = vec![0u8; max_sfb];
+    let pns_off = pns_disabled_by_env();
     for sfb in 0..max_sfb {
         let q = &q_bands[sfb];
         cbs[sfb] = if q.iter().all(|&x| x == 0) {
             0
-        } else if pns_eligible_band(swb, sfb, sample_rate) {
+        } else if !pns_off && pns_eligible_band(swb, sfb, sample_rate) {
             if let Some(pns_sf) = classify_pns_band(spec, swb[sfb] as usize, swb[sfb + 1] as usize)
             {
                 sfs[sfb] = pns_sf;
@@ -1389,6 +1390,17 @@ fn analyse_and_quantise_short_opts(
 /// information is already irrelevant to the human auditory system, so
 /// substituting shaped noise for Huffman-coded tones is a clean win.
 const PNS_IS_MIN_HZ: f32 = 4_000.0;
+
+/// Test/debug knob: when the environment variable `OXIDEAV_AAC_DISABLE_PNS`
+/// is set (any value), the encoder will not classify any band as `NOISE_HCB`
+/// — every non-zero band falls back to a regular Huffman codebook. Used by
+/// `tests/encode_pns_savings.rs` to A/B-compare frame sizes with PNS on vs
+/// off on a noise-rich fixture, demonstrating the bit savings PNS buys.
+/// Default behaviour (env var unset) leaves PNS classification fully
+/// active; this knob never changes the bitstream of regular runs.
+fn pns_disabled_by_env() -> bool {
+    std::env::var("OXIDEAV_AAC_DISABLE_PNS").is_ok()
+}
 
 /// True if scalefactor band `sfb` at `sample_rate` sits entirely above
 /// `PNS_IS_MIN_HZ`. Used as a hard gate on PNS and intensity-stereo —

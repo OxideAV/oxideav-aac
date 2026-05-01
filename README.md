@@ -379,6 +379,19 @@ and that TNS-bearing frames decode without error.
 - Pulse data is emitted on at least one frame of a loud 440 Hz tone
   and the round-trip Goertzel ratio stays >=50x.
 
+`tests/encode_pns_savings.rs` (task #132) pins the bit-savings PNS
+buys on noise-rich content (cymbals + sax-like harmonic stack +
+room-tone broadband background, 1 s mono at 44.1 kHz / 96 kbps):
+
+- PNS-active vs PNS-disabled (`OXIDEAV_AAC_DISABLE_PNS=1`) A/B encode:
+  raw_data_block bytes drop **63.9%** (8 749 B vs 24 256 B).
+- Self-decoder RMS round-trip ratio: 0.977 (PNS preserves band
+  energy within 2.3% of the input).
+- ffmpeg cross-decode runs clean (no warnings, no errors). The
+  ffmpeg-decoder RMS ratio of 6.06× is the same FAAD2-vs-ffmpeg
+  `dpcm_noise_nrg` calibration delta documented in the r19 audit;
+  not blocking the cross-decode-clean criterion.
+
 ## Codec id
 
 - `"aac"` — both encoder and decoder.

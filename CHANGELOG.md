@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (PNS bit-savings audit, task #132)
+- Added `tests/encode_pns_savings.rs` to pin the bit-savings PNS
+  buys on noise-rich content. The fixture is a synthesised
+  cymbals-and-sax-and-room-tone clip (broadband background +
+  three LF/mid sine tones + an HF cymbal-like noise envelope).
+  A/B encodes the same fixture twice — PNS active and PNS forced
+  off — and asserts the PNS-active stream is materially smaller.
+- Measured **63.9% reduction in raw_data_block bytes** on the
+  noise-rich mono fixture at 96 kbps / 44.1 kHz (PNS-on:
+  8 749 B; PNS-off: 24 256 B). Far exceeds the 8-15% target
+  cited in the workspace README brief because the fixture is
+  deliberately noise-dominant above 4 kHz.
+- ffmpeg cross-decode is clean (`aac (LC), 44100 Hz, mono` with
+  no warnings). Self-decoder RMS round-trip ratio = 0.977 (PNS
+  preserves band energy within 2.3% of the input). ffmpeg-decoder
+  RMS ratio = 6.06× — same FAAD2-vs-ffmpeg PNS-gain calibration
+  delta documented in the r19 audit; ffmpeg's reading of
+  `dpcm_noise_nrg` differs from FAAD2's `2^(sf/4 - 14.5)`
+  convention. Outside the scope of #132.
+- Added a process-global env-var gate `OXIDEAV_AAC_DISABLE_PNS`
+  read in `analyse_and_quantise_opts` so the A/B test can flip
+  PNS classification off for one back-to-back encode and
+  measure the byte delta. Default behaviour (env var unset)
+  leaves PNS fully active; this knob is test-only and never
+  changes the bitstream of regular runs.
+
 ### Notes (round 24)
 - Built `tests/r24_sbr_fil_diff.rs`: encodes the r18 amplitude
   fixture (1 kHz / amp 0.3 / 0.5 s mono, 48 kHz, 48 kbps HE-AAC)
