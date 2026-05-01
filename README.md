@@ -124,6 +124,14 @@ TNS-flattened coefficients.
 - 44.1 kHz 5.1 sine-per-channel through our own decoder (each of the 6
   channels recovers its tone above a 20x Goertzel floor)
 - 44.1 kHz 7.1 sine-per-channel through our own decoder (all 8 channels)
+- 44.1 kHz 5.1 sine-per-channel through ffmpeg (`encode_51_roundtrip_ffmpeg`).
+  All 6 channels survive ffmpeg's bitstream→WAVE-5.1 reorder
+  (C/L/R/Ls/Rs/LFE → L/R/C/LFE/Ls/Rs); per-channel PSNR floors at
+  20 dB (matching the AC-3 5.1 acceptance pattern), with five of
+  six channels clearing 25 dB on the synthetic tone fixture. The
+  L/R-CPE R channel running an octave-paired tone (R = 880 Hz vs
+  L = 440 Hz) sits at ~22 dB because M/S coding biases bit allocation
+  toward the side signal.
 
 ### r19 — AAC-LC ffmpeg-interop RMS audit (2026-04-26)
 

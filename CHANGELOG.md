@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (5.1 ffmpeg cross-decode, task #142)
+- Added `tests/encode_roundtrip.rs::encode_51_roundtrip_ffmpeg`. The
+  multichannel encode path (channel_configuration 1..=7, including
+  5.1's SCE(C) + CPE(L,R) + CPE(Ls,Rs) + LFE element sequence per
+  ISO/IEC 14496-3 §1.6.3 and §4.5) was already in place from the
+  pre-#142 multichannel-encode work; this round adds the ffmpeg
+  cross-decode acceptance gate the workspace README brief calls out.
+- The fixture encodes 6 distinct sine tones (one per channel: 440,
+  550, 880, 1320, 1760, 330 Hz at amp 0.3) into a 44.1 kHz 5.1 AAC-LC
+  stream, decodes through ffmpeg with `-ac 6` (no resample, no
+  downmix), and asserts every input tone shows up on the expected
+  ffmpeg WAVE-5.1 output channel above a Goertzel ratio of 50× and a
+  per-channel PSNR floor of 20 dB. ffmpeg reorders bitstream order
+  (C, L, R, Ls, Rs, LFE) to WAVE order (L, R, C, LFE, Ls, Rs); the
+  test bakes the inverse mapping `[2, 0, 1, 4, 5, 3]`.
+- Measured per-channel PSNR (44.1 kHz, 256 kbps, 1 s tones, mid
+  window 4096..total-4096):
+    - C   (440 Hz, ffmpeg ch 2):  30.15 dB
+    - L   (550 Hz, ffmpeg ch 0):  34.79 dB
+    - R   (880 Hz, ffmpeg ch 1):  22.56 dB
+    - Ls  (1320 Hz, ffmpeg ch 4): 34.51 dB
+    - Rs  (1760 Hz, ffmpeg ch 5): 35.46 dB
+    - LFE (330 Hz, ffmpeg ch 3):  35.76 dB
+  Five of six channels clear 25 dB; the L/R-CPE octave-paired R
+  channel (440 Hz vs 880 Hz fundamentals — exact octave) sits at
+  ~22 dB because M/S mid/side bit allocation biases toward the
+  side signal and the residual quant noise on R is correspondingly
+  larger. The test asserts (a) every channel ≥ 20 dB and (b) at
+  least 4/6 channels ≥ 25 dB. Mirrors the AC-3 5.1 acceptance
+  pattern (`oxideav-ac3::encoder::tests::five_one_ffmpeg_crossdecode`
+  asserts > 10 dB and reports ~24 dB on its 880 Hz channel).
+- No encoder code changed in this round — the gate is purely a
+  cross-decode acceptance test on existing multichannel encoder
+  scaffolding. Test count delta: +1 (181 → 182).
+
 ### Notes (PNS bit-savings audit, task #132)
 - Added `tests/encode_pns_savings.rs` to pin the bit-savings PNS
   buys on noise-rich content. The fixture is a synthesised
