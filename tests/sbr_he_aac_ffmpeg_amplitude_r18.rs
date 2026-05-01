@@ -22,12 +22,35 @@
 //! fdkaac-encoded HE-AACv2 streams). This **disproves** the round-17
 //! brief's "structural sbr_dequant rejection" hypothesis.
 //!
-//! The actual interop gap appears to lie outside the SBR envelope path —
-//! likely the AAC-LC core spectrum scale, since steady-state amplitude on
-//! the LC-only path also disagrees with ffmpeg's expected scale (see the
-//! `encode_mono_roundtrip_ffmpeg` test, where steady-state mid-stream
-//! amplitude is ≈ 0.6× the expected value, and frame-boundary spikes
-//! reach 32 767).
+//! ## Round 21 audit notes (2026-04-26)
+//!
+//! Round 19 closed the LC RMS interop gap and round 20 fixed the
+//! per-frame ±32k saturation on real CPE content. With those landing,
+//! the round-18 hypothesis "AAC-LC core spectrum scale" is also ruled
+//! out — `tests/lc_rms_interop_r19.rs` confirms the LC-only round-trip
+//! lands within ±5% of unity in all four directions.
+//!
+//! Round-21 probe data (mono SCE fixture, 1 kHz tone amp 0.3 at 48 kHz):
+//!
+//! ```text
+//! input (peak / RMS)              :  9 830 / 6 951
+//! ours-encode -> ours-decode       : 10 256 / 6 582  (peak within 5% of input)
+//! ours-encode -> ffmpeg-decode     : 32 767 / 17 181 (square-wave clipping)
+//! fdkaac-encode -> ffmpeg-decode   :  9 822 / 6 920  (within 1% of input)
+//! fdkaac-encode -> ours-decode     : 13 009 / 7 061  (within ~30% of input)
+//! ```
+//!
+//! Both fdkaac and our encoder transmit `bs_data_env[0] = 0` for tonal
+//! content with no high-band energy (E_orig = 64, the spec minimum).
+//! The bitstream-level envelope value is therefore **not** the source
+//! of the saturation — both encoders emit the same value yet ffmpeg
+//! decodes the fdkaac stream cleanly while saturating ours.
+//!
+//! The remaining gap is in the SBR HF-generation / limiter / patches
+//! interaction with our specific frequency-table choices and our LC
+//! core's particular spectral envelope. Round 21 leaves the test
+//! ignored pending a deeper SBR pipeline audit on a multi-frequency
+//! corpus.
 //!
 //! Skips when ffmpeg is unavailable.
 
@@ -52,7 +75,7 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 #[test]
-#[ignore = "round-18 known interop gap — ffmpeg saturates HE-AAC output to peak 32768 regardless of SBR envelope; root cause not yet diagnosed"]
+#[ignore = "round-21 known interop gap — ffmpeg saturates our HE-AAC streams to peak 32768; bitstream-level envelope value is identical to fdkaac's (which decodes cleanly), so root cause is in SBR HF-generation / limiter for our specific freq-table choice"]
 fn ffmpeg_decoded_amplitude_matches_input() {
     if which("ffmpeg").is_none() {
         eprintln!("no ffmpeg on PATH — skipping");

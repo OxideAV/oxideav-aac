@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (round 21)
+- `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs` updated with round-21 audit
+  data:
+  ```
+  ours-encode -> ours-decode      : peak 10 256 / RMS 6 582  (within 5% of input)
+  ours-encode -> ffmpeg-decode    : peak 32 767 / RMS 17 181 (saturated)
+  fdkaac-encode -> ffmpeg-decode  : peak  9 822 / RMS 6 920  (within 1% of input)
+  fdkaac-encode -> ours-decode    : peak 13 009 / RMS 7 061  (within 30% of input)
+  ```
+  Direct probe of the bitstream-level envelope value reveals **both
+  fdkaac and our encoder transmit `bs_data_env[0] = 0`** for tonal
+  content with no high-band energy (E_orig = 64, the spec minimum).
+  The bitstream-level envelope value is therefore not the source of the
+  saturation — both encoders emit the same value yet ffmpeg decodes the
+  fdkaac stream cleanly while saturating ours.
+- Round 21 audited the §4.6.18 SBR pipeline end to end: synthesis QMF
+  gain (1/64 internal scale per §4.6.18.4.2 / Fig. 4.43) is correct;
+  envelope adjuster `gain = sqrt(E_orig / (E_curr * (1 + Q_orig)))` is
+  spec-correct; HF generation patches and limiter cap (`g_ref *
+  limiter_gain_cap`) match Table 4.176. The remaining saturation must
+  arise from a divergence between our encoder's SBR header / freq-table
+  configuration and ffmpeg's decoder expectations for one of those —
+  but the immediate audit on `bs_start_freq=5`, `bs_stop_freq=9`,
+  `bs_freq_scale=2`, `bs_alter_scale=true`, `bs_xover_band=0`,
+  `bs_noise_bands=2` did not isolate it. Round 22+ target.
+- All 170 tests + 1 ignored remain unchanged from round 20.
+
 ### Added (round 19)
 - `tests/lc_rms_interop_r19.rs` — pins AAC-LC ffmpeg-interop within ±10%
   of unity on the RMS metric across all four directions

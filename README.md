@@ -164,9 +164,29 @@ diagnostic probes used to land this audit; both report RMS alongside
 peak so subsequent rounds don't re-chase the same phantom.
 
 **Note**: `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs` (HE-AACv1 SBR
-amplitude saturation at peak 32_768) remains ignored — that gap is
-**unrelated** to the LC core; it lives in the SBR payload path (likely
-SBR envelope quantization or HF-generation gain). Round 20+ target.
+amplitude saturation at peak 32_768) remains ignored.
+
+Round 21 audit data (1 kHz tone amp 0.3 mono SCE at 48 kHz):
+
+```
+input (peak / RMS)              :  9 830 / 6 951
+ours-encode -> ours-decode       : 10 256 / 6 582  (within 5% of input)
+ours-encode -> ffmpeg-decode     : 32 767 / 17 181 (saturated)
+fdkaac-encode -> ffmpeg-decode   :  9 822 / 6 920  (within 1% of input)
+fdkaac-encode -> ours-decode     : 13 009 / 7 061  (within 30% of input)
+```
+
+Round-21 probe of the bitstream-level envelope value confirms **both
+fdkaac and our encoder transmit `bs_data_env[0] = 0`** for tonal
+content with no high-band energy (E_orig = 64, the spec minimum).
+The bitstream-level envelope value is therefore not the source of
+the saturation — both encoders emit the same value yet ffmpeg
+decodes the fdkaac stream cleanly while saturating ours. Audit of
+§4.6.18.4.2 (synthesis QMF gain `1/64`), §4.6.18.7.1 (E_orig
+formula), §4.6.18.7.5 (limiter gain cap, Table 4.176), and the HF
+generator patches all confirms spec-correctness; the divergence
+must arise from a difference in how ffmpeg reads our specific
+header configuration vs fdkaac's. Round 22+ target.
 
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
