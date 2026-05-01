@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (round 24)
+- Built `tests/r24_sbr_fil_diff.rs`: encodes the r18 amplitude
+  fixture (1 kHz / amp 0.3 / 0.5 s mono, 48 kHz, 48 kbps HE-AAC)
+  through both our `HeAacMonoEncoder` and `fdkaac -p 5 -f 2`,
+  parses every ADTS frame's SBR FIL element via the same
+  `oxideav_aac::sbr::bitstream::parse_*` routines our decoder
+  uses, and diffs the resulting `SbrChannelData` field-by-field.
+  The harness walks the SCE element bit-cursor through the
+  now-`pub` `decoder::decode_ics` + `decoder::fill_spectrum` so
+  the FIL bit position is exact.
+- **Field-by-field diff (ours vs fdkaac on the r18 fixture)**:
+    - `bs_amp_res` (header): 0 vs 1
+    - `bs_start_freq` / `bs_stop_freq` / `bs_freq_scale`: 5/9/2 vs 13/11/1
+    - derived `n_high` / `nq`: 16/4 vs 14/2
+    - FIL payload bits / frame: 96 vs 80
+    - `bs_invf_mode` totals: `[0;5]` vs `[5,2,0,0,0]`
+    - `bs_add_harmonic_flag` set on: 0/12 frames vs 1/15 frames
+    - `bs_df_env` / `bs_df_noise` totals: `[0;5]` / `[0;2]` vs
+      `[2,4,2,1,0]` / `[9,2]` (fdkaac uses time-direction delta;
+      we always use freq-direction)
+    - frame[0] `env_sf[0]`: `[29,-1,-1,…]` vs `[0;14]`
+    - frame[0] `noise_sf[0]`: `[18,0,0,0]` vs `[14,0]`
+- **Refuted thesis — the envelope value is NOT the saturation
+  source.** First it looked like our `env_sf[0][0] = 29`
+  (= `64·2^14.5`; QMF analysis-bank skirt leakage of the 1 kHz
+  tone into the bottom-most SBR subband, amplified by
+  `INT16_SCALE_SQ = 2^30`) was the cause. Added the
+  `OXIDEAV_AAC_SBR_ENV_FORCE_ZERO` env-var probe in
+  `sbr/encode.rs::estimate_envelope`: when set, every band gets
+  value 0 (matching fdkaac) and noise gets 14. Re-ran
+  ffmpeg-decode of the r18 mono fixture under the override:
+
+  ```
+  mono HE-AAC, no override:    peak=32768  rms=28739
+  mono HE-AAC, FORCE_ZERO=1:   peak=32768  rms=28739  (identical)
+  ```
+
+  Pinned the override actually zeros every frame's envelope
+  (`force_zero_env_var_actually_zeros_envelope` regression). Same
+  saturation reading, byte-identical decode artefacts. **Envelope
+  fully ruled out.**
+- ffmpeg consistently logs `No quantized data read for sbr_dequant`
+  on every decode, regardless of envelope value. The warning fires
+  *before* any envelope arithmetic, suggesting ffmpeg's parser is
+  giving up on our SBR data structurally.
+- ffmpeg interop on `solana-ad.mp4` via `oxideplay --vo null
+  --ao null`: completes cleanly past 27 s (no panic, no demuxer
+  rejections, audio path remains byte-tight).
+- All 169 active tests pass + 1 ignored (the r18 SBR amplitude
+  regression remains `#[ignore]`d). Net **+5** from r23's 164
+  active: 4 new in `tests/r24_sbr_fil_diff.rs` (the diff harness
+  + three regression pins) + 1 in `tests/r24_mono_ffmpeg_check.rs`
+  (mono HE-AAC ffmpeg-amplitude probe; diagnostic-only, no
+  assertion). Net diff also includes `decoder::decode_ics` and
+  `decoder::fill_spectrum` becoming `pub` so test harnesses can
+  replay the production element walk without duplicating the ICS
+  state machine.
+- Pre-commit: `cargo fmt --all` + `cargo clippy -p oxideav-aac
+  --all-targets -- -D warnings` both clean.
+
+### r25 leads
+- The "No quantized data read for sbr_dequant" warning is the
+  most actionable signal: ffmpeg is rejecting our SBR payload
+  structurally before it even tries to dequantise. Three
+  candidate causes the diff highlights:
+  1. **Header-vs-grid `bs_amp_res` mismatch.** We send
+     `bs_amp_res = 0` in the header and rely on the FIXFIX
+     `bs_num_env == 1` rule (§4.6.18.3.3) to override to 0 in
+     `parse_sbr_grid`. fdkaac sends `bs_amp_res = 1` in the
+     header and relies on the same override. ffmpeg may pre-read
+     the start-value bit count from the raw header value before
+     the override fires — try sending `bs_amp_res = 1` in the
+     header while keeping our envelope at 1.5 dB step (which the
+     FIXFIX override mandates).
+  2. **Freq-direction delta on first frame.** ffmpeg may not
+     accept `bs_df_env = 0` / `bs_df_noise = 0` (freq-direction)
+     on the very first frame of an HE-AAC stream when there is
+     no prior frame to provide a baseline. fdkaac uses
+     time-direction (`bs_df = 1`) on most frames. Our writer
+     always emits freq-direction. Try `bs_df_env = 1` from
+     frame 1 onwards (frame 0 is required to be freq).
+  3. **`bs_extended_data` framing edge-case.** Our SCE always
+     ends with `bs_extended_data = 0` followed by zero fill bits
+     to the FIL byte boundary. fdkaac's SCE is shorter (53 bits
+     vs our 63) but both end byte-aligned. The 4-bit
+     `extension_payload(cnt)` count alignment may differ in some
+     subtle way that ffmpeg checks before accepting the payload.
+- Recommend: r25 should iterate on (1) first since it's a
+  one-line change to the writer in
+  `crate::sbr::encode::write_sbr_header`. The diff harness will
+  immediately surface whether ffmpeg accepts the new payload
+  (the warning disappears) and whether the saturation drops.
+- The `OXIDEAV_AAC_SBR_ENV_FORCE_ZERO` env-var stays in place as
+  a permanent debugging knob for r25+ probes.
+
 ### Notes (round 23)
 - Tested the round-22 thesis directly: dropped `MDCT_FORWARD_SCALE`
   from `65 536` to `4 096` (the value at which r22 claimed ffmpeg-RMS

@@ -884,7 +884,7 @@ impl AacDecoder {
 /// Parsed individual_channel_stream: everything except the spectrum.
 /// Returned by [`decode_ics`]; the spectrum is filled in separately by
 /// `fill_spectrum`.
-type DecodedIcs = (
+pub type DecodedIcs = (
     IcsInfo,
     Vec<i32>,
     SectionData,
@@ -895,7 +895,11 @@ type DecodedIcs = (
 /// Decode a single-channel ICS into (info, scalefactors, section_data, tns_data, pulse_data).
 /// Reads global_gain, ics_info, section_data, scalefactors, pulse / TNS / gain-control
 /// fields. Spectrum decoding is left to caller.
-fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Result<DecodedIcs> {
+///
+/// Exposed at crate-public scope so test harnesses (e.g. the r24 SBR FIL
+/// diff probe) can replay the production decoder's element walk without
+/// duplicating the ICS state-machine.
+pub fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Result<DecodedIcs> {
     let global_gain = br.read_u32(8)? as u8;
     let info = parse_ics_info(br, sf_index)?;
     let sec = parse_section_data(br, &info)?;
@@ -926,7 +930,9 @@ fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Result<D
     Ok((info, sf, sec, tns, pulse))
 }
 
-fn fill_spectrum(
+/// Fill the spectrum coefficients into `spec` from the bit-stream `br`.
+/// Companion to [`decode_ics`]; exposed pub for test harnesses.
+pub fn fill_spectrum(
     br: &mut BitReader<'_>,
     info: &IcsInfo,
     sec: &SectionData,

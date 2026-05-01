@@ -290,6 +290,83 @@ HE-AAC ffmpeg-interop saturation lives in the **SBR FIL extension
 itself** (most likely `bs_invf_mode`, `bs_add_harmonic`, or an
 HF-generation-stage gain), not the LC core. Pinned for round 24.
 
+### Round 24 (2026-04-30): SBR FIL diff vs fdkaac
+
+Round 24 built `tests/r24_sbr_fil_diff.rs`: encodes the r18 fixture
+(1 kHz / amp 0.3 / 0.5 s mono, 48 kHz, 48 kbps HE-AAC) through
+**both** our `HeAacMonoEncoder` and `fdkaac -p 5 -f 2`, parses every
+ADTS frame's SBR FIL element via the same
+`oxideav_aac::sbr::bitstream::parse_*` routines our decoder uses, and
+diffs the resulting `SbrChannelData` field-by-field. The harness
+walks the SCE element bit-cursor through the now-pub
+`decoder::decode_ics` + `decoder::fill_spectrum` so the FIL bit
+position is exact (no brute-force bit-offset scanning).
+
+| Field                     | ours              | fdkaac                         |
+| ------------------------- | ----------------- | ------------------------------ |
+| `bs_amp_res` (header)     | 0                 | 1                              |
+| `bs_start_freq`           | 5                 | 13                             |
+| `bs_stop_freq`            | 9                 | 11                             |
+| `bs_freq_scale`           | 2                 | 1                              |
+| derived `n_high` / `nq`   | 16 / 4            | 14 / 2                         |
+| FIL payload bits / frame  | 96                | 80                             |
+| `bs_invf_mode` totals     | `[0,0,0,0,0]`     | `[5,2,0,0,0]` (varies)         |
+| `bs_add_harmonic_flag`    | 0/12 frames       | 1/15 frames                    |
+| `bs_df_env` totals        | `[0,0,0,0,0]`     | `[2,4,2,1,0]` (uses time-dir)  |
+| `bs_df_noise` totals      | `[0,0]`           | `[9,2]` (uses time-dir)        |
+| frame[0] `env_sf[0]`      | `[29,-1,-1,...]`  | `[0,0,0,...]` (E_orig minimum) |
+| frame[0] `noise_sf[0]`    | `[18,0,0,0]`      | `[14,0]`                       |
+
+**Refuted thesis — the envelope value is NOT the saturation source.**
+The diff first looked like our `env_sf[0][0] = 29` (= `64 · 2^14.5`
+≈ 1.5 M; QMF analysis-bank skirt leakage of the 1 kHz tone into the
+bottom-most SBR subband, amplified by `INT16_SCALE_SQ = 2^30`) was
+the cause. To pin this we added the
+`OXIDEAV_AAC_SBR_ENV_FORCE_ZERO` env-var probe in
+`sbr/encode.rs::estimate_envelope`: when set, every band gets
+value 0 (matching fdkaac's "no high-band content" output) and the
+noise floor gets value 14. Re-ran ffmpeg-decode of the r18 mono
+fixture under the override:
+
+```
+mono HE-AAC, no override:    peak=32768  rms=28739
+mono HE-AAC, FORCE_ZERO=1:   peak=32768  rms=28739  (identical)
+```
+
+The override is verified to actually zero the envelope on every
+frame (`force_zero_env_var_actually_zeros_envelope` regression).
+**Same saturation reading**, byte-identical decode artefacts.
+The envelope is fully ruled out.
+
+ffmpeg consistently logs `No quantized data read for sbr_dequant`
+on every decode, regardless of envelope value. This warning fires
+*before* any envelope arithmetic, suggesting ffmpeg's parser is
+giving up on our SBR data structurally — likely either:
+
+1. **Header-vs-grid `bs_amp_res` mismatch**: we send `bs_amp_res = 0`
+   in the header but rely on the FIXFIX `bs_num_env == 1` rule
+   (§4.6.18.3.3) to override to 0 inside `parse_sbr_grid`. fdkaac
+   sends `bs_amp_res = 1` in the header and relies on the same
+   override. ffmpeg may be reading the start-value bit count from
+   the *raw* header value before the override fires.
+2. **`bs_extended_data = 0` framing edge-case**: our SCE always
+   ends with `bs_extended_data = 0` (1 bit) followed by zero fill
+   bits to the FIL byte boundary. fdkaac's SCE is shorter (53 bits
+   vs our 63), suggesting its grid + envelope shapes use fewer
+   bits, but both end byte-aligned. The 4-bit
+   `extension_payload(cnt)` count alignment may differ in some
+   subtle way.
+3. **Time-vs-freq delta encoding**: fdkaac uses time-direction
+   delta on noise (`bs_df_noise` totals 9/2) and on envelope (2/4)
+   while ours always uses freq-direction. Time-direction requires
+   a previous-frame baseline; freq-direction encodes the first
+   band as an absolute. ffmpeg may not accept freq-direction on
+   the very first frame of a HE-AAC stream.
+
+The diff harness is permanent infrastructure now; r25 can change
+any header field or encoding strategy and re-run the diff to
+verify convergence with fdkaac.
+
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
 and that TNS-bearing frames decode without error.

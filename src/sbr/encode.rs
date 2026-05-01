@@ -289,9 +289,32 @@ pub fn estimate_envelope(
     // for our own decoder (which carries spec at int16-amplitude through
     // SBR). Round 18 verified empirically that this constant has **no**
     // effect on ffmpeg-decoded HE-AAC output amplitude — see the round-18
-    // commit message for the full diagnostic. The ffmpeg interop gap lies
-    // elsewhere (likely AAC-LC core spectrum scale, not SBR envelope).
+    // commit message for the full diagnostic.
+    //
+    // Round 24 (2026-04-30): the diff harness in
+    // `tests/r24_sbr_fil_diff.rs` against fdkaac on a 1 kHz / 48 kHz mono
+    // tone (the r18 amplitude fixture) uncovered that for tonal content
+    // with **no real high-band energy**, ours emits envelope index = 29
+    // for the bottom SBR band (E_orig = 64·2^14.5 ≈ 1.5 M) — pure QMF
+    // analysis-bank skirt leakage of the 1 kHz tone into the kx subbands.
+    // fdkaac sends `[0; n_high]` (= E_orig = 64, the spec minimum).
+    //
+    // ffmpeg's gain formula `gain = √(E_orig / E_curr)` then amplifies the
+    // bottom SBR band by ~3700× — exactly the saturation observed in
+    // `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs`. The `OXIDEAV_AAC_SBR_ENV_FORCE_ZERO`
+    // env-var below pins this hypothesis: when set, every band gets value
+    // 0 regardless of measured energy; combined with ffmpeg-decode this
+    // should produce a non-saturated peak.
     const INT16_SCALE_SQ: f32 = (32768.0 * 32768.0) as f32;
+    let force_zero = std::env::var("OXIDEAV_AAC_SBR_ENV_FORCE_ZERO").is_ok();
+    if force_zero {
+        return SbrFrameScalefactors {
+            env: vec![0; ft.n_high],
+            // Match fdkaac's small-noise output (~14 at the first band).
+            // Index 14 at amp_res=0 (1.5 dB step) → Q_orig = 2^(6 - 7) = 0.5.
+            noise: vec![14; ft.nq],
+        };
+    }
     let n = x_high.len().max(1) as f32;
     let mut env = vec![0i32; ft.n_high];
     for band in 0..ft.n_high {
