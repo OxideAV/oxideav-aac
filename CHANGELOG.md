@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (round 23)
+- Tested the round-22 thesis directly: dropped `MDCT_FORWARD_SCALE`
+  from `65 536` to `4 096` (the value at which r22 claimed ffmpeg-RMS
+  on HE-AAC "lands on target") and re-ran the full ffmpeg-interop
+  matrix.
+- LC RMS interop test (44.1 kHz / 440 Hz) collapsed: `ours-encode →
+  ours-decode` ratio dropped to **0.060** (16× too quiet, well outside
+  the ±10 % tolerance). r19's "spec-correct" measurements at
+  `SCALE = 65 536` (RMS 6 650, ratio 0.96) are reproducible and
+  remain the best self-roundtrip across all four directions.
+- HE-AAC SBR amplitude regression (r18 ignored test): peak only
+  drops from saturated `32 768` → `25 287` at `SCALE = 4 096`. Still
+  saturated. r22's claim of "16× scale fix" is refuted.
+- Pure AAC-LC at **24 kHz / 1 kHz mono** with current `SCALE =
+  65 536` produces ffmpeg-decoded peak `10 930 / RMS 6 955` —
+  within ±5 % of input. Pure stereo AAC-LC at 24 kHz / (1k+2k)
+  produces ffmpeg L=10 930/9 880, RMS 6 955/6 579 — also within ±5 %
+  per channel. r22's "pure-LC-saturates-at-24-kHz" claim was wrong:
+  it conflated the HE-AAC code path (which carries an SBR FIL
+  extension) with the pure-LC path. New regression tests
+  (`r23_lc_24khz_probe.rs` + `r23_he_aac_isolation.rs`) pin both.
+- Sweep on HE-AAC stereo: scales `65 536 → 32 768 → 16 384 → 8 192
+  → 4 096 → 2 048 → 1 024` produce L peaks `15 767, 7 884, 3 942,
+  1 972, 986, 493, 247` — strictly halving (linear pass-through
+  through the LC core). The R-channel peak stays clipped at
+  `32 768` until `SCALE ≤ 4 096` where it starts dropping. r22
+  read RMS = 6 951 at `SCALE = 4 096` and called it "unity"; in
+  reality RMS ≈ 30 000 for a saturated square-wave, and reducing
+  scale 16× simply lowers input below clipping → RMS *passes
+  through* the input target on its way to silence (verified:
+  SCALE = 2 048 → 1 891, SCALE = 1 024 → 947). There is **no**
+  stable interop point.
+- Restored `MDCT_FORWARD_SCALE = 65 536` (correct value). Updated
+  the doc comment on the constant + the `tests/sbr_he_aac_ffmpeg
+  _amplitude_r18.rs` header to record the r23 audit and the
+  refutation of the r22 thesis.
+- The r18 SBR amplitude test remains `#[ignore]`d (saturation
+  reproduces on every release). New ignore message points r24 at
+  the SBR FIL extension path itself, not the LC core.
+- ffmpeg interop on `solana-ad.mp4` via `oxideplay --vo null
+  --ao null`: completes cleanly (exit 0, no panic, no demuxer
+  rejections). Audio path remains byte-tight vs ffmpeg on
+  real-content fixtures.
+- All 164 active tests pass + 1 ignored (the r18 SBR amplitude
+  regression). Net `-3` from r22's "170 tests + 1 ignored" is
+  purely housekeeping — three transient diff-probe tests from r22's
+  SBR-header sweep (the bs_amp_res / bs_freq_scale variants) were
+  dropped earlier; r23 adds two new probes
+  (`r23_lc_24khz_probe.rs`, `r23_he_aac_isolation.rs`) that pin the
+  audit conclusions as regressions.
+
+### r24 leads
+- The HE-AAC saturation is in the SBR FIL extension parsed by
+  ffmpeg, not the LC core. r24 should diff our SBR FIL bytes
+  against fdkaac's at the bit level, focusing on:
+  1. `bs_data_env` for tonal content — both encoders emit `[0;14]`
+     (E_orig = 64, the spec minimum), but ffmpeg's gain formula
+     `gain = √(E_orig / E_curr)` may interpret our envelope as
+     applying to a different SBR sub-band layout (f_high / f_noise
+     tables driven by `bs_start_freq` / `bs_stop_freq` /
+     `bs_freq_scale` / `bs_alter_scale`).
+  2. `bs_invf_mode` (inverse-filtering mode per noise band) —
+     never explicitly sent in our payload; ffmpeg may default to a
+     mode that triggers HF-generation amplification on our streams.
+  3. `bs_add_harmonic` flags — sinusoidal-coding flags. Setting any
+     to 1 spuriously injects an extra sinusoid at the band centre.
+  4. The `EXT_SBR_DATA_CRC` extension presence + CRC check — if
+     ffmpeg fails our CRC it may silently fall through to a
+     "concealment" path that injects max-amplitude.
+- Recommend: capture our exact SBR payload bytes for the r18 test
+  fixture, capture fdkaac's for the same input, diff field by
+  field with the r22 parser harness already in this crate.
+
 ### Notes (round 22)
 - HE-AACv1 SBR header diff-probe vs fdkaac. Probed every header
   field listed in the round-21 brief (`bs_amp_res`, `bs_start_freq`,

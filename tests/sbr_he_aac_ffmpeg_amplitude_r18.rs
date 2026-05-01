@@ -46,7 +46,7 @@
 //! of the saturation — both encoders emit the same value yet ffmpeg
 //! decodes the fdkaac stream cleanly while saturating ours.
 //!
-//! ## Round-22 update (2026-04-26): root cause is in the LC core
+//! ## Round-22 update (2026-04-26): claim of LC-core scale issue
 //!
 //! Round-22 ran the methodical SBR header diff-probe specified in r21:
 //!
@@ -59,20 +59,40 @@
 //! - Forced our envelope SF data to `[0;14]` (matching fdkaac's
 //!   E_orig = 64 for tonal content) by setting `INT16_SCALE_SQ = 1.0`.
 //!   Still saturates.
-//! - **Critical**: even completely omitting the SBR FIL extension
-//!   (pure AAC-LC core only, decoded as 24 kHz mono) still produces
-//!   ffmpeg peak 32 768. So the saturation is **not** in the SBR
-//!   pipeline at all — it's in the AAC-LC core MDCT scale.
-//! - `MDCT_FORWARD_SCALE` sweep: ffmpeg's RMS lands on the input
-//!   target (~6 951) at `MDCT_FORWARD_SCALE = 4 096` — exactly 16x
-//!   smaller than the round-19 chosen value (65 536). Our own decoder
-//!   at SCALE = 4 096 gives peak ~661 (16x quieter than target),
-//!   confirming a 16x scale mismatch between our encoder and ffmpeg's
-//!   decoder at 24 kHz core.
+//! - r22 *claimed* even pure AAC-LC core at 24 kHz produced ffmpeg
+//!   peak 32 768. r22 *claimed* `MDCT_FORWARD_SCALE = 4096` produced
+//!   "ffmpeg RMS unity" → 16x scale mismatch.
 //!
-//! Round-22 verdict: the round-21 SBR-header hypothesis is
-//! invalidated. The fix lives in `encoder.rs::MDCT_FORWARD_SCALE` (or
-//! in a decoder-side rescale) and is the round-23 target.
+//! ## Round-23 audit (2026-04-30): r22 thesis refuted
+//!
+//! Round-23 directly tested the r22 thesis by setting
+//! `MDCT_FORWARD_SCALE = 4096` and re-running the matrix:
+//!
+//! - LC RMS at 44.1 kHz / 440 Hz: `ours-encode → ours-decode` ratio
+//!   collapses to **0.060** (16x quieter, well outside ±10 % tol).
+//! - SBR amplitude (this test): peak only drops from 32 768 → 25 287,
+//!   still saturated.
+//! - Pure AAC-LC at 24 kHz / 1 kHz **mono** with current
+//!   SCALE = 65 536 produces ffmpeg-decoded peak **10 930 / RMS 6 955**
+//!   — well within ±5 % of the input. r22's "pure-LC-saturates" claim
+//!   was wrong: it conflated the HE-AAC code path with pure-LC.
+//! - Pure AAC-LC stereo at 24 kHz / (1k+2k) with SCALE = 65 536
+//!   produces ffmpeg L=10 930/9 880 RMS ~6 700 — also within ±5 %.
+//! - HE-AAC mono at 24 kHz core with SCALE = 65 536 saturates → the
+//!   bug is uniquely in the SBR FIL pipeline (the `EXT_SBR_DATA`
+//!   extension), not the LC core.
+//! - r22's "RMS lands on target at SCALE = 4 096" reading was a
+//!   methodological error: a clipped square-wave at 32 768 has RMS
+//!   ≈ 30 000; reducing SCALE 16x reduces input level by 16x so
+//!   clipping eases off and RMS *passes through* the input target on
+//!   its way down to silence. RMS continues to drop at SCALE = 2 048
+//!   (1 891) and 1 024 (947) — there is no stable interop point.
+//!
+//! Round-23 verdict: `MDCT_FORWARD_SCALE = 65 536` is correct (verified
+//! by 4 LC-only ffmpeg interop measurements) and remains so. The
+//! saturation bug lives in the SBR FIL extension itself — an envelope
+//! amplification, HF generation gain, or `noise_floor` over-pump
+//! triggered when ffmpeg parses our SBR payload. Pinned for r24.
 //!
 //! Skips when ffmpeg is unavailable.
 
@@ -97,7 +117,7 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 #[test]
-#[ignore = "round-22 known interop gap — ffmpeg saturates our HE-AAC streams to peak 32768; root cause isolated to AAC-LC core MDCT_FORWARD_SCALE 16x mismatch (not SBR header / envelope / limiter); pinned for r23"]
+#[ignore = "round-23 known interop gap — ffmpeg saturates our HE-AAC streams to peak 32768; r22's MDCT_FORWARD_SCALE thesis refuted (pure LC at 24 kHz decodes cleanly through ffmpeg); root cause is in the SBR FIL extension itself, pinned for r24"]
 fn ffmpeg_decoded_amplitude_matches_input() {
     if which("ffmpeg").is_none() {
         eprintln!("no ffmpeg on PATH — skipping");

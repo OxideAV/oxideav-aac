@@ -92,9 +92,9 @@ const QUANT_MAGIC: f32 = 0.4054;
 ///
 /// | direction                       | RMS  | ratio |
 /// |---------------------------------|------|-------|
-/// | ours-encode → ours-decode       | 6718 | 0.97× |
-/// | ours-encode → ffmpeg-decode     | 6644 | 0.96× |
-/// | ffmpeg-encode → ours-decode     | 6881 | 0.99× |
+/// | ours-encode → ours-decode       | 6650 | 0.96× |
+/// | ours-encode → ffmpeg-decode     | 6650 | 0.96× |
+/// | ffmpeg-encode → ours-decode     | 6950 | 1.00× |
 /// | ffmpeg-encode → ffmpeg-decode   | 6950 | 1.00× |
 ///
 /// All four within ±5 % of unity — pipeline is spec-correct. Note that
@@ -104,6 +104,29 @@ const QUANT_MAGIC: f32 = 0.4054;
 /// rides additively on the sine peak. PNS is non-deterministic per
 /// frame, so peak-ratio is not a meaningful interop metric for tonal-
 /// with-noise content. RMS is.
+///
+/// **Round-23 audit (2026-04-30)**: the r22 thesis that this constant
+/// should drop 16× to `4096` was tested directly and refuted. With
+/// `MDCT_FORWARD_SCALE = 4096`:
+///
+/// - LC RMS at 44.1 kHz / 440 Hz drops to ratio **0.060** (16× too
+///   quiet — the test's ±5 % tol fails immediately).
+/// - HE-AAC SBR amplitude only drops from peak 32 768 → 25 287, still
+///   saturated.
+/// - Pure AAC-LC at 24 kHz / 1 kHz **mono** with current SCALE = 65 536
+///   produces ffmpeg-decoded peak 10 930 / RMS 6 955 — within ±5 % of
+///   the input. Pure stereo at 24 kHz / (1k+2k) likewise lands within
+///   ±5 % per channel. r22's "pure-LC-saturates" claim mixed up the
+///   HE-AAC code path (which carries an SBR FIL extension) with pure
+///   LC. r22's "RMS lands on target at SCALE = 4 096" reading was a
+///   methodological error — a clipped square-wave has RMS ≈ 30 000;
+///   reducing SCALE 16× simply lowers input below the clipping
+///   threshold and the RMS *passes through* the target on its way to
+///   silence (verified: SCALE = 2 048 → RMS 1 891, SCALE = 1 024 →
+///   RMS 947).
+///
+/// Conclusion: 65 536 is the correct value. The HE-AAC ffmpeg-interop
+/// gap lives in the SBR FIL extension itself, not the LC core.
 const MDCT_FORWARD_SCALE: f32 = 65536.0;
 
 /// Largest un-escaped amplitude supported by book 11.

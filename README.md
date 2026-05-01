@@ -239,41 +239,56 @@ the SBR FIL extension** (pure AAC-LC core only, decoded as 24 kHz
 mono) still produces ffmpeg peak 32 768 / RMS 30 961, vs our own
 decoder's clean 10 683 / RMS ~6 000 on the identical stream.
 
-Cross-check: **pure AAC-LC encode at 24 kHz** (no HE-AAC wrapping,
-direct `AacEncoder`) on the same 1 kHz / 0.3-amp tone gives ffmpeg
-peak 32 768 / RMS 9 478 — a 1.36x RMS inflation that's hidden by
-the round-19 LC-RMS test running at 44.1 kHz on a 440 Hz tone (RMS
-ratio 0.96 — within ±10% tolerance). The 24 kHz core path
-nonetheless clips at peak 32 768 ≈ 7.6% saturated samples, vs the
-HE-AAC-pipeline 24 kHz core which clips ~82% of samples.
+### Round 23 (2026-04-30) audit: r22 MDCT-scale thesis refuted
 
-Sweep of `MDCT_FORWARD_SCALE` confirms a **16x scale mismatch
-between our encoder and ffmpeg's decoder** at 24 kHz core:
+Round 23 set `MDCT_FORWARD_SCALE = 4 096` and re-ran the matrix:
+
+- **LC RMS interop test (44.1 kHz / 440 Hz)**: `ours-encode →
+  ours-decode` ratio collapsed to **0.060** (16× too quiet). The
+  test fails on the very first assertion. There is no ±5 % window
+  that can absorb a 16× reduction.
+- **HE-AAC SBR amplitude (the r18 ignored test)**: peak only
+  drops from `32 768` (saturated) to `25 287`. Still saturated.
+  The 16× scale change does not unblock HE-AAC interop.
+- **Pure AAC-LC mono at 24 kHz / 1 kHz** with current SCALE =
+  `65 536`: ffmpeg-decoded peak `10 930 / RMS 6 955`, within
+  ±5 % of the input. Pure stereo LC at 24 kHz / (1k+2k)
+  produces L=10 930/9 880, RMS 6 955/6 579 — also within ±5 %
+  per channel. **r22's claim that pure-LC-at-24 kHz saturates
+  was wrong**: it conflated the HE-AAC code path (which carries
+  an SBR FIL extension) with pure-LC. New regression tests
+  (`r23_lc_24khz_probe.rs` + `r23_he_aac_isolation.rs`) pin both
+  cases at the spec-correct unity-RMS measurement.
+
+Sweep on HE-AAC stereo with current SCALE values:
 
 ```
-SCALE   ffmpeg-decode peak  ffmpeg-decode RMS  ours-decode peak
-65536   32 768 (sat)        28 665             10 578
-16384   32 768 (sat)        20 213             —
- 4096   32 768 (sat)         6 941 (target!)   ~661
- 1024   21 387               1 787             —
-  512   10 694                 893             —
+SCALE   L-peak  L-rms   R-peak  R-rms   verdict
+65536   15767   6544    32768   30461   sat (R)
+32768    7884   3272    32768   28126   sat (R)
+16384    3942   1636    32768   23068   sat (R)
+ 8192    1972    818    32768   14711   sat (R)
+ 4096     986    409    25287    7563   passing-through
+ 2048     493    204    12643    3782   silent
+ 1024     247    102     6321    1891   silent
 ```
 
-ffmpeg's RMS lands on the input target (~6 951) at SCALE = 4 096 —
-exactly 16x smaller than the round-19 chosen value. Our decoder at
-SCALE = 4 096 produces only peak 661 (16x quieter than target).
-The 16x ratio is consistent across the sweep and matches the
-predicted product of (forward MDCT scale 2x) * (IMDCT 2x) *
-(decoder S16 stage 0.5x) * (8 from … TBD in r23).
+The L-peak strictly halves with SCALE (linear pass-through through
+the LC core). The R-peak stays clipped at 32 768 until the input
+drops below the clipping threshold, then itself halves. r22's
+"RMS = 6 951 at SCALE = 4 096 → unity" reading was a methodological
+error: a clipped square-wave at 32 768 has RMS ≈ 30 000, and
+reducing SCALE 16× simply lowers input below the clipping
+threshold — RMS *passes through* the input target on its way to
+silence (verified: SCALE = 2 048 → 1 891, SCALE = 1 024 → 947).
+There is **no** stable interop point in the sweep.
 
-**Conclusion (r22)**: the HE-AACv1 ffmpeg-decode saturation is an
-**AAC-LC core MDCT scale mismatch**, not an SBR header issue. The
-round-19 fix (`MDCT_FORWARD_SCALE = 65536`) was correct for our
-self-roundtrip but is 16x too large for ffmpeg's decoder at 24 kHz
-core / 1024-sample window. The fix is to **decouple the encoder's
-forward scale from our decoder's IMDCT 2x carry-over** — either by
-halving `MDCT_FORWARD_SCALE` and having the decoder upscale, or by
-matching ffmpeg's normalised int16 contract. Pinned for round 23.
+**Conclusion (r23)**: `MDCT_FORWARD_SCALE = 65 536` is the correct
+value (verified by 4 LC-only ffmpeg interop measurements at both
+44.1 kHz and 24 kHz, mono and stereo) and remains in place. The
+HE-AAC ffmpeg-interop saturation lives in the **SBR FIL extension
+itself** (most likely `bs_invf_mode`, `bs_add_harmonic`, or an
+HF-generation-stage gain), not the LC core. Pinned for round 24.
 
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
