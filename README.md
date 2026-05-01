@@ -188,6 +188,93 @@ generator patches all confirms spec-correctness; the divergence
 must arise from a difference in how ffmpeg reads our specific
 header configuration vs fdkaac's. Round 22+ target.
 
+### r22 — HE-AACv1 SBR header diff-probe (2026-04-26)
+
+Round 22 ran the methodical SBR header diff-probe specified in the
+round-21 brief. **Result: no SBR header field is the saturation
+source.** The fdkaac vs ours header values for a 1 kHz / 0.3-amp
+mono SCE at 48 kHz output (24 kHz core) were captured via our own
+SBR header parser:
+
+```
+field              fdkaac  ours
+bs_amp_res         1       0       (effective per-frame value: both 0,
+                                    forced to 0 for FIXFIX num_env=1)
+bs_start_freq      13      5       (k0 = 22 vs k0 = 12)
+bs_stop_freq       11      9
+bs_xover_band      0       0       (same)
+bs_freq_scale      1       2       (8 bands/octave vs 10)
+bs_alter_scale     1       1       (same)
+bs_noise_bands     2       2       (same)
+bs_limiter_bands   2       2       (same)
+bs_limiter_gains   2       2       (same)
+bs_interpol_freq   1       1       (same)
+bs_smoothing_mode  1       1       (same)
+```
+
+Forcing each differing field individually (`bs_amp_res=1`,
+`bs_start_freq=13`, `bs_stop_freq=11`, `bs_freq_scale=1`) and the
+combined fdkaac configuration **all** still produced ffmpeg peak
+32 768 (full saturation). Forcing `bs_stop_freq=11` and
+`bs_freq_scale=1` with our `bs_start_freq=5` triggers ffmpeg
+"Invalid bitstream, too many QMF subbands: 41" / "Invalid vDk0[1]:
+0" — these are spec-consistent with the freq-table derivation
+(§4.6.18.3.2.1) and rule out the `bs_start_freq` / `bs_stop_freq`
+pair as a meaningful encoder-side fix.
+
+The differential probe further extracted the per-band envelope and
+noise scalefactor data:
+
+```
+fdkaac: env[0] sf(14b) = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        noise[0] sf(2b) = [14, 0]
+ours:   env[0] sf(16b) = [29, -1, -1, -1, 0, -1, -1, 0, -1, -1, ...]
+        noise[0] sf(4b) = [18, 0, 0, 0]
+```
+
+Setting our encoder's `INT16_SCALE_SQ` to 1.0 reproduces fdkaac's
+all-zero envelope (E_orig = 64, the spec minimum) — yet ffmpeg
+**still** saturates ours to peak 32 768. Even **completely omitting
+the SBR FIL extension** (pure AAC-LC core only, decoded as 24 kHz
+mono) still produces ffmpeg peak 32 768 / RMS 30 961, vs our own
+decoder's clean 10 683 / RMS ~6 000 on the identical stream.
+
+Cross-check: **pure AAC-LC encode at 24 kHz** (no HE-AAC wrapping,
+direct `AacEncoder`) on the same 1 kHz / 0.3-amp tone gives ffmpeg
+peak 32 768 / RMS 9 478 — a 1.36x RMS inflation that's hidden by
+the round-19 LC-RMS test running at 44.1 kHz on a 440 Hz tone (RMS
+ratio 0.96 — within ±10% tolerance). The 24 kHz core path
+nonetheless clips at peak 32 768 ≈ 7.6% saturated samples, vs the
+HE-AAC-pipeline 24 kHz core which clips ~82% of samples.
+
+Sweep of `MDCT_FORWARD_SCALE` confirms a **16x scale mismatch
+between our encoder and ffmpeg's decoder** at 24 kHz core:
+
+```
+SCALE   ffmpeg-decode peak  ffmpeg-decode RMS  ours-decode peak
+65536   32 768 (sat)        28 665             10 578
+16384   32 768 (sat)        20 213             —
+ 4096   32 768 (sat)         6 941 (target!)   ~661
+ 1024   21 387               1 787             —
+  512   10 694                 893             —
+```
+
+ffmpeg's RMS lands on the input target (~6 951) at SCALE = 4 096 —
+exactly 16x smaller than the round-19 chosen value. Our decoder at
+SCALE = 4 096 produces only peak 661 (16x quieter than target).
+The 16x ratio is consistent across the sweep and matches the
+predicted product of (forward MDCT scale 2x) * (IMDCT 2x) *
+(decoder S16 stage 0.5x) * (8 from … TBD in r23).
+
+**Conclusion (r22)**: the HE-AACv1 ffmpeg-decode saturation is an
+**AAC-LC core MDCT scale mismatch**, not an SBR header issue. The
+round-19 fix (`MDCT_FORWARD_SCALE = 65536`) was correct for our
+self-roundtrip but is 16x too large for ffmpeg's decoder at 24 kHz
+core / 1024-sample window. The fix is to **decouple the encoder's
+forward scale from our decoder's IMDCT 2x carry-over** — either by
+halving `MDCT_FORWARD_SCALE` and having the decoder upscale, or by
+matching ffmpeg's normalised int16 contract. Pinned for round 23.
+
 ffmpeg-dependent tests skip cleanly when `ffmpeg` is not on `PATH`.
 `tests/encode_tns.rs` confirms the encoder emits TNS on transient content
 and that TNS-bearing frames decode without error.

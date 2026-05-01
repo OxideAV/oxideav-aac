@@ -46,11 +46,33 @@
 //! of the saturation — both encoders emit the same value yet ffmpeg
 //! decodes the fdkaac stream cleanly while saturating ours.
 //!
-//! The remaining gap is in the SBR HF-generation / limiter / patches
-//! interaction with our specific frequency-table choices and our LC
-//! core's particular spectral envelope. Round 21 leaves the test
-//! ignored pending a deeper SBR pipeline audit on a multi-frequency
-//! corpus.
+//! ## Round-22 update (2026-04-26): root cause is in the LC core
+//!
+//! Round-22 ran the methodical SBR header diff-probe specified in r21:
+//!
+//! - Captured fdkaac's choices for 24 kHz core / 48 kHz output as
+//!   `bs_start_freq=13, bs_stop_freq=11, bs_freq_scale=1, bs_amp_res=1`
+//!   (vs ours `5/9/2/0`).
+//! - Forced our encoder to each fdkaac field individually + the
+//!   combined fdkaac configuration. **None** of the candidate
+//!   header fields drops the saturation.
+//! - Forced our envelope SF data to `[0;14]` (matching fdkaac's
+//!   E_orig = 64 for tonal content) by setting `INT16_SCALE_SQ = 1.0`.
+//!   Still saturates.
+//! - **Critical**: even completely omitting the SBR FIL extension
+//!   (pure AAC-LC core only, decoded as 24 kHz mono) still produces
+//!   ffmpeg peak 32 768. So the saturation is **not** in the SBR
+//!   pipeline at all — it's in the AAC-LC core MDCT scale.
+//! - `MDCT_FORWARD_SCALE` sweep: ffmpeg's RMS lands on the input
+//!   target (~6 951) at `MDCT_FORWARD_SCALE = 4 096` — exactly 16x
+//!   smaller than the round-19 chosen value (65 536). Our own decoder
+//!   at SCALE = 4 096 gives peak ~661 (16x quieter than target),
+//!   confirming a 16x scale mismatch between our encoder and ffmpeg's
+//!   decoder at 24 kHz core.
+//!
+//! Round-22 verdict: the round-21 SBR-header hypothesis is
+//! invalidated. The fix lives in `encoder.rs::MDCT_FORWARD_SCALE` (or
+//! in a decoder-side rescale) and is the round-23 target.
 //!
 //! Skips when ffmpeg is unavailable.
 
@@ -75,7 +97,7 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 #[test]
-#[ignore = "round-21 known interop gap — ffmpeg saturates our HE-AAC streams to peak 32768; bitstream-level envelope value is identical to fdkaac's (which decodes cleanly), so root cause is in SBR HF-generation / limiter for our specific freq-table choice"]
+#[ignore = "round-22 known interop gap — ffmpeg saturates our HE-AAC streams to peak 32768; root cause isolated to AAC-LC core MDCT_FORWARD_SCALE 16x mismatch (not SBR header / envelope / limiter); pinned for r23"]
 fn ffmpeg_decoded_amplitude_matches_input() {
     if which("ffmpeg").is_none() {
         eprintln!("no ffmpeg on PATH — skipping");

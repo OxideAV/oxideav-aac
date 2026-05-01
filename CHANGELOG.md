@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (round 22)
+- HE-AACv1 SBR header diff-probe vs fdkaac. Probed every header
+  field listed in the round-21 brief (`bs_amp_res`, `bs_start_freq`,
+  `bs_stop_freq`, `bs_xover_band`, `bs_freq_scale`, `bs_alter_scale`,
+  `bs_noise_bands`, `bs_limiter_bands`, `bs_limiter_gains`,
+  `bs_interpol_freq`, `bs_smoothing_mode`) by running our own SBR
+  parser on `fdkaac -p 5` output of the same 1 kHz / 0.3-amp 48 kHz
+  mono tone. Captured fdkaac's choices for 24 kHz core / 48 kHz
+  output as `bs_start_freq=13, bs_stop_freq=11, bs_freq_scale=1,
+  bs_amp_res=1` (vs ours `5/9/2/0`). All other fields match.
+- Forced our encoder to each fdkaac field individually + the
+  combined fdkaac configuration via env-var probes. **None** of the
+  candidate header fields drops the saturation — ffmpeg-decoded
+  peak stays at 32 768 in every variant. `bs_stop_freq=11` /
+  `bs_freq_scale=1` with our `bs_start_freq=5` triggers ffmpeg
+  "too many QMF subbands: 41" / "Invalid vDk0[1]: 0" errors, which
+  rule those out as encoder-side fixes (the spec's freq-table
+  derivation in §4.6.18.3.2.1 forces consistency across the four).
+- Inspected per-band envelope/noise SF data: fdkaac transmits
+  `env[0] = [0;14]` (E_orig = 64, the spec minimum), ours
+  transmits `[29, -1, ...]` due to our `INT16_SCALE_SQ = 2^30`
+  scaling. Setting `INT16_SCALE_SQ = 1.0` reproduces fdkaac's
+  all-zero envelope yet **ffmpeg still saturates** — so the
+  envelope SF data is not the saturation source either.
+- Critical isolation finding: **even completely omitting the SBR
+  FIL extension** (pure AAC-LC core only, decoded as 24 kHz mono)
+  produces ffmpeg peak 32 768 / RMS 30 961 vs our own decoder's
+  clean 10 683 / RMS ≈ 6 000 on the identical stream. Pure
+  AAC-LC encode at 24 kHz with no HE-AAC wrapping likewise gives
+  ffmpeg peak 32 768 / RMS 9 478 (1.36x inflation) — the
+  round-19 LC-RMS test passes at 44.1 kHz / 440 Hz because the
+  ±10% tolerance absorbs the inflation, but 24 kHz core / 1 kHz
+  triggers full-scale clipping.
+- `MDCT_FORWARD_SCALE` sweep on the HE-AAC pipeline shows a
+  **16x scale mismatch** between our encoder and ffmpeg's
+  decoder at 24 kHz core: ffmpeg's RMS lands on the target
+  (~6 951) at `MDCT_FORWARD_SCALE = 4 096` (vs current 65 536).
+  Our own decoder at the same scale gives only peak ~661 (16x
+  quieter), confirming the offset is in the LC core scale carrier
+  not in the SBR pipeline. **Conclusion**: the saturation is an
+  AAC-LC core MDCT scale issue, not an SBR header issue.
+- Round 22 verdict: **the round-21 working hypothesis is
+  invalidated** — the SBR header fields are not the differentiator.
+  The fix lives in `encoder.rs::MDCT_FORWARD_SCALE` (or in a
+  decoder-side rescale) and is **out of scope for r22's SBR-header
+  probe**. Pinned for r23.
+- `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs` remains ignored.
+- All 170 tests + 1 ignored remain unchanged.
+
 ### Notes (round 21)
 - `tests/sbr_he_aac_ffmpeg_amplitude_r18.rs` updated with round-21 audit
   data:
