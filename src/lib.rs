@@ -128,6 +128,7 @@ pub mod adts;
 pub mod asc;
 pub mod decoder;
 pub mod encoder;
+pub mod gapless;
 pub mod he_aac_encoder;
 pub mod huffman;
 pub mod huffman_tables;

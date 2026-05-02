@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (gapless padding tuning, task #169)
+- New module `gapless` exposes the (encoder_delay, padding_samples,
+  valid_samples) triple and an Apple iTunSMPB-format string emitter.
+  Constants `ENCODER_DELAY_AAC_LC = 2112` and `ENCODER_DELAY_HE_AAC =
+  2624` capture the well-documented Apple iTunes convention.
+- `AacEncoder` tracks `total_input_samples` (per-channel) and
+  `frames_emitted`. Public methods `encoder_delay()`, `valid_samples()`,
+  `frames_emitted()`, `padding_samples()`, `gapless_info()`, and
+  `iTunSMPB_string()` give a downstream MP4 muxer (`edts/elst` writer)
+  or ID3 wrapper (TXXX `iTunSMPB`) the exact numbers needed for
+  sample-accurate gapless playback. `set_encoder_delay()` is a hook the
+  HE-AAC wrappers use to bump the reported delay to 2624 at the
+  high rate.
+- `AacEncoder::flush_final` now emits additional silence-padded frames
+  until `frames_emitted * 1024 >= encoder_delay + valid_samples`, so the
+  bitstream invariant required by iTunSMPB (a player skipping the
+  documented priming and trimming the documented padding lands on
+  exactly `valid_samples` of real PCM) holds. The padding count rounds
+  up to the next packet boundary, matching the iTunes encoder. Gated
+  off via `set_skip_gapless_padding(true)` for the HE-AAC wrappers
+  because each tail frame in the SBR path needs its own pre-staged FIL
+  element (or ffmpeg trips the round-26 "No quantized data read for
+  sbr_dequant" warning — regression-pinned in
+  `tests/r26_no_sbr_dequant_warning.rs`).
+- `HeAacMonoEncoder`, `HeAacStereoEncoder`, and `HeAacV2Encoder` each
+  expose `gapless_info()` / `iTunSMPB_string()` reporting the high-rate
+  triple (`encoder_delay = 2624`, padding from the inner core's emitted
+  frame count scaled by 2, `valid_samples` from the high-rate input
+  tally).
+- `tests/encode_gapless.rs` (new, +7 tests): asserts the AAC-LC default
+  delay is 2112; asserts padding lands on a frame boundary for a clean
+  4-frame encode; asserts iTunSMPB string starts with the canonical
+  ` 00000000 00000840 ` prefix (zero flag + 2112 hex) and has 12 hex
+  words; asserts each HE-AAC wrapper reports 2624 high-rate priming;
+  end-to-end concatenated-AAC continuity check (`encoded_concat_no_click_at_join`)
+  glues two 0.5 s sine fixtures together, decodes the join through our
+  own decoder, and asserts the per-sample delta at the gapless-trimmed
+  boundary stays under 0.5 (i.e. no full-scale click).
+- `gapless` module also adds 5 unit tests for the constants and the
+  iTunSMPB formatter (12-hex-word layout, leading-space convention).
+- `oxideav-aac` does NOT itself emit `edts/elst` or iTunSMPB — those
+  carriers live in the container layer (oxideav-mp4 / oxideav-id3). The
+  module documents the integration point so a future container-side
+  task (oxideav-mp4 muxer extension) can call `enc.gapless_info()` and
+  splice the values into an `edts/elst` segment_duration without
+  needing to know the spec details.
+- Carrier-side notes for follow-up: the existing oxideav-mp4 muxer
+  already parses `edts/elst` on demux but does not write either box on
+  mux; oxideav-id3 stores arbitrary `TXXX` frames via `Id3Frame::Text`
+  with id `"TXXX"` and a `description = "iTunSMPB"`. Both integrations
+  are now unblocked on the encoder API surface.
+- Test count delta: 183 → 196 (+13: 7 in new `tests/encode_gapless.rs`,
+  5 in `src/gapless.rs` unit tests, plus 1 he_aac_v2_encode test that
+  was off-by-one in baseline counting).
+- No regressions: all four channel-layout regression tests (mono /
+  stereo / 5.1 / 7.1 ffmpeg cross-decode), the SBR fix (#111), PNS
+  (#132), and short-block percussive round-trip stay green. The
+  round-26 SBR-dequant warning regression pin (`tests/r26_no_sbr_dequant_warning.rs`)
+  passes via the `set_skip_gapless_padding(true)` gate on the HE-AAC
+  wrappers.
+
 ### Notes (7.1 ffmpeg cross-decode, task #154)
 - Added `tests/encode_roundtrip.rs::encode_71_roundtrip_ffmpeg`. The
   8-channel encode path (`channel_configuration = 7`,

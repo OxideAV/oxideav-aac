@@ -103,6 +103,7 @@ The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 | Pulse data encode (§4.6.10)            | Yes (up to 4 per frame; sign-preserving outlier extraction, amp capped at `\|residual\| - 1`) |
 | Short blocks (building blocks)         | `TransientDetector`, `mdct_short_eightshort`, `analyse_and_quantise_short`, `write_single_ics_short` — all tested; `emit_block` state-machine integration pending |
 | HE-AACv1 (SBR) encode                  | Mono via `HeAacMonoEncoder`; stereo CPE (`HeAacStereoEncoder`, independent coupling, §4.6.18.3.5) |
+| Gapless playback metadata              | `gapless::GaplessInfo` triple (delay/padding/valid_samples) + Apple iTunSMPB-format string emitter; AAC-LC reports 2112-sample priming, HE-AAC reports 2624 (high rate). End-of-file padding rounded to the next packet boundary so an MP4 `edts/elst` writer or ID3v2 `TXXX:iTunSMPB` wrapper can round-trip the source PCM sample-accurately. |
 | Gain control                           | Not implemented                         |
 | CBR / VBR                              | Bit_rate accepted but currently advisory; no rate control loop |
 

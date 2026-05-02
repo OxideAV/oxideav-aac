@@ -52,6 +52,12 @@ pub struct HeAacMonoEncoder {
     out_rate: u32,
     /// Input PCM sample format. Defaults to `S16`. Accepts `S16` or `F32`.
     input_sample_format: SampleFormat,
+    /// Cumulative high-rate input-sample count (per channel). Authoritative
+    /// for the iTunSMPB "valid samples" word at HE-AAC's high rate. The
+    /// inner [`AacEncoder`] separately tracks core-rate input samples for
+    /// its own gapless info; the wrapper exposes the high-rate view via
+    /// [`Self::gapless_info`].
+    high_input_samples: u64,
     out_params: CodecParameters,
 }
 
@@ -86,7 +92,22 @@ impl HeAacMonoEncoder {
         inner_params.sample_rate = Some(core_rate);
         inner_params.channels = Some(1);
         inner_params.sample_format = Some(SampleFormat::F32);
-        let inner = AacEncoder::new(&inner_params)?;
+        let mut inner = AacEncoder::new(&inner_params)?;
+        // The inner encoder defaults to AAC-LC's 2112-sample delay. HE-AAC
+        // reports 2624 (Apple iTunes convention) at the high rate; see
+        // [`crate::gapless::ENCODER_DELAY_HE_AAC`]. The inner counter
+        // operates at the **core** rate (half the high rate), so when
+        // callers ask for the delay through the wrapper they get the
+        // correct high-rate value via [`Self::gapless_info`] which scales
+        // by 2.
+        inner.set_encoder_delay(crate::gapless::ENCODER_DELAY_AAC_LC);
+        // The wrapper manages its own SBR-aware silence-tail loop on
+        // flush; turn off the inner encoder's gapless-padding loop so
+        // it doesn't emit silence frames without an accompanying SBR
+        // FIL (which would trip ffmpeg's "No quantized data read for
+        // sbr_dequant" warning, regression-pinned in
+        // tests/r26_no_sbr_dequant_warning.rs).
+        inner.set_skip_gapless_padding(true);
         let sbr = SbrEncoder::new(core_rate)?;
         let mut out_params = params.clone();
         out_params.media_type = MediaType::Audio;
@@ -103,6 +124,7 @@ impl HeAacMonoEncoder {
             core_rate,
             out_rate,
             input_sample_format,
+            high_input_samples: 0,
             out_params,
         })
     }
@@ -149,7 +171,35 @@ impl HeAacMonoEncoder {
                 )));
             }
         }
+        // Track the high-rate input-sample count so the gapless tag can
+        // express padding/valid-sample fields at the right time base
+        // (high rate = 2 × AAC-LC core rate).
+        self.high_input_samples = self.high_input_samples.saturating_add(n as u64);
         Ok(())
+    }
+
+    /// Gapless-playback metadata at the **high** sample rate (= 2 ×
+    /// `core_rate`). HE-AAC's iTunes-convention encoder delay is 2624
+    /// samples (the AAC-LC priming + the SBR QMF warm-up). Padding is
+    /// derived from the high-rate input count and the inner encoder's
+    /// emitted frame count (one core frame = 2048 high-rate samples).
+    pub fn gapless_info(&self) -> crate::gapless::GaplessInfo {
+        let delay = crate::gapless::ENCODER_DELAY_HE_AAC;
+        let padding = crate::gapless::GaplessInfo::compute_padding(
+            delay,
+            self.inner.frames_emitted(),
+            HIGH_RATE_FRAME as u32,
+            self.high_input_samples,
+        );
+        crate::gapless::GaplessInfo::new(delay, padding, self.high_input_samples)
+    }
+
+    /// Convenience: render the gapless triple as an Apple iTunSMPB tag
+    /// string. See [`crate::gapless::GaplessInfo::format_itunsmpb`] for
+    /// the layout.
+    #[allow(non_snake_case)]
+    pub fn iTunSMPB_string(&self) -> String {
+        self.gapless_info().format_itunsmpb()
     }
 
     fn drain_frames(&mut self) -> Result<()> {
@@ -295,6 +345,9 @@ pub struct HeAacStereoEncoder {
     out_rate: u32,
     /// Input PCM sample format. Defaults to `S16`. Accepts `S16` or `F32`.
     input_sample_format: SampleFormat,
+    /// High-rate input-sample count (per channel). See
+    /// [`HeAacMonoEncoder::high_input_samples`] for the rationale.
+    high_input_samples: u64,
     out_params: CodecParameters,
 }
 
@@ -326,7 +379,17 @@ impl HeAacStereoEncoder {
         inner_params.sample_rate = Some(core_rate);
         inner_params.channels = Some(2);
         inner_params.sample_format = Some(SampleFormat::F32);
-        let inner = AacEncoder::new(&inner_params)?;
+        let mut inner = AacEncoder::new(&inner_params)?;
+        // See HeAacMonoEncoder::new — same delay-tagging story applies
+        // to the stereo CPE path.
+        inner.set_encoder_delay(crate::gapless::ENCODER_DELAY_AAC_LC);
+        // The wrapper manages its own SBR-aware silence-tail loop on
+        // flush; turn off the inner encoder's gapless-padding loop so
+        // it doesn't emit silence frames without an accompanying SBR
+        // FIL (which would trip ffmpeg's "No quantized data read for
+        // sbr_dequant" warning, regression-pinned in
+        // tests/r26_no_sbr_dequant_warning.rs).
+        inner.set_skip_gapless_padding(true);
         let sbr = SbrStereoEncoder::new(core_rate)?;
         let mut out_params = params.clone();
         out_params.media_type = MediaType::Audio;
@@ -345,8 +408,29 @@ impl HeAacStereoEncoder {
             core_rate,
             out_rate,
             input_sample_format,
+            high_input_samples: 0,
             out_params,
         })
+    }
+
+    /// Gapless-playback metadata at the high sample rate. Mirrors
+    /// [`HeAacMonoEncoder::gapless_info`] for the stereo path.
+    pub fn gapless_info(&self) -> crate::gapless::GaplessInfo {
+        let delay = crate::gapless::ENCODER_DELAY_HE_AAC;
+        let padding = crate::gapless::GaplessInfo::compute_padding(
+            delay,
+            self.inner.frames_emitted(),
+            HIGH_RATE_FRAME as u32,
+            self.high_input_samples,
+        );
+        crate::gapless::GaplessInfo::new(delay, padding, self.high_input_samples)
+    }
+
+    /// Convenience: render the gapless triple as an Apple iTunSMPB tag
+    /// string. Stereo equivalent of [`HeAacMonoEncoder::iTunSMPB_string`].
+    #[allow(non_snake_case)]
+    pub fn iTunSMPB_string(&self) -> String {
+        self.gapless_info().format_itunsmpb()
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
@@ -401,6 +485,8 @@ impl HeAacStereoEncoder {
                 )));
             }
         }
+        // Track high-rate per-channel input count for gapless metadata.
+        self.high_input_samples = self.high_input_samples.saturating_add(n as u64);
         Ok(())
     }
 
@@ -585,6 +671,8 @@ pub struct HeAacV2Encoder {
     out_rate: u32,
     /// Input PCM sample format. Defaults to `S16`. Accepts `S16` or `F32`.
     input_sample_format: SampleFormat,
+    /// Per-channel high-rate input-sample tally (for gapless metadata).
+    high_input_samples: u64,
     out_params: CodecParameters,
 }
 
@@ -619,7 +707,18 @@ impl HeAacV2Encoder {
         // pipeline — pin its expected input format so it doesn't fall back
         // to the user-facing default (S16) and misinterpret bytes.
         inner_params.sample_format = Some(SampleFormat::F32);
-        let inner = AacEncoder::new(&inner_params)?;
+        let mut inner = AacEncoder::new(&inner_params)?;
+        // PS-extended HE-AACv1 still uses the HE-AAC delay convention
+        // (the PS payload rides inside the same SBR FIL element so the
+        // decoder still pays the SBR QMF warm-up cost).
+        inner.set_encoder_delay(crate::gapless::ENCODER_DELAY_AAC_LC);
+        // The wrapper manages its own SBR-aware silence-tail loop on
+        // flush; turn off the inner encoder's gapless-padding loop so
+        // it doesn't emit silence frames without an accompanying SBR
+        // FIL (which would trip ffmpeg's "No quantized data read for
+        // sbr_dequant" warning, regression-pinned in
+        // tests/r26_no_sbr_dequant_warning.rs).
+        inner.set_skip_gapless_padding(true);
         let mut sbr = SbrEncoder::new(core_rate)?;
         sbr.set_emit_ps(true);
         // Output params — we advertise 2 output channels even though the
@@ -642,8 +741,31 @@ impl HeAacV2Encoder {
             core_rate,
             out_rate,
             input_sample_format,
+            high_input_samples: 0,
             out_params,
         })
+    }
+
+    /// Gapless-playback metadata at the high sample rate. Same logic as
+    /// the v1 mono / stereo paths — encoder delay is the HE-AAC
+    /// convention 2624, padding is computed from the inner core's emitted
+    /// frame count scaled to high rate.
+    pub fn gapless_info(&self) -> crate::gapless::GaplessInfo {
+        let delay = crate::gapless::ENCODER_DELAY_HE_AAC;
+        let padding = crate::gapless::GaplessInfo::compute_padding(
+            delay,
+            self.inner.frames_emitted(),
+            HIGH_RATE_FRAME as u32,
+            self.high_input_samples,
+        );
+        crate::gapless::GaplessInfo::new(delay, padding, self.high_input_samples)
+    }
+
+    /// Convenience: render the gapless triple as an Apple iTunSMPB tag
+    /// string. v2 equivalent of the v1 mono/stereo helpers.
+    #[allow(non_snake_case)]
+    pub fn iTunSMPB_string(&self) -> String {
+        self.gapless_info().format_itunsmpb()
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
@@ -698,6 +820,8 @@ impl HeAacV2Encoder {
                 )));
             }
         }
+        // High-rate input-sample tally for gapless metadata.
+        self.high_input_samples = self.high_input_samples.saturating_add(n as u64);
         Ok(())
     }
 

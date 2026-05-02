@@ -196,6 +196,34 @@ pub struct AacEncoder {
     /// (taken) each call — the HE-AAC wrapper must set it before every
     /// frame.
     pending_sbr_fil: Option<SbrFilBits>,
+    /// Total raw input samples (per-channel) accepted so far. Used by
+    /// [`Self::gapless_info`] / [`Self::valid_samples`] so a downstream
+    /// MP4 muxer or iTunSMPB writer can express "trim N priming samples
+    /// off the front and M padding samples off the tail".
+    total_input_samples: u64,
+    /// Encoder-side count of `raw_data_block`s emitted so far. Increments
+    /// on every [`Self::emit_payload`] — combined with `FRAME_LEN` this
+    /// gives the total *emitted* sample count (which always exceeds
+    /// `total_input_samples + encoder_delay` by the OLA flush tail; the
+    /// difference is the padding count).
+    frames_emitted: u64,
+    /// Latched encoder-delay value reported by [`Self::encoder_delay`].
+    /// Defaults to [`crate::gapless::ENCODER_DELAY_AAC_LC`] (2112 samples,
+    /// the Apple iTunes convention for AAC-LC). The HE-AAC wrappers
+    /// override this to [`crate::gapless::ENCODER_DELAY_HE_AAC`] (2624
+    /// samples) via [`Self::set_encoder_delay`] so a single inner-encoder
+    /// instance can serve either profile without callers having to
+    /// special-case which convention to read.
+    encoder_delay: u32,
+    /// When true, [`Self::flush_final`] skips the gapless-padding loop
+    /// that emits extra silence frames to reach the
+    /// `frames_emitted * FRAME_LEN >= encoder_delay + valid_samples`
+    /// invariant. The HE-AAC wrappers set this so they can manage their
+    /// own SBR-FIL-aware silence-frame emission (each tail frame in the
+    /// SBR path needs a freshly-analysed FIL element staged or ffmpeg
+    /// trips `"No quantized data read for sbr_dequant"`). Standalone
+    /// AAC-LC encoders leave it false so the gapless invariant holds.
+    skip_gapless_padding: bool,
 }
 
 /// Staged SBR FIL payload: raw byte-aligned SBR bytes (produced by
@@ -279,7 +307,88 @@ impl AacEncoder {
             enable_short_blocks: false,
             short_state: (0..n_ch).map(|_| ChannelShortState::default()).collect(),
             pending_sbr_fil: None,
+            total_input_samples: 0,
+            frames_emitted: 0,
+            encoder_delay: crate::gapless::ENCODER_DELAY_AAC_LC,
+            skip_gapless_padding: false,
         })
+    }
+
+    /// Disable (or re-enable) the flush-time gapless-padding silence
+    /// loop. The HE-AAC wrappers call this with `true` because each
+    /// silence tail frame they emit must carry its own pre-staged SBR
+    /// FIL element (otherwise ffmpeg's `ff_aac_sbr_apply` trips
+    /// `"No quantized data read for sbr_dequant"` on the trailing frame).
+    /// Standalone AAC-LC users leave the default `false`.
+    pub fn set_skip_gapless_padding(&mut self, skip: bool) {
+        self.skip_gapless_padding = skip;
+    }
+
+    /// Override the reported encoder-delay value. The HE-AAC wrappers
+    /// call this with [`crate::gapless::ENCODER_DELAY_HE_AAC`] so the
+    /// inner [`AacEncoder`] reports the SBR-aware figure (2624 samples
+    /// at the high rate) rather than the AAC-LC default (2112). The
+    /// MDCT priming behaviour itself is unchanged — this only affects
+    /// what [`Self::gapless_info`] / [`Self::iTunSMPB_string`] report
+    /// to downstream container code.
+    pub fn set_encoder_delay(&mut self, samples: u32) {
+        self.encoder_delay = samples;
+    }
+
+    /// Encoder delay in samples: how many priming samples a downstream
+    /// player should skip before the first "real" sample of the source
+    /// PCM appears. Defaults to 2112 (AAC-LC) and is bumped to 2624 by
+    /// the HE-AAC wrappers. See [`crate::gapless`] for the derivation.
+    pub fn encoder_delay(&self) -> u32 {
+        self.encoder_delay
+    }
+
+    /// Number of input samples (per channel) accepted via `send_frame`
+    /// to date. Authoritative for the iTunSMPB "valid samples" word and
+    /// for the `segment_duration` of an MP4 `elst` edit segment.
+    pub fn valid_samples(&self) -> u64 {
+        self.total_input_samples
+    }
+
+    /// Number of `raw_data_block`s emitted so far. One frame == 1024
+    /// PCM samples per channel.
+    pub fn frames_emitted(&self) -> u64 {
+        self.frames_emitted
+    }
+
+    /// Padding samples at the tail (i.e.
+    /// `frames_emitted * 1024 - encoder_delay - valid_samples`,
+    /// saturated at zero). Only meaningful **after** [`Encoder::flush`]
+    /// — before flush the encoder hasn't decided on the final frame
+    /// count and the residual buffer has not yet been padded out.
+    pub fn padding_samples(&self) -> u32 {
+        crate::gapless::GaplessInfo::compute_padding(
+            self.encoder_delay,
+            self.frames_emitted,
+            FRAME_LEN as u32,
+            self.total_input_samples,
+        )
+    }
+
+    /// Bundle (encoder_delay, padding_samples, valid_samples) into a
+    /// single [`crate::gapless::GaplessInfo`] suitable for handing to
+    /// an MP4 `edts/elst` writer or an iTunSMPB tag emitter.
+    pub fn gapless_info(&self) -> crate::gapless::GaplessInfo {
+        crate::gapless::GaplessInfo::new(
+            self.encoder_delay,
+            self.padding_samples(),
+            self.total_input_samples,
+        )
+    }
+
+    /// Convenience: format the gapless triple as an Apple iTunSMPB
+    /// metadata-tag string. Container code that wants ID3v2 carriage
+    /// emits this string as the value of a `TXXX` user-text frame with
+    /// description `"iTunSMPB"`; MP4 ilst carriage uses the same value
+    /// inside an `----` named atom (`com.apple.iTunes:iTunSMPB`).
+    #[allow(non_snake_case)]
+    pub fn iTunSMPB_string(&self) -> String {
+        self.gapless_info().format_itunsmpb()
     }
 
     /// Stage an SBR payload (as produced by the HE-AACv1 encoder) so the
@@ -362,6 +471,12 @@ impl AacEncoder {
                 )));
             }
         }
+        // Track the **per-channel** input-sample count for gapless
+        // metadata. The buffer's per-channel length grows by `n`
+        // regardless of the channel count (we push n samples per
+        // channel), so the total counter advances by `n` not `n *
+        // channels`.
+        self.total_input_samples = self.total_input_samples.saturating_add(n as u64);
         Ok(())
     }
 
@@ -401,6 +516,45 @@ impl AacEncoder {
         // actually emitted.
         if self.enable_short_blocks {
             self.drain_held()?;
+        }
+        // ===== Gapless padding tuning (task #169) =====
+        //
+        // The Apple iTunSMPB convention demands the bitstream invariant
+        //
+        //     frames_emitted * FRAME_LEN >= encoder_delay + valid_samples
+        //
+        // so the (delay, padding, valid_samples) triple stays internally
+        // consistent: a player skipping `encoder_delay` priming samples
+        // and trimming `padding_samples` off the tail must land on
+        // exactly `valid_samples` of real PCM. Emit additional silence
+        // frames here until the invariant holds (rounding up to the next
+        // packet boundary). This keeps the per-stream tail honest and
+        // — crucially for concatenated playback — gives downstream
+        // muxers a frame-boundary-aligned padding count to record in
+        // an `edts/elst` segment_duration or an iTunSMPB tail-pad word.
+        //
+        // The HE-AAC wrappers gate this loop off with
+        // `set_skip_gapless_padding(true)` because every tail frame they
+        // emit must carry a freshly-staged SBR FIL element; the wrapper
+        // manages its own padding-frame loop and stages an SBR FIL on
+        // each iteration.
+        if !self.skip_gapless_padding {
+            let need = (self.encoder_delay as u64).saturating_add(self.total_input_samples);
+            let mut emitted_samples = self.frames_emitted.saturating_mul(FRAME_LEN as u64);
+            while emitted_samples < need {
+                for ch in 0..self.channels as usize {
+                    self.input_buf[ch].clear();
+                    self.input_buf[ch].resize(FRAME_LEN, 0.0);
+                }
+                self.emit_block(true)?;
+                if self.enable_short_blocks {
+                    // The short-block path holds one frame back; drain it
+                    // so the silence frame actually emerges from the
+                    // encoder. Without this the loop never advances.
+                    self.drain_held()?;
+                }
+                emitted_samples = self.frames_emitted.saturating_mul(FRAME_LEN as u64);
+            }
         }
         Ok(())
     }
@@ -634,6 +788,10 @@ impl AacEncoder {
         let pkt = Packet::new(0, self.time_base, adts_frame).with_pts(self.pts);
         self.pts += samples_per_frame as i64;
         self.output_queue.push_back(pkt);
+        // Tally the emitted-frame count for the gapless-padding maths
+        // (see [`Self::padding_samples`]). One ADTS frame == one
+        // raw_data_block == FRAME_LEN samples per channel.
+        self.frames_emitted = self.frames_emitted.saturating_add(1);
         Ok(())
     }
 
