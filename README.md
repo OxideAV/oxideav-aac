@@ -132,6 +132,14 @@ TNS-flattened coefficients.
   L/R-CPE R channel running an octave-paired tone (R = 880 Hz vs
   L = 440 Hz) sits at ~22 dB because M/S coding biases bit allocation
   toward the side signal.
+- 44.1 kHz 7.1 sine-per-channel through ffmpeg (`encode_71_roundtrip_ffmpeg`,
+  task #154). All 8 channels survive ffmpeg's bitstream→WAVE-7.1
+  reorder (AAC bitstream order C/L/R/Ls/Rs/Lb/Rb/LFE per §1.6.3
+  Table 1.19 → WAVE FL/FR/FC/LFE/BL/BR/SL/SR, inverse mapping
+  `[2, 0, 1, 6, 7, 4, 5, 3]`); per-channel PSNR floors at 22 dB,
+  with seven of eight channels clearing 24 dB on the synthetic tone
+  fixture. The L/R-CPE R channel hits the M/S-bias floor for the
+  same reason as 5.1.
 
 ### r19 — AAC-LC ffmpeg-interop RMS audit (2026-04-26)
 

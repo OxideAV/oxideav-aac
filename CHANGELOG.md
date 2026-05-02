@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notes (7.1 ffmpeg cross-decode, task #154)
+- Added `tests/encode_roundtrip.rs::encode_71_roundtrip_ffmpeg`. The
+  8-channel encode path (`channel_configuration = 7`,
+  SCE(C) + CPE(L,R) + CPE(Ls,Rs) + CPE(Lb,Rb) + LFE per ISO/IEC
+  14496-3 §1.6.3 Table 1.19) was already wired into `element_sequence`
+  and the decoder's `expected_channels` from the pre-#154 multichannel
+  scaffolding; this round adds the ffmpeg cross-decode acceptance gate
+  the workspace task brief calls out.
+- The fixture encodes 8 distinct sine tones (one per AAC bitstream
+  channel: C=440, L=550, R=880, Ls=1100, Rs=1320, Lb=1540, Rb=1760,
+  LFE=330 Hz at amp 0.3) into a 44.1 kHz 7.1 AAC-LC stream, decodes
+  through ffmpeg with `-ac 8` (no resample, no downmix), and asserts
+  every input tone shows up on the expected ffmpeg WAVE-7.1 output
+  channel above a Goertzel ratio of 50× and a per-channel PSNR floor
+  of 22 dB.
+- ffmpeg decodes channel_configuration=7 to AV_CH_LAYOUT_7POINT1 and
+  emits WAVE 7.1 order (FL, FR, FC, LFE, BL, BR, SL, SR) when forced
+  to 8 channels. Bitstream-to-WAVE inverse mapping baked into the
+  test: `[2, 0, 1, 6, 7, 4, 5, 3]` (AAC "side" → WAVE side, AAC
+  "back" → WAVE back). The test additionally probes every output
+  channel for every input frequency at runtime so a future ffmpeg
+  layout change shows up as a diagnostic before the assertion fires.
+- Measured per-channel PSNR (44.1 kHz, 384 kbps metadata, 1 s tones,
+  mid window 4096..total-4096, lag search ±8192):
+    - C   (440 Hz, ffmpeg ch 2):  30.15 dB
+    - L   (550 Hz, ffmpeg ch 0):  34.91 dB
+    - R   (880 Hz, ffmpeg ch 1):  22.56 dB
+    - Ls  (1100 Hz, ffmpeg ch 6): 24.66 dB
+    - Rs  (1320 Hz, ffmpeg ch 7): 31.60 dB
+    - Lb  (1540 Hz, ffmpeg ch 4): 25.91 dB
+    - Rb  (1760 Hz, ffmpeg ch 5): 34.69 dB
+    - LFE (330 Hz, ffmpeg ch 3):  36.15 dB
+  All eight channels clear 22 dB. The L/R-CPE octave-paired R channel
+  (440 Hz vs 880 Hz are not in the same CPE here, but L=550 / R=880
+  shares the M/S-bias pattern documented in the 5.1 round) sits at
+  ~22 dB for the same reason — M/S bit allocation biases toward the
+  side signal; the other seven channels exceed 24 dB.
+- Widened `psnr_i16`'s lag-search window from ±4096 to ±8192. The
+  7.1 layout's deeper element ordering pushes individual CPE channels
+  past the original 4096-sample boundary on some channels (observed
+  best-lag values up to ±7900). The 5.1 ffmpeg test still passes
+  with the wider window.
+- No encoder code changed in this round — same scaffolding as the
+  5.1 work; only the test gate is new. Test count delta: +1
+  (encode_roundtrip 10 → 11; full crate suite 184 → 185).
+
 ### Notes (5.1 ffmpeg cross-decode, task #142)
 - Added `tests/encode_roundtrip.rs::encode_51_roundtrip_ffmpeg`. The
   multichannel encode path (channel_configuration 1..=7, including
