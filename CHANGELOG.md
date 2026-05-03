@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-aac/compare/v0.0.9...v0.0.10) - 2026-05-03
+
+### Added
+
+- LOAS/LATM transport demux (ISO/IEC 14496-3 §1.7)
+
+### Other
+
+- allow dead Tier::Ignored variant
+- 3 clippy fixes (range pattern, unit-let, div_ceil)
+- rename Error::Invalid to Error::InvalidData in test pattern
+- rustfmt docs_corpus.rs
+- wire docs/audio/aac/fixtures/ corpus into integration suite
+
 ### Added
 
 - LOAS AudioSyncStream framing parser (`oxideav_aac::loas`) and LATM
