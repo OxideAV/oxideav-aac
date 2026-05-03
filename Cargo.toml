@@ -15,3 +15,10 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Used by tests/docs_corpus.rs to demux the .m4a (ISOBMFF) input
+# fixtures from docs/audio/aac/fixtures/ — extracts the
+# AudioSpecificConfig from `esds` into params.extradata so the AAC
+# decoder can bootstrap, then emits one raw_data_block per packet.
+oxideav-mp4 = "0.0"
