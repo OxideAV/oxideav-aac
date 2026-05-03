@@ -140,7 +140,7 @@ mod tests {
         let bad = [0u8; 4];
         assert!(matches!(
             parse_loas_frame(&bad),
-            Err(oxideav_core::Error::Invalid(_))
+            Err(oxideav_core::Error::InvalidData(_))
         ));
     }
 
