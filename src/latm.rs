@@ -183,7 +183,7 @@ fn parse_stream_mux_config(br: &mut BitReader<'_>, ctx: &mut LatmContext) -> Res
                 "LATM: frameLengthType=1 (fixed-length frames) not supported",
             ));
         }
-        3 | 4 | 5 => {
+        3..=5 => {
             return Err(Error::unsupported(
                 "LATM: frameLengthType in {3,4,5} (CELP) not supported",
             ));
@@ -242,7 +242,7 @@ fn capture_asc_inline(br: &mut BitReader<'_>) -> Result<Vec<u8>> {
     let snapshot = *br;
     let scratch = drain_aligned_bytes(snapshot, 64)?;
     let mut probe = BitReader::new(&scratch);
-    let _ = parse_asc_into(&mut probe)?;
+    parse_asc_into(&mut probe)?;
     let consumed_bits = probe.bit_position() as usize;
 
     // Now read exactly `consumed_bits` from the live `br` into a Vec<u8>.
@@ -272,7 +272,7 @@ fn drain_aligned_bytes(mut br: BitReader<'_>, n: usize) -> Result<Vec<u8>> {
 /// MSB-first within each byte. The trailing byte is zero-padded if
 /// `n` is not a multiple of 8.
 fn read_bits_into_bytes(br: &mut BitReader<'_>, n: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; (n + 7) / 8];
+    let mut out = vec![0u8; n.div_ceil(8)];
     let full_bytes = n / 8;
     let tail_bits = (n % 8) as u32;
     for byte in out.iter_mut().take(full_bytes) {
