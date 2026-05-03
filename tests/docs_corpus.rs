@@ -60,6 +60,8 @@ fn fixture_dir(name: &str) -> PathBuf {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Ignored is part of the corpus tier vocabulary
+                    // even when no current fixture lands there.
 enum Tier {
     /// Decode is permitted to diverge from the FFmpeg reference; we
     /// log the deltas but do not gate CI on them. AAC is a lossy codec
