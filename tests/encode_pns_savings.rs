@@ -38,7 +38,7 @@ fn lcg(state: &mut u32) -> f32 {
 /// bytes. Composition:
 ///  * Wideband white noise at modest amplitude (room tone).
 ///  * Three low/mid sine tones (350 / 880 / 1500 Hz) — sax-like fundamental
-///    + harmonics that should *stay* on regular Huffman codebooks (band
+///    plus harmonics that should *stay* on regular Huffman codebooks (band
 ///    centres < 4 kHz, gated by `PNS_IS_MIN_HZ`).
 ///  * High-frequency shaped noise (5-15 kHz pink-ish, gated by an
 ///    exponential decay envelope) — the "cymbal" component PNS should
