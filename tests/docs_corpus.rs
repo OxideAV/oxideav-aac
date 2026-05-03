@@ -39,8 +39,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_core::{
-    CodecId, CodecParameters, ContainerRegistry, Error, Frame, NullCodecResolver, Packet,
-    ReadSeek, SampleFormat, TimeBase,
+    CodecId, CodecParameters, ContainerRegistry, Error, Frame, NullCodecResolver, Packet, ReadSeek,
+    SampleFormat, TimeBase,
 };
 // `Box<dyn Decoder>` / `Box<dyn Demuxer>` resolve trait methods through
 // the dyn-vtable, so the traits don't need to be in scope at the call
@@ -205,13 +205,19 @@ fn decode_adts(case: &CorpusCase, bytes: &[u8]) -> Option<DecodedPcm> {
     let sr = match first.sample_rate() {
         Some(s) => s,
         None => {
-            eprintln!("{}: first ADTS header has invalid sampling-frequency-index", case.name);
+            eprintln!(
+                "{}: first ADTS header has invalid sampling-frequency-index",
+                case.name
+            );
             return None;
         }
     };
     let ch = first.channel_configuration as u16;
     if ch == 0 {
-        eprintln!("{}: ADTS channel_configuration=0 (PCE-defined) not handled here", case.name);
+        eprintln!(
+            "{}: ADTS channel_configuration=0 (PCE-defined) not handled here",
+            case.name
+        );
         return None;
     }
     if let Some(want_ch) = case.channels {
@@ -261,8 +267,8 @@ fn decode_adts(case: &CorpusCase, bytes: &[u8]) -> Option<DecodedPcm> {
         if h.frame_length == 0 || pos + h.frame_length > body.len() {
             break;
         }
-        let pkt = Packet::new(0, tb, body[pos..pos + h.frame_length].to_vec())
-            .with_pts(frame_idx * 1024);
+        let pkt =
+            Packet::new(0, tb, body[pos..pos + h.frame_length].to_vec()).with_pts(frame_idx * 1024);
         if let Err(e) = decoder.send_packet(&pkt) {
             decoder_errors += 1;
             if decoder_errors <= 3 {
@@ -287,7 +293,10 @@ fn decode_adts(case: &CorpusCase, bytes: &[u8]) -> Option<DecodedPcm> {
             Err(e) => {
                 decoder_errors += 1;
                 if decoder_errors <= 3 {
-                    eprintln!("{}: receive_frame error at frame {frame_idx}: {e}", case.name);
+                    eprintln!(
+                        "{}: receive_frame error at frame {frame_idx}: {e}",
+                        case.name
+                    );
                 }
             }
         }
@@ -341,10 +350,7 @@ fn decode_mp4(case: &CorpusCase, file: fs::File) -> Option<DecodedPcm> {
                 .iter()
                 .map(|s| s.params.codec_id.as_str().to_owned())
                 .collect();
-            eprintln!(
-                "{}: mp4 has no AAC track (got: {:?})",
-                case.name, codecs
-            );
+            eprintln!("{}: mp4 has no AAC track (got: {:?})", case.name, codecs);
             return None;
         }
     };
@@ -599,7 +605,10 @@ fn compare(ours: &DecodedPcm, refp: &RefPcm) -> Vec<ChannelStat> {
 /// Decode -> compare -> log -> tier-aware assert (no AAC fixture
 /// currently bit-exact, so all tiers are ReportOnly today).
 fn evaluate(case: &CorpusCase) {
-    eprintln!("--- {} (carrier={:?} tier={:?}) ---", case.name, case.carrier, case.tier);
+    eprintln!(
+        "--- {} (carrier={:?} tier={:?}) ---",
+        case.name, case.carrier, case.tier
+    );
     if matches!(case.tier, Tier::Ignored) {
         eprintln!("{}: Tier::Ignored — skipping", case.name);
         return;
