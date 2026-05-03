@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-aac/compare/v0.0.8...v0.0.9) - 2026-05-03
+
+### Other
+
+- fix doc_lazy_continuation in encode_pns_savings
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- encoder delay + EOF padding tracking + iTunSMPB string (task #169)
+- 7.1 multichannel encode ffmpeg cross-decode acceptance gate (task #154)
+- 5.1 multichannel encode ffmpeg cross-decode acceptance gate (task #142)
+- PNS encoder bit-savings audit (task #132)
+- kill ffmpeg SBR dequant warning on HE-AAC interop
+- SBR FIL diff harness vs fdkaac; envelope ruled out
+- refute r22 MDCT_FORWARD_SCALE thesis; root cause is in SBR FIL
+- HE-AACv1 SBR header diff-probe (negative result)
+- round 21 — HE-AACv1 SBR ffmpeg-interop audit (honest negative)
+- fix per-frame ±32k saturation on real-content CPE streams
+- widen SpectralValues i16 → i32 for codebook-11 escape range
+- fix KBD window — rising half, not symmetric bell (ffmpeg interop)
+- round 19 — close LC ffmpeg-interop gap on RMS metric
+- round 18 — disprove SBR-envelope hypothesis for ffmpeg interop gap
+- round 17 — wire bs_limiter_gains through SBR envelope adjuster
+- adopt slim AudioFrame shape
+- confirm ffmpeg "sbr_dequant" warning is benign + spec-tighten header
+- SBR envelope int16-scale fix + dual-decoder PSNR test
+- HE-AACv2 PS encoder: time-direction differential + multi-envelope
+- HE-AACv2 PS encoder: real per-band IID/ICC analysis
+- HE-AACv2 encoder: no-op Parametric Stereo emission
+- SBR CPE: fix Table 4.66 independent-coupling bitstream order
+- HE-AACv1 stereo encoder via independent-coupling CPE
+- pin release-plz to patch-only bumps
+
 ### Notes (gapless padding tuning, task #169)
 - New module `gapless` exposes the (encoder_delay, padding_samples,
   valid_samples) triple and an Apple iTunSMPB-format string emitter.
