@@ -3,8 +3,9 @@
 //! Each fixture under `../../docs/audio/aac/fixtures/<name>/` ships an
 //! input AAC bitstream in one of three carriers — raw `.aac` (ADTS
 //! frames, with or without an ID3v2 prefix), `.m4a` (ISOBMFF / MP4 with
-//! the AudioSpecificConfig in `esds`), or `.latm` (LOAS/LATM transport,
-//! parser TBD) — plus an `expected.wav` ground-truth produced by
+//! the AudioSpecificConfig in `esds`), or `.latm` (LOAS/LATM transport
+//! via the in-tree [`oxideav_aac::loas`] / [`oxideav_aac::latm`]
+//! parsers) — plus an `expected.wav` ground-truth produced by
 //! FFmpeg's reference AAC decoder. This driver:
 //!
 //! 1. Demuxes the input through the appropriate path: in-tree
@@ -25,11 +26,11 @@
 //! can see at a glance how close we are. A BitExact tier is reserved
 //! for future use.
 //!
-//! Carriers we don't yet support:
-//! - `.latm` — the LOAS/LATM transport parser (ISO 14496-3 §1.7) is
-//!   not implemented anywhere in the workspace today, so the
-//!   `aac-latm-stream` fixture is skipped with `Tier::Ignored`.
-//!   Adding a LATM parser would unblock it without changing this test.
+//! All three carriers (`.aac`, `.m4a`, `.latm`) are now wired in-tree:
+//! the `.latm` path walks LOAS frames via
+//! [`oxideav_aac::loas::LoasFrameIter`], extracts each
+//! AudioMuxElement's AAC payload, and runs it through the same
+//! decoder as the other two carriers.
 //!
 //! The trace.txt + probe.json files under each fixture dir are not
 //! consumed here; they are an aid for the human implementer when
@@ -47,6 +48,7 @@ use oxideav_core::{
 // site here.
 
 use oxideav_aac::adts::parse_adts_header;
+use oxideav_aac::loas::LoasFrameIter;
 
 /// Locate `docs/audio/aac/fixtures/<name>/`. When the test runs as
 /// part of the umbrella workspace, CWD is the crate root and the docs
@@ -77,8 +79,10 @@ enum Carrier {
     /// ISOBMFF / MP4 (`.m4a`). Demuxed through `oxideav-mp4`. The
     /// stream's `extradata` carries the AudioSpecificConfig.
     Mp4,
-    /// LOAS/LATM transport. Not yet implemented; the driver returns
-    /// `None` and the test passes.
+    /// LOAS / LATM transport (`.latm`). Demuxed inline via
+    /// [`oxideav_aac::loas::LoasFrameIter`] — each LOAS frame is fed as
+    /// a packet to the AAC decoder, which dispatches to its built-in
+    /// LATM AudioMuxElement parser.
     Latm,
 }
 
@@ -448,6 +452,139 @@ fn decode_mp4(case: &CorpusCase, file: fs::File) -> Option<DecodedPcm> {
     })
 }
 
+/// Decode a LOAS/LATM-carriered fixture. Walks every LOAS frame in
+/// the buffer, feeds it as a packet to the AAC decoder (whose own
+/// `send_packet` recognises the 0x2B7 syncword and demultiplexes the
+/// LATM AudioMuxElement), and concatenates the resulting PCM.
+fn decode_latm(case: &CorpusCase, bytes: &[u8]) -> Option<DecodedPcm> {
+    // Probe: parse the first LOAS frame's StreamMuxConfig so we can
+    // seed the decoder with the right CodecParameters before running
+    // the whole stream through it. This mirrors what an MP4 demuxer
+    // would do via the `esds` extradata blob.
+    let mut probe_iter = LoasFrameIter::new(bytes);
+    let (_first_off, first_frame) = match probe_iter.next() {
+        Some(x) => x,
+        None => {
+            eprintln!(
+                "{}: no LOAS frame found in {} bytes",
+                case.name,
+                bytes.len()
+            );
+            return None;
+        }
+    };
+    let mut probe_ctx = oxideav_aac::latm::LatmContext::new();
+    let probe_ame =
+        match oxideav_aac::latm::AudioMuxElement::parse(first_frame.payload, &mut probe_ctx) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!(
+                    "{}: first LOAS audio_mux_element parse failed: {e}",
+                    case.name
+                );
+                return None;
+            }
+        };
+    let asc = match probe_ame.frames.first().map(|f| f.asc.clone()) {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "{}: first LOAS audio_mux_element produced 0 sub-frames",
+                case.name
+            );
+            return None;
+        }
+    };
+    let sr = asc.sampling_frequency;
+    let ch = asc.channel_configuration as u16;
+    if let Some(want_ch) = case.channels {
+        assert_eq!(
+            ch, want_ch,
+            "{}: LATM ASC says {ch} channels, expected {want_ch}",
+            case.name
+        );
+    }
+    if let Some(want_sr) = case.sample_rate {
+        assert_eq!(
+            sr, want_sr,
+            "{}: LATM ASC says {sr} Hz, expected {want_sr}",
+            case.name
+        );
+    }
+
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.sample_rate = Some(sr);
+    params.channels = Some(ch);
+    params.sample_format = Some(SampleFormat::S16);
+    let mut decoder = match oxideav_aac::decoder::make_decoder(&params) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}: decoder ctor failed: {e}", case.name);
+            return None;
+        }
+    };
+
+    let tb = TimeBase::new(1, sr as i64);
+    let mut samples: Vec<i16> = Vec::new();
+    let mut decoder_errors = 0usize;
+    let mut frame_idx = 0i64;
+
+    for (off, frame) in LoasFrameIter::new(bytes) {
+        let raw = bytes[off..off + frame.frame_length].to_vec();
+        let pkt = Packet::new(0, tb, raw).with_pts(frame_idx * 1024);
+        if let Err(e) = decoder.send_packet(&pkt) {
+            decoder_errors += 1;
+            if decoder_errors <= 3 {
+                eprintln!(
+                    "{}: send_packet error at LOAS frame {frame_idx}: {e}",
+                    case.name
+                );
+            }
+            frame_idx += 1;
+            continue;
+        }
+        loop {
+            match decoder.receive_frame() {
+                Ok(Frame::Audio(af)) => {
+                    let plane = &af.data[0];
+                    for chunk in plane.chunks_exact(2) {
+                        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    }
+                }
+                Ok(other) => {
+                    eprintln!("{}: unexpected non-audio frame: {other:?}", case.name);
+                    break;
+                }
+                Err(Error::NeedMore) => break,
+                Err(Error::Eof) => break,
+                Err(e) => {
+                    decoder_errors += 1;
+                    if decoder_errors <= 3 {
+                        eprintln!(
+                            "{}: receive_frame error at LOAS frame {frame_idx}: {e}",
+                            case.name
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        frame_idx += 1;
+    }
+    if decoder_errors > 0 {
+        eprintln!(
+            "{}: total decoder errors: {decoder_errors} (decoded {} samples)",
+            case.name,
+            samples.len(),
+        );
+    }
+    Some(DecodedPcm {
+        samples,
+        channels: ch,
+        sample_rate: sr,
+    })
+}
+
 fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
     let dir = fixture_dir(case.name);
     let in_path = dir.join(case.input_file);
@@ -473,11 +610,14 @@ fn decode_fixture_pcm(case: &CorpusCase) -> Option<DecodedPcm> {
             decode_mp4(case, file)
         }
         Carrier::Latm => {
-            eprintln!(
-                "skip {}: LATM/LOAS transport parser not implemented yet",
-                case.name
-            );
-            None
+            let bytes = match fs::read(&in_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("skip {}: missing {} ({e})", case.name, in_path.display());
+                    return None;
+                }
+            };
+            decode_latm(case, &bytes)
         }
     }
 }
@@ -714,14 +854,16 @@ fn evaluate(case: &CorpusCase) {
 
 #[test]
 fn corpus_aac_latm_stream() {
-    // No LATM/LOAS parser in the workspace yet.
+    // LATM/LOAS demux now in-tree (oxideav_aac::loas + oxideav_aac::latm).
+    // Driver walks every LOAS frame, the decoder strips the framing and
+    // feeds each AAC raw_data_block through the existing path.
     evaluate(&CorpusCase {
         name: "aac-latm-stream",
         input_file: "input.latm",
         carrier: Carrier::Latm,
         channels: Some(2),
         sample_rate: Some(44_100),
-        tier: Tier::Ignored,
+        tier: Tier::ReportOnly,
     });
 }
 

@@ -2,6 +2,10 @@
 //!
 //! Decoder implements:
 //! - ADTS frame header parser (§1.A.2 / 13818-7 §6.2)
+//! - LOAS AudioSyncStream framing + LATM AudioMuxElement demultiplex
+//!   (§1.7.2 / §1.7.3) — single-program, single-layer, frameLengthType=0
+//!   subset; multi-program / scalable / CELP / HVXC layouts return
+//!   `Error::Unsupported`
 //! - AudioSpecificConfig parser (§1.6.2.1)
 //! - Huffman codebooks 1-11 + scalefactor (§4.A.1)
 //! - SCE / CPE / LFE syntax (§4.6.2 / §4.6.3 / §4.6.10)
@@ -134,6 +138,8 @@ pub mod huffman;
 pub mod huffman_tables;
 pub mod ics;
 pub mod imdct;
+pub mod latm;
+pub mod loas;
 pub mod mdct;
 pub mod pce;
 pub mod pns;

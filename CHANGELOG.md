@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- LOAS AudioSyncStream framing parser (`oxideav_aac::loas`) and LATM
+  AudioMuxElement demultiplexer (`oxideav_aac::latm`) per ISO/IEC
+  14496-3 §1.7.2 / §1.7.3. Single-program / single-layer /
+  `frameLengthType=0` subset; multi-program, scalable, CELP and HVXC
+  layouts surface `Error::Unsupported`.
+- The `Decoder` impl now recognises the LOAS sync word `0x2B7` at
+  `send_packet` time and routes through the LATM parser to extract
+  the embedded `AudioSpecificConfig` plus AAC `raw_data_block`(s).
+- `aac-latm-stream` corpus fixture moves from `Tier::Ignored` to
+  `Tier::ReportOnly`.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-aac/compare/v0.0.8...v0.0.9) - 2026-05-03
 
 ### Other

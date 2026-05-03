@@ -16,6 +16,8 @@ use crate::ics::{
     parse_section_data, IcsInfo, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, SPEC_LEN,
     ZERO_HCB,
 };
+use crate::latm::{AudioMuxElement, LatmContext};
+use crate::loas::parse_loas_frame;
 use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
 use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
 use crate::sbr::bitstream::SbrChannelData;
@@ -59,6 +61,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, params.sample_rate.unwrap_or(44_100) as i64),
         pending: None,
+        latm_pending: Vec::new(),
+        latm_ctx: LatmContext::new(),
         eof: false,
         sf_index,
         channels,
@@ -84,6 +88,13 @@ struct AacDecoder {
     codec_id: CodecId,
     time_base: TimeBase,
     pending: Option<Packet>,
+    /// Extra raw_data_block payloads queued from a LATM AudioMuxElement
+    /// that carried more than one sub-frame per LOAS audio_sync_stream.
+    /// `decode_packet` drains this before touching `pending`.
+    latm_pending: Vec<Vec<u8>>,
+    /// Persistent LATM/LOAS demux state — caches the last
+    /// `StreamMuxConfig` so frames marked `useSameStreamMux=1` reuse it.
+    latm_ctx: LatmContext,
     eof: bool,
     sf_index: u8,
     channels: u8,
@@ -118,24 +129,92 @@ impl Decoder for AacDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || !self.latm_pending.is_empty() {
             return Err(Error::other(
                 "AAC decoder: receive_frame must be called before sending another packet",
             ));
+        }
+        // LOAS / LATM dispatch: if the packet carries the LOAS sync
+        // word, demultiplex it into one or more raw_data_block payloads
+        // up-front and queue them on `latm_pending` so subsequent
+        // `receive_frame` calls drain them in order.
+        let data = &packet.data;
+        if data.len() >= 2 && data[0] == 0x56 && (data[1] & 0xE0) == 0xE0 {
+            // Walk every LOAS frame in the packet (a transport packet
+            // can pack several).
+            let mut offset = 0usize;
+            while offset < data.len() {
+                if offset + 2 >= data.len() {
+                    break;
+                }
+                if data[offset] != 0x56 || (data[offset + 1] & 0xE0) != 0xE0 {
+                    offset += 1;
+                    continue;
+                }
+                let frame = match parse_loas_frame(&data[offset..]) {
+                    Ok(f) => f,
+                    Err(Error::NeedMore) => break,
+                    Err(e) => return Err(e),
+                };
+                let consumed = frame.frame_length;
+                let ame = AudioMuxElement::parse(frame.payload, &mut self.latm_ctx)?;
+                // Snapshot the ASC into the decoder's stream config —
+                // sample rate / channel count come from the cached ASC.
+                if let Some(asc) = self.latm_ctx.asc.as_ref() {
+                    if asc.object_type != AOT_AAC_LC {
+                        return Err(Error::unsupported(
+                            "AAC: LOAS/LATM advertises non-LC profile",
+                        ));
+                    }
+                    self.sf_index = sample_rate_to_index(asc.sampling_frequency)
+                        .unwrap_or(asc.sampling_frequency_index);
+                    self.channels = asc.channel_configuration;
+                    self.object_type = asc.object_type;
+                    self.configured = true;
+                    self.time_base = TimeBase::new(1, asc.sampling_frequency as i64);
+                    self.sbr_explicit = asc.sbr_present;
+                    self.ps_explicit = asc.ps_present;
+                }
+                for f in ame.frames {
+                    self.latm_pending.push(f.payload);
+                }
+                offset += consumed;
+            }
+            if self.latm_pending.is_empty() {
+                return Err(Error::invalid("LOAS packet yielded no AAC sub-frames"));
+            }
+            // The first sub-frame inherits the original packet's pts /
+            // stream_index so downstream timing stays put. Subsequent
+            // sub-frames are stored without packet metadata; the time
+            // base stays the same and the caller can offset by 1024
+            // samples per sub-frame if it cares.
+            let first = self.latm_pending.remove(0);
+            let mut head = packet.clone();
+            head.data = first;
+            self.pending = Some(head);
+            return Ok(());
         }
         self.pending = Some(packet.clone());
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let Some(pkt) = self.pending.take() else {
-            return if self.eof {
-                Err(Error::Eof)
-            } else {
-                Err(Error::NeedMore)
-            };
-        };
-        self.decode_packet(&pkt)
+        // Drain queued LATM sub-frames (already demultiplexed at
+        // send_packet time) before falling back to `pending`.
+        if let Some(pkt) = self.pending.take() {
+            return self.decode_packet(&pkt);
+        }
+        if !self.latm_pending.is_empty() {
+            let payload = self.latm_pending.remove(0);
+            // Reuse the time_base set when the LOAS frame was parsed.
+            let pkt = Packet::new(0, self.time_base, payload);
+            return self.decode_packet(&pkt);
+        }
+        if self.eof {
+            Err(Error::Eof)
+        } else {
+            Err(Error::NeedMore)
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -155,6 +234,12 @@ impl Decoder for AacDecoder {
             *ch = ChannelState::new();
         }
         self.pending = None;
+        self.latm_pending.clear();
+        // Drop the cached LATM StreamMuxConfig — after a seek the next
+        // LOAS frame is required to either re-emit a config or be
+        // already configured at the muxer's choice. The conservative
+        // thing is to start over and let the next frame re-establish.
+        self.latm_ctx = LatmContext::new();
         self.eof = false;
         Ok(())
     }
