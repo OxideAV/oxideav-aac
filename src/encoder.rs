@@ -324,6 +324,22 @@ impl AacEncoder {
         self.skip_gapless_padding = skip;
     }
 
+    /// Build the AudioSpecificConfig blob a downstream MP4 muxer needs
+    /// to advertise this stream in its `esds` box (or that a DASH
+    /// manifest needs to inline as a base64 `codecs` parameter). The
+    /// returned bytes describe the AAC-LC core configuration the
+    /// encoder is currently emitting; HE-AAC wrappers
+    /// ([`crate::he_aac_encoder::HeAacMonoEncoder`] etc.) carry their
+    /// own `audio_specific_config()` that prepends the explicit
+    /// AOT-5/AOT-29 SBR/PS extension prefix.
+    pub fn audio_specific_config(&self) -> Vec<u8> {
+        // `Self::new` already validated channel_configuration ∈ 1..=7
+        // and sample_rate against the standard SF index table; the
+        // builder cannot fail here.
+        crate::asc::AscBuilder::lc(self.sample_rate, self.channel_configuration)
+            .expect("encoder constructor pre-validates ASC builder inputs")
+    }
+
     /// Override the reported encoder-delay value. The HE-AAC wrappers
     /// call this with [`crate::gapless::ENCODER_DELAY_HE_AAC`] so the
     /// inner [`AacEncoder`] reports the SBR-aware figure (2624 samples

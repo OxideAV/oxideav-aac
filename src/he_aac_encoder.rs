@@ -202,6 +202,16 @@ impl HeAacMonoEncoder {
         self.gapless_info().format_itunsmpb()
     }
 
+    /// AudioSpecificConfig blob for an MP4 muxer's `esds` (or DASH
+    /// manifest `codecs` parameter). Uses the explicit AOT-5 prefix
+    /// (`mp4a.40.5`) — the most universally recognised HE-AAC v1
+    /// signalling. Channel count is hard-coded to 1 since this is the
+    /// mono encoder.
+    pub fn audio_specific_config(&self) -> Vec<u8> {
+        crate::asc::AscBuilder::he_aac(self.core_rate, self.out_rate, 1)
+            .expect("HeAacMonoEncoder constructor pre-validates ASC inputs")
+    }
+
     fn drain_frames(&mut self) -> Result<()> {
         while self.high_pcm.len() >= HIGH_RATE_FRAME {
             self.emit_frame(false)?;
@@ -431,6 +441,14 @@ impl HeAacStereoEncoder {
     #[allow(non_snake_case)]
     pub fn iTunSMPB_string(&self) -> String {
         self.gapless_info().format_itunsmpb()
+    }
+
+    /// AudioSpecificConfig blob for an MP4 muxer's `esds` (or DASH
+    /// manifest `codecs` parameter). Stereo equivalent of
+    /// [`HeAacMonoEncoder::audio_specific_config`].
+    pub fn audio_specific_config(&self) -> Vec<u8> {
+        crate::asc::AscBuilder::he_aac(self.core_rate, self.out_rate, 2)
+            .expect("HeAacStereoEncoder constructor pre-validates ASC inputs")
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {
@@ -766,6 +784,16 @@ impl HeAacV2Encoder {
     #[allow(non_snake_case)]
     pub fn iTunSMPB_string(&self) -> String {
         self.gapless_info().format_itunsmpb()
+    }
+
+    /// AudioSpecificConfig blob for an MP4 muxer's `esds` (or DASH
+    /// manifest `codecs` parameter). Uses the explicit AOT-29 prefix
+    /// (`mp4a.40.29`), the canonical HE-AAC v2 / PS signalling. The
+    /// channel_configuration field is always 1 (mono SBR core, with
+    /// PS upmix to stereo at the decoder).
+    pub fn audio_specific_config(&self) -> Vec<u8> {
+        crate::asc::AscBuilder::he_aac_v2(self.core_rate, self.out_rate)
+            .expect("HeAacV2Encoder constructor pre-validates ASC inputs")
     }
 
     fn push_audio(&mut self, frame: &AudioFrame) -> Result<()> {

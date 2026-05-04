@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `asc::AscBuilder` emits AudioSpecificConfig blobs for the three
+  signalling shapes a downstream MP4 muxer (`esds`) or DASH manifest
+  (`codecs` parameter) needs: plain `lc(sample_rate, channels)`,
+  explicit-AOT-5 `he_aac(core, ext, channels)`, and explicit-AOT-29
+  `he_aac_v2(core, ext)`. Each variant validates its sample-rate
+  index against the standard set (Table 1.16) and the channel
+  configuration against Table 1.19; non-standard inputs return
+  `Error::InvalidData` rather than producing a malformed blob.
+- `AacEncoder::audio_specific_config()`,
+  `HeAacMonoEncoder::audio_specific_config()`,
+  `HeAacStereoEncoder::audio_specific_config()`, and
+  `HeAacV2Encoder::audio_specific_config()` expose the matching ASC
+  for whatever rate/channels the encoder was configured with. Callers
+  no longer have to hand-roll the ASC bytes — a regression where
+  `tests/sbr_encode_roundtrip.rs` open-coded `[0x2B, 0x09, 0x88]`
+  is exactly the kind of thing this prevents.
+
 ### Changed
 
 - The LATM `StreamMuxConfig` length probe now delegates to the unified

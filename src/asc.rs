@@ -326,6 +326,112 @@ pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificC
     })
 }
 
+/// Builder for the AudioSpecificConfig blob a downstream MP4 muxer
+/// (`esds`) or DASH manifest needs to advertise the AAC stream.
+///
+/// Three modes are supported:
+///
+/// - **Plain AAC-LC** ([`AscBuilder::lc`]) — single AOT 2, no SBR.
+/// - **HE-AAC v1** ([`AscBuilder::he_aac`]) — explicit AOT 5 prefix
+///   plus the underlying AAC-LC, advertising the SBR extension SF
+///   index. Use this for MP4 muxers that target broad player support;
+///   the explicit-AOT-5 layout is the most universally recognised
+///   HE-AAC signalling mode.
+/// - **HE-AAC v2 (PS)** ([`AscBuilder::he_aac_v2`]) — AOT 29 prefix
+///   for streams whose mono SBR core is upmixed to stereo via
+///   parametric-stereo metadata.
+///
+/// Both `sample_rate` and `ext_sample_rate` (HE-AAC variants only)
+/// must match one of the 13 standard SF indices (Table 1.16); arbitrary
+/// rates via the 24-bit escape (`0xF`) are not yet exposed.
+pub struct AscBuilder;
+
+impl AscBuilder {
+    /// Plain AAC-LC ASC. `sample_rate` is the core PCM rate and
+    /// `channels` is one of the standard channel_configuration values
+    /// (1..=7; per Table 1.19, `1=mono`, `2=stereo`, ..., `6=5.1`,
+    /// `7=7.1`). Returns `Err(Error::InvalidData)` if either value is
+    /// outside the standard set.
+    pub fn lc(sample_rate: u32, channels: u8) -> Result<Vec<u8>> {
+        let sf_idx = sample_rate_to_index_strict(sample_rate)?;
+        validate_channel_configuration(channels)?;
+        let mut bw = oxideav_core::bits::BitWriter::new();
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_u32(sf_idx as u32, 4);
+        bw.write_u32(channels as u32, 4);
+        // Minimal GASpecificConfig — frameLengthFlag/dependsOnCoreCoder/
+        // extensionFlag all zero. A muxer that needs the embedded PCE
+        // for channel_configuration=0 should construct that path
+        // separately (the embedded PCE encoder lives behind a builder
+        // not yet exposed here).
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        Ok(bw.finish())
+    }
+
+    /// HE-AAC v1 ASC with the explicit AOT 5 prefix (`mp4a.40.5`
+    /// signalling). `core_sample_rate` is the rate the underlying
+    /// AAC-LC SCE/CPE elements operate at; `ext_sample_rate` is the
+    /// post-SBR doubled rate the muxer should advertise on the track.
+    /// Both must be standard SF indices.
+    pub fn he_aac(core_sample_rate: u32, ext_sample_rate: u32, channels: u8) -> Result<Vec<u8>> {
+        let core_idx = sample_rate_to_index_strict(core_sample_rate)?;
+        let ext_idx = sample_rate_to_index_strict(ext_sample_rate)?;
+        validate_channel_configuration(channels)?;
+        let mut bw = oxideav_core::bits::BitWriter::new();
+        bw.write_u32(AOT_SBR as u32, 5);
+        bw.write_u32(core_idx as u32, 4);
+        bw.write_u32(channels as u32, 4);
+        bw.write_u32(ext_idx as u32, 4);
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        Ok(bw.finish())
+    }
+
+    /// HE-AAC v2 (PS) ASC with the explicit AOT 29 prefix
+    /// (`mp4a.40.29` signalling). The underlying SBR core is mono
+    /// (`channel_configuration=1`); the PS upmix produces stereo on
+    /// decode. `core_sample_rate` is the SBR core rate;
+    /// `ext_sample_rate` is the post-SBR doubled rate.
+    pub fn he_aac_v2(core_sample_rate: u32, ext_sample_rate: u32) -> Result<Vec<u8>> {
+        let core_idx = sample_rate_to_index_strict(core_sample_rate)?;
+        let ext_idx = sample_rate_to_index_strict(ext_sample_rate)?;
+        let mut bw = oxideav_core::bits::BitWriter::new();
+        bw.write_u32(AOT_PS as u32, 5);
+        bw.write_u32(core_idx as u32, 4);
+        // PS sits on top of mono SBR: the core ASC lists 1 channel,
+        // the PS upmix at the decoder turns it into 2.
+        bw.write_u32(1, 4);
+        bw.write_u32(ext_idx as u32, 4);
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        Ok(bw.finish())
+    }
+}
+
+fn sample_rate_to_index_strict(rate: u32) -> Result<u8> {
+    crate::syntax::SAMPLE_RATES
+        .iter()
+        .position(|&r| r == rate)
+        .map(|i| i as u8)
+        .ok_or_else(|| Error::invalid("ASC builder: sample rate is not a standard SF index"))
+}
+
+fn validate_channel_configuration(ch: u8) -> Result<()> {
+    if (1..=7).contains(&ch) {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            "ASC builder: channel_configuration must be 1..=7 (Table 1.19)",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +600,69 @@ mod tests {
         let asc = parse_asc(&bytes).unwrap();
         assert_eq!(asc.object_type, AOT_AAC_LTP);
         assert!(!asc.sbr_present);
+    }
+
+    #[test]
+    fn builder_lc_round_trips_through_parser() {
+        let bytes = AscBuilder::lc(48_000, 2).expect("build LC ASC");
+        let asc = parse_asc(&bytes).expect("re-parse");
+        assert_eq!(asc.object_type, AOT_AAC_LC);
+        assert_eq!(asc.sampling_frequency, 48_000);
+        assert_eq!(asc.channel_configuration, 2);
+        assert!(!asc.sbr_present);
+        assert!(!asc.ps_present);
+    }
+
+    #[test]
+    fn builder_he_aac_round_trips() {
+        // 24 kHz core, 48 kHz extended (the canonical HE-AAC v1 setup).
+        let bytes = AscBuilder::he_aac(24_000, 48_000, 2).expect("build HE-AAC ASC");
+        let asc = parse_asc(&bytes).expect("re-parse");
+        assert_eq!(asc.object_type, AOT_AAC_LC);
+        assert!(asc.sbr_present, "explicit AOT 5 must surface sbr_present");
+        assert!(!asc.ps_present);
+        assert_eq!(asc.ext_sampling_frequency, Some(48_000));
+        assert_eq!(asc.channel_configuration, 2);
+    }
+
+    #[test]
+    fn builder_he_aac_v2_round_trips() {
+        // 22.05 kHz core, 44.1 kHz extended, mono SBR core that PS
+        // upmixes to stereo at decode time.
+        let bytes = AscBuilder::he_aac_v2(22_050, 44_100).expect("build HE-AAC v2 ASC");
+        let asc = parse_asc(&bytes).expect("re-parse");
+        assert_eq!(asc.object_type, AOT_AAC_LC);
+        assert!(asc.sbr_present);
+        assert!(asc.ps_present, "explicit AOT 29 must surface ps_present");
+        assert_eq!(asc.ext_sampling_frequency, Some(44_100));
+        assert_eq!(
+            asc.channel_configuration, 1,
+            "PS-bearing ASC carries mono channel_configuration"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_nonstandard_sample_rate() {
+        // 12345 is not in the 13 standard SF indices.
+        assert!(AscBuilder::lc(12_345, 2).is_err());
+        assert!(AscBuilder::he_aac(12_345, 48_000, 2).is_err());
+        assert!(AscBuilder::he_aac(24_000, 12_345, 2).is_err());
+    }
+
+    #[test]
+    fn builder_rejects_invalid_channel_configuration() {
+        // 0 (PCE-defined) and 8 are both out of the supported range.
+        assert!(AscBuilder::lc(48_000, 0).is_err());
+        assert!(AscBuilder::lc(48_000, 8).is_err());
+    }
+
+    #[test]
+    fn builder_lc_he_aac_match_byte_widths() {
+        // Sanity: AAC-LC ASC is 2 bytes (5+4+4+3 = 16 bits + zero pad);
+        // HE-AAC ASC is 4 bytes (5+4+4+4+5+3 = 25 bits + zero pad);
+        // HE-AAC v2 same shape as HE-AAC = 4 bytes.
+        assert_eq!(AscBuilder::lc(44_100, 2).unwrap().len(), 2);
+        assert_eq!(AscBuilder::he_aac(22_050, 44_100, 2).unwrap().len(), 4);
+        assert_eq!(AscBuilder::he_aac_v2(22_050, 44_100).unwrap().len(), 4);
     }
 }
