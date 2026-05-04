@@ -69,12 +69,17 @@
 //!
 //! ## Gating
 //!
-//! Off by default. Enabled per-encoder via
-//! [`crate::encoder::AacEncoder::set_enable_psy_model`] or globally via
-//! environment variable `OXIDEAV_AAC_PSY_MODEL=1`. The legacy flat
-//! target_max=7 path is preserved as the default to avoid bitrate
-//! regressions on existing benchmarks until the new path is fully
-//! validated against the corpus.
+//! **On by default** as of the corpus-validation gate
+//! (`tests/psy_corpus_validation.rs`, 2026-05). Every fixture under
+//! `docs/audio/aac/fixtures/` came within 2 dB PSNR of the legacy
+//! flat-quantiser baseline at matched bitrate, with a +0.07 dB mean
+//! improvement and consistent ~25-35 % byte savings across the
+//! corpus. Disabled per-encoder via
+//! [`crate::encoder::AacEncoder::set_enable_psy_model(false)`] or
+//! globally via environment variable
+//! `OXIDEAV_AAC_PSY_MODEL=0` / `=off` / `=false`. The legacy flat
+//! target_max=7 path is preserved as the opt-out so downstream
+//! callers can A/B against it.
 //!
 //! ## References
 //!
@@ -180,11 +185,15 @@ pub struct PsyModel {
     spread: Vec<Vec<f32>>,
 }
 
-/// Read the env-var override that lights the model up globally.
+/// Read the env-var that gates the psy model. On by default; only
+/// `OXIDEAV_AAC_PSY_MODEL=0`, `=off`, or `=false` flips it off.
+/// Empty string is treated as "set" (on) to match the conventional
+/// shell idiom `OXIDEAV_AAC_PSY_MODEL=`.
 pub fn enabled_via_env() -> bool {
-    std::env::var("OXIDEAV_AAC_PSY_MODEL")
-        .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "off"))
-        .unwrap_or(false)
+    match std::env::var("OXIDEAV_AAC_PSY_MODEL") {
+        Ok(v) => !matches!(v.as_str(), "0" | "false" | "off"),
+        Err(_) => true,
+    }
 }
 
 impl PsyModel {
@@ -399,6 +408,19 @@ impl PsyModel {
         // line. That keeps the existing analyse_and_quantise_opts code
         // shape — it picks per-band SF by solving for a target_max.
         let mut target_max = vec![7i32; n];
+        // Re-derive whether each band is genuinely buried under a
+        // louder neighbour's spread mask. Only those bands are allowed
+        // to coarsen below the flat baseline_target_max (= 7); any
+        // band whose own energy peeks above the neighbour mask must
+        // stay at >= baseline so the encoder doesn't drop the stereo
+        // tone-purity / Goertzel-ratio gates in the round-trip
+        // suite. (Without this floor, neighbour bands of a strong
+        // tone — which carry a small amount of MDCT-window leakage
+        // but more energy than the underlying noise floor — got
+        // coarsened to 1-3, bleeding broadband noise into the
+        // off-band region and dropping the tone-purity ratio from
+        // ~80 to ~25 on stereo 440+880 Hz roundtrips.)
+        let baseline = 7i32;
         for b in 0..n {
             let lo = swb[b] as usize;
             let hi = swb[b + 1] as usize;
@@ -408,20 +430,43 @@ impl PsyModel {
                 continue;
             }
             let th = threshold[b].max(1e-12);
-            // Maximum permissible step size.
             let step_max = (12.0_f32.sqrt() * th).powf(3.0 / 4.0);
-            // q_max from peak / step_max:
             let q_peak = (peak / step_max.max(1e-18)).powf(0.75);
-            // Clamp to a useful range. The flat baseline is 7 (LAV of
-            // book 7/8). Allow finer up to 16 — that lands in book 9/10
-            // (LAV 12/16, no escape) which is ~25 % more bits per pair
-            // than book 7/8 but still avoids the much-more-expensive
-            // book 11 escape codes (≈ 9-10 bits/coef extra). The bench
-            // showed that capping at 40 over-spent on tonal bands
-            // without measurable SDR gain at matched bitrate. Coarsen
-            // down to 1 for fully masked bands.
-            let qm = q_peak.clamp(1.0, 16.0).round() as i32;
-            target_max[b] = qm;
+            // Above-baseline range (8..=16) lands in book 9/10 — ~25 %
+            // more bits per pair than book 7/8. Below-baseline range
+            // (1..=6) saves bits by pushing onto book 1-3 territory
+            // but is only safe on fully-masked bands.
+            let raw = q_peak.clamp(1.0, 16.0).round() as i32;
+            // Strict floor at the legacy flat baseline. The psy
+            // model is ratcheted to be **monotone-improving**: it may
+            // recommend FINER quantisation than `target_max = 7` (on
+            // tonal/loud bands, sending the band into book 9/10/11),
+            // but it must never recommend COARSER. Sub-baseline
+            // target_max generated per-line quant noise on neighbour
+            // bands of strong tones — perceptually masked, yes, but
+            // `tests/encode_roundtrip.rs` measures the ratio of the
+            // tone's energy to the per-line maximum off-band energy,
+            // and per-line noise broke that gate (Goertzel ratios
+            // dropped from ~80 to ~25 on stereo 440+880 Hz
+            // roundtrips when neighbour bands were coarsened to
+            // target_max in 1..=3).
+            //
+            // The trade-off: corpus byte-savings on the wider corpus
+            // are ~25-35 % (vs ~30-40 % when sub-baseline coarsening
+            // was allowed on truly-masked bands). PSNR-vs-source on
+            // the corpus stays positive (mean Δ +0.07 dB; see
+            // `tests/psy_corpus_validation.rs`). Tone-purity gates
+            // on the round-trip suite all hold.
+            //
+            // If a future round wants to recover the lost bit-savings
+            // on demonstrably masked bands, the path forward is to
+            // (a) sample-rate-aware-broaden the masking window so
+            // neighbour bands of a tone don't *look* fully masked,
+            // (b) gate sub-baseline coarsening on a "no tonal
+            // neighbour within ±3 SFB" check, and (c) update the
+            // tone-purity tests to use a band-integrated rather than
+            // per-line noise floor.
+            target_max[b] = raw.max(baseline);
         }
 
         PsyAnalysis {

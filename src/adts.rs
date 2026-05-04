@@ -44,6 +44,13 @@ pub struct AdtsHeader {
     pub channel_configuration: u8,
     /// Total ADTS frame size including the header itself.
     pub frame_length: usize,
+    /// `adts_buffer_fullness` — 11-bit decoder-buffer-room field
+    /// (ISO/IEC 13818-7 §6.2.1). `0x7FF` is the conventional
+    /// VBR sentinel; any value 0..=0x7FE encodes the room in
+    /// 32-bit units. Consumed by the bit-reservoir CBR test gate
+    /// (`tests/cbr_bit_reservoir.rs`) so callers can verify the
+    /// encoder is emitting a live buffer-fullness value.
+    pub buffer_fullness: u16,
     /// Number of raw_data_blocks in this ADTS frame minus one (i.e. 0..=3
     /// where 0 means the most common single-block layout).
     pub number_of_raw_blocks_minus_one: u8,
@@ -98,7 +105,7 @@ pub fn parse_adts_header(data: &[u8]) -> Result<AdtsHeader> {
     let _copyright_id_bit = br.read_bit()?;
     let _copyright_id_start = br.read_bit()?;
     let frame_length = br.read_u32(13)? as usize;
-    let _adts_buffer_fullness = br.read_u32(11)?;
+    let adts_buffer_fullness = br.read_u32(11)? as u16;
     let number_of_raw_blocks_minus_one = br.read_u32(2)? as u8;
 
     if frame_length < ADTS_HEADER_NO_CRC {
@@ -120,6 +127,7 @@ pub fn parse_adts_header(data: &[u8]) -> Result<AdtsHeader> {
         sampling_freq_index,
         channel_configuration,
         frame_length,
+        buffer_fullness: adts_buffer_fullness,
         number_of_raw_blocks_minus_one,
     })
 }

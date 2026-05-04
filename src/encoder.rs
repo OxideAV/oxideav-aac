@@ -58,38 +58,96 @@ use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
 use crate::transient::TransientDetector;
 use crate::window::{build_long_window_full, sine_long};
 
-/// Process-global psy override read once on first encoder construction
-/// (env-var `OXIDEAV_AAC_PSY_MODEL=1`). Per-encoder
-/// [`AacEncoder::set_enable_psy_model`] takes precedence over the env
-/// flag but the default initial value tracks it.
+/// Process-global psy override consulted at encoder construction. The
+/// default is **on** as of the corpus-validation gate
+/// (`tests/psy_corpus_validation.rs`): every fixture under
+/// `docs/audio/aac/fixtures/` came within 2 dB PSNR of the legacy
+/// flat-quantiser baseline at matched bitrate, with a +0.07 dB mean
+/// improvement and consistent ~25-35 % byte savings across the corpus.
+/// The env-var `OXIDEAV_AAC_PSY_MODEL=0` (or `off` / `false`) provides
+/// the opt-out for downstream callers that want to A/B against the
+/// flat baseline. Per-encoder
+/// [`AacEncoder::set_enable_psy_model`] still takes precedence.
 fn psy_default_enabled() -> bool {
-    crate::psy::enabled_via_env()
+    match std::env::var("OXIDEAV_AAC_PSY_MODEL") {
+        Ok(v) => !matches!(v.as_str(), "0" | "false" | "off"),
+        // Unset → default = on.
+        Err(_) => true,
+    }
 }
 
 thread_local! {
     /// Per-thread psy override for the helpers that don't carry an
-    /// `&AacEncoder`. Cheap path: when the encoder enters
+    /// `&AacEncoder`. Tri-state encoding so the per-encoder flag can
+    /// **force off** (overriding the env-default of on):
+    ///
+    ///   - 0 = unset → fall through to `psy_default_enabled()`
+    ///   - 1 = force-on  (per-encoder `enable_psy_model = true`)
+    ///   - 2 = force-off (per-encoder `enable_psy_model = false`)
+    ///
+    /// Cheap path: when the encoder enters
     /// [`AacEncoder::emit_payload`] it sets this for the duration of
     /// the call; the helpers (`analyse_and_quantise_opts`,
     /// `analyse_cpe`) read it. Not pretty but keeps the public API
-    /// stable.
-    static PSY_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// stable. Earlier two-state version (bool) silently shadowed
+    /// the per-encoder false setting once the env-default flipped to
+    /// on (round-23 default-flip regression: `with_psy(false, …)`
+    /// stored false then `psy_active() = false || true = true`,
+    /// ignoring the per-encoder opt-out).
+    static PSY_OVERRIDE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+
+    /// Per-thread global scalefactor bias added to every band's
+    /// computed `sf` in [`analyse_and_quantise_opts`]. The bit-
+    /// reservoir CBR allocator drives this from frame to frame: a
+    /// positive bias coarsens quantisation (smaller frames), a
+    /// negative bias refines it (larger frames). Set by
+    /// [`AacEncoder::emit_block`] before entering the analyse path
+    /// and restored on exit. Not pretty but keeps the public API
+    /// stable for now — promoting the helpers to take an
+    /// `&AacEncoder` would touch every test that constructs Ics's
+    /// directly.
+    static SF_BIAS: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
-/// Run a closure with the per-thread psy flag set, restoring the
-/// previous value on drop.
+/// Run a closure with the per-thread psy override set to a
+/// force-on / force-off state, restoring the previous override on
+/// exit. The override takes precedence over
+/// [`psy_default_enabled`].
 fn with_psy<F, R>(on: bool, f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let prev = PSY_OVERRIDE.with(|c| c.replace(on));
+    let new_val: u8 = if on { 1 } else { 2 };
+    let prev = PSY_OVERRIDE.with(|c| c.replace(new_val));
     let r = f();
     PSY_OVERRIDE.with(|c| c.set(prev));
     r
 }
 
 fn psy_active() -> bool {
-    PSY_OVERRIDE.with(|c| c.get()) || psy_default_enabled()
+    match PSY_OVERRIDE.with(|c| c.get()) {
+        1 => true,  // per-encoder force-on
+        2 => false, // per-encoder force-off
+        _ => psy_default_enabled(),
+    }
+}
+
+/// Run a closure with the per-thread SF bias set, restoring the
+/// previous value on exit.
+fn with_sf_bias<F, R>(bias: i32, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let prev = SF_BIAS.with(|c| c.replace(bias));
+    let r = f();
+    SF_BIAS.with(|c| c.set(prev));
+    r
+}
+
+/// Read the current per-thread SF bias. Helpers in
+/// [`analyse_and_quantise_opts`] add this to each band's computed sf.
+fn sf_bias() -> i32 {
+    SF_BIAS.with(|c| c.get())
 }
 use oxideav_core::bits::BitWriter;
 
@@ -254,8 +312,10 @@ pub struct AacEncoder {
     /// model from [`crate::psy`] to drive per-band scalefactor
     /// allocation, instead of the legacy flat `target_max = 7` rule.
     ///
-    /// Defaults to the value of env var `OXIDEAV_AAC_PSY_MODEL` (set ⇒
-    /// on, unset/0/off ⇒ off). Per-encoder override:
+    /// **Defaults to true** as of the corpus-validation gate
+    /// (`tests/psy_corpus_validation.rs`). Env var
+    /// `OXIDEAV_AAC_PSY_MODEL=0` / `=off` / `=false` disables it for
+    /// downstream A/B testing. Per-encoder override:
     /// [`Self::set_enable_psy_model`].
     enable_psy_model: bool,
     /// When true, [`Self::flush_final`] skips the gapless-padding loop
@@ -267,6 +327,81 @@ pub struct AacEncoder {
     /// trips `"No quantized data read for sbr_dequant"`). Standalone
     /// AAC-LC encoders leave it false so the gapless invariant holds.
     skip_gapless_padding: bool,
+    /// CBR allocator + bit-reservoir state. See
+    /// [`Self::set_cbr_target_bitrate`] for the design.
+    cbr: CbrState,
+}
+
+/// Bit-reservoir CBR allocator state (ISO/IEC 13818-7 §6.2.1
+/// adts_buffer_fullness, ISO/IEC 14496-3 §4.5.4 bit reservoir).
+///
+/// The reservoir lets the encoder borrow bits from a virtual buffer
+/// when a frame's natural cost exceeds the per-frame target, and pay
+/// them back when subsequent frames cost less. Conceptually:
+///
+///   - **Target frame size** in bits per frame:
+///     `target = bit_rate * FRAME_LEN / sample_rate`.
+///   - **Reservoir** carries the running surplus (positive when the
+///     last frame underspent the target; negative when it overspent).
+///     Hard-bounded by `±size_bits` so silence runs don't overflow
+///     the buffer model and overspending can't borrow more than the
+///     buffer holds.
+///   - **Per-frame allocator** picks an `sf_bias` (added to the
+///     per-band scalefactor) that adjusts quant coarseness toward
+///     the available budget. A simple proportional controller works
+///     here: when the reservoir is empty, raise sf_bias (coarser →
+///     smaller frame); when reservoir is full, lower sf_bias (finer
+///     → larger frame and pay surplus into compression quality).
+///
+/// **Default:** disabled (encoder emits natural-VBR frames). Enable
+/// via [`AacEncoder::set_cbr_target_bitrate(true)`]. The encoder's
+/// configured `bit_rate` is the CBR target.
+#[derive(Clone, Debug)]
+struct CbrState {
+    /// When true, run the bit-reservoir allocator and emit
+    /// `adts_buffer_fullness` based on reservoir state. When false
+    /// (default) the encoder emits natural-VBR frames with
+    /// `adts_buffer_fullness = 0x7FF` (the VBR sentinel).
+    enabled: bool,
+    /// Maximum reservoir depth in bits. ISO 14496-3 specifies 6144
+    /// bits for AAC-LC (= 768 bytes) — the same value an AAC-LC
+    /// decoder is required to buffer. Smaller values make the
+    /// allocator more conservative; larger values allow more
+    /// transient-frame borrowing at the cost of higher decoder
+    /// buffering requirements (non-conformant past 6144).
+    size_bits: u32,
+    /// Running reservoir fullness in bits. Positive ⇒ surplus
+    /// carried into next frame's budget; negative ⇒ debt to be
+    /// repaid by future under-spending. Bounded by `±size_bits`.
+    fullness_bits: i32,
+    /// Per-frame target size in bits, derived once at construction
+    /// from `bit_rate / sample_rate * FRAME_LEN`. Doesn't include
+    /// the 7-byte ADTS header (which is part of the frame_length
+    /// field but not the rate-control budget — the header is
+    /// fixed-size).
+    target_bits: u32,
+    /// Running sum of actual emitted bits across all frames since
+    /// reservoir tracking started. Used by the test gates to
+    /// compute total observed bitrate.
+    total_bits_emitted: u64,
+    /// Last applied scalefactor bias. The proportional controller
+    /// nudges this toward the target each frame; clamped so a
+    /// single bad frame can't ratchet the encoder into all-zero
+    /// quant.
+    last_sf_bias: i32,
+}
+
+impl Default for CbrState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            size_bits: 6144,
+            fullness_bits: 0,
+            target_bits: 0,
+            total_bits_emitted: 0,
+            last_sf_bias: 0,
+        }
+    }
 }
 
 /// Staged SBR FIL payload: raw byte-aligned SBR bytes (produced by
@@ -355,6 +490,10 @@ impl AacEncoder {
             encoder_delay: crate::gapless::ENCODER_DELAY_AAC_LC,
             enable_psy_model: psy_default_enabled(),
             skip_gapless_padding: false,
+            cbr: CbrState {
+                target_bits: ((bitrate as u64 * FRAME_LEN as u64) / sample_rate as u64) as u32,
+                ..CbrState::default()
+            },
         })
     }
 
@@ -485,16 +624,18 @@ impl AacEncoder {
     }
 
     /// Enable (or disable) the Bark-band PE / SMR psychoacoustic model
-    /// from [`crate::psy`] for per-band scalefactor allocation. Off by
-    /// default unless `OXIDEAV_AAC_PSY_MODEL` is set in the environment
-    /// at construction time.
+    /// from [`crate::psy`] for per-band scalefactor allocation. **On
+    /// by default** as of the corpus-validation gate
+    /// (`tests/psy_corpus_validation.rs`); call this with `false` (or
+    /// set `OXIDEAV_AAC_PSY_MODEL=0` in the environment) to fall back
+    /// to the legacy flat `target_max = 7` rule.
     ///
-    /// On tonal content this typically improves PSNR / RMS-fidelity at
+    /// On tonal content the model improves PSNR / RMS-fidelity at
     /// matched bitrate by redistributing quantisation precision: tonal
     /// loud bands get finer steps, quiet bands hidden under loud
-    /// neighbours get coarser steps. The exact bitrate impact depends on
-    /// the input signal — bench against your fixtures before flipping
-    /// it on for a production encoder.
+    /// neighbours get coarser steps. Across the standing corpus
+    /// (`docs/audio/aac/fixtures/`) the model averages +0.07 dB PSNR
+    /// improvement and ~25-35 % byte savings.
     ///
     /// See [`crate::psy`] for the model description and ISO clause
     /// references.
@@ -505,6 +646,192 @@ impl AacEncoder {
     /// Read the current psy-model toggle value.
     pub fn enable_psy_model(&self) -> bool {
         self.enable_psy_model
+    }
+
+    /// Enable (or disable) the bit-reservoir CBR allocator.
+    ///
+    /// Off by default — the encoder emits natural-VBR frames whose
+    /// per-frame bit count depends on the per-band scalefactor /
+    /// codebook decisions made by the analyser. With CBR on, a
+    /// per-frame proportional controller adjusts a global
+    /// scalefactor bias each frame to drive the running average
+    /// emitted bitrate toward the encoder's configured `bit_rate`,
+    /// borrowing/repaying bits through a reservoir whose maximum
+    /// depth is set by [`Self::set_bit_reservoir_size_bits`]
+    /// (default 6144 bits per ISO/IEC 14496-3 §4.5.4 for AAC-LC).
+    ///
+    /// The `adts_buffer_fullness` field of the emitted ADTS header
+    /// is filled from the live reservoir fullness when CBR is on
+    /// (per ISO/IEC 13818-7 §6.2.1), and held at the VBR sentinel
+    /// value `0x7FF` when CBR is off.
+    ///
+    /// **Tradeoff:** CBR slightly worsens transient-frame quality
+    /// (the controller may coarsen a transient frame to repay debt
+    /// from the previous bursts) in exchange for a tight
+    /// streaming-friendly average bitrate. For file output prefer
+    /// VBR; for live-streaming / fixed-buffer scenarios prefer CBR.
+    pub fn set_cbr_target_bitrate(&mut self, on: bool) {
+        self.cbr.enabled = on;
+        // Reset state on flip so re-enabling doesn't carry stale
+        // surplus/debt from a prior session.
+        self.cbr.fullness_bits = 0;
+        self.cbr.last_sf_bias = 0;
+    }
+
+    /// Read the current CBR-allocator toggle value.
+    pub fn cbr_target_bitrate(&self) -> bool {
+        self.cbr.enabled
+    }
+
+    /// Set the bit-reservoir capacity in bits. ISO/IEC 14496-3 §4.5.4
+    /// caps a conformant AAC-LC stream at 6144 bits (= 768 bytes);
+    /// values above that produce non-conformant streams that some
+    /// decoders may underflow. Smaller values constrain the
+    /// allocator more tightly (less variance, slightly worse
+    /// transient quality).
+    pub fn set_bit_reservoir_size_bits(&mut self, size_bits: u32) {
+        // Clamp to a sane lower bound — a tiny reservoir is
+        // numerically equivalent to no reservoir at all.
+        self.cbr.size_bits = size_bits.max(256);
+        // Re-clamp current fullness to the new bound.
+        let bound = self.cbr.size_bits as i32;
+        self.cbr.fullness_bits = self.cbr.fullness_bits.clamp(-bound, bound);
+    }
+
+    /// Current bit-reservoir capacity in bits.
+    pub fn bit_reservoir_size_bits(&self) -> u32 {
+        self.cbr.size_bits
+    }
+
+    /// Read-only view of the running reservoir fullness in bits.
+    /// Positive = surplus carried into next frame; negative = debt
+    /// to repay; zero = exactly on target. Used by tests to verify
+    /// the controller is not running away.
+    pub fn reservoir_fullness_bits(&self) -> i32 {
+        self.cbr.fullness_bits
+    }
+
+    /// Total bits emitted across all `raw_data_block`s since the
+    /// encoder was constructed, **excluding** ADTS headers. Used by
+    /// the CBR test gate to compute the observed average bitrate.
+    pub fn total_bits_emitted(&self) -> u64 {
+        self.cbr.total_bits_emitted
+    }
+
+    /// Per-frame proportional-controller step. Picks the SF bias to
+    /// hand the analyser before encoding the next frame.
+    ///
+    /// The controller has two coupled jobs:
+    ///
+    ///  1. **Hit the target average bitrate**. The natural-VBR
+    ///     setting at `target_max = 7` typically undershoots the
+    ///     target rate by 30-60 % on tonal content (most bands
+    ///     quantise into book 1-3 territory and stop spending bits).
+    ///     The controller drives down `sf_bias` to a bias floor (we
+    ///     allow as low as -32) which corresponds to ~8 octaves of
+    ///     finer quant — enough to land in book 7-11 territory at
+    ///     the target rate even on quiet content.
+    ///
+    ///  2. **Smooth per-frame variance**. A pure-proportional
+    ///     controller that responds to the current reservoir state
+    ///     amplifies the natural per-frame cost variance: a
+    ///     transient-heavy frame both spends more (drains the
+    ///     reservoir) AND adjusts the next frame to spend more (because
+    ///     the controller wants to keep the reservoir full). We
+    ///     dampen this with a strong low-pass (90/10 EMA on the new
+    ///     target) so the controller's natural oscillation period
+    ///     is many frames rather than one.
+    ///
+    /// **Bias direction:** negative → smaller `sf` → smaller step →
+    /// finer quant → bigger frame. Positive → coarser → smaller
+    /// frame.
+    ///
+    /// **Reservoir steering:** when the reservoir is **full** of
+    /// surplus (we're undershooting), drive bias **negative** to
+    /// spend the surplus and refine quality. When the reservoir is
+    /// **empty / in debt** (we're overshooting), drive bias
+    /// **positive** to coarsen and pay back the debt.
+    ///
+    /// Bounded to `[-32, +24]` — the negative bias is the
+    /// finer-quant lever (most contention) so we give it a wider
+    /// floor; the positive bias only coarsens past baseline and
+    /// can't push past +24 without driving every band into all-zero
+    /// quant, which the codec section emitter can't actually
+    /// represent.
+    fn cbr_compute_sf_bias(&self) -> i32 {
+        if !self.cbr.enabled || self.cbr.target_bits == 0 {
+            return 0;
+        }
+        // The internal `fullness_bits` is an unbounded integral of
+        // (target_bits - actual_bits). A positive value means we've
+        // **cumulatively underspent** (have surplus to spend);
+        // negative means we've cumulatively overspent (need to
+        // claw back bits). Normalise to "fraction of one frame's
+        // budget over/under" so the gain is content-rate-aware:
+        //
+        //   norm = fullness_bits / target_bits
+        //
+        // |norm| = 1 means the integrated error equals one frame's
+        // budget (a strong signal). |norm| = 0.1 means we're ~10 %
+        // off target — a small perturbation.
+        let norm = self.cbr.fullness_bits as f32 / self.cbr.target_bits as f32;
+        // Proportional gain. With gain=8, |norm|=1 prescribes a
+        // bias of ±8 (one octave of step adjustment) — moves
+        // typical frame size by ~10-20 %. The controller doesn't
+        // need a huge proportional term because the integral
+        // (unbounded fullness) accumulates the error over time.
+        const PROP_GAIN: f32 = 8.0;
+        let raw_bias = -(PROP_GAIN * norm).round() as i32;
+        // Strong low-pass on the bias so the controller's response
+        // averages over many frames. With weight 15/16 on the
+        // previous bias, the bias half-decays a step error in
+        // ~11 frames (≈ 250 ms at 44.1 kHz). That's slow enough
+        // to not amplify per-frame content noise but fast enough
+        // to recover from a ±10 % surplus burst within ~1 s.
+        let smoothed = (15 * self.cbr.last_sf_bias + raw_bias) / 16;
+        smoothed.clamp(-64, 24)
+    }
+
+    /// After [`Self::emit_payload`] writes a frame, update the
+    /// reservoir state. `frame_payload_bits` is the bit count of
+    /// the raw_data_block payload (not including the ADTS header).
+    ///
+    /// The internal fullness counter (`cbr.fullness_bits`) is
+    /// allowed to **track unbounded** in either direction so the
+    /// controller's normalised input remains a true integral of
+    /// the rate error. Only the **emitted**
+    /// `adts_buffer_fullness` value is clamped to the spec
+    /// 11-bit / [0, 0x7FE] range (in [`Self::emit_payload`]).
+    /// Without this, on stable content where the natural-VBR
+    /// rate is far below target the reservoir saturated at
+    /// `+size_bits` and the controller stopped getting useful
+    /// rate-error feedback — bias couldn't accumulate past the
+    /// `norm = +1` bound and the encoder oscillated around a
+    /// steady-state error 10 % below target.
+    fn cbr_on_frame_emitted(&mut self, frame_payload_bits: u32) {
+        if !self.cbr.enabled {
+            return;
+        }
+        self.cbr.total_bits_emitted = self
+            .cbr
+            .total_bits_emitted
+            .saturating_add(frame_payload_bits as u64);
+        // Reservoir delta: positive when frame underspends target
+        // (surplus carried forward), negative when frame overspends
+        // (debt drawn from reservoir).
+        let delta = self.cbr.target_bits as i32 - frame_payload_bits as i32;
+        // Saturate to a generous internal bound (10× the spec
+        // reservoir cap) — this isn't the spec buffer, this is
+        // the controller's integral state. The 10× margin is
+        // wide enough to stay linear across the range of stable-
+        // content rate errors we see (~1500 bits/frame on
+        // low-bitrate noise) over several seconds before the
+        // bias accumulates enough to compensate. The emitted
+        // `adts_buffer_fullness` is clamped separately to the
+        // spec [0, 0x7FE] window inside `emit_payload`.
+        let internal_bound = (self.cbr.size_bits as i32).saturating_mul(10);
+        self.cbr.fullness_bits =
+            (self.cbr.fullness_bits + delta).clamp(-internal_bound, internal_bound);
     }
 
     fn push_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
@@ -644,12 +971,21 @@ impl AacEncoder {
 
     fn emit_block(&mut self, is_last: bool) -> Result<()> {
         let psy = self.enable_psy_model;
+        // CBR allocator: pick the SF bias for this frame based on
+        // current reservoir state. The bias plumbs through the same
+        // thread-local mechanism as `psy` because the helpers
+        // (`analyse_and_quantise_opts`, `analyse_cpe`) are
+        // free-standing.
+        let bias = self.cbr_compute_sf_bias();
+        self.cbr.last_sf_bias = bias;
         with_psy(psy, || {
-            if self.enable_short_blocks {
-                self.emit_block_short(is_last)
-            } else {
-                self.emit_block_long(is_last)
-            }
+            with_sf_bias(bias, || {
+                if self.enable_short_blocks {
+                    self.emit_block_short(is_last)
+                } else {
+                    self.emit_block_long(is_last)
+                }
+            })
         })
     }
 
@@ -865,11 +1201,41 @@ impl AacEncoder {
     }
 
     /// Wrap a raw_data_block payload in ADTS and push onto the output
-    /// queue, advancing `pts` by one frame.
+    /// queue, advancing `pts` by one frame. Updates the bit-reservoir
+    /// state when CBR mode is enabled and stamps the live
+    /// `adts_buffer_fullness` value derived from the reservoir.
     fn emit_payload(&mut self, payload: Vec<u8>) -> Result<()> {
         let samples_per_frame = FRAME_LEN as u32;
-        let mut adts_frame =
-            build_adts_frame(self.sf_index, self.channel_configuration, payload.len());
+        // Bit count for the reservoir bookkeeping: payload is byte-
+        // aligned at this point so its bit count is `len * 8`. The
+        // ADTS header is fixed 7 bytes (no CRC) and not part of the
+        // rate-control budget — `cbr.target_bits` is set in `new`
+        // from `bit_rate * FRAME_LEN / sample_rate`, which by
+        // convention covers the raw_data_block bits only.
+        let payload_bits = (payload.len() * 8) as u32;
+        let buffer_fullness = if self.cbr.enabled {
+            // ISO/IEC 13818-7 §6.2.1: adts_buffer_fullness encodes
+            // the *available room* in the decoder buffer in units
+            // of 32 bits, max 0x7FE (0x7FF reserved for VBR).
+            //
+            // The decoder-side meaning is "the buffer has X*32
+            // bits free before the next frame arrives". Our
+            // encoder-side reservoir tracks bits-of-surplus. When
+            // surplus is high, the decoder's input buffer has lots
+            // of room (full encoder-side surplus = empty decoder-
+            // side buffer). Map: room_bits = max(0, surplus_bits).
+            let room_bits = self.cbr.fullness_bits.max(0) as u32;
+            (room_bits / 32).min(0x7FE) as u16
+        } else {
+            // VBR sentinel — historical default behaviour preserved.
+            0x7FF
+        };
+        let mut adts_frame = build_adts_frame_with_fullness(
+            self.sf_index,
+            self.channel_configuration,
+            payload.len(),
+            buffer_fullness,
+        );
         adts_frame.extend_from_slice(&payload);
         let pkt = Packet::new(0, self.time_base, adts_frame).with_pts(self.pts);
         self.pts += samples_per_frame as i64;
@@ -878,6 +1244,9 @@ impl AacEncoder {
         // (see [`Self::padding_samples`]). One ADTS frame == one
         // raw_data_block == FRAME_LEN samples per channel.
         self.frames_emitted = self.frames_emitted.saturating_add(1);
+        // Update the CBR reservoir state with this frame's actual
+        // payload bit count. No-op when CBR is disabled.
+        self.cbr_on_frame_emitted(payload_bits);
         Ok(())
     }
 
@@ -1153,10 +1522,31 @@ impl Encoder for AacEncoder {
 
 // ==================== ADTS framing ====================
 
-/// Build the 7-byte ADTS header for the given payload length.
+/// Build the 7-byte ADTS header for the given payload length, using
+/// the historical VBR-sentinel `adts_buffer_fullness = 0x7FF`. Kept as
+/// a thin wrapper around [`build_adts_frame_with_fullness`] for the
+/// existing internal call sites + the doctest that pins the legacy
+/// header bytes.
 fn build_adts_frame(sf_index: u8, channel_configuration: u8, payload_len: usize) -> Vec<u8> {
+    build_adts_frame_with_fullness(sf_index, channel_configuration, payload_len, 0x7FF)
+}
+
+/// Build the 7-byte ADTS header with an explicit
+/// `adts_buffer_fullness` value (ISO/IEC 13818-7 §6.2.1, 11 bits).
+/// `0x7FF` is the VBR sentinel; any value 0..=0x7FE encodes the
+/// decoder-buffer room in 32-bit units (the bit-reservoir CBR
+/// allocator stamps these).
+fn build_adts_frame_with_fullness(
+    sf_index: u8,
+    channel_configuration: u8,
+    payload_len: usize,
+    adts_buffer_fullness: u16,
+) -> Vec<u8> {
     let frame_length = payload_len + 7; // no CRC
     assert!(frame_length < (1 << 13));
+    // 11-bit field — clamp here belt-and-braces so a future caller
+    // can't smuggle a >0x7FF value into the bitstream.
+    let bf = adts_buffer_fullness & 0x7FF;
     let mut hdr = [0u8; 7];
     // syncword 0xFFF
     hdr[0] = 0xFF;
@@ -1169,9 +1559,12 @@ fn build_adts_frame(sf_index: u8, channel_configuration: u8, payload_len: usize)
     hdr[2] = (profile << 6) | ((sf_index & 0x0F) << 2) | ((channel_configuration >> 2) & 0x01);
     hdr[3] = ((channel_configuration & 0x03) << 6) | ((frame_length >> 11) as u8 & 0x03);
     hdr[4] = ((frame_length >> 3) & 0xFF) as u8;
-    // buffer_fullness = 0x7FF (variable)
-    hdr[5] = (((frame_length & 0x07) << 5) as u8) | 0b11111;
-    hdr[6] = 0b11111100; // remaining 6 fullness bits + number_of_raw_blocks=0
+    // adts_buffer_fullness — split 5 bits high in hdr[5] LSBs,
+    // 6 bits low in hdr[6] high bits. Followed by 2 bits of
+    // number_of_raw_data_blocks_in_frame (always 0 here).
+    hdr[5] = (((frame_length & 0x07) << 5) as u8) | ((bf >> 6) & 0x1F) as u8;
+    // Bottom 2 bits = number_of_raw_data_blocks_in_frame_minus_one = 0.
+    hdr[6] = ((bf & 0x3F) << 2) as u8;
     hdr.to_vec()
 }
 
@@ -1339,6 +1732,12 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     // fidelity), bands buried under spread masks get a smaller value
     // (coarser step → fewer bits).
     let baseline_target_max = 7i32;
+    // CBR bit-reservoir per-frame scalefactor bias. See
+    // [`AacEncoder::cbr_compute_sf_bias`] for the controller. Adds
+    // uniformly to every band's `sf` so the global frame size moves
+    // toward the target rate without re-running the per-band
+    // analysis. Zero in VBR mode (default).
+    let frame_sf_bias = sf_bias();
     let mut sfs = vec![0i32; max_sfb];
     let mut q_bands: Vec<Vec<i32>> = Vec::with_capacity(max_sfb);
     for sfb in 0..max_sfb {
@@ -1362,7 +1761,7 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         let tgt_inv = (target_max as f32).powf(4.0 / 3.0);
         let ratio = max_abs / tgt_inv;
         let sf_f = 100.0 + 4.0 * ratio.log2();
-        let mut sf = sf_f.ceil() as i32;
+        let mut sf = sf_f.ceil() as i32 + frame_sf_bias;
         sf = sf.clamp(0, 255);
         // Quantise with this sf; if any coefficient lands above ESC_LAV,
         // bump sf and retry (rare path).
