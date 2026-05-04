@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/OxideAV/oxideav-aac/compare/v0.0.11...v0.1.0) - 2026-05-04
+
+### Other
+
+- promote to 0.1
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-aac/compare/v0.0.10...v0.0.11) - 2026-05-04
 
 ### Other
