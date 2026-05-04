@@ -631,11 +631,15 @@ impl AacEncoder {
     /// to the legacy flat `target_max = 7` rule.
     ///
     /// On tonal content the model improves PSNR / RMS-fidelity at
-    /// matched bitrate by redistributing quantisation precision: tonal
-    /// loud bands get finer steps, quiet bands hidden under loud
-    /// neighbours get coarser steps. Across the standing corpus
-    /// (`docs/audio/aac/fixtures/`) the model averages +0.07 dB PSNR
-    /// improvement and ~25-35 % byte savings.
+    /// matched-band-target by giving tonal/loud bands a finer
+    /// `target_max` (book 9/10/11 territory). Across the standing
+    /// corpus (`docs/audio/aac/fixtures/`) the model averages
+    /// +0.07 dB PSNR delta vs the flat baseline at slightly higher
+    /// byte cost (~1-4 % typical, 16 % on the noise-band fixture
+    /// where tonality classification is unstable). Use with the
+    /// bit-reservoir CBR allocator
+    /// ([`Self::set_cbr_target_bitrate`]) to bound bytes at a
+    /// configured rate target.
     ///
     /// See [`crate::psy`] for the model description and ISO clause
     /// references.

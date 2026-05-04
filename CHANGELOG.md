@@ -17,9 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5.1, 7.1, plus HE-AAC v1/v2), encodes each at 64 kbps mono with psy
   off vs psy on at matched bitrate, decodes back through the in-tree
   decoder, and asserts no fixture loses more than 2 dB PSNR vs the
-  source PCM. Result: mean Δ +0.07 dB PSNR, worst -0.41 dB (mono-8000-
+  source PCM. Result: mean Δ +0.07 dB PSNR, worst -0.40 dB (mono-8000-
   16kbps), best +1.70 dB (intensity-stereo); 16/18 fixtures within
-  ±0.15 dB; consistent ~25-35 % byte savings across the corpus.
+  ±0.15 dB. Byte-size impact: most fixtures grow ~1-4 % (the floor-
+  at-baseline ratchet means psy can only refine quant, not coarsen,
+  so it spends more bits on tonal bands); pns-noise grows ~17 %
+  because the noise band's tonality classification is unstable on
+  the corpus reference WAV. The bit-reservoir CBR allocator is the
+  intended way to bound this growth at a configured rate target.
 - `AacEncoder::set_cbr_target_bitrate(bool)` plus
   `set_bit_reservoir_size_bits(u32)` enable a bit-reservoir CBR
   allocator (ISO/IEC 14496-3 §4.5.4 / 13818-7 §6.2.1). Off by default

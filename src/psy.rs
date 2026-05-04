@@ -73,13 +73,15 @@
 //! (`tests/psy_corpus_validation.rs`, 2026-05). Every fixture under
 //! `docs/audio/aac/fixtures/` came within 2 dB PSNR of the legacy
 //! flat-quantiser baseline at matched bitrate, with a +0.07 dB mean
-//! improvement and consistent ~25-35 % byte savings across the
-//! corpus. Disabled per-encoder via
+//! improvement at slightly higher byte cost (~1-4 % typical; the
+//! floor-at-baseline ratchet on `target_max` lets the model only
+//! refine, never coarsen). Disabled per-encoder via
 //! [`crate::encoder::AacEncoder::set_enable_psy_model(false)`] or
 //! globally via environment variable
-//! `OXIDEAV_AAC_PSY_MODEL=0` / `=off` / `=false`. The legacy flat
-//! target_max=7 path is preserved as the opt-out so downstream
-//! callers can A/B against it.
+//! `OXIDEAV_AAC_PSY_MODEL=0` / `=off` / `=false`. Pair with the
+//! bit-reservoir CBR allocator
+//! ([`crate::encoder::AacEncoder::set_cbr_target_bitrate`]) to bound
+//! bytes at a configured rate.
 //!
 //! ## References
 //!
