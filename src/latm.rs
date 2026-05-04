@@ -31,7 +31,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::asc::{parse_asc, AudioSpecificConfig};
+use crate::asc::{parse_asc, parse_asc_from_bitreader, AudioSpecificConfig};
 
 /// One AAC access unit extracted from a LATM `audio_mux_element`,
 /// together with the `AudioSpecificConfig` that should be used to
@@ -285,74 +285,16 @@ fn read_bits_into_bytes(br: &mut BitReader<'_>, n: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Mirror of [`crate::asc::parse_asc`] that operates on a `BitReader`
-/// (so we can measure how many bits it consumed). Returning the parsed
-/// view is unnecessary here — the caller only cares about the bit
-/// position afterwards — but we surface it so the helper stays useful.
+/// Bit-position-tracking ASC walk. Delegates to
+/// [`crate::asc::parse_asc_from_bitreader`] so the LATM length probe
+/// stays in lock-step with the production ASC parser — including
+/// GASpecificConfig and the backward-compatible SBR/PS sync extension.
+/// Without delegation, an LATM stream carrying backward-compat SBR
+/// signalling (`audioObjectType=2` + trailing `0x2B7`) would have its
+/// captured ASC truncated and `parse_asc(captured)` would silently
+/// drop the extension flags.
 fn parse_asc_into(br: &mut BitReader<'_>) -> Result<()> {
-    use crate::syntax::{sample_rate, AOT_PS, AOT_SBR};
-    fn read_aot(br: &mut BitReader<'_>) -> Result<u8> {
-        let mut aot = br.read_u32(5)? as u8;
-        if aot == 31 {
-            aot = (32 + br.read_u32(6)?) as u8;
-        }
-        Ok(aot)
-    }
-    fn read_sf(br: &mut BitReader<'_>) -> Result<u32> {
-        let idx = br.read_u32(4)? as u8;
-        if idx == 0xF {
-            br.read_u32(24)
-        } else {
-            sample_rate(idx).ok_or_else(|| Error::invalid("LATM ASC: reserved SF index"))
-        }
-    }
-    let mut aot = read_aot(br)?;
-    let _sf = read_sf(br)?;
-    let _ch_cfg = br.read_u32(4)?;
-    if aot == AOT_SBR || aot == AOT_PS {
-        let _ext_sf = read_sf(br)?;
-        aot = read_aot(br)?;
-    }
-    // GASpecificConfig (§4.4.1): for AAC-LC the next bits are
-    //   frameLengthFlag           1
-    //   dependsOnCoreCoder        1
-    //   if (depends) coreCoderDelay  14
-    //   extensionFlag             1
-    //   if (channel_config==0) program_config_element()  (we don't model)
-    //   if (extensionFlag) ... (object-type dependent)
-    // We model the cheap tail to track the ASC bit-length faithfully.
-    if matches!(aot, 1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22 | 23) {
-        let _frame_length_flag = br.read_bit()?;
-        let depends_on_core = br.read_bit()?;
-        if depends_on_core {
-            let _core_coder_delay = br.read_u32(14)?;
-        }
-        let extension_flag = br.read_bit()?;
-        // channel_config==0 case omitted — LATM streams in the wild
-        // always carry an explicit channel config.
-        // §4.4.1.1: layerNr is signalled for AAC-scalable (6) and ER
-        // AAC-scalable (20).
-        if matches!(aot, 6 | 20) {
-            let _layer_nr = br.read_u32(3)?;
-        }
-        if extension_flag {
-            // §4.4.1.1: extensionFlag tail is object-type-dependent.
-            //   AOT 22:        numOfSubFrame(5) + layer_length(11)
-            //   AOTs 17/19/20/23: 3 resilience flag bits
-            //   then extensionFlag3 (1 bit).
-            // For pure AAC-LC (AOT 2) the spec says extensionFlag is
-            // reserved-zero, but defensively we still read the
-            // extensionFlag3 trailer if it ever shows up.
-            if aot == 22 {
-                let _ = br.read_u32(5)?;
-                let _ = br.read_u32(11)?;
-            } else if matches!(aot, 17 | 19 | 20 | 23) {
-                let _ = br.read_u32(3)?;
-            }
-            let _extension_flag3 = br.read_bit()?;
-        }
-    }
-    Ok(())
+    parse_asc_from_bitreader(br).map(|_| ())
 }
 
 /// Result of one `audio_mux_element` parse — zero or more AAC access
@@ -506,6 +448,60 @@ mod tests {
         assert_eq!(ame.frames.len(), 1);
         assert_eq!(ame.frames[0].payload, vec![0x11, 0x22, 0x33]);
         assert_eq!(ame.frames[0].asc.sampling_frequency, 44_100);
+    }
+
+    /// Build an audio_mux_element whose embedded ASC carries the
+    /// backward-compatible SBR signalling (sync extension `0x2B7` + AOT
+    /// 5 + SBR-present + extSamplingFrequencyIndex). This is the common
+    /// HE-AAC-in-LATM shape used by broadcast streams.
+    fn build_lc_with_backcompat_sbr_audio_mux_element() -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // useSameStreamMux
+        bw.write_bit(false); // audioMuxVersion = 0
+        bw.write_bit(true); // allStreamsSameTimeFraming
+        bw.write_u32(0, 6); // numSubFrames
+        bw.write_u32(0, 4); // numProgram
+        bw.write_u32(0, 3); // numLayer
+                            // ASC: LC at 22.05 kHz (idx=7) stereo + GASpecificConfig +
+                            // backward-compat sync 0x2B7 + AOT 5 + sbrPresent=1 + ext_idx=4 (44.1k)
+        bw.write_u32(2, 5); // AOT = LC
+        bw.write_u32(7, 4); // sf_idx = 7 (22.05 kHz core)
+        bw.write_u32(2, 4); // channel_config = 2
+        bw.write_bit(false); // frameLengthFlag
+        bw.write_bit(false); // dependsOnCoreCoder
+        bw.write_bit(false); // extensionFlag
+        bw.write_u32(0x2B7, 11); // sync_extension_type
+        bw.write_u32(5, 5); // extensionAudioObjectType = SBR
+        bw.write_bit(true); // sbrPresentFlag
+        bw.write_u32(4, 4); // extSamplingFrequencyIndex = 44.1 kHz
+                            // LATM tail
+        bw.write_u32(0, 3); // frameLengthType = 0
+        bw.write_u32(0xFF, 8); // latmBufferFullness
+        bw.write_bit(false); // otherDataPresent
+        bw.write_bit(false); // crcCheckPresent
+        bw.write_u32(3, 8); // PayloadLengthInfo => 3 bytes
+        for b in [0xAB, 0xCD, 0xEF] {
+            bw.write_u32(b, 8);
+        }
+        bw.align_to_byte();
+        bw.finish()
+    }
+
+    #[test]
+    fn parses_lc_with_backcompat_sbr_in_latm() {
+        let data = build_lc_with_backcompat_sbr_audio_mux_element();
+        let mut ctx = LatmContext::new();
+        let ame = AudioMuxElement::parse(&data, &mut ctx).expect("parse");
+        let asc = ctx.asc.as_ref().expect("asc cached");
+        assert_eq!(asc.object_type, crate::syntax::AOT_AAC_LC);
+        assert_eq!(asc.sampling_frequency, 22_050);
+        assert!(
+            asc.sbr_present,
+            "LATM ASC walk must surface backward-compat SBR signalling"
+        );
+        assert_eq!(asc.ext_sampling_frequency, Some(44_100));
+        assert_eq!(ame.frames.len(), 1);
+        assert_eq!(ame.frames[0].payload, vec![0xAB, 0xCD, 0xEF]);
     }
 
     #[test]

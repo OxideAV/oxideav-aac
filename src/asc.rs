@@ -152,14 +152,16 @@ fn parse_ga_specific_config(
 /// Walk the optional backward-compatible sync extension at the tail of
 /// the ASC (§1.6.6.1). Returns `(sbr_present, ps_present, ext_sf_hz)`.
 /// All `false` / `None` if the extension is absent or unrecognised.
+/// In every "no extension" outcome the bit cursor is rewound to the
+/// pre-call position so the LATM length probe (which measures the ASC
+/// span via `br.bit_position()`) doesn't overcount.
 ///
 /// Carriers in the wild (especially MP4 broadcasts) often use this
 /// signalling instead of explicit `AOT_SBR == 5`; without it the
 /// decoder would never enable the SBR pipeline.
 fn parse_backward_compat_extension(br: &mut BitReader<'_>) -> (bool, bool, Option<u32>) {
-    // We consume bits speculatively. If anything fails (incl. running
-    // out of buffer mid-extension), fall back to "no extension".
-    let start_pos = br.bit_position();
+    // BitReader is Copy — snapshot before any speculative read.
+    let checkpoint = *br;
     let outcome: Result<(bool, bool, Option<u32>)> = (|| {
         let sync = br.read_u32(11)?;
         if sync != SYNC_EXTENSION_TYPE_SBR {
@@ -176,11 +178,24 @@ fn parse_backward_compat_extension(br: &mut BitReader<'_>) -> (bool, bool, Optio
             // (value 0x548) followed by `psPresentFlag` may appear
             // for AOT_PS (29). If reading runs out of buffer just
             // settle for SBR-only.
-            let ps_sync = br.read_u32(11).ok();
-            let ps_present_flag = if ps_sync == Some(0x548) {
-                br.read_bit().unwrap_or(false)
-            } else {
-                false
+            let ps_check = *br;
+            let ps_sync = br.read_u32(11);
+            let ps_present_flag = match ps_sync {
+                Ok(0x548) => br.read_bit().unwrap_or_else(|_| {
+                    *br = ps_check;
+                    false
+                }),
+                Ok(_) => {
+                    // 11 bits consumed but no PS sub-sync — rewind so
+                    // the cursor only reflects the SBR extension we
+                    // actually accepted.
+                    *br = ps_check;
+                    false
+                }
+                Err(_) => {
+                    *br = ps_check;
+                    false
+                }
             };
             Ok((true, ps_present_flag, Some(ext_sf)))
         } else if ext_aot == 22 {
@@ -200,14 +215,12 @@ fn parse_backward_compat_extension(br: &mut BitReader<'_>) -> (bool, bool, Optio
         }
     })();
     match outcome {
-        Ok(t) => t,
-        Err(_) => {
-            // Roll back the speculative read. BitReader doesn't
-            // expose a rewind API — but the only callers of this
-            // function consume the rest of the ASC unconditionally,
-            // so leaving the cursor in place is harmless. We simply
-            // report "no extension".
-            let _ = start_pos;
+        Ok(t @ (true, _, _)) => t,
+        Ok(_) | Err(_) => {
+            // No usable extension found (or speculative read ran off
+            // the end of the buffer): rewind to the saved checkpoint
+            // so callers see a no-op cursor advance.
+            *br = checkpoint;
             (false, false, None)
         }
     }
@@ -216,9 +229,16 @@ fn parse_backward_compat_extension(br: &mut BitReader<'_>) -> (bool, bool, Optio
 /// Parse an AudioSpecificConfig blob.
 pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
     let mut br = BitReader::new(data);
+    parse_asc_from_bitreader(&mut br)
+}
 
-    let mut object_type = read_audio_object_type(&mut br)?;
-    let (mut sampling_frequency_index, mut sampling_frequency) = read_sampling_frequency(&mut br)?;
+/// Parse an AudioSpecificConfig from an in-flight `BitReader`. Useful
+/// for the LATM `StreamMuxConfig` capture path which needs to know
+/// exactly how many bits the ASC consumed (`br.bit_position()` after
+/// the call). Behaviour is otherwise identical to [`parse_asc`].
+pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificConfig> {
+    let mut object_type = read_audio_object_type(br)?;
+    let (mut sampling_frequency_index, mut sampling_frequency) = read_sampling_frequency(br)?;
     let channel_configuration = br.read_u32(4)? as u8;
 
     let mut sbr_present = false;
@@ -232,10 +252,10 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
         if object_type == AOT_PS {
             ps_present = true;
         }
-        let (_ext_idx, ext_sf) = read_sampling_frequency(&mut br)?;
+        let (_ext_idx, ext_sf) = read_sampling_frequency(br)?;
         ext_sampling_frequency = Some(ext_sf);
         // The actual underlying object type follows.
-        object_type = read_audio_object_type(&mut br)?;
+        object_type = read_audio_object_type(br)?;
         // For SBR-only streams the underlying is usually AAC-LC (2). PS
         // (29) implies stereo from a mono base channel.
         // Note we don't carry forward the index, just the rate — that's
@@ -258,7 +278,7 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
     // backward-compat sync probe and the optional embedded PCE.
     let mut pce = None;
     if is_ga_aot(object_type) {
-        match parse_ga_specific_config(&mut br, object_type, channel_configuration) {
+        match parse_ga_specific_config(br, object_type, channel_configuration) {
             Ok(p) => pce = p,
             Err(Error::NeedMore) | Err(Error::InvalidData(_)) => {
                 // PCE *required* (channel_configuration == 0) and we
@@ -284,7 +304,7 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
             AOT_AAC_MAIN | AOT_AAC_LC | AOT_AAC_SSR | AOT_AAC_LTP
         )
     {
-        let (sbr_ext, ps_ext, ext_sf) = parse_backward_compat_extension(&mut br);
+        let (sbr_ext, ps_ext, ext_sf) = parse_backward_compat_extension(br);
         if sbr_ext {
             sbr_present = true;
             ext_sampling_frequency = ext_sf;

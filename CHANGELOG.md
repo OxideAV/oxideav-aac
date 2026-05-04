@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The LATM `StreamMuxConfig` length probe now delegates to the unified
+  `parse_asc_from_bitreader` helper instead of carrying its own
+  hand-rolled mirror of `parse_asc`. Consequence: LATM streams whose
+  embedded ASC carries backward-compatible SBR/PS signalling
+  (sync `0x2B7` after a plain LC GASpecificConfig) capture the SBR
+  flag + extended sample rate correctly, where the prior code would
+  truncate the captured ASC and silently drop the extension. New
+  `parses_lc_with_backcompat_sbr_in_latm` regression test pins the
+  LC-22.05k → SBR-44.1k path.
+
 ### Added
 
 - ASC parser now walks the full `GASpecificConfig` (§4.4.1) and
