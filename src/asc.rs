@@ -4,11 +4,41 @@
 //! object type, sample rate index (with optional 24-bit escape), and
 //! channel configuration. SBR / PS extensions append further fields; we
 //! detect them and surface them so the caller can decide whether to fail.
+//!
+//! Two SBR signalling modes per §1.6.5 are decoded:
+//!
+//! - **Explicit**: the outer `audioObjectType` is `AOT_SBR` (5) or
+//!   `AOT_PS` (29). The extension SF index appears immediately, followed
+//!   by the *underlying* AOT (typically AAC-LC).
+//! - **Backward-compatible** (a.k.a. "implicit-with-sync"): the outer
+//!   AOT is the underlying object (e.g. AAC-LC = 2). After the
+//!   GASpecificConfig, a 16-bit `syncExtensionType == 0x2B7` flags a
+//!   trailing extension. If `extensionAudioObjectType == 5` (SBR) the
+//!   `sbrPresentFlag` bit and (when set) `extSamplingFrequencyIndex`
+//!   follow. `extensionAudioObjectType == 22` (PS) further unlocks a
+//!   `psPresentFlag`. Many MP4-in-the-wild streams (broadcast HE-AAC,
+//!   iTunes encodes) use this layout — a stripped GASpecificConfig
+//!   parser would skip the extension and downstream IMDCT would
+//!   under-clock the SBR pipeline by 2x.
+//!
+//! The GASpecificConfig (§4.4.1) is also walked end-to-end so a
+//! `channel_configuration == 0` ASC carrying an embedded
+//! `program_config_element()` (§4.5.2.1) lands the implied channel
+//! count in the returned struct rather than silently surfacing
+//! `channel_configuration = 0`.
 
 use oxideav_core::{Error, Result};
 
-use crate::syntax::{sample_rate, AOT_PS, AOT_SBR};
+use crate::pce::{parse_program_config_element, ProgramConfigElement};
+use crate::syntax::{
+    sample_rate, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SCALABLE, AOT_AAC_SSR, AOT_PS,
+    AOT_SBR,
+};
 use oxideav_core::bits::BitReader;
+
+/// Backward-compatible SBR-signalling sync extension type
+/// (ISO/IEC 14496-3 §1.6.6.1, Table 1.18).
+const SYNC_EXTENSION_TYPE_SBR: u32 = 0x2B7;
 
 #[derive(Clone, Debug)]
 pub struct AudioSpecificConfig {
@@ -20,6 +50,31 @@ pub struct AudioSpecificConfig {
     pub ext_sampling_frequency: Option<u32>,
     pub sbr_present: bool,
     pub ps_present: bool,
+    /// Embedded `program_config_element()` payload — present only when
+    /// `channel_configuration == 0` (caller is expected to source the
+    /// channel count from `pce.channel_count()` instead).
+    pub pce: Option<ProgramConfigElement>,
+}
+
+impl AudioSpecificConfig {
+    /// Channel count implied by this ASC. For `channel_configuration
+    /// in 1..=7` returns the standard channel count for that index
+    /// (Table 1.19); for `0` (PCE-defined) returns the count derived
+    /// from the embedded PCE if present, else `0` (caller may fall
+    /// back to ADTS / external signalling).
+    pub fn channel_count(&self) -> u8 {
+        match self.channel_configuration {
+            0 => self
+                .pce
+                .as_ref()
+                .map(|p| p.channel_count() as u8)
+                .unwrap_or(0),
+            // Table 1.19: 1=mono, 2=stereo, 3=3.0, 4=4.0, 5=5.0, 6=5.1, 7=7.1
+            1..=6 => self.channel_configuration,
+            7 => 8,
+            _ => 0,
+        }
+    }
 }
 
 fn read_audio_object_type(br: &mut BitReader<'_>) -> Result<u8> {
@@ -38,6 +93,124 @@ fn read_sampling_frequency(br: &mut BitReader<'_>) -> Result<(u8, u32)> {
         sample_rate(idx).ok_or_else(|| Error::invalid("ASC: reserved SF index"))?
     };
     Ok((idx, freq))
+}
+
+/// Returns true if `aot` is a "GA-class" object type that carries a
+/// `GASpecificConfig` payload after the channel_configuration field
+/// (§4.4.1). Covers AAC Main / LC / SSR / LTP / scalable / TwinVQ /
+/// ER variants.
+fn is_ga_aot(aot: u8) -> bool {
+    matches!(aot, 1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22 | 23)
+}
+
+/// Walk a `GASpecificConfig` (§4.4.1). Returns the embedded
+/// `program_config_element()` if `channel_configuration == 0`. The
+/// reader is left at the bit immediately after the GASpecificConfig
+/// (i.e. ready for an optional backward-compat sync extension).
+fn parse_ga_specific_config(
+    br: &mut BitReader<'_>,
+    aot: u8,
+    channel_configuration: u8,
+) -> Result<Option<ProgramConfigElement>> {
+    let _frame_length_flag = br.read_bit()?;
+    let depends_on_core_coder = br.read_bit()?;
+    if depends_on_core_coder {
+        let _core_coder_delay = br.read_u32(14)?;
+    }
+    let extension_flag = br.read_bit()?;
+
+    let pce = if channel_configuration == 0 {
+        Some(parse_program_config_element(br)?)
+    } else {
+        None
+    };
+
+    // §4.4.1.1: layerNr is signalled for AAC-scalable (6) and
+    // ER AAC-scalable (20).
+    if matches!(aot, AOT_AAC_SCALABLE | 20) {
+        let _layer_nr = br.read_u32(3)?;
+    }
+    if extension_flag {
+        // Object-type-dependent tail. AOT 22 = ER AAC-LD-style; AOT
+        // 17/19/20/23 = ER family; for plain LC the tail is reserved
+        // zero but a defensive read of `extensionFlag3` keeps the
+        // bit cursor honest.
+        if aot == 22 {
+            let _num_of_sub_frame = br.read_u32(5)?;
+            let _layer_length = br.read_u32(11)?;
+        } else if matches!(aot, 17 | 19 | 20 | 23) {
+            let _aac_section_data_resilience_flag = br.read_bit()?;
+            let _aac_scalefactor_data_resilience_flag = br.read_bit()?;
+            let _aac_spectral_data_resilience_flag = br.read_bit()?;
+        }
+        let _extension_flag3 = br.read_bit()?;
+    }
+
+    Ok(pce)
+}
+
+/// Walk the optional backward-compatible sync extension at the tail of
+/// the ASC (§1.6.6.1). Returns `(sbr_present, ps_present, ext_sf_hz)`.
+/// All `false` / `None` if the extension is absent or unrecognised.
+///
+/// Carriers in the wild (especially MP4 broadcasts) often use this
+/// signalling instead of explicit `AOT_SBR == 5`; without it the
+/// decoder would never enable the SBR pipeline.
+fn parse_backward_compat_extension(br: &mut BitReader<'_>) -> (bool, bool, Option<u32>) {
+    // We consume bits speculatively. If anything fails (incl. running
+    // out of buffer mid-extension), fall back to "no extension".
+    let start_pos = br.bit_position();
+    let outcome: Result<(bool, bool, Option<u32>)> = (|| {
+        let sync = br.read_u32(11)?;
+        if sync != SYNC_EXTENSION_TYPE_SBR {
+            return Ok((false, false, None));
+        }
+        let ext_aot = read_audio_object_type(br)?;
+        if ext_aot == AOT_SBR {
+            let sbr_present_flag = br.read_bit()?;
+            if !sbr_present_flag {
+                return Ok((false, false, None));
+            }
+            let (_idx, ext_sf) = read_sampling_frequency(br)?;
+            // ISO/IEC 14496-3 §1.6.6.1: an additional 11-bit sync
+            // (value 0x548) followed by `psPresentFlag` may appear
+            // for AOT_PS (29). If reading runs out of buffer just
+            // settle for SBR-only.
+            let ps_sync = br.read_u32(11).ok();
+            let ps_present_flag = if ps_sync == Some(0x548) {
+                br.read_bit().unwrap_or(false)
+            } else {
+                false
+            };
+            Ok((true, ps_present_flag, Some(ext_sf)))
+        } else if ext_aot == 22 {
+            // ER AAC-LD with PS hook (rare). Same shape as AOT 5
+            // without PS sub-sync. Surfaces SBR but not PS.
+            let sbr_present_flag = br.read_bit()?;
+            if !sbr_present_flag {
+                return Ok((false, false, None));
+            }
+            let (_idx, ext_sf) = read_sampling_frequency(br)?;
+            // ext_channel_configuration (4 bits) — discarded; the
+            // outer config carries authoritative channel info.
+            let _ = br.read_u32(4)?;
+            Ok((true, false, Some(ext_sf)))
+        } else {
+            Ok((false, false, None))
+        }
+    })();
+    match outcome {
+        Ok(t) => t,
+        Err(_) => {
+            // Roll back the speculative read. BitReader doesn't
+            // expose a rewind API — but the only callers of this
+            // function consume the rest of the ASC unconditionally,
+            // so leaving the cursor in place is harmless. We simply
+            // report "no extension".
+            let _ = start_pos;
+            (false, false, None)
+        }
+    }
 }
 
 /// Parse an AudioSpecificConfig blob.
@@ -73,6 +246,54 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
         sampling_frequency = ext_sf;
     }
 
+    // GASpecificConfig (§4.4.1) — for AAC LC/Main/SSR/LTP/scalable/etc.
+    // Embedded PCE captured when channel_configuration == 0. ASC blobs in
+    // the wild (especially the explicit-SBR shape produced by some
+    // encoders) sometimes truncate the GASpecificConfig tail; treat a
+    // mid-walk read failure as "best-effort done" so we don't reject
+    // a stream the spec-permissive prior parser used to accept. The
+    // mandatory information (`object_type` / `sampling_frequency` /
+    // `channel_configuration` / SBR-PS extension) is already captured
+    // before this point; the GASpecificConfig walk only feeds the
+    // backward-compat sync probe and the optional embedded PCE.
+    let mut pce = None;
+    if is_ga_aot(object_type) {
+        match parse_ga_specific_config(&mut br, object_type, channel_configuration) {
+            Ok(p) => pce = p,
+            Err(Error::NeedMore) | Err(Error::InvalidData(_)) => {
+                // PCE *required* (channel_configuration == 0) and we
+                // couldn't read it — surface the original error so the
+                // caller knows the channel topology is undefined.
+                if channel_configuration == 0 && pce.is_none() {
+                    return Err(Error::invalid(
+                        "ASC: channel_configuration=0 but PCE truncated",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Backward-compatible SBR/PS signalling (§1.6.6.1) — only meaningful
+    // when the outer AOT did NOT already advertise the extension. If the
+    // outer AOT was AAC-LC and a 0x2B7 sync follows, the stream is
+    // HE-AAC[v2] and downstream needs to know the doubled SBR rate.
+    if !sbr_present
+        && matches!(
+            object_type,
+            AOT_AAC_MAIN | AOT_AAC_LC | AOT_AAC_SSR | AOT_AAC_LTP
+        )
+    {
+        let (sbr_ext, ps_ext, ext_sf) = parse_backward_compat_extension(&mut br);
+        if sbr_ext {
+            sbr_present = true;
+            ext_sampling_frequency = ext_sf;
+        }
+        if ps_ext {
+            ps_present = true;
+        }
+    }
+
     Ok(AudioSpecificConfig {
         object_type,
         sampling_frequency_index,
@@ -81,6 +302,7 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
         ext_sampling_frequency,
         sbr_present,
         ps_present,
+        pce,
     })
 }
 
@@ -88,6 +310,7 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
 mod tests {
     use super::*;
     use crate::syntax::AOT_AAC_LC;
+    use oxideav_core::bits::BitWriter;
 
     #[test]
     fn lc_44100_stereo() {
@@ -98,6 +321,158 @@ mod tests {
         assert_eq!(asc.object_type, AOT_AAC_LC);
         assert_eq!(asc.sampling_frequency, 44_100);
         assert_eq!(asc.channel_configuration, 2);
+        assert!(!asc.sbr_present);
+        assert!(asc.pce.is_none());
+        assert_eq!(asc.channel_count(), 2);
+    }
+
+    fn build_lc_stereo_with_backward_sbr(core_idx: u8, ext_idx: u8) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_u32(core_idx as u32, 4);
+        bw.write_u32(2, 4); // channel_configuration = 2
+                            // GASpecificConfig
+        bw.write_bit(false); // frameLengthFlag
+        bw.write_bit(false); // dependsOnCoreCoder
+        bw.write_bit(false); // extensionFlag
+                             // Backward-compat sync
+        bw.write_u32(SYNC_EXTENSION_TYPE_SBR, 11);
+        bw.write_u32(AOT_SBR as u32, 5);
+        bw.write_bit(true); // sbrPresentFlag
+        bw.write_u32(ext_idx as u32, 4); // extSamplingFrequencyIndex
+        bw.finish()
+    }
+
+    #[test]
+    fn lc_with_backward_compat_sbr_signalling() {
+        // Core 22.05 kHz (idx=7), extension 44.1 kHz (idx=4).
+        let bytes = build_lc_stereo_with_backward_sbr(7, 4);
+        let asc = parse_asc(&bytes).unwrap();
+        assert_eq!(asc.object_type, AOT_AAC_LC);
+        assert_eq!(asc.sampling_frequency, 22_050);
+        assert_eq!(asc.channel_configuration, 2);
+        assert!(asc.sbr_present, "backward-compat SBR sync should set flag");
+        assert_eq!(asc.ext_sampling_frequency, Some(44_100));
+        assert_eq!(asc.channel_count(), 2);
+    }
+
+    #[test]
+    fn lc_with_backward_compat_sbr_and_ps_sync() {
+        // Build LC + SBR ext + 0x548 PS sync + ps_present=1.
+        let mut bw = BitWriter::new();
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_u32(7, 4); // core idx = 7 (22.05 kHz)
+        bw.write_u32(2, 4); // channel_configuration = 2 (note: PS upmix overrides this in practice)
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_u32(SYNC_EXTENSION_TYPE_SBR, 11);
+        bw.write_u32(AOT_SBR as u32, 5);
+        bw.write_bit(true);
+        bw.write_u32(4, 4); // ext idx = 44.1 kHz
+        bw.write_u32(0x548, 11);
+        bw.write_bit(true); // psPresentFlag
+        let bytes = bw.finish();
+        let asc = parse_asc(&bytes).unwrap();
+        assert!(asc.sbr_present);
+        assert!(asc.ps_present);
+        assert_eq!(asc.ext_sampling_frequency, Some(44_100));
+    }
+
+    #[test]
+    fn explicit_aot_sbr_prefix_unchanged() {
+        // AOT 5 explicit SBR, core idx skipped via the wrapper, ext sf
+        // 48 kHz (idx=3), underlying aot=2 (LC), then GASpecificConfig
+        // (3 zero bits).
+        let mut bw = BitWriter::new();
+        bw.write_u32(AOT_SBR as u32, 5);
+        bw.write_u32(4, 4); // core idx
+        bw.write_u32(2, 4); // channel_configuration = 2
+        bw.write_u32(3, 4); // ext sf idx = 48000
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        let bytes = bw.finish();
+        let asc = parse_asc(&bytes).unwrap();
+        assert_eq!(asc.object_type, AOT_AAC_LC);
+        assert!(asc.sbr_present);
+        assert!(!asc.ps_present);
+        assert_eq!(asc.ext_sampling_frequency, Some(48_000));
+    }
+
+    #[test]
+    fn channel_config_zero_pulls_pce() {
+        // LC at 44.1 kHz with channel_configuration = 0 carrying a
+        // PCE that defines a stereo CPE on the front.
+        let mut bw = BitWriter::new();
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_u32(4, 4); // sf idx = 44.1 kHz
+        bw.write_u32(0, 4); // channel_configuration = 0 → PCE follows
+        bw.write_bit(false); // frameLengthFlag
+        bw.write_bit(false); // dependsOnCoreCoder
+        bw.write_bit(false); // extensionFlag
+                             // PCE: same minimal stereo CPE as pce.rs round_trip_minimal_pce_stereo
+        bw.write_u32(0, 4); // element_instance_tag
+        bw.write_u32(1, 2); // object_type = 1 (LC)
+        bw.write_u32(4, 4); // sf_index = 4
+        bw.write_u32(1, 4); // num_front
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 3);
+        bw.write_u32(0, 4);
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        bw.write_u32(0, 1);
+        bw.write_u32(1, 1); // is_cpe
+        bw.write_u32(0, 4); // tag_select
+        bw.write_u32(0, 8); // comment_len = 0
+        let bytes = bw.finish();
+        let asc = parse_asc(&bytes).unwrap();
+        assert_eq!(asc.channel_configuration, 0);
+        assert!(asc.pce.is_some());
+        assert_eq!(asc.channel_count(), 2);
+    }
+
+    #[test]
+    fn rejects_truncated_input() {
+        // Only 4 bits — read_u32(5) for the AOT must fail.
+        let bytes = [0x10u8];
+        let res = parse_asc(&bytes[..0]);
+        assert!(res.is_err(), "empty buffer should error");
+    }
+
+    #[test]
+    fn channel_count_table_19() {
+        // channel_configuration 7 maps to 8 channels (7.1) per Table 1.19.
+        let mut bw = BitWriter::new();
+        bw.write_u32(AOT_AAC_LC as u32, 5);
+        bw.write_u32(4, 4);
+        bw.write_u32(7, 4); // channel_configuration = 7
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        let bytes = bw.finish();
+        let asc = parse_asc(&bytes).unwrap();
+        assert_eq!(asc.channel_count(), 8);
+    }
+
+    #[test]
+    fn ltp_aot_walks_ga_specific() {
+        // LTP (AOT 4) carries the same GASpecificConfig as LC; ensure
+        // we don't mis-skip those bits before any backward-compat
+        // extension probe.
+        let mut bw = BitWriter::new();
+        bw.write_u32(AOT_AAC_LTP as u32, 5);
+        bw.write_u32(4, 4);
+        bw.write_u32(2, 4);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        let bytes = bw.finish();
+        let asc = parse_asc(&bytes).unwrap();
+        assert_eq!(asc.object_type, AOT_AAC_LTP);
         assert!(!asc.sbr_present);
     }
 }

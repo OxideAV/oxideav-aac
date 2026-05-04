@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- ASC parser now walks the full `GASpecificConfig` (§4.4.1) and
+  detects backward-compatible SBR/PS signalling (§1.6.6.1, sync
+  extension type `0x2B7`). HE-AAC streams that advertise SBR via
+  the legacy `audioObjectType=2` + trailing-`0x2B7` shape (common
+  in MP4 broadcast / iTunes encodes) now light up
+  `sbr_present` / `ext_sampling_frequency` / `ps_present` instead
+  of being treated as plain AAC-LC. `channel_configuration == 0`
+  ASCs carry the embedded `program_config_element()` through to
+  `AudioSpecificConfig::pce`, and `channel_count()` resolves it
+  via the PCE's element list. Truncated GASpecificConfig tails
+  (encoder-side bug seen in some explicit-SBR ASCs) are tolerated
+  as long as the channel topology is unambiguous.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-aac/compare/v0.0.9...v0.0.10) - 2026-05-03
 
 ### Added
