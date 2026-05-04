@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-aac/compare/v0.0.10...v0.0.11) - 2026-05-04
+
+### Other
+
+- noise-tonality gate + HE-AAC mono/v2 default-on (round 25)
+- correct CHANGELOG / docs to match floor-at-baseline byte cost
+- psy default-on after corpus gate + bit-reservoir CBR allocator
+- Bark-band PE/SMR psychoacoustic model for AAC-LC encoder
+- asc + encoders: AudioSpecificConfig builder + per-encoder accessors
+- delegate ASC length probe to unified asc::parse_asc_from_bitreader
+- walk GASpecificConfig + backward-compat SBR signalling
+
 ### Added
 
 - `tests/he_aac_psy_validation.rs` — HE-AAC + SBR psychoacoustic-model
