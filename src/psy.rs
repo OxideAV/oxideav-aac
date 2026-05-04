@@ -423,12 +423,36 @@ impl PsyModel {
         // off-band region and dropping the tone-purity ratio from
         // ~80 to ~25 on stereo 440+880 Hz roundtrips.)
         let baseline = 7i32;
+        // Bands whose tonality is below this threshold are treated as
+        // **noise-like** and pinned to the baseline target_max. Pure-noise
+        // content (random-spectrum fixtures) had high-magnitude bands
+        // whose `peak/step_max` formula overshot to target_max ≈ 16
+        // simply because peak grows as `RMS · sqrt(2·log(N))` — a
+        // higher-precision quantiser doesn't actually buy fidelity on
+        // noise (the band's spectrum is unstructured and the listener
+        // can't distinguish coarsely-quantised noise from finely-
+        // quantised noise of the same band-integrated energy). Without
+        // this gate the `aac-lc-pns-noise` corpus fixture grew + 17 %
+        // bytes with psy on (round-25 measurement) for zero PSNR
+        // benefit. The `0.15` constant is empirically chosen: it
+        // catches pure-noise / PNS-eligible bands (tonality
+        // typically < 0.05 on white noise, < 0.1 on coloured noise)
+        // while leaving partially-tonal bands (e.g. transient
+        // noise-bursts that ride on a short-window sub-block) free to
+        // refine via the standard PE/SMR allocator.
+        const NOISE_TONALITY_GATE: f32 = 0.15;
         for b in 0..n {
             let lo = swb[b] as usize;
             let hi = swb[b + 1] as usize;
             let peak = spec[lo..hi].iter().fold(0.0f32, |a, &x| a.max(x.abs()));
             if peak <= 0.0 {
                 target_max[b] = 1;
+                continue;
+            }
+            // Noise-like band — keep at baseline. Above-baseline
+            // refinement on noise wastes bits with no perceptual gain.
+            if tonality[b] < NOISE_TONALITY_GATE {
+                target_max[b] = baseline;
                 continue;
             }
             let th = threshold[b].max(1e-12);

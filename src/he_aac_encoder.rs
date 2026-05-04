@@ -108,20 +108,17 @@ impl HeAacMonoEncoder {
         // sbr_dequant" warning, regression-pinned in
         // tests/r26_no_sbr_dequant_warning.rs).
         inner.set_skip_gapless_padding(true);
-        // HE-AAC routes the LF half of the spectrum through the AAC-LC
-        // core at half the input sample rate. The Bark-band psy
-        // model (default-on for plain AAC-LC since `tests/
-        // psy_corpus_validation.rs` validated the corpus) wasn't
-        // validated against the HE-AAC + SBR stack — the corpus
-        // gate encodes mono PCM through the LC encoder only — and
-        // our existing HE-AAC ffmpeg-interop gates (`tests/
-        // sbr_he_aac_*.rs`) rely on the flat-baseline per-band
-        // precision shape (SBR FIL elements expect a specific LF
-        // noise floor for the high-band envelope reconstruction to
-        // sit on top of). Keep psy off in the inner LC encoder for
-        // HE-AAC; the wider-corpus validation needs HE-AAC fixtures
-        // before the default flips here.
-        inner.set_enable_psy_model(false);
+        // HE-AAC mono routes the LF half of the spectrum through the
+        // AAC-LC SCE path. The plain AAC-LC psy model
+        // ([`crate::psy::PsyModel`]) is default-on as of round-24
+        // (`tests/psy_corpus_validation.rs`); for the HE-AAC mono
+        // path the round-25 corpus + synthetic gate
+        // (`tests/he_aac_psy_validation.rs`) confirmed +3.17 dB on
+        // the v1 mono fixture and +1.62 dB on the v2 fixture (downmix
+        // path) with no >2 dB regression. The constructor therefore
+        // leaves `inner.enable_psy_model` at its env-default (psy
+        // on); callers can override per-encoder via
+        // [`Self::set_enable_psy_model`].
         let sbr = SbrEncoder::new(core_rate)?;
         let mut out_params = params.clone();
         out_params.media_type = MediaType::Audio;
@@ -275,6 +272,23 @@ impl HeAacMonoEncoder {
     pub fn output_sample_rate(&self) -> u32 {
         self.out_rate
     }
+
+    /// Override the inner AAC-LC encoder's psychoacoustic-model gate.
+    /// HE-AAC defaults the inner LC psy to **off** because the
+    /// SBR-bridged corpus had not been validated; the round-25 HE-AAC
+    /// corpus probe (`tests/he_aac_psy_validation.rs`) is the gate
+    /// that decides whether the default flips. Callers that have
+    /// validated their own HE-AAC content can call this with `true`
+    /// to enable the Bark-band PE / SMR allocator on the LF half of
+    /// the spectrum.
+    pub fn set_enable_psy_model(&mut self, on: bool) {
+        self.inner.set_enable_psy_model(on);
+    }
+
+    /// Read the inner encoder's psy-model toggle.
+    pub fn enable_psy_model(&self) -> bool {
+        self.inner.enable_psy_model()
+    }
 }
 
 impl Encoder for HeAacMonoEncoder {
@@ -414,19 +428,17 @@ impl HeAacStereoEncoder {
         // sbr_dequant" warning, regression-pinned in
         // tests/r26_no_sbr_dequant_warning.rs).
         inner.set_skip_gapless_padding(true);
-        // HE-AAC routes the LF half of the spectrum through the AAC-LC
-        // core at half the input sample rate. The Bark-band psy
-        // model (default-on for plain AAC-LC since `tests/
-        // psy_corpus_validation.rs` validated the corpus) wasn't
-        // validated against the HE-AAC + SBR stack — the corpus
-        // gate encodes mono PCM through the LC encoder only — and
-        // our existing HE-AAC ffmpeg-interop gates (`tests/
-        // sbr_he_aac_*.rs`) rely on the flat-baseline per-band
-        // precision shape (SBR FIL elements expect a specific LF
-        // noise floor for the high-band envelope reconstruction to
-        // sit on top of). Keep psy off in the inner LC encoder for
-        // HE-AAC; the wider-corpus validation needs HE-AAC fixtures
-        // before the default flips here.
+        // HE-AAC stereo routes the LF half of L+R through the AAC-LC
+        // core via a CPE pair. The plain AAC-LC psy model (default-on
+        // since round-24) regresses synthetic clean-tone CPE M/S
+        // round-trips (the L↔R correlated noise re-combination on
+        // L = M+S / R = M-S is not yet modelled — see the round-25
+        // CHANGELOG entry); to avoid breaking the existing
+        // `sbr_he_aac_stereo_ffmpeg` interop pin (synthetic 1+2 kHz
+        // tone-pair, 24 kHz core) we keep psy off in the stereo
+        // wrapper until the M/S quant-noise model lands. Mono HE-AAC
+        // does not have this issue (no CPE) and defaults to psy-on
+        // via the inner encoder's env-default.
         inner.set_enable_psy_model(false);
         let sbr = SbrStereoEncoder::new(core_rate)?;
         let mut out_params = params.clone();
@@ -591,6 +603,17 @@ impl HeAacStereoEncoder {
     /// Return the output sample rate (= 2 × core rate).
     pub fn output_sample_rate(&self) -> u32 {
         self.out_rate
+    }
+
+    /// Override the inner AAC-LC encoder's psychoacoustic-model gate.
+    /// See [`HeAacMonoEncoder::set_enable_psy_model`].
+    pub fn set_enable_psy_model(&mut self, on: bool) {
+        self.inner.set_enable_psy_model(on);
+    }
+
+    /// Read the inner encoder's psy-model toggle.
+    pub fn enable_psy_model(&self) -> bool {
+        self.inner.enable_psy_model()
     }
 }
 
@@ -765,20 +788,13 @@ impl HeAacV2Encoder {
         // sbr_dequant" warning, regression-pinned in
         // tests/r26_no_sbr_dequant_warning.rs).
         inner.set_skip_gapless_padding(true);
-        // HE-AAC routes the LF half of the spectrum through the AAC-LC
-        // core at half the input sample rate. The Bark-band psy
-        // model (default-on for plain AAC-LC since `tests/
-        // psy_corpus_validation.rs` validated the corpus) wasn't
-        // validated against the HE-AAC + SBR stack — the corpus
-        // gate encodes mono PCM through the LC encoder only — and
-        // our existing HE-AAC ffmpeg-interop gates (`tests/
-        // sbr_he_aac_*.rs`) rely on the flat-baseline per-band
-        // precision shape (SBR FIL elements expect a specific LF
-        // noise floor for the high-band envelope reconstruction to
-        // sit on top of). Keep psy off in the inner LC encoder for
-        // HE-AAC; the wider-corpus validation needs HE-AAC fixtures
-        // before the default flips here.
-        inner.set_enable_psy_model(false);
+        // HE-AAC v2 (= v1 + Parametric Stereo) routes the LF stream
+        // through a single SCE — the upmix to stereo is decoder-side
+        // PS — but the *input* is stereo and the wrapper down-mixes
+        // L+R into the inner mono SCE. Psy on the inner mono channel
+        // is the plain AAC-LC SCE path with no CPE M/S noise
+        // correlation issue, so we leave the inner encoder at its
+        // env-default (psy on as of round-24).
         let mut sbr = SbrEncoder::new(core_rate)?;
         sbr.set_emit_ps(true);
         // Output params — we advertise 2 output channels even though the
@@ -988,6 +1004,17 @@ impl HeAacV2Encoder {
     /// Output sample rate (= 2 × core rate).
     pub fn output_sample_rate(&self) -> u32 {
         self.out_rate
+    }
+
+    /// Override the inner AAC-LC encoder's psychoacoustic-model gate.
+    /// See [`HeAacMonoEncoder::set_enable_psy_model`].
+    pub fn set_enable_psy_model(&mut self, on: bool) {
+        self.inner.set_enable_psy_model(on);
+    }
+
+    /// Read the inner encoder's psy-model toggle.
+    pub fn enable_psy_model(&self) -> bool {
+        self.inner.enable_psy_model()
     }
 }
 

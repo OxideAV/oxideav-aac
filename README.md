@@ -102,10 +102,11 @@ The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 | Intensity stereo encode (§4.6.8.1.4)   | Yes (long windows; L/R correlation + energy ratio above 4 kHz in CPE common-window path) |
 | Pulse data encode (§4.6.10)            | Yes (up to 4 per frame; sign-preserving outlier extraction, amp capped at `\|residual\| - 1`) |
 | Short blocks (building blocks)         | `TransientDetector`, `mdct_short_eightshort`, `analyse_and_quantise_short`, `write_single_ics_short` — all tested; `emit_block` state-machine integration pending |
-| HE-AACv1 (SBR) encode                  | Mono via `HeAacMonoEncoder`; stereo CPE (`HeAacStereoEncoder`, independent coupling, §4.6.18.3.5) |
+| HE-AACv1 (SBR) encode                  | Mono (`HeAacMonoEncoder`, psy-on default); stereo CPE (`HeAacStereoEncoder`, independent coupling, §4.6.18.3.5, psy-off pending M/S quant-noise model); v2 (`HeAacV2Encoder`, mono SCE + PS, psy-on default) |
 | Gapless playback metadata              | `gapless::GaplessInfo` triple (delay/padding/valid_samples) + Apple iTunSMPB-format string emitter; AAC-LC reports 2112-sample priming, HE-AAC reports 2624 (high rate). End-of-file padding rounded to the next packet boundary so an MP4 `edts/elst` writer or ID3v2 `TXXX:iTunSMPB` wrapper can round-trip the source PCM sample-accurately. |
+| Psychoacoustic model                   | Bark-band PE/SMR allocator (`psy::PsyModel`, default-on for AAC-LC + HE-AAC mono/v2, off for HE-AAC stereo CPE); per-band tonality-driven `target_max`, baseline-floor at 7, sub-baseline coarsening gated on tonality < 0.15 (avoids +17 % bytes on noise-only fixtures). Override via `AacEncoder::set_enable_psy_model` or env `OXIDEAV_AAC_PSY_MODEL=0`. Corpus-validated to within +0.08 dB mean PSNR / -0.42 dB worst (`tests/psy_corpus_validation.rs`); HE-AAC corpus-validated mean +1.92 dB / worst +0.07 dB (`tests/he_aac_psy_validation.rs`). |
 | Gain control                           | Not implemented                         |
-| CBR / VBR                              | Bit_rate accepted but currently advisory; no rate control loop |
+| CBR / VBR                              | Bit-reservoir CBR allocator (`AacEncoder::set_cbr_target_bitrate`) drives a per-frame scalefactor bias from a 6144-bit reservoir to bound output frames at the configured rate; default off (VBR) |
 
 The encoder advertises `max_channels = 8` and `max_sample_rate = 48_000`.
 Multi-channel output emits elements in AAC element order (C, L, R for

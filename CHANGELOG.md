@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/he_aac_psy_validation.rs` — HE-AAC + SBR psychoacoustic-model
+  validation gate. Walks the available HE-AAC fixtures under
+  `docs/audio/aac/fixtures/` (`he-aac-v1-stereo-44100-32kbps-adts`,
+  `he-aac-v2-stereo-32000-24kbps-m4a`) plus 2 in-process synthetic
+  stereo cases (440+880 Hz tone-pair @ 44.1 kHz, 1+1.5 kHz +
+  uncorrelated noise @ 48 kHz), encodes each through
+  `HeAacMonoEncoder` / `HeAacStereoEncoder` with psy off vs on at
+  matched bitrate, decodes, and asserts no case loses more than 2 dB
+  PSNR. Result: mean Δ +1.92 dB, worst +0.07 dB (synth 440+880),
+  best +3.17 dB (v1 mono fixture). Defaults flipped accordingly:
+  HE-AAC mono + v2 are now psy-on by default; HE-AAC stereo CPE
+  remains psy-off pending the M/S quant-noise model fix.
+- `HeAacMonoEncoder::set_enable_psy_model(bool)` / `enable_psy_model()`
+  + matching helpers on `HeAacStereoEncoder` and `HeAacV2Encoder`
+  let callers override the per-wrapper psy default. Previously the
+  inner LC encoder's psy was hard-wired off in the wrapper
+  constructors.
+
+### Changed
+
+- HE-AAC mono + v2 wrappers (`HeAacMonoEncoder`, `HeAacV2Encoder`)
+  now default the inner AAC-LC psychoacoustic model **on**
+  (matching plain AAC-LC) following the corpus + synthetic gate
+  above. HE-AAC stereo (`HeAacStereoEncoder`) keeps psy explicitly
+  off in the inner encoder pending the CPE M/S quant-noise model
+  — the existing `tests/sbr_he_aac_stereo_ffmpeg.rs` synthetic
+  1+2 kHz tone-pair gate fell from 36 dB SNR to 26 dB SNR with
+  psy on, the same M/S CPE pathology that keeps psy off in
+  `tests/encode_roundtrip.rs`.
+- `psy::PsyModel::analyse` now pins per-band `target_max` to the
+  baseline (= 7) when band tonality is below 0.15 (clearly noise-
+  like content). Without this gate the model overshot to
+  `target_max ≈ 16` on high-magnitude noise bands purely because
+  `q_peak ∝ RMS^0.1875` — finer quantisation on a noise band buys
+  no perceptual fidelity but blows up bit-cost. Cuts the
+  `aac-lc-pns-noise` fixture's psy-on byte cost from 13 768 →
+  12 129 bytes (was +17 % over psy-off baseline, now +2.9 %); PSNR
+  delta on the fixture stays within 0.03 dB. Mean corpus PSNR
+  delta improved from +0.07 → +0.08 dB.
+
+### Added (round 24)
+
 - `tests/psy_corpus_validation.rs` — wider-corpus validation gate for
   the Bark-band PE/SMR psychoacoustic model. Walks every fixture under
   `docs/audio/aac/fixtures/` (18 fixtures across all standard AAC
