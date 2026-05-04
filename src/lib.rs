@@ -143,6 +143,7 @@ pub mod loas;
 pub mod mdct;
 pub mod pce;
 pub mod pns;
+pub mod psy;
 pub mod pulse;
 pub mod sbr;
 pub mod sfband;

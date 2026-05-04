@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `psy::PsyModel` Bark-band perceptual-entropy / signal-to-mask-ratio
+  psychoacoustic model for the AAC-LC encoder. Replaces the flat
+  `target_max = 7` quantiser-target rule with a per-band target derived
+  from a tonality-weighted Schroeder spreading function in the Bark
+  domain (slopes +27 dB / -15 dB per Bark, self-mask term for noise
+  bands, audibility check against louder neighbours). Per-encoder
+  `AacEncoder::set_enable_psy_model(bool)` plus environment override
+  `OXIDEAV_AAC_PSY_MODEL=1`. **Off by default** until the bench-bar is
+  validated against the wider corpus; downstream callers must opt in
+  to avoid silent bitrate shifts. Bench results in
+  `tests/psy_model_bench.rs`: three-tone harmonic stack at 220 Hz/440 Hz/
+  660 Hz gains +5.0 dB SDR-at-tone while spending 22 % fewer bytes
+  (4912 → 3812); tone-plus-noise (440 Hz) holds SDR within 0.31 dB at
+  matched bitrate (-1.2 % bytes); white-noise total-energy delta
+  within 0.03 dB. Implementation cites ISO/IEC 14496-3 §B.2 (informative
+  PE outline) and ISO/IEC 11172-3 Annex D (psy-model 2 outline) only —
+  no fdk-aac / FAAD2 / FAAC / libaac / ffmpeg AAC source consulted.
 - `asc::AscBuilder` emits AudioSpecificConfig blobs for the three
   signalling shapes a downstream MP4 muxer (`esds`) or DASH manifest
   (`codecs` parameter) needs: plain `lc(sample_rate, channels)`,

@@ -51,11 +51,46 @@ use crate::huffman_tables::{
 use crate::ics::SPEC_LEN;
 use crate::ics::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::mdct::mdct_long;
+use crate::psy::PsyModel;
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{ElementType, WindowSequence, WindowShape, AOT_AAC_LC, SAMPLE_RATES};
 use crate::tns_analyse::{analyse_long as tns_analyse_long, TnsEncFilter};
 use crate::transient::TransientDetector;
 use crate::window::{build_long_window_full, sine_long};
+
+/// Process-global psy override read once on first encoder construction
+/// (env-var `OXIDEAV_AAC_PSY_MODEL=1`). Per-encoder
+/// [`AacEncoder::set_enable_psy_model`] takes precedence over the env
+/// flag but the default initial value tracks it.
+fn psy_default_enabled() -> bool {
+    crate::psy::enabled_via_env()
+}
+
+thread_local! {
+    /// Per-thread psy override for the helpers that don't carry an
+    /// `&AacEncoder`. Cheap path: when the encoder enters
+    /// [`AacEncoder::emit_payload`] it sets this for the duration of
+    /// the call; the helpers (`analyse_and_quantise_opts`,
+    /// `analyse_cpe`) read it. Not pretty but keeps the public API
+    /// stable.
+    static PSY_OVERRIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run a closure with the per-thread psy flag set, restoring the
+/// previous value on drop.
+fn with_psy<F, R>(on: bool, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let prev = PSY_OVERRIDE.with(|c| c.replace(on));
+    let r = f();
+    PSY_OVERRIDE.with(|c| c.set(prev));
+    r
+}
+
+fn psy_active() -> bool {
+    PSY_OVERRIDE.with(|c| c.get()) || psy_default_enabled()
+}
 use oxideav_core::bits::BitWriter;
 
 /// MDCT length (long block).
@@ -215,6 +250,14 @@ pub struct AacEncoder {
     /// instance can serve either profile without callers having to
     /// special-case which convention to read.
     encoder_delay: u32,
+    /// When true, the encoder uses the Bark-band PE/SMR psychoacoustic
+    /// model from [`crate::psy`] to drive per-band scalefactor
+    /// allocation, instead of the legacy flat `target_max = 7` rule.
+    ///
+    /// Defaults to the value of env var `OXIDEAV_AAC_PSY_MODEL` (set ⇒
+    /// on, unset/0/off ⇒ off). Per-encoder override:
+    /// [`Self::set_enable_psy_model`].
+    enable_psy_model: bool,
     /// When true, [`Self::flush_final`] skips the gapless-padding loop
     /// that emits extra silence frames to reach the
     /// `frames_emitted * FRAME_LEN >= encoder_delay + valid_samples`
@@ -310,6 +353,7 @@ impl AacEncoder {
             total_input_samples: 0,
             frames_emitted: 0,
             encoder_delay: crate::gapless::ENCODER_DELAY_AAC_LC,
+            enable_psy_model: psy_default_enabled(),
             skip_gapless_padding: false,
         })
     }
@@ -438,6 +482,29 @@ impl AacEncoder {
                 s.held = None;
             }
         }
+    }
+
+    /// Enable (or disable) the Bark-band PE / SMR psychoacoustic model
+    /// from [`crate::psy`] for per-band scalefactor allocation. Off by
+    /// default unless `OXIDEAV_AAC_PSY_MODEL` is set in the environment
+    /// at construction time.
+    ///
+    /// On tonal content this typically improves PSNR / RMS-fidelity at
+    /// matched bitrate by redistributing quantisation precision: tonal
+    /// loud bands get finer steps, quiet bands hidden under loud
+    /// neighbours get coarser steps. The exact bitrate impact depends on
+    /// the input signal — bench against your fixtures before flipping
+    /// it on for a production encoder.
+    ///
+    /// See [`crate::psy`] for the model description and ISO clause
+    /// references.
+    pub fn set_enable_psy_model(&mut self, on: bool) {
+        self.enable_psy_model = on;
+    }
+
+    /// Read the current psy-model toggle value.
+    pub fn enable_psy_model(&self) -> bool {
+        self.enable_psy_model
     }
 
     fn push_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
@@ -576,11 +643,14 @@ impl AacEncoder {
     }
 
     fn emit_block(&mut self, is_last: bool) -> Result<()> {
-        if self.enable_short_blocks {
-            self.emit_block_short(is_last)
-        } else {
-            self.emit_block_long(is_last)
-        }
+        let psy = self.enable_psy_model;
+        with_psy(psy, || {
+            if self.enable_short_blocks {
+                self.emit_block_short(is_last)
+            } else {
+                self.emit_block_long(is_last)
+            }
+        })
     }
 
     /// Long-only emit path — every frame is OnlyLong. Simpler and used
@@ -1229,6 +1299,21 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     }
     let max_sfb = max_band_active.max(1).min(total_sfb);
 
+    // Optional psychoacoustic-model pass — produces per-band target_max
+    // overrides that drive finer quantisation on tonal/loud bands and
+    // coarser quantisation on bands hidden under spread masks.
+    let psy_target: Option<Vec<i32>> = if psy_active() {
+        let sr = SAMPLE_RATES
+            .get(sf_index as usize)
+            .copied()
+            .unwrap_or(44_100);
+        let model = PsyModel::new_long(sf_index, sr);
+        let analysis = model.analyse(spec);
+        Some(analysis.target_max)
+    } else {
+        None
+    };
+
     // Copy the spectrum into a fixed-size array so the TNS analyser can
     // apply its forward filter in place. If TNS is gated off, `spec_tns`
     // is identical to the input.
@@ -1245,11 +1330,15 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     let spec: &[f32] = &spec_tns[..];
 
     // Pick per-band scalefactor so the largest quantised magnitude lands
-    // in a useful range. We aim for `target_max ≈ 7` so smaller bands
-    // can use the cheaper books 7-8 (LAV 7) instead of always falling
-    // back to book 11. Loud bands will still drift higher and end up on
-    // book 9/10/11 — that's fine.
-    let target_max = 7i32;
+    // in a useful range. The flat baseline target_max ≈ 7 lets smaller
+    // bands use the cheaper books 7-8 (LAV 7) and pushes loud bands
+    // onto book 9/10/11.
+    //
+    // When the psy model is active, target_max becomes per-band: tonal
+    // / loud bands get a larger value (finer step → more bits, more
+    // fidelity), bands buried under spread masks get a smaller value
+    // (coarser step → fewer bits).
+    let baseline_target_max = 7i32;
     let mut sfs = vec![0i32; max_sfb];
     let mut q_bands: Vec<Vec<i32>> = Vec::with_capacity(max_sfb);
     for sfb in 0..max_sfb {
@@ -1263,6 +1352,10 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
             q_bands.push(vec![0i32; end - start]);
             continue;
         }
+        let target_max = match psy_target.as_ref().and_then(|t| t.get(sfb).copied()) {
+            Some(t) => t.clamp(1, 16),
+            None => baseline_target_max,
+        };
         // Find the smallest scalefactor that makes ceil((|max|/2^((sf-100)/4))^(3/4))
         // <= target_max. Solve: 2^((sf-100)/4) >= (max_abs / target_max^(4/3))
         // => sf >= 100 + 4 * log2(max_abs / target_max^(4/3))
