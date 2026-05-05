@@ -27,7 +27,7 @@ fn aac_self_registers_into_runtime_context_via_slice() {
     let params = CodecParameters::audio(id);
     let _decoder = ctx
         .codecs
-        .make_decoder(&params)
+        .first_decoder(&params)
         .expect("aac decoder factory should be installed via the linkme slice walker");
 }
 
@@ -47,7 +47,7 @@ fn aac_can_be_filtered_out() {
     let id = CodecId::new("aac");
     let params = CodecParameters::audio(id);
     assert!(
-        ctx.codecs.make_decoder(&params).is_err(),
+        ctx.codecs.first_decoder(&params).is_err(),
         "filter should suppress aac registration"
     );
 }
