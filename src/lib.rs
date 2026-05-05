@@ -203,9 +203,16 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 
 /// Unified registration entry point — installs AAC into the codec
 /// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick AAC up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_codecs(&mut ctx.codecs);
 }
+
+oxideav_core::register!("aac", register);
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
