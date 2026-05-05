@@ -54,7 +54,7 @@ read it instead of looking for an ADTS sync word on the first packet.
 
 | Feature                                | Status                                  |
 |----------------------------------------|-----------------------------------------|
-| Object types                           | AAC-LC (`AOT 2`) only                   |
+| Object types                           | AAC-LC (`AOT 2`) decode + encode; AAC-LD (`AOT 23`) / AAC-ELD (`AOT 39`) ASC parse only (frame decode deferred) |
 | Containers                             | ADTS (with or without CRC) and raw + ASC|
 | Channel configurations                 | 1..=7 (mono, stereo, 3.0, 4.0, 5.0, 5.1, 7.1) |
 | Sample rates                           | All 13 standard SF indices (96k - 7350) |
@@ -67,7 +67,8 @@ read it instead of looking for an ADTS sync word on the first packet.
 | Intensity stereo (§4.6.8.2.3)          | Yes (cb 14/15, sign from ms_used)       |
 | TNS (§4.6.9)                           | Long AND short-window filters           |
 | Pulse data (§4.6.5)                    | Yes (long-window only); short-window rejects as non-conformant |
-| Fill / DSE elements                    | Skipped cleanly (FIL `count==15` escape uses spec-literal `cnt = 14 + esc_count`) |
+| Fill / DSE elements                    | Skipped cleanly; FIL `count==15, esc_count==0` off-by-one fixed (v0.1.1) |
+| LD/ELD AudioSpecificConfig             | `asc.ld_config` / `asc.eld_config` populated for AOT 23/39; `SWB_LD_512` / `SWB_LD_480` tables in `ld_eld` module |
 | LFE element (§4.6.10)                  | Yes (long-window SCE-like path)         |
 | PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
 | Gain control / SSR / Main / LTP        | Refused (`Error::Unsupported`)          |

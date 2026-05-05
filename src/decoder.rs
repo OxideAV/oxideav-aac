@@ -27,7 +27,7 @@ use crate::sbr::decode::{
 };
 use crate::sbr::ps::{apply_ps_simple, PsFrame};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
-use crate::syntax::{ElementType, WindowSequence, AOT_AAC_LC};
+use crate::syntax::{ElementType, WindowSequence, AOT_AAC_ELD, AOT_AAC_LC, AOT_ER_AAC_LD};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
 use crate::tns::{apply_tns_long, apply_tns_short, parse_tns_data, TnsData};
 use oxideav_core::bits::BitReader;
@@ -39,6 +39,20 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let (sf_index, channels, object_type, sbr_present, ps_explicit) =
         if !params.extradata.is_empty() {
             let asc = parse_asc(&params.extradata)?;
+            // Dispatch hook: LD/ELD configs are parsed and surfaced but
+            // full frame decoding is not yet implemented (multi-round work).
+            // The ASC parse itself succeeds so callers can inspect the config;
+            // only the actual frame-decode path is gated.
+            if asc.object_type == AOT_ER_AAC_LD {
+                return Err(Error::unsupported(
+                    "AAC: AAC-LD (objectType 23) frame decode not yet implemented",
+                ));
+            }
+            if asc.object_type == AOT_AAC_ELD {
+                return Err(Error::unsupported(
+                    "AAC: AAC-ELD (objectType 39) frame decode not yet implemented",
+                ));
+            }
             if asc.object_type != AOT_AAC_LC {
                 return Err(Error::unsupported(
                     "AAC: only AAC-LC profile (object_type=2) supported",

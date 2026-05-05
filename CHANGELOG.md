@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **AAC-LD / AAC-ELD parse scaffold (objectType 23 / 39).** The
+  `AudioSpecificConfig` parser now detects `AOT_ER_AAC_LD` (23) and
+  `AOT_AAC_ELD` (39), parses their respective config blocks
+  (`LDSpecificConfig` / `ELDSpecificConfig`), and surfaces them as
+  `asc.ld_config` / `asc.eld_config` on the returned struct.
+  - `src/ld_eld.rs` — new module with `LdSpecificConfig`,
+    `EldSpecificConfig`, `LdFrameLength` (512 / 480 samples), and
+    `SWB_LD_512` / `SWB_LD_480` scalefactor-band offset tables for all
+    13 standard sample-rate indices (ISO/IEC 14496-3 §4.5.4,
+    Tables 4.137–4.156).
+  - `ELDSpecificConfig` parses `ldSbrPresentFlag` / `ldSbrSamplingRate` /
+    `ldSbrCrcFlag` and propagates `sbr_present` + `ext_sampling_frequency`
+    into `AudioSpecificConfig` so downstream callers see the same SBR
+    signalling interface regardless of LD vs. LC profile.
+  - `decoder::make_decoder` returns `Error::Unsupported` with a descriptive
+    message for AOT 23/39 extradata — full LD/ELD frame decode is deferred
+    to a future round (LD-MDCT, LD-filterbank, LD-SBR are multi-round work).
+  - 12 new unit tests in `ld_eld::tests`: config parsing (512/480 frames,
+    `coreCoderDelay`, ELD-SBR), SWB table boundary checks, and full
+    round-trip ASC parse for AOT 23 and AOT 39.
+  - `AOT_AAC_ELD = 39` added to `syntax.rs`.
+
+- **Bitreader FIL edge-case confirmed fixed** (landed in v0.1.1 commit
+  `8ef4edd`; documented here for traceability). The FIL `count == 15,
+  esc_count == 0` off-by-one that caused `Error::invalid("bitreader: out
+  of bits")` on ~1.4 % of real-world ADTS frames is resolved; the
+  regression fixture in `tests/fil_esc_count_zero.rs` pins the fix.
+
 ### Changed
 
 - **Encoder PNS / M/S / IS refinement (task #523).** Three independent

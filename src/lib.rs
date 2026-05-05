@@ -131,6 +131,7 @@
 pub mod adts;
 pub mod asc;
 pub mod decoder;
+pub mod ld_eld;
 pub mod encoder;
 pub mod gapless;
 pub mod he_aac_encoder;

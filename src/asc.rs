@@ -29,10 +29,11 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::ld_eld::{parse_eld_specific_config, parse_ld_specific_config, EldSpecificConfig, LdSpecificConfig};
 use crate::pce::{parse_program_config_element, ProgramConfigElement};
 use crate::syntax::{
-    sample_rate, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SCALABLE, AOT_AAC_SSR, AOT_PS,
-    AOT_SBR,
+    sample_rate, AOT_AAC_ELD, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SCALABLE,
+    AOT_AAC_SSR, AOT_ER_AAC_LD, AOT_PS, AOT_SBR,
 };
 use oxideav_core::bits::BitReader;
 
@@ -54,6 +55,14 @@ pub struct AudioSpecificConfig {
     /// `channel_configuration == 0` (caller is expected to source the
     /// channel count from `pce.channel_count()` instead).
     pub pce: Option<ProgramConfigElement>,
+    /// Parsed `LDSpecificConfig` — present when `object_type == AOT_ER_AAC_LD` (23).
+    /// Carries `frame_length` (512 or 480 samples) and resilience flags.
+    /// Dispatch hook for the LD frame decoder (not yet implemented).
+    pub ld_config: Option<LdSpecificConfig>,
+    /// Parsed `ELDSpecificConfig` — present when `object_type == AOT_AAC_ELD` (39).
+    /// Carries `frame_length`, resilience flags, and LD-SBR signalling.
+    /// Dispatch hook for the ELD frame decoder (not yet implemented).
+    pub eld_config: Option<EldSpecificConfig>,
 }
 
 impl AudioSpecificConfig {
@@ -99,8 +108,12 @@ fn read_sampling_frequency(br: &mut BitReader<'_>) -> Result<(u8, u32)> {
 /// `GASpecificConfig` payload after the channel_configuration field
 /// (§4.4.1). Covers AAC Main / LC / SSR / LTP / scalable / TwinVQ /
 /// ER variants.
+///
+/// Note: AOT 23 (`AOT_ER_AAC_LD`) carries `LDSpecificConfig`, NOT
+/// `GASpecificConfig`. It is intentionally excluded here and handled via
+/// `parse_ld_specific_config` below.
 fn is_ga_aot(aot: u8) -> bool {
-    matches!(aot, 1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22 | 23)
+    matches!(aot, 1 | 2 | 3 | 4 | 6 | 7 | 17 | 19 | 20 | 21 | 22)
 }
 
 /// Walk a `GASpecificConfig` (§4.4.1). Returns the embedded
@@ -277,6 +290,8 @@ pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificC
     // before this point; the GASpecificConfig walk only feeds the
     // backward-compat sync probe and the optional embedded PCE.
     let mut pce = None;
+    let mut ld_config = None;
+    let mut eld_config = None;
     if is_ga_aot(object_type) {
         match parse_ga_specific_config(br, object_type, channel_configuration) {
             Ok(p) => pce = p,
@@ -292,12 +307,50 @@ pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificC
             }
             Err(e) => return Err(e),
         }
+    } else if object_type == AOT_ER_AAC_LD {
+        // AAC-LD (objectType 23) carries LDSpecificConfig instead of
+        // GASpecificConfig. Parse it best-effort: if the bitstream
+        // truncates mid-parse we still have the mandatory fields
+        // (object_type / sampling_frequency / channel_configuration)
+        // that the caller needs to know we're LD.
+        match parse_ld_specific_config(br) {
+            Ok(cfg) => ld_config = Some(cfg),
+            Err(_) => {
+                // Truncated LDSpecificConfig — the LD frame decoder will
+                // surface a more precise error later; surface what we have.
+            }
+        }
+    } else if object_type == AOT_AAC_ELD {
+        // AAC-ELD (objectType 39) carries ELDSpecificConfig.
+        match parse_eld_specific_config(br) {
+            Ok(cfg) => {
+                // LD-SBR signalling is embedded in the ELD config itself
+                // (no separate backward-compat sync-extension for ELD).
+                if cfg.ld_sbr_present {
+                    sbr_present = true;
+                    // LD-SBR at the same rate does not change the output
+                    // sample rate (ldSbrSamplingRate=0). Only the doubled
+                    // rate (ldSbrSamplingRate=1) would double it. We set
+                    // sbr_present so downstream can gate on it, but leave
+                    // ext_sampling_frequency as None for same-rate LD-SBR.
+                    if cfg.ld_sbr_sampling_rate {
+                        ext_sampling_frequency = Some(sampling_frequency * 2);
+                    }
+                }
+                eld_config = Some(cfg);
+            }
+            Err(_) => {
+                // Truncated ELDSpecificConfig — leave eld_config as None.
+            }
+        }
     }
 
     // Backward-compatible SBR/PS signalling (§1.6.6.1) — only meaningful
     // when the outer AOT did NOT already advertise the extension. If the
     // outer AOT was AAC-LC and a 0x2B7 sync follows, the stream is
     // HE-AAC[v2] and downstream needs to know the doubled SBR rate.
+    // LD/ELD use their own integrated SBR signalling (see above), so skip
+    // the backward-compat probe for those object types.
     if !sbr_present
         && matches!(
             object_type,
@@ -323,6 +376,8 @@ pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificC
         sbr_present,
         ps_present,
         pce,
+        ld_config,
+        eld_config,
     })
 }
 
