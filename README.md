@@ -95,10 +95,10 @@ The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 | Spectral codebook selection            | Per-band cheapest of books 1-11 (incl. escape) |
 | Section data                           | Run-length compressed; merges adjacent same-cb bands |
 | Scalefactors                           | Huffman-coded deltas with global_gain anchor; 3-accumulator path (g_gain / g_noise / g_is) for NOISE / IS bands |
-| M/S stereo (§4.6.13)                   | Per-band L/R-vs-M/S decision by bit cost |
+| M/S stereo (§4.6.13)                   | Per-band L/R-vs-M/S decision by bit cost + activity gate (energy-balance ∈ [1/8, 8] AND \|corr\| ≥ 0.4) so imbalanced/uncorrelated bands don't leak side-channel quant noise |
 | TNS (§4.6.9)                           | LPC analysis on SCE long blocks; 4-bit parcor quantisation; gated on prediction-gain (~1.4 dB) |
-| PNS encode (§4.6.12)                   | Yes (long windows; peak-to-RMS noise test, >=4 kHz band-centre gate) |
-| Intensity stereo encode (§4.6.8.1.4)   | Yes (long windows; L/R correlation + energy ratio above 4 kHz in CPE common-window path) |
+| PNS encode (§4.6.12)                   | Yes (long windows; peak-to-RMS ≤ 2.6 + SFM ≥ 0.25 noise gate, ≥ 4 kHz band-centre gate; trimmed-mean energy gain matches source RMS within ±1 dB) |
+| Intensity stereo encode (§4.6.8.1.4)   | Yes (long windows; \|corr\| ≥ 0.95 + per-line sign-agreement ≥ 80 % + energy ratio ∈ [1/256, 256] in CPE common-window path; ≥ 4 kHz band-centre gate; corpus PSNR delta +1.7 dB on `aac-lc-intensity-stereo` after round-#523 tuning) |
 | Pulse data encode (§4.6.10)            | Yes (up to 4 per frame; sign-preserving outlier extraction, amp capped at `\|residual\| - 1`) |
 | Short blocks (building blocks)         | `TransientDetector`, `mdct_short_eightshort`, `analyse_and_quantise_short`, `write_single_ics_short` — all tested; `emit_block` state-machine integration pending |
 | HE-AACv1 (SBR) encode                  | Mono (`HeAacMonoEncoder`, psy-on default); stereo CPE (`HeAacStereoEncoder`, independent coupling, §4.6.18.3.5, psy-on default as of round-27 M/S CPE side-lobe fix); v2 (`HeAacV2Encoder`, mono SCE + PS, psy-on default) |

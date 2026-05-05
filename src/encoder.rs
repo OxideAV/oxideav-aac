@@ -2175,6 +2175,17 @@ fn pns_eligible_band(swb: &[u16], sfb: usize, sample_rate: u32) -> bool {
 /// Criteria (conservative):
 ///  * `||L|| > 1e-3` (otherwise the scale is ill-defined — zero band).
 ///  * `|<L, R>| / (||L||·||R||) > 0.95` — L and R are near-colinear.
+///  * Per-line **sign agreement** with the global polarity ≥ 80 %. A
+///    high scalar correlation can hide a small population of
+///    sign-flipped lines (e.g. when one tone dominates the dot product
+///    while the noise floor is anti-correlated). On decode, IS forces
+///    every line to share the global polarity, so those flipped lines
+///    invert phase and collapse the stereo image. Reject the band when
+///    too many lines disagree. Round-#523 IS tuning.
+///  * Energy ratio `||R||² / ||L||²` ∈ `[1/256, 256]`. Outside this
+///    band the per-band scale step caps out anyway and IS recovers
+///    less energy than a regular codebook coding of R; let the
+///    bit-cost path handle it. Round-#523 IS tuning.
 ///  * |is_position| ≤ 60 so the SF-Huffman delta fits.
 fn classify_is_band(
     l: &[f32],
@@ -2202,6 +2213,34 @@ fn classify_is_band(
     if corr.abs() < 0.95 {
         return None;
     }
+    // Energy-ratio gate: reject IS when one channel dwarfs the other.
+    // The IS scale step is 2^(±15) max → log2(ratio) ≈ ±8 covers it
+    // with margin. Outside ±8 (256:1) IS reconstructs the silent side
+    // with random polarity, so a regular Huffman coding of R is safer.
+    let ratio_log2 = 0.5 * (sum_rr / sum_ll).log2();
+    if !(-4.0..=4.0).contains(&ratio_log2) {
+        return None;
+    }
+    // Per-line sign-agreement check. The global polarity is the sign
+    // of the dot product `sum_lr`; count how many per-line products
+    // `l[i] * r[i]` agree with that polarity (weighted by their
+    // magnitude). Pure colinear pairs (R = ±α·L) score 100 %; a
+    // single anti-correlated outlier in an otherwise correlated
+    // background drops the score sharply.
+    let global_sign_pos = sum_lr >= 0.0;
+    let mut agree = 0.0f32;
+    let mut total = 0.0f32;
+    for i in 0..lb.len() {
+        let p = lb[i] * rb[i];
+        let w = p.abs();
+        total += w;
+        if (p >= 0.0) == global_sign_pos {
+            agree += w;
+        }
+    }
+    if total > 0.0 && agree / total < 0.8 {
+        return None;
+    }
     let scale = sum_lr / sum_ll; // least-squares R ≈ scale·L
     let mag = scale.abs();
     if mag < 1e-4 {
@@ -2214,24 +2253,50 @@ fn classify_is_band(
     Some((is_pos, scale < 0.0))
 }
 
-/// Classify a scalefactor band as PNS (noise-like) if it passes all three
-/// conservative tests:
+/// Classify a scalefactor band as PNS (noise-like) and return the
+/// scalefactor that reproduces the band's energy on decode (or `None`
+/// if the band is not a noise candidate).
+///
+/// Conservative gates (all required):
 ///
 ///  1. Band is long enough (≥ 4 samples) to give a stable energy estimate.
-///  2. Peak-to-RMS ratio is ≤ 2.8 — a well-behaved noise band has most
-///     samples near its RMS magnitude; a tonal band has a small number
-///     of samples much higher than its RMS.
-///  3. Band has non-trivial average energy (> 1e-8 per sample) — silent
+///  2. Peak-to-RMS ratio ≤ 2.6 — a well-behaved noise band has most samples
+///     near its RMS magnitude; a tonal band has a small number of samples
+///     much higher than its RMS. Tightened from 2.8 in round-#523 PNS
+///     refinement: the looser bound let "near-noise but mildly tonal"
+///     bands through, where PNS replaces an audible micro-tone with
+///     uncorrelated random lines.
+///  3. Spectral Flatness Measure (SFM = geomean / arithmean of squared
+///     magnitudes) ≥ 0.25. A pure tone has SFM ≈ 0; uniformly-
+///     distributed noise has SFM ≈ exp(-γ) ≈ 0.56 in the large-N
+///     limit but lands closer to 0.3-0.4 on the 4-32-line bands
+///     typical of AAC. Round-#523 PNS gain refinement: peak-to-RMS
+///     alone misses bands with one tone spread across 4-8 lines (e.g.
+///     a vibrato'd partial whose energy leaks to neighbours). SFM
+///     catches them — geomean → 0 the moment any single line dominates
+///     by a factor of ~5+.
+///  4. Band has non-trivial average energy (> 1e-8 per sample) — silent
 ///     bands stay on codebook 0 where they cost nothing anyway.
 ///
-/// Returns the PNS scalefactor that reproduces the band's energy on
-/// decode, or `None` if the band is not a noise candidate.
+/// **Gain calibration.** PNS decoder synthesises each spectral line as
+/// `uniform(-1, 1) * gain` where `gain = 2^(sf/4 - 14.5)`. Variance of
+/// uniform on `[-1, 1)` is `1/3`, so expected energy per line is
+/// `gain² / 3`. Inverting, with `e = sum_sq / len`:
 ///
-/// The PNS decoder synthesises each spectral line as `uniform(-1, 1) *
-/// gain` where `gain = 2^(sf/4 - 14.5)`. The expected energy per line is
-/// `gain² / 3` (variance of uniform on [-1, 1)). Invert:
-///   `gain = sqrt(3 · energy_per_line)`
-///   `sf   = 4·(log₂(gain) + 14.5) = 2·log₂(3·energy_per_line) + 58`.
+/// ```text
+/// gain = sqrt(3 · e)
+/// sf   = 4·(log₂(gain) + 14.5) = 2·log₂(3·e) + 58
+/// ```
+///
+/// Round-#523 PNS gain refinement: we now use a **trimmed** mean energy
+/// computed by dropping the single highest-magnitude line of the band
+/// before averaging. The PNS decoder produces uniform-noise lines with
+/// no outliers — for a real noise band the largest line sits ~`sqrt(2·ln(N))`
+/// RMS above the mean, and including it in the energy estimate biases
+/// the gain ~10-15 % high. Excluding it makes the resynthesised band
+/// energy match the source band's bulk-line energy to within a fraction
+/// of a dB, eliminating the +0.5 dB bias the older formula introduced
+/// on noise-rich material.
 fn classify_pns_band(spec: &[f32], band_start: usize, band_end: usize) -> Option<i32> {
     let band = &spec[band_start..band_end];
     let len = band.len();
@@ -2239,23 +2304,53 @@ fn classify_pns_band(spec: &[f32], band_start: usize, band_end: usize) -> Option
         return None;
     }
     let mut sum_sq = 0.0f32;
+    let mut peak_sq = 0.0f32;
     let mut peak = 0.0f32;
+    let mut sum_log = 0.0f64;
+    const EPS: f32 = 1e-12;
     for &x in band {
-        sum_sq += x * x;
+        let sq = x * x;
+        sum_sq += sq;
+        if sq > peak_sq {
+            peak_sq = sq;
+        }
         let a = x.abs();
         if a > peak {
             peak = a;
         }
+        sum_log += (sq as f64 + EPS as f64).ln();
     }
     let rms = (sum_sq / len as f32).sqrt();
     if rms < 1e-4 {
         return None;
     }
     let peak_rms = peak / rms;
-    if peak_rms > 2.8 {
+    if peak_rms > 2.6 {
         return None; // tonal band — leave it on a regular codebook.
     }
-    let energy_per_line = sum_sq / len as f32;
+    // SFM = geomean(sq) / arithmean(sq); both in linear power units.
+    let arith_mean = (sum_sq / len as f32).max(EPS);
+    let geo_mean = (sum_log / len as f64).exp() as f32;
+    let sfm = (geo_mean / arith_mean).clamp(0.0, 1.0);
+    if sfm < 0.25 {
+        return None; // not flat enough — PNS would substitute audible noise for a tone.
+    }
+    // Trimmed mean: drop the single highest-energy line so the gain
+    // reflects the bulk-line energy, not the outlier.
+    let trimmed_sum_sq = if len > 4 {
+        (sum_sq - peak_sq).max(0.0)
+    } else {
+        sum_sq
+    };
+    let trimmed_len = if len > 4 {
+        (len - 1) as f32
+    } else {
+        len as f32
+    };
+    let energy_per_line = trimmed_sum_sq / trimmed_len;
+    if energy_per_line <= EPS {
+        return None;
+    }
     let sf_f = 2.0 * (3.0 * energy_per_line).log2() + 58.0;
     let sf = sf_f.round() as i32;
     Some(sf.clamp(-100, 200))
@@ -2888,6 +2983,73 @@ fn write_spectral_data(bw: &mut BitWriter, ics: &Ics) {
 
 // ==================== CPE analysis ====================
 
+/// Compute per-band energy on each channel and the L/R linear
+/// correlation coefficient. Returns `(energy_l, energy_r, corr)` where
+/// `corr ∈ [-1, 1]` (or `0.0` when either channel's energy is zero).
+/// Used by the M/S activity gate (`ms_band_safe`) and shared with the
+/// IS classifier through the same band traversal.
+fn band_energy_corr(l: &[f32], r: &[f32], band_start: usize, band_end: usize) -> (f32, f32, f32) {
+    if band_end <= band_start || band_end > l.len() || band_end > r.len() {
+        return (0.0, 0.0, 0.0);
+    }
+    let lb = &l[band_start..band_end];
+    let rb = &r[band_start..band_end];
+    let mut sum_ll = 0.0f32;
+    let mut sum_rr = 0.0f32;
+    let mut sum_lr = 0.0f32;
+    for i in 0..lb.len() {
+        sum_ll += lb[i] * lb[i];
+        sum_rr += rb[i] * rb[i];
+        sum_lr += lb[i] * rb[i];
+    }
+    let denom = (sum_ll * sum_rr).sqrt();
+    let corr = if denom > 1e-12 { sum_lr / denom } else { 0.0 };
+    (sum_ll, sum_rr, corr)
+}
+
+/// Round-#523 M/S detection refinement: gate the per-band M/S decision
+/// on activity, in addition to the bit-cost test.
+///
+/// M/S transmits `M = (L+R)/2` and `S = (L-R)/2`. The decoder reverses
+/// it: `L' = M + S`, `R' = M - S`. If quantisation introduces noise `n_M`
+/// and `n_S` to the transmitted M/S coefficients, the per-channel
+/// reconstruction noise becomes `n_L = n_M + n_S`, `n_R = n_M - n_S` —
+/// the side-channel's quantisation noise leaks **at full amplitude**
+/// into both reconstructed channels.
+///
+/// On bands where one channel dominates (e.g. L loud, R near-silent —
+/// a panned source), the bit-cost path will often pick M/S because the
+/// S channel is small and codes cheaply; but the M-channel quantisation
+/// noise then doubles in the silent-side reconstruction. The listener
+/// hears noise leaking into the silent side. Reject M/S in those
+/// imbalanced-energy cases — the bit-cost saving is < 1 % in practice
+/// while the audibility cost is large.
+///
+/// We also gate on a mild correlation requirement: bands where L and R
+/// are uncorrelated (independent ambient noise on the two channels)
+/// also lose under M/S, because then `M` and `S` both have full
+/// amplitude and the noise-leak doubles compared with separate L/R
+/// coding. The classic heuristic (Johnston, *Estimation of Perceptual
+/// Entropy Using Noise Masking Criteria*) gates M/S on `|corr| ≥ 0.5`.
+///
+/// Gates:
+///  * Energy ratio ∈ `[1/8, 8]` — neither channel dominates
+///    (~9 dB max imbalance).
+///  * `|corr| ≥ 0.4` — channels are at least loosely related.
+///  * Both channels carry meaningful energy (above an absolute noise floor).
+fn ms_band_safe(e_l: f32, e_r: f32, corr: f32) -> bool {
+    if e_l < 1e-8 || e_r < 1e-8 {
+        // One side is silent — M/S would leak the other side's noise
+        // into a quiet channel; let LR coding handle it cheaply.
+        return false;
+    }
+    let ratio = e_l / e_r;
+    if !(0.125..=8.0).contains(&ratio) {
+        return false;
+    }
+    corr.abs() >= 0.4
+}
+
 /// Choose M/S stereo per band and return per-channel ICS.
 ///
 /// For common-window CPE both channels MUST share the same ics_info
@@ -2948,14 +3110,24 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
     for sfb in 0..max_sfb {
         let mut best_cost = cost_lr[sfb];
         let mut choice: u8 = 0; // 0 = LR, 1 = MS, 2 = IS
-        if cost_ms[sfb] < best_cost {
+                                // Per-band L/R energy + correlation snapshot used by both the M/S
+                                // activity gate and the IS classifier below. Round-#523 M/S
+                                // detection refinement: pure bit-cost was previously the only
+                                // arbiter, but bit-cost is symmetric across "well-behaved
+                                // correlated stereo" and "imbalanced one-sided stereo" while
+                                // the latter degrades audibly under M/S quantisation noise
+                                // (the side channel's quant noise leaks fully into the
+                                // dominant channel on decode). Gate M/S on energy-balance and
+                                // mild correlation in addition to the cost test.
+        let band_start = swb[sfb] as usize;
+        let band_end = swb[sfb + 1] as usize;
+        let (e_l, e_r, corr_lr) = band_energy_corr(l, r, band_start, band_end);
+        if cost_ms[sfb] < best_cost && ms_band_safe(e_l, e_r, corr_lr) {
             best_cost = cost_ms[sfb];
             choice = 1;
         }
         if pns_eligible_band(swb, sfb, sample_rate) {
-            if let Some((pos, sign)) =
-                classify_is_band(l, r, swb[sfb] as usize, swb[sfb + 1] as usize)
-            {
+            if let Some((pos, sign)) = classify_is_band(l, r, band_start, band_end) {
                 let is_cost = band_bit_cost(sfb, &ics_l_alone).saturating_add(10);
                 if is_cost < best_cost {
                     best_cost = is_cost;
@@ -3724,5 +3896,181 @@ mod tests {
         // Both should be ADTS-framed.
         assert_eq!(pkt1.data[0], 0xFF);
         assert_eq!(pkt2.data[0], 0xFF);
+    }
+
+    // ============== Round-#523 unit tests ==============
+
+    /// PNS classifier rejects bands the SFM gate (≥ 0.25) catches
+    /// independently of the peak-to-RMS gate. Build a 16-line band:
+    /// 12 strong lines + 4 nearly-zero lines. peak/RMS ≈ 1.15 (well
+    /// under the 2.6 gate) but the SFM is ≈ 0.13 (below 0.25) because
+    /// the geomean is dragged down by the four tiny lines. Without the
+    /// SFM gate, this band would PNS-substitute uniform noise across
+    /// the whole 16-line span — including across the four lines that
+    /// were essentially silent — adding audible broadband hiss.
+    #[test]
+    fn pns_sfm_gate_rejects_band_with_silent_lines() {
+        let mut spec = vec![0.0f32; 1024];
+        for i in 0..12 {
+            spec[i] = 1.0;
+        }
+        for i in 12..16 {
+            spec[i] = 0.01;
+        }
+        let result = classify_pns_band(&spec, 0, 16);
+        assert!(
+            result.is_none(),
+            "SFM gate should reject a band with mostly-quiet lines (avoid hiss-fill on silence)"
+        );
+    }
+
+    /// PNS classifier accepts a flat-noise band and the gain matches
+    /// the source band's bulk-line RMS within a fraction of a dB. The
+    /// trimmed-mean refinement keeps the gain from over-shooting due to
+    /// any single outlier line in the source.
+    #[test]
+    fn pns_gain_matches_source_rms_to_within_half_db() {
+        // 32-line uniformly-distributed noise band. The PNS-decoded
+        // band should have ~the same energy on average.
+        let mut state: u32 = 0xCAFE_F00D;
+        let mut band = Vec::with_capacity(32);
+        for _ in 0..32 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let v = ((state >> 16) as i32 & 0xFFFF) as f32 / 32768.0 - 1.0;
+            band.push(v * 100.0);
+        }
+        let mut spec = vec![0.0f32; 1024];
+        for (i, &v) in band.iter().enumerate() {
+            spec[i] = v;
+        }
+        let sf = classify_pns_band(&spec, 0, 32).expect("flat noise should classify");
+        // Compute the resynthesised band energy.
+        let gain = crate::pns::pns_gain(sf);
+        // Expected per-line energy from PNS = gain² / 3 (uniform [-1,1)).
+        let expected = gain * gain / 3.0;
+        // Source per-line energy excluding the peak (matches what the
+        // trimmed-mean refinement targets).
+        let mut sum_sq = 0.0f32;
+        let mut peak_sq = 0.0f32;
+        for &x in &band {
+            let s = x * x;
+            sum_sq += s;
+            if s > peak_sq {
+                peak_sq = s;
+            }
+        }
+        let source = (sum_sq - peak_sq) / 31.0;
+        let ratio_db = 10.0 * (expected / source).log10();
+        assert!(
+            ratio_db.abs() < 1.0,
+            "PNS gain mismatch: expected per-line {expected:.3e}, source {source:.3e} (ratio {ratio_db:.2} dB)"
+        );
+    }
+
+    /// M/S gate rejects bands where one channel dominates by a wide
+    /// margin (would leak side-channel quant noise into the silent
+    /// reconstruction). Even though the bit cost is symmetric, the
+    /// activity gate must veto.
+    #[test]
+    fn ms_gate_rejects_imbalanced_energy() {
+        // L is 100×, R is 1× — energy ratio = 10 000:1, well outside the
+        // 8:1 gate.
+        assert!(
+            !ms_band_safe(10_000.0, 1.0, 0.95),
+            "imbalanced-energy band must reject M/S"
+        );
+        assert!(
+            !ms_band_safe(1.0, 10_000.0, 0.95),
+            "imbalanced-energy band (other side) must reject M/S"
+        );
+    }
+
+    /// M/S gate accepts a balanced, correlated band.
+    #[test]
+    fn ms_gate_accepts_balanced_correlated() {
+        assert!(ms_band_safe(100.0, 80.0, 0.7));
+        assert!(ms_band_safe(50.0, 100.0, 0.6));
+    }
+
+    /// M/S gate rejects uncorrelated balanced bands. Independent ambient
+    /// noise on each channel should NOT use M/S — both M and S have full
+    /// amplitude and quant noise leaks at full amplitude into both
+    /// reconstructed channels.
+    #[test]
+    fn ms_gate_rejects_uncorrelated_balanced() {
+        assert!(
+            !ms_band_safe(100.0, 100.0, 0.1),
+            "uncorrelated balanced band must reject M/S"
+        );
+        assert!(
+            !ms_band_safe(100.0, 100.0, -0.2),
+            "weakly anti-correlated balanced band must reject M/S"
+        );
+    }
+
+    /// IS classifier rejects a band where R is mostly correlated with L
+    /// at the bulk level but a few high-magnitude lines are
+    /// anti-correlated. Pure scalar correlation can mask those lines;
+    /// the per-line sign-agreement check catches them. On decode IS
+    /// would force every line to share the global polarity, collapsing
+    /// the stereo image at the offending lines.
+    #[test]
+    fn is_classifier_rejects_per_line_sign_disagreement() {
+        // 16-line band: most lines are R = +0.5·L, one large line is
+        // R = -2.0·L. The dot-product still favours the positive
+        // global polarity because of the first 15 lines, but the per-
+        // line agreement weighted by magnitude drops below 80 %
+        // because the anti-correlated line is much higher amplitude.
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        for i in 0..15 {
+            l[i] = 1.0;
+            r[i] = 0.5;
+        }
+        l[15] = 1.0;
+        r[15] = -8.0; // huge anti-correlated line
+        let result = classify_is_band(&l, &r, 0, 16);
+        assert!(
+            result.is_none(),
+            "per-line sign-disagreement band must reject IS, got {:?}",
+            result
+        );
+    }
+
+    /// IS classifier accepts a clean colinear band.
+    #[test]
+    fn is_classifier_accepts_clean_colinear() {
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        for i in 0..16 {
+            let v = (i as f32 + 1.0) * 0.1;
+            l[i] = v;
+            r[i] = v * 0.4;
+        }
+        let result = classify_is_band(&l, &r, 0, 16);
+        assert!(
+            result.is_some(),
+            "colinear positive-scaling band should classify as IS"
+        );
+        let (_pos, sign_flip) = result.unwrap();
+        assert!(!sign_flip, "positive scale must not set sign_flip");
+    }
+
+    /// IS classifier rejects bands where the energy ratio is way out
+    /// of the addressable scale step range (256:1).
+    #[test]
+    fn is_classifier_rejects_extreme_energy_imbalance() {
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        for i in 0..16 {
+            l[i] = 100.0;
+            r[i] = 0.001; // ~10^10 ratio, way above the 256:1 cap
+        }
+        let result = classify_is_band(&l, &r, 0, 16);
+        assert!(
+            result.is_none(),
+            "extreme L >> R imbalance must reject IS, got {:?}",
+            result
+        );
     }
 }

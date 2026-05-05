@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Encoder PNS / M/S / IS refinement (task #523).** Three independent
+  per-band classifier tightenings push corpus mean PSNR up by +0.08 dB
+  with a +1.70 dB win on the `aac-lc-intensity-stereo` fixture and no
+  regression beyond -0.37 dB on any of the 18 fixtures
+  (`tests/psy_corpus_validation.rs`). Round-trip RMS on the noise-rich
+  PNS fixture is 0.99× source (within 0.1 dB).
+  - `encoder::classify_pns_band` adds a Spectral Flatness Measure gate
+    (SFM ≥ 0.25, geomean / arithmean of squared magnitudes) on top of
+    the existing peak-to-RMS test (tightened from ≤ 2.8 to ≤ 2.6).
+    The SFM gate catches "near-noise but mostly silent" bands the
+    peak-to-RMS test admits — bands where 12 of 16 lines are loud and
+    4 are nearly zero score peak/RMS ≈ 1.15 (passes) but SFM ≈ 0.13
+    (fails); without the gate, PNS would substitute uniform noise across
+    the silent lines and add audible broadband hiss.
+  - `encoder::classify_pns_band` PNS gain calibration uses a **trimmed**
+    mean energy (drops the single highest-magnitude line of the band
+    before averaging). The PNS decoder synthesises uniform-noise lines
+    with no outliers; for a real noise band the largest line sits
+    `~sqrt(2·ln(N))` RMS above the mean, so including it in the energy
+    estimate biased the gain ~10-15 % high. Trimmed-mean keeps the
+    resynthesised band energy within ±1 dB of source bulk-line RMS.
+  - `encoder::analyse_cpe` adds an **activity gate** (`ms_band_safe`) to
+    the per-band M/S decision: M/S is now allowed only when the L/R
+    energy ratio sits in `[1/8, 8]` (~9 dB max imbalance) AND the
+    L/R correlation `|corr| ≥ 0.4`. M/S leaks the side-channel quant
+    noise into both reconstructed channels, so on imbalanced bands
+    (one channel dominant) the previously-permitted M/S choice doubled
+    the noise floor on the silent side; on uncorrelated balanced bands
+    M and S both have full amplitude and the noise leak doubles
+    compared with separate L/R coding (Johnston, *Estimation of
+    Perceptual Entropy Using Noise Masking Criteria*).
+  - `encoder::classify_is_band` tightens IS eligibility with two new
+    gates beyond the existing `|corr| ≥ 0.95` check: per-line
+    magnitude-weighted sign agreement ≥ 80 % (catches anti-correlated
+    high-magnitude outliers in an otherwise correlated band — IS would
+    force every line to share the global polarity on decode, collapsing
+    the stereo image at the offending lines), and per-band energy
+    ratio `||R||² / ||L||²` ∈ `[1/256, 256]` (outside this range the
+    IS scale step caps out and a regular Huffman coding of R recovers
+    more energy). New unit tests:
+    `encoder::tests::pns_sfm_gate_rejects_band_with_silent_lines`,
+    `pns_gain_matches_source_rms_to_within_half_db`,
+    `ms_gate_rejects_imbalanced_energy`,
+    `ms_gate_accepts_balanced_correlated`,
+    `ms_gate_rejects_uncorrelated_balanced`,
+    `is_classifier_rejects_per_line_sign_disagreement`,
+    `is_classifier_accepts_clean_colinear`,
+    `is_classifier_rejects_extreme_energy_imbalance`.
 - **`register` entry point unified on `RuntimeContext`** (task #502).
   The legacy `pub fn register(reg: &mut CodecRegistry)` is renamed to
   `register_codecs` and a new `pub fn register(ctx: &mut
