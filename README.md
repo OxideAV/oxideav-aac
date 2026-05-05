@@ -22,17 +22,16 @@ The crate registers a single codec id, `"aac"`, that maps to both the
 decoder and the encoder.
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters};
+use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-oxideav_aac::register(&mut codecs);
+let mut ctx = RuntimeContext::new();
+oxideav_aac::register(&mut ctx);
 
 // Decode an ADTS stream
 let mut params = CodecParameters::audio(CodecId::new("aac"));
 params.sample_rate = Some(44_100);
 params.channels = Some(2);
-let mut dec = codecs.make_decoder(&params)?;
+let mut dec = ctx.codecs.make_decoder(&params)?;
 // dec.send_packet(&adts_packet)?;
 // dec.receive_frame()?  -> Frame::Audio (interleaved S16, FRAME_LEN=1024)
 

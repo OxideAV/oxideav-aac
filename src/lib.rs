@@ -159,7 +159,7 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "aac";
 
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let cid = CodecId::new(CODEC_ID_STR);
     let dec_caps = CodecCapabilities::audio("aac_sw")
         .with_lossy(true)
@@ -201,10 +201,36 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
+/// Unified registration entry point — installs AAC into the codec
+/// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
 
 fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     encoder::make_encoder(params)
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "encoder factory not installed via RuntimeContext"
+        );
+    }
 }
