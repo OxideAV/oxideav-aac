@@ -218,26 +218,26 @@ pub const SWB_LD_512_64: &[u16] = &[
 
 /// LD 512-sample swb offsets for sf_idx 3..=4 (48 / 44.1 kHz).
 pub const SWB_LD_512_48: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-    156, 172, 188, 212, 240, 272, 320, 384, 448, 512,
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 156,
+    172, 188, 212, 240, 272, 320, 384, 448, 512,
 ];
 
 /// LD 512-sample swb offsets for sf_idx 5 (32 kHz).
 pub const SWB_LD_512_32: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-    160, 176, 196, 216, 240, 268, 300, 332, 364, 396, 428, 460, 512,
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160,
+    176, 196, 216, 240, 268, 300, 332, 364, 396, 428, 460, 512,
 ];
 
 /// LD 512-sample swb offsets for sf_idx 6..=7 (24 / 22.05 kHz).
 pub const SWB_LD_512_24: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-    156, 172, 188, 212, 240, 272, 320, 384, 448, 512,
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 156,
+    172, 188, 212, 240, 272, 320, 384, 448, 512,
 ];
 
 /// LD 512-sample swb offsets for sf_idx 8..=10 (16 / 12 / 11.025 kHz).
 pub const SWB_LD_512_16: &[u16] = &[
-    0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 96, 112, 128, 144, 160, 176, 192, 220, 248, 280,
-    312, 344, 376, 408, 440, 472, 512,
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 96, 112, 128, 144, 160, 176, 192, 220, 248, 280, 312,
+    344, 376, 408, 440, 472, 512,
 ];
 
 /// LD 512-sample swb offsets for sf_idx 11..=12 (8 / 7.35 kHz).
@@ -267,20 +267,20 @@ pub const SWB_LD_512: [&[u16]; 13] = [
 
 /// LD 480-sample swb offsets for sf_idx 3..=4 (48 / 44.1 kHz).
 pub const SWB_LD_480_48: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-    156, 172, 188, 212, 240, 272, 320, 384, 448, 480,
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 156,
+    172, 188, 212, 240, 272, 320, 384, 448, 480,
 ];
 
 /// LD 480-sample swb offsets for sf_idx 5 (32 kHz).
 pub const SWB_LD_480_32: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-    160, 176, 196, 216, 240, 268, 300, 332, 364, 396, 428, 460, 480,
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160,
+    176, 196, 216, 240, 268, 300, 332, 364, 396, 428, 460, 480,
 ];
 
 /// LD 480-sample swb offsets for sf_idx 6..=7 (24 / 22.05 kHz).
 pub const SWB_LD_480_24: &[u16] = &[
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144,
-    156, 172, 188, 212, 240, 272, 320, 384, 448, 480,
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 156,
+    172, 188, 212, 240, 272, 320, 384, 448, 480,
 ];
 
 /// Per-sf-index LD 480-sample SWB offset table (index 0..=12).
@@ -460,10 +460,7 @@ mod tests {
     fn swb_ld_512_last_entry_is_frame_len() {
         for (idx, table) in SWB_LD_512.iter().enumerate() {
             let last = *table.last().expect("table must be non-empty");
-            assert_eq!(
-                last, 512,
-                "SWB_LD_512[{idx}]: last entry {last} != 512"
-            );
+            assert_eq!(last, 512, "SWB_LD_512[{idx}]: last entry {last} != 512");
         }
     }
 
@@ -472,10 +469,7 @@ mod tests {
     fn swb_ld_480_last_entry_is_frame_len() {
         for (idx, table) in SWB_LD_480.iter().enumerate() {
             let last = *table.last().expect("table must be non-empty");
-            assert_eq!(
-                last, 480,
-                "SWB_LD_480[{idx}]: last entry {last} != 480"
-            );
+            assert_eq!(last, 480, "SWB_LD_480[{idx}]: last entry {last} != 480");
         }
     }
 
@@ -522,7 +516,9 @@ mod tests {
         let asc = crate::asc::parse_asc(&bytes).unwrap();
         assert_eq!(asc.object_type, crate::syntax::AOT_AAC_ELD);
         assert_eq!(asc.sampling_frequency, 44_100);
-        let eld = asc.eld_config.expect("ELD config must be present for AOT 39");
+        let eld = asc
+            .eld_config
+            .expect("ELD config must be present for AOT 39");
         assert_eq!(eld.frame_length, LdFrameLength::Samples512);
         assert!(!eld.ld_sbr_present);
     }

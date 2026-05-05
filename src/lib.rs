@@ -131,7 +131,6 @@
 pub mod adts;
 pub mod asc;
 pub mod decoder;
-pub mod ld_eld;
 pub mod encoder;
 pub mod gapless;
 pub mod he_aac_encoder;
@@ -140,6 +139,7 @@ pub mod huffman_tables;
 pub mod ics;
 pub mod imdct;
 pub mod latm;
+pub mod ld_eld;
 pub mod loas;
 pub mod mdct;
 pub mod pce;

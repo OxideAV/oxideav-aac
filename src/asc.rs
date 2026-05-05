@@ -29,11 +29,13 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::ld_eld::{parse_eld_specific_config, parse_ld_specific_config, EldSpecificConfig, LdSpecificConfig};
+use crate::ld_eld::{
+    parse_eld_specific_config, parse_ld_specific_config, EldSpecificConfig, LdSpecificConfig,
+};
 use crate::pce::{parse_program_config_element, ProgramConfigElement};
 use crate::syntax::{
-    sample_rate, AOT_AAC_ELD, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SCALABLE,
-    AOT_AAC_SSR, AOT_ER_AAC_LD, AOT_PS, AOT_SBR,
+    sample_rate, AOT_AAC_ELD, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SCALABLE, AOT_AAC_SSR,
+    AOT_ER_AAC_LD, AOT_PS, AOT_SBR,
 };
 use oxideav_core::bits::BitReader;
 
