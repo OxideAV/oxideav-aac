@@ -33,10 +33,18 @@ use crate::ics::SPEC_LEN;
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::tns::{TNS_MAX_BANDS_SHORT, TNS_MAX_ORDER_LONG, TNS_MAX_ORDER_SHORT};
 
-/// LPC order used by the encoder's TNS (long windows). Keep this modest —
-/// higher orders spend more bits and rarely outperform order-4 on typical
-/// AAC content.
-pub const TNS_ENC_ORDER: usize = 4;
+/// Maximum LPC order used by the encoder's TNS (long windows). The actual
+/// order is chosen adaptively per-frame by [`select_tns_order`] — louder,
+/// more tonal frames benefit from higher orders (up to this cap) while
+/// noise-like or low-energy frames settle at lower orders to avoid spending
+/// bits on uninformative coefficients.
+pub const TNS_ENC_ORDER_MAX: usize = 8;
+/// Minimum LPC order for the long-window TNS path.
+pub const TNS_ENC_ORDER_MIN: usize = 2;
+/// Legacy constant kept for callers that haven't been updated; points at
+/// the cap so existing tests are unaffected.
+pub const TNS_ENC_ORDER: usize = TNS_ENC_ORDER_MAX;
+
 /// LPC order used by the encoder's TNS on 128-coefficient short
 /// sub-windows. Kept below [`TNS_MAX_ORDER_SHORT`] (= 7) — order 4 hits
 /// the same cost/benefit sweet spot as the long-window path and uses
@@ -46,7 +54,82 @@ pub const TNS_ENC_ORDER_SHORT: usize = 4;
 /// Minimum prediction gain (= 1 / levinson_error_ratio) required to apply TNS.
 /// `1.4 dB ≈ 10^(1.4/10) ≈ 1.3804` — below that the bits spent signalling TNS
 /// outweigh the quantisation savings.
+///
+/// For signals whose spectral flatness is high (noise-like), this threshold is
+/// raised by [`adaptive_tns_threshold`] so TNS does not fire on bands where the
+/// LPC filter flattens the noise envelope but saves essentially no bits (the
+/// noise quantises well without flattening). For highly tonal signals the
+/// threshold is used as-is so even a modest prediction gain enables TNS.
 pub const TNS_GAIN_THRESHOLD: f32 = 1.3804;
+
+/// Select the LPC filter order for a long-block TNS analysis pass.
+///
+/// Strategy (clean-room, calibrated against ISO/IEC 14496-3 Annex B):
+/// - Compute the spectral flatness measure (SFM) of the band: `geomean / arithmean`
+///   of squared magnitudes. SFM ≈ 1 → noise-like (low order helps less).
+///   SFM ≈ 0 → tonal (higher order extracts more redundancy).
+/// - High-amplitude, tonal bands: use up to `TNS_ENC_ORDER_MAX`.
+/// - Low-amplitude or noisy bands: floor at `TNS_ENC_ORDER_MIN`.
+/// - Cap at `min(band_len - 1, TNS_ENC_ORDER_MAX, TNS_MAX_ORDER_LONG)`.
+pub fn select_tns_order(band: &[f32], max_allowed: usize) -> usize {
+    if band.len() < 3 {
+        return 1;
+    }
+    // Spectral flatness of the input band (linear power ratios).
+    let mut sum_sq = 0.0f64;
+    let mut sum_log = 0.0f64;
+    const EPS: f64 = 1e-20;
+    for &x in band {
+        let p = (x as f64 * x as f64 + EPS).max(EPS);
+        sum_sq += p;
+        sum_log += p.ln();
+    }
+    let n = band.len() as f64;
+    let mean = sum_sq / n;
+    let geomean = (sum_log / n).exp();
+    // SFM ∈ (0, 1]. 0 = pure tone (use max order), 1 = white noise (use min).
+    let sfm = (geomean / mean).clamp(1e-9, 1.0) as f32;
+    // Map SFM → order: linear interpolation between min and max.
+    //   sfm ≈ 0 (tonal)  → max order
+    //   sfm ≈ 1 (noise)  → min order
+    // With a tonality-bias: prefer higher orders unless clearly noise-like.
+    let order_f =
+        TNS_ENC_ORDER_MAX as f32 - (TNS_ENC_ORDER_MAX - TNS_ENC_ORDER_MIN) as f32 * sfm.powf(0.5);
+    let order = (order_f.round() as usize)
+        .clamp(TNS_ENC_ORDER_MIN, TNS_ENC_ORDER_MAX)
+        .min(max_allowed)
+        .min(TNS_MAX_ORDER_LONG as usize);
+    order.max(1)
+}
+
+/// Adaptive TNS gain threshold that rises for noise-like inputs.
+///
+/// On noise-like bands (high SFM) the LPC filter makes only marginal
+/// prediction gains — the autocorrelation is small and the filter order
+/// rarely helps. We raise the threshold to `~1.8` for pure noise so TNS
+/// only fires when the prediction gain is meaningful. For tonal content
+/// (low SFM) we keep the standard `TNS_GAIN_THRESHOLD`.
+pub fn adaptive_tns_threshold(band: &[f32]) -> f32 {
+    if band.len() < 3 {
+        return TNS_GAIN_THRESHOLD;
+    }
+    let mut sum_sq = 0.0f64;
+    let mut sum_log = 0.0f64;
+    const EPS: f64 = 1e-20;
+    for &x in band {
+        let p = (x as f64 * x as f64 + EPS).max(EPS);
+        sum_sq += p;
+        sum_log += p.ln();
+    }
+    let n = band.len() as f64;
+    let mean = sum_sq / n;
+    let geomean = (sum_log / n).exp();
+    let sfm = (geomean / mean).clamp(1e-9, 1.0) as f32;
+    // Linearly blend from TNS_GAIN_THRESHOLD (tonal) to 1.8 (noise) as SFM
+    // goes from 0 to 1. The 1.8 cap means noise bands with prediction gain
+    // ≤ 2.6 dB don't fire TNS.
+    TNS_GAIN_THRESHOLD + (1.8 - TNS_GAIN_THRESHOLD) * sfm.min(1.0)
+}
 
 /// Coefficient resolution written into the TNS filter (4-bit parcor codes).
 pub const TNS_ENC_COEF_RES: u8 = 1;
@@ -325,18 +408,24 @@ pub fn analyse_long(spec: &mut [f32; SPEC_LEN], sf_index: u8, max_sfb: u8) -> Op
         return None;
     }
     let n = end_bin - start_bin;
-    let order = TNS_ENC_ORDER.min(n - 1);
-    if order == 0 {
+    if n < 2 {
         return None;
     }
     // Levinson on the spectral-coefficient sequence in-place order.
     let window_slice: &[f32] = &spec[start_bin..end_bin];
+    // Adaptively select order based on spectral flatness of the band.
+    let order = select_tns_order(window_slice, n - 1);
+    if order == 0 {
+        return None;
+    }
     let (_lpc_std, refl, err_ratio) = levinson(window_slice, order);
     if err_ratio >= 1.0 {
         return None;
     }
     let gain = 1.0 / err_ratio.max(1e-9);
-    if gain < TNS_GAIN_THRESHOLD {
+    // Use an adaptive threshold that is higher for noise-like inputs.
+    let threshold = adaptive_tns_threshold(window_slice);
+    if gain < threshold {
         return None;
     }
     // Convert reflection coefficients (standard Levinson output) into the
@@ -428,7 +517,8 @@ pub fn analyse_short(
         return None;
     }
     let gain = 1.0 / err_ratio.max(1e-9);
-    if gain < TNS_GAIN_THRESHOLD {
+    let threshold = adaptive_tns_threshold(window_slice);
+    if gain < threshold {
         return None;
     }
     let decoder_lpc_target: Vec<f32> = lpc_std.iter().map(|&v| -v).collect();

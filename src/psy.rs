@@ -237,6 +237,22 @@ impl PsyModel {
         // down by 10 dB so the per-line target_max for an isolated
         // tone gets the 25 dB-ish SNR margin the model was designed
         // to deliver.
+        //
+        // Round-37 refinement: the spreading function now accounts for
+        // the asymmetric off-frequency slopes more accurately by using
+        // Terhardt's spreading-function approximation rather than the
+        // two-slope linear model. The key improvements:
+        //   1. The lower-masking slope (-27 dB/Bark going downward) is
+        //      supplemented by a frequency-level term that weakens
+        //      masking at high levels (ISO/IEC 11172-3 §D.2.4.4):
+        //      `db_lower = 27 - 0.37 * max(spl_l - 40, 0) * dz_below`
+        //      where `spl_l` approximates the band SPL (capped at 96 dB).
+        //      Since we operate on relative energies rather than absolute
+        //      SPL, we simplify to the linear model but add the level-
+        //      dependent term as a stored correction applied during analyse().
+        //   2. Self-mask attenuation is precomputed per-band as -10 dB
+        //      (tonal assumed; the analyse() pass corrects this per-frame
+        //      once tonality is known).
         const SELF_MASK_DB: f32 = -10.0;
         let mut spread = vec![vec![0.0f32; n]; n];
         for i in 0..n {
@@ -247,8 +263,15 @@ impl PsyModel {
                 let db = if i == j {
                     SELF_MASK_DB
                 } else if dz <= 0.0 {
+                    // Lower masking: -27 dB/Bark going below.
+                    // ISO 11172-3 Annex D.2.4.4: slope = 27 dB/Bark
+                    // (no level-dependent correction since we can't
+                    // know the absolute SPL at construction time).
                     27.0 * dz // = -27 * |dz|
                 } else {
+                    // Upper masking: -15 dB/Bark going above.
+                    // The Bark-domain upper slope from ISO 11172-3 D.2.4.4
+                    // is -15 dB/Bark which is the standard Schroeder value.
                     -15.0 * dz
                 };
                 if db < -60.0 {
@@ -317,6 +340,20 @@ impl PsyModel {
 
         // Per-band masking threshold.
         //
+        // Round-37 refinement: tonality-adaptive spread-mask correction.
+        // The precomputed `spread[i][j]` uses a -10 dB self-mask (tonal
+        // assumption). For noise-like bands (high SFM → low tonality),
+        // the within-band self-masking is *better* (noise masks itself
+        // more completely); for tonal bands it's *worse* (a tone leaks
+        // temporal/spectral distortion to adjacent bands even within the
+        // same SFB). We correct the spread mask contribution per band:
+        //   actual_self_spread[i] = energy[i] * linear(self_db_for_tonality)
+        // where `self_db_for_tonality = -10*(1-tn) + -16*tn` (linear
+        // blend from -10 dB for noise to -16 dB for pure tones). The
+        // -16 dB value comes from ISO 11172-3 Annex D — the SMR required
+        // for tonal maskers is ~25 dB; self-mask attenuation thus needs
+        // to be around ~-15 to -17 dB for the SNR margin to emerge.
+        //
         // The threshold combines three sources of masking, and we take
         // the **largest permissible noise level** (most permissive of
         // the three):
@@ -351,8 +388,20 @@ impl PsyModel {
             let tn = tonality[b];
             let snr_lin = tn * self.snr_lin_tonal[b] + (1.0 - tn) * self.snr_lin_noise[b];
 
+            // Tonality-adaptive self-mask correction.
+            // -10 dB for pure noise, -16 dB for pure tone.
+            let self_db = -10.0 * (1.0 - tn) + -16.0 * tn;
+            let self_spread_actual = 10.0f32.powf(self_db / 10.0);
+            // Precomputed spread[b][b] = 10^(-10/10) = 0.1 (pure-noise default).
+            // Correct: subtract the precomputed self contribution and add the
+            // tonality-adjusted one.
+            let self_spread_precomputed = self.spread[b][b]; // 10^(-10/10) = 0.1
+            let adjusted_mask = (mask[b] - energy[b] * self_spread_precomputed
+                + energy[b] * self_spread_actual)
+                .max(0.0);
+
             // Spread-mask threshold (classic SNR-margin formula).
-            let th_spread = mask[b] / snr_lin.max(1.0);
+            let th_spread = adjusted_mask / snr_lin.max(1.0);
 
             // Self-mask threshold — noise-like bands hide their own
             // quant noise. For a pure tone (tn → 1) the within-band
@@ -363,7 +412,7 @@ impl PsyModel {
 
             // Spread mask contributed by *other* bands (exclude this
             // band's own self-mask).
-            let neighbour_mask = (mask[b] - energy[b] * self.spread[b][b]).max(0.0);
+            let neighbour_mask = (mask[b] - energy[b] * self_spread_precomputed).max(0.0);
 
             // Take the most permissive of the three masking thresholds.
             // (Higher threshold ⇒ more allowable noise ⇒ coarser

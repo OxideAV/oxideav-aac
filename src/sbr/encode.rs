@@ -361,9 +361,81 @@ pub fn estimate_envelope(
     }
     // Noise floor — Q_orig = 2^(NOISE_FLOOR_OFFSET - sf). The decoder's
     // NOISE_FLOOR_OFFSET is 6, so sf=6 gives Q_orig=1 (roughly equal
-    // noise:signal), sf>=10 gives <-6 dB below signal. Pick a high sf
-    // (≈ very low noise) for tonal input.
-    let noise = vec![18i32; ft.nq];
+    // noise:signal), sf>=10 gives <-6 dB below signal.
+    //
+    // Round-37 refinement: compute the noise floor per-band from the ratio
+    // of minimum to maximum subband energy within the noise band range.
+    // Low ratio (tonal content, little noise) → high sf (≈ very low noise
+    // floor contribution). High ratio (noisy content) → lower sf so the
+    // decoder adds appropriate shaped noise to fill in the gaps.
+    //
+    // The noise bands span the same range as the SBR envelope bands, grouped
+    // by ft.nq. For each noise band, we look at the full set of QMF subbands
+    // in that range and compute the ratio min_energy/mean_energy. For tonal
+    // input, isolated sine peaks drive the mean up while most subbands have
+    // near-zero energy (min → 0, ratio → 0) → high sf. For wideband noise,
+    // all subbands have similar energy (ratio ≈ 1) → lower sf.
+    let mut noise = vec![0i32; ft.nq];
+    for nq in 0..ft.nq {
+        // The noise band table ft.f_noise maps noise bands to QMF subband
+        // ranges. Use the beginning of each noise band as a proxy for its
+        // QMF range since ft.f_noise may not be available here — fall back
+        // to dividing the full SBR band range into ft.nq equal parts.
+        let total_sbr_bands = ft.n_high;
+        let band_start_frac = nq as f32 / ft.nq as f32;
+        let band_end_frac = (nq + 1) as f32 / ft.nq as f32;
+        let hi_start = (band_start_frac * total_sbr_bands as f32).round() as usize;
+        let hi_end = (band_end_frac * total_sbr_bands as f32)
+            .round()
+            .max(hi_start as f32 + 1.0) as usize;
+        let hi_end = hi_end.min(total_sbr_bands);
+
+        if hi_start >= hi_end {
+            noise[nq] = 18;
+            continue;
+        }
+
+        // Get the QMF range corresponding to this envelope-band range.
+        let k0 = ft.f_high[hi_start].max(0) as usize;
+        let k1 = ft.f_high[hi_end.min(ft.f_high.len() - 1)]
+            .min(NUM_QMF_BANDS as i32)
+            .max(k0 as i32) as usize;
+        if k1 <= k0 {
+            noise[nq] = 18;
+            continue;
+        }
+
+        // Collect per-subband mean energies across time slots.
+        let mut band_energies = vec![0.0f32; k1 - k0];
+        for row in x_high.iter() {
+            for (bi, kk) in (k0..k1).enumerate() {
+                band_energies[bi] += row[kk].norm_sqr();
+            }
+        }
+        let n_slots = x_high.len().max(1) as f32;
+        for e in band_energies.iter_mut() {
+            *e /= n_slots;
+        }
+
+        let mean_e: f32 = band_energies.iter().sum::<f32>() / band_energies.len() as f32;
+        let min_e: f32 = band_energies.iter().cloned().fold(f32::MAX, f32::min);
+
+        // Noise-to-signal proxy: min_e / mean_e in (0, 1].
+        // For tonal content: min ≈ 0, ratio → 0 (little noise → high sf).
+        // For broadband noise: min ≈ mean, ratio ≈ 1 (more noise → lower sf).
+        let noise_ratio = if mean_e > 1e-20 {
+            (min_e / mean_e).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Map noise_ratio → sf:
+        //   noise_ratio ≈ 0 (tonal)     → sf = 18 (≈ -12 dB noise relative to E_orig=64)
+        //   noise_ratio ≈ 1 (noisy)     → sf = 10 (≈ -4 dB, meaningful noise contribution)
+        // Linear blend: sf = 18 - 8 * noise_ratio
+        let sf_f = 18.0 - 8.0 * noise_ratio;
+        noise[nq] = sf_f.round() as i32;
+    }
     SbrFrameScalefactors { env, noise }
 }
 

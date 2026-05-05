@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **TNS adaptive filter-order selection (round 37).** `tns_analyse::analyse_long`
+  now calls `select_tns_order(band, max_allowed)` instead of using a fixed
+  order-4. The order is chosen per-frame via Spectral Flatness Measure (SFM):
+  tonal bands (SFM ≈ 0) get up to order 8 (`TNS_ENC_ORDER_MAX`); noise-like
+  bands (SFM ≈ 1) get a minimum of order 2 (`TNS_ENC_ORDER_MIN`). The mapping
+  is `order ≈ MAX − (MAX−MIN)·√SFM` (square-root tonality bias keeps order
+  higher than a linear blend on mildly tonal material). Long-window cap stays
+  within `TNS_MAX_ORDER_LONG` (= 12 per spec); short-window order stays fixed
+  at 4. Saves bits on noise-only frames (lower-order filter) and improves
+  prediction gain on tonal frames (higher-order filter).
+
+- **Adaptive TNS gain threshold (round 37).** `adaptive_tns_threshold(band)`
+  replaces the fixed `TNS_GAIN_THRESHOLD = 1.38` with a tonality-blended
+  value: tonal (SFM ≈ 0) stays at 1.38 (~1.4 dB); pure noise (SFM ≈ 1)
+  raises the threshold to 1.8 (~2.6 dB). TNS is suppressed on bands where
+  the Levinson filter finds only marginal prediction gain — avoids spending
+  parcor bits on uninformative noise-band autocorrelation.
+
+- **Tonality-adaptive PSY self-masking correction (round 37).** The
+  precomputed spreading matrix uses a fixed -10 dB self-mask. Per-frame,
+  `PsyModel::analyse` now corrects the within-band spread contribution using
+  the actual per-band tonality: pure noise → -10 dB (unchanged); pure tone →
+  -16 dB (worse self-masking per ISO 11172-3 Annex D). The tonal self-mask
+  correction raises the threshold margin for tonal bands, directing more bits
+  to high-tonality content.
+
+- **M/S stereo sign-agreement gate (round 37).** `analyse_cpe` adds a
+  magnitude-weighted per-line sign-agreement check (`ms_sign_agreement`) to
+  the per-band M/S decision. M/S is blocked when fewer than 55 % of
+  coefficient pairs (weighted by |L|·|R| geometric mean) agree with the
+  dominant polarity. Prevents M/S on bands with partially anti-phased energy
+  where Mid = (L+R)/2 would leave loud destructive-interference zeros in the
+  wrong channel.
+
+- **SBR per-band noise-floor estimation (round 37).** `sbr::encode` now
+  derives the noise-floor scalefactor (`noise[nq]`) from actual QMF-subband
+  energy instead of the fixed value 18. For each noise band, the ratio of
+  minimum subband energy to mean energy is mapped to a scalefactor in [10, 18]:
+  tonal subbands (min ≈ 0) keep sf ≈ 18; noise-floor-dominated subbands
+  (min/mean ≈ 1) get sf ≈ 10, preserving broadband noise energy in the SBR
+  reconstructed high-band.
+
+- **PNS classification now operates on pre-TNS spectrum (round 37 bugfix).**
+  `classify_pns_band` was previously called on the TNS-filtered spectrum
+  (after `tns_analyse_long` modifies `spec_tns` in place). The TNS all-zero
+  forward filter, especially at order 8, can alter the peak-to-RMS
+  distribution of genuine noise bands enough to push them above the 2.6
+  threshold and suppress PNS. The classifier is now called on the original
+  (pre-TNS) spectrum, which correctly reflects the source signal's noisiness;
+  the quantiser and scalefactor search still operate on the TNS-filtered
+  spectrum. HF-band PNS coverage on white noise improves from 73 % to 77 %
+  at 96 kbps.
+
 ### Added
 
 - **AAC-LD / AAC-ELD parse scaffold (objectType 23 / 39).** The

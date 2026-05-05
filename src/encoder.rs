@@ -1746,6 +1746,13 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     let mut spec_tns = [0.0f32; SPEC_LEN];
     let copy_len = spec.len().min(SPEC_LEN);
     spec_tns[..copy_len].copy_from_slice(&spec[..copy_len]);
+    // Save a reference to the original (pre-TNS) spectrum for PNS
+    // classification below. PNS classifies whether the *source* signal is
+    // noise-like; the TNS forward filter (especially at order 8) can alter
+    // the peak-to-RMS distribution of noise bands and suppress PNS
+    // triggering on bands that are genuinely noise-like in the original
+    // signal. The quantiser still operates on the TNS-filtered spectrum.
+    let spec_pre_tns: &[f32] = spec;
     let tns = if use_tns {
         tns_analyse_long(&mut spec_tns, sf_index, max_sfb as u8)
     } else {
@@ -1856,7 +1863,11 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         cbs[sfb] = if q.iter().all(|&x| x == 0) {
             0
         } else if !pns_off && pns_eligible_band(swb, sfb, sample_rate) {
-            if let Some(pns_sf) = classify_pns_band(spec, swb[sfb] as usize, swb[sfb + 1] as usize)
+            // Classify on the original (pre-TNS) spectrum: PNS asks whether
+            // the source signal is noise-like. TNS alters peak-to-RMS
+            // distribution so noise bands near the 2.6 gate can fail.
+            if let Some(pns_sf) =
+                classify_pns_band(spec_pre_tns, swb[sfb] as usize, swb[sfb + 1] as usize)
             {
                 sfs[sfb] = pns_sf;
                 NOISE_HCB
@@ -3050,6 +3061,47 @@ fn ms_band_safe(e_l: f32, e_r: f32, corr: f32) -> bool {
     corr.abs() >= 0.4
 }
 
+/// Round-37 M/S coherence gate: compute the per-line magnitude-weighted
+/// sign-agreement ratio between L and R for a band.
+///
+/// Returns the fraction of per-line products `L[i] * R[i]` that agree with
+/// the global polarity (weighted by the geometric mean of `|L[i]|` and
+/// `|R[i]|`). This parallels the IS classifier's sign-agreement gate but
+/// with a lower eligibility threshold for M/S (M/S does not demand near-
+/// perfect colinearity, only that the two channels don't have many
+/// anti-correlated high-magnitude lines that would expand M and S above
+/// their LR equivalents).
+///
+/// Returns 0.0 for silent bands. Range: `[0, 1]`. A value ≥ `0.55`
+/// means the majority of energy-weighted samples agree in sign, i.e.
+/// the channels are predominantly in-phase — a good M/S candidate.
+fn ms_sign_agreement(l: &[f32], r: &[f32], band_start: usize, band_end: usize) -> f32 {
+    if band_end <= band_start || band_end > l.len() || band_end > r.len() {
+        return 0.0;
+    }
+    let lb = &l[band_start..band_end];
+    let rb = &r[band_start..band_end];
+    let mut agree = 0.0f32;
+    let mut total = 0.0f32;
+    // Determine global polarity from the dot product sign.
+    let dot: f32 = lb.iter().zip(rb.iter()).map(|(&a, &b)| a * b).sum();
+    let global_pos = dot >= 0.0;
+    for i in 0..lb.len() {
+        let p = lb[i] * rb[i];
+        // Weight by geometric mean of magnitudes to emphasise loud lines.
+        let w = (lb[i].abs() * rb[i].abs()).sqrt();
+        total += w;
+        if (p >= 0.0) == global_pos {
+            agree += w;
+        }
+    }
+    if total < 1e-12 {
+        0.0
+    } else {
+        agree / total
+    }
+}
+
 /// Choose M/S stereo per band and return per-channel ICS.
 ///
 /// For common-window CPE both channels MUST share the same ics_info
@@ -3122,7 +3174,15 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
         let band_start = swb[sfb] as usize;
         let band_end = swb[sfb + 1] as usize;
         let (e_l, e_r, corr_lr) = band_energy_corr(l, r, band_start, band_end);
-        if cost_ms[sfb] < best_cost && ms_band_safe(e_l, e_r, corr_lr) {
+        // Round-37 M/S gate: add per-band sign-agreement check on top of
+        // the energy-balance + correlation gates. Bands where the two
+        // channels are predominantly anti-phase (sign-agreement < 0.55)
+        // benefit from S = (L-R)/2 having full amplitude (side channel
+        // nearly equals mid); the M/S choice doubles quant noise on both
+        // channels for no bit-savings benefit. Skip M/S when sign agreement
+        // is below the threshold even if the cost metric prefers M/S.
+        let sign_agree = ms_sign_agreement(l, r, band_start, band_end);
+        if cost_ms[sfb] < best_cost && ms_band_safe(e_l, e_r, corr_lr) && sign_agree >= 0.55 {
             best_cost = cost_ms[sfb];
             choice = 1;
         }
