@@ -672,15 +672,30 @@ impl AacDecoder {
                     let _pce = crate::pce::parse_program_config_element(&mut br)?;
                 }
                 ElementType::Fil => {
+                    // ISO/IEC 14496-3:2009 Table 4.11 — fill_element():
+                    //
+                    //   cnt = count;                 // 4 bits
+                    //   if (cnt == 15)
+                    //       cnt += esc_count - 1;    // 8 bits
+                    //
+                    // i.e. when the 4-bit `count` saturates at 15 the real
+                    // payload byte length is `15 + esc_count - 1`, which
+                    // simplifies to `14 + esc_count`. The earlier
+                    // `count += esc_count.saturating_sub(1)` form misread
+                    // this — for the conformant `esc_count == 0` case it
+                    // yielded `count = 15` instead of `14`, asking the
+                    // bit-reader for one extra byte and tripping
+                    // `bitreader: out of bits` on the trailing FIL of
+                    // ~1.4 % of real-world ADTS-AAC frames (e.g. the AAC
+                    // track of `congress_mtgox_coins.mp4`, where 51 of
+                    // 3711 packets carry exactly this pattern). The
+                    // correct expression is the literal spec subtraction;
+                    // `esc_count` is unsigned so it can legitimately
+                    // shrink the total by one when zero.
                     let mut count = br.read_u32(4)?;
                     if count == 15 {
-                        // Per §4.4.2.7: extended count `esc_count` is added
-                        // verbatim; the stored count is `esc_count + 15 - 1`.
-                        // Use saturating_sub so a malformed `esc_count = 0`
-                        // stream doesn't overflow — we simply yield
-                        // `count = 14` which matches the reconstructed
-                        // extended count convention.
-                        count += br.read_u32(8)?.saturating_sub(1);
+                        let esc_count = br.read_u32(8)?;
+                        count = 14 + esc_count;
                     }
                     if count > 0 {
                         let total_bits = 8 * count;

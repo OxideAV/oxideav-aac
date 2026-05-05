@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `decoder::AacDecoder` — `fill_element()` `count == 15` escape now
+  computes the payload byte count as `14 + esc_count` (i.e. the literal
+  `cnt = 15 + esc_count - 1` from ISO/IEC 14496-3:2009 Table 4.11)
+  instead of `15 + esc_count.saturating_sub(1)`. The earlier
+  `saturating_sub` clamp turned the spec's `0 - 1` underflow into `0`,
+  so a conformant FIL element with `esc_count == 0` asked the
+  bit-reader for one extra byte and tripped
+  `Error::invalid("bitreader: out of bits")` on the trailing element of
+  ~1.4 % of real-world ADTS-AAC frames (51 of 3711 packets in the AAC
+  track of `congress_mtgox_coins.mp4`). Added
+  `tests/fil_esc_count_zero.rs` pinning the fix against the third raw
+  ADTS frame from that stream — pre-fix the test errors at the FIL
+  parse, post-fix it produces a normal 1024-sample stereo frame.
+
 ### Added
 
 - `tests/r27_ms_cpe_psy_diagnose.rs` — round-27 regression gate for the

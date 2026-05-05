@@ -68,7 +68,7 @@ read it instead of looking for an ADTS sync word on the first packet.
 | Intensity stereo (§4.6.8.2.3)          | Yes (cb 14/15, sign from ms_used)       |
 | TNS (§4.6.9)                           | Long AND short-window filters           |
 | Pulse data (§4.6.5)                    | Yes (long-window only); short-window rejects as non-conformant |
-| Fill / DSE elements                    | Skipped cleanly                         |
+| Fill / DSE elements                    | Skipped cleanly (FIL `count==15` escape uses spec-literal `cnt = 14 + esc_count`) |
 | LFE element (§4.6.10)                  | Yes (long-window SCE-like path)         |
 | PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
 | Gain control / SSR / Main / LTP        | Refused (`Error::Unsupported`)          |
