@@ -429,17 +429,22 @@ impl HeAacStereoEncoder {
         // tests/r26_no_sbr_dequant_warning.rs).
         inner.set_skip_gapless_padding(true);
         // HE-AAC stereo routes the LF half of L+R through the AAC-LC
-        // core via a CPE pair. The plain AAC-LC psy model (default-on
-        // since round-24) regresses synthetic clean-tone CPE M/S
-        // round-trips (the L↔R correlated noise re-combination on
-        // L = M+S / R = M-S is not yet modelled — see the round-25
-        // CHANGELOG entry); to avoid breaking the existing
-        // `sbr_he_aac_stereo_ffmpeg` interop pin (synthetic 1+2 kHz
-        // tone-pair, 24 kHz core) we keep psy off in the stereo
-        // wrapper until the M/S quant-noise model lands. Mono HE-AAC
-        // does not have this issue (no CPE) and defaults to psy-on
-        // via the inner encoder's env-default.
-        inner.set_enable_psy_model(false);
+        // core via a CPE pair. Round-25 had to keep psy off here to
+        // dodge a 5-10 dB SNR drop on the `sbr_he_aac_stereo_ffmpeg`
+        // synthetic 1+2 kHz tone-pair gate, traced to the AAC-LC psy
+        // model recommending above-baseline `target_max=16` on the CPE
+        // tonal bands. Without TNS-flattening (the CPE LR/MS analysis
+        // disables TNS so the per-band M/S decision has consistent
+        // coefficients), a fine-step on a tonal band's peak rounds
+        // side-lobe lines up to ±1 and dequantises to ±step^(4/3) —
+        // spurious off-tone noise that beats the source. Round-27
+        // (`tests/r27_ms_cpe_psy_diagnose`) closed this with the
+        // `use_tns=false` clamp in `analyse_and_quantise_opts`: when
+        // TNS is off, psy's above-baseline recommendations are pinned
+        // to baseline=7. The clamp recovers the per-line tone purity
+        // exactly to the psy-off baseline (Goertzel ratio drop 0%) so
+        // HE-AAC stereo can now default to psy-on like mono and v2.
+        // The inner encoder's env-default takes effect.
         let sbr = SbrStereoEncoder::new(core_rate)?;
         let mut out_params = params.clone();
         out_params.media_type = MediaType::Audio;

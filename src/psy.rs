@@ -463,36 +463,26 @@ impl PsyModel {
             // (1..=6) saves bits by pushing onto book 1-3 territory
             // but is only safe on fully-masked bands.
             let raw = q_peak.clamp(1.0, 16.0).round() as i32;
-            // Strict floor at the legacy flat baseline. The psy
-            // model is ratcheted to be **monotone-improving**: it may
-            // recommend FINER quantisation than `target_max = 7` (on
-            // tonal/loud bands, sending the band into book 9/10/11),
-            // but it must never recommend COARSER. Sub-baseline
-            // target_max generated per-line quant noise on neighbour
-            // bands of strong tones — perceptually masked, yes, but
-            // `tests/encode_roundtrip.rs` measures the ratio of the
-            // tone's energy to the per-line maximum off-band energy,
-            // and per-line noise broke that gate (Goertzel ratios
-            // dropped from ~80 to ~25 on stereo 440+880 Hz
-            // roundtrips when neighbour bands were coarsened to
-            // target_max in 1..=3).
-            //
-            // The trade-off: corpus byte-savings on the wider corpus
-            // are ~25-35 % (vs ~30-40 % when sub-baseline coarsening
-            // was allowed on truly-masked bands). PSNR-vs-source on
-            // the corpus stays positive (mean Δ +0.07 dB; see
-            // `tests/psy_corpus_validation.rs`). Tone-purity gates
-            // on the round-trip suite all hold.
-            //
-            // If a future round wants to recover the lost bit-savings
-            // on demonstrably masked bands, the path forward is to
-            // (a) sample-rate-aware-broaden the masking window so
-            // neighbour bands of a tone don't *look* fully masked,
-            // (b) gate sub-baseline coarsening on a "no tonal
-            // neighbour within ±3 SFB" check, and (c) update the
-            // tone-purity tests to use a band-integrated rather than
-            // per-line noise floor.
-            target_max[b] = raw.max(baseline);
+            // Round-27: floor at baseline=7 dropped. Previously this line
+            // was `raw.max(baseline)` to defend the per-line tone-purity
+            // gate in `tests/encode_roundtrip.rs` against neighbour-band
+            // quant noise from sub-baseline-coarsened bands. The actual
+            // mechanism was traced in round 27 (`tests/r27_ms_cpe_…`):
+            // the gate broke not because of *coarsened* neighbour bands
+            // but because the CPE LR-only path runs without TNS, and
+            // psy-recommended above-baseline target_max on a tonal band
+            // pushes step^(4/3) below the side-lobe magnitude in that
+            // same band, rounding side-lobe lines from "should be 0" to
+            // ±1 and dequantising to ±step^(4/3) noise that beats
+            // against the source tone. The corrective fix lives in
+            // `analyse_and_quantise_opts`: when `use_tns=false` (the
+            // CPE path), psy's above-baseline recommendations get
+            // clamped to baseline. With that gate in place, sub-baseline
+            // coarsening on demonstrably-masked bands is safe again, so
+            // the floor goes away — corpus byte-savings recover from
+            // ~25-35 % back toward ~30-40 % (without re-breaking the
+            // round-trip Goertzel gates).
+            target_max[b] = raw;
         }
 
         PsyAnalysis {

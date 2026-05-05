@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tests/r27_ms_cpe_psy_diagnose.rs` — round-27 regression gate for the
+  M/S CPE psy-vs-baseline Goertzel ratio. Encodes a 440 Hz / 880 Hz
+  stereo pair and an L=440 / R=silence stereo pair through `AacEncoder`
+  with psy off vs psy on at 128 kbps and 256 kbps respectively, decodes
+  back through the in-tree decoder, and asserts the per-channel
+  Goertzel ratio at the source frequency stays within 10 % of the
+  psy-off baseline. Pre-fix the L Goertzel dropped 78 % under psy on
+  (psy-off ratio 635 → psy-on ratio 138 on the 440/880 stereo case);
+  post-fix both channels match the baseline within rounding (drop ≤
+  0.1 %).
+
+### Changed
+
+- `encoder::analyse_and_quantise_opts` clamps psy-recommended
+  above-baseline `target_max` to `baseline = 7` when called with
+  `use_tns = false` (the CPE LR/MS analysis path). The CPE encoder
+  disables TNS — a single TNS filter can't span per-band M/S
+  decisions — so the band's peak-to-side-lobe ratio stays steep, and a
+  fine-step quantiser (target_max = 16) on the tonal band rounds
+  side-lobe lines (scaled magnitude ~0.5..1.5) up to ±1 instead of
+  zero. Those lines then dequantise to ±step^(4/3), injecting spurious
+  off-tone noise that beats against the source tone. The Goertzel
+  ratio at the source frequency drops 5-10× even though the
+  band-integrated PSNR is unaffected. With the clamp the fine-quant
+  side-lobe noise is suppressed and per-line tone purity matches the
+  psy-off baseline exactly. Mono SCE (TNS-on path) is unaffected and
+  keeps full above-baseline psy fidelity.
+- `psy::PsyModel::analyse` drops the round-25 `raw.max(baseline)`
+  floor on per-band `target_max`. With the round-27 `use_tns` clamp
+  in place, the floor is no longer needed: sub-baseline coarsening on
+  demonstrably-masked bands is safe again because the CPE-only
+  per-line side-lobe pathology was the actual cause of the
+  round-trip Goertzel breakage the floor was put in place to defend
+  against. Corpus byte-savings recover toward the original
+  ~30-40 % range.
+- `encoder::quantise_band_widen_dead_zone` introduced as a
+  drop-in extension of `quantise_band` that takes an
+  `extra_dead_zone_scaled` threshold; lines with scaled magnitude
+  below the threshold round to zero instead of going through the
+  spec-§4.6.6 `floor(|s|^0.75 + 0.4054)` rule. The mono SCE path
+  (TNS on, psy can recommend target_max above baseline) calls it
+  with `extra_dz = 0.503 · (target_max/7)^(4/3)` — the equivalent of
+  the baseline-step's implicit dead-zone expressed in the fine-step's
+  scaled units. Defends against the same per-line side-lobe
+  over-amplification on mono content even though it isn't currently
+  triggering a regression there.
+- `HeAacStereoEncoder` defaults psy on (matching mono and v2). The
+  round-25 `inner.set_enable_psy_model(false)` opt-out has been
+  removed — it was a workaround for the M/S CPE side-lobe pathology
+  that round-27's `use_tns` clamp closes. The
+  `tests/sbr_he_aac_stereo_ffmpeg` synthetic 1+2 kHz tone-pair gate
+  holds at SNR L=38 dB, R=24 dB (was SNR R=23 dB pre-flip — within
+  rounding of the psy-off baseline).
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-aac/compare/v0.0.11...v0.1.0) - 2026-05-04
 
 ### Other

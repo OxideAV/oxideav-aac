@@ -1699,6 +1699,22 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     // Optional psychoacoustic-model pass — produces per-band target_max
     // overrides that drive finer quantisation on tonal/loud bands and
     // coarser quantisation on bands hidden under spread masks.
+    // Psychoacoustic-model pass — produces per-band target_max overrides
+    // that drive finer quantisation on tonal/loud bands.
+    //
+    // TNS-disabled callers (CPE LR/MS analysis, where a single TNS filter
+    // can't span across per-band M/S decisions) suppress the
+    // above-baseline target_max recommendations: without TNS-flattening,
+    // a tonal band's peak-to-side-lobe ratio is steep and a fine-quant
+    // step (target_max=16) over-amplifies side-lobe lines just above
+    // the implicit dead-zone (scaled magnitude ~0.5) — they round to
+    // ±1 and dequantise to ±step^(4/3), beating against the source tone
+    // and dropping the per-line Goertzel ratio 5-10×. With TNS-flattening
+    // (mono SCE path) the peak-to-side-lobe ratio is small enough that
+    // fine quant is safe. Round-27 fix: gate the above-baseline psy
+    // recommendation on `use_tns`. Pure noise / non-tonal bands are
+    // unaffected (psy already pins them to baseline via the
+    // NOISE_TONALITY_GATE in `psy.rs`).
     let psy_target: Option<Vec<i32>> = if psy_active() {
         let sr = SAMPLE_RATES
             .get(sf_index as usize)
@@ -1706,7 +1722,20 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
             .unwrap_or(44_100);
         let model = PsyModel::new_long(sf_index, sr);
         let analysis = model.analyse(spec);
-        Some(analysis.target_max)
+        let baseline = 7i32;
+        let target_max = if use_tns {
+            analysis.target_max
+        } else {
+            // TNS-flattened: above-baseline psy is safe.
+            // TNS-disabled: clamp to baseline so per-line side-lobe
+            // over-amplification can't kick in on tonal CPE bands.
+            analysis
+                .target_max
+                .into_iter()
+                .map(|t| t.min(baseline))
+                .collect()
+        };
+        Some(target_max)
     } else {
         None
     };
@@ -1767,9 +1796,29 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         let sf_f = 100.0 + 4.0 * ratio.log2();
         let mut sf = sf_f.ceil() as i32 + frame_sf_bias;
         sf = sf.clamp(0, 255);
+        // Widened dead-zone for psy-tightened bands (target_max above
+        // baseline=7 in the mono SCE / TNS-on path). When the SF is
+        // pulled tight on the band peak, side-lobe lines whose scaled
+        // magnitude lands at ~0.5..1.5 round to ±1 and dequantise to
+        // ±step^(4/3) — spurious off-tone noise that beats the source.
+        // Widening the dead-zone to the equivalent of the baseline-step's
+        // dead-zone (in scaled units of the fine step) zeros those lines
+        // before they get rounded up, while keeping the fine quantisation
+        // on lines significantly above the side-lobe floor. The effect
+        // is small in mono (TNS already flattens the spectrum so the
+        // peak-to-side-lobe ratio is small) but the widening is harmless
+        // and ratchets the per-line tone purity tighter. See the round-27
+        // CHANGELOG entry for the rationale.
+        let extra_dz = if target_max > baseline_target_max {
+            const BASELINE_DEAD_ZONE_SCALED: f32 = 0.503; // 0.5946^(4/3) — implicit dead-zone of QUANT_MAGIC=0.4054
+            BASELINE_DEAD_ZONE_SCALED
+                * (target_max as f32 / baseline_target_max as f32).powf(4.0 / 3.0)
+        } else {
+            0.0
+        };
         // Quantise with this sf; if any coefficient lands above ESC_LAV,
         // bump sf and retry (rare path).
-        let (q, ok) = quantise_band(band, sf);
+        let (q, ok) = quantise_band_widen_dead_zone(band, sf, extra_dz);
         if ok {
             sfs[sfb] = sf;
             q_bands.push(q);
@@ -1777,7 +1826,7 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
             let mut sf2 = sf + 1;
             let final_q;
             loop {
-                let (q2, ok2) = quantise_band(band, sf2);
+                let (q2, ok2) = quantise_band_widen_dead_zone(band, sf2, extra_dz);
                 if ok2 || sf2 >= 255 {
                     final_q = q2;
                     break;
@@ -1855,6 +1904,34 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
 }
 
 fn quantise_band(band: &[f32], sf: i32) -> (Vec<i32>, bool) {
+    quantise_band_widen_dead_zone(band, sf, 0.0)
+}
+
+/// Quantise a single scalefactor band with the standard AAC §4.6.6
+/// rounding rule, optionally widening the dead-zone so any line whose
+/// post-scale magnitude is below `extra_dead_zone_scaled` is rounded
+/// to zero instead of ±1. Pass `0.0` to disable (= legacy behaviour).
+///
+/// The widened dead-zone is needed when the caller picks a fine
+/// scalefactor (small `step`) on a band whose energy is dominated by
+/// 1-2 narrow tonal lines, with the rest of the band carrying just
+/// MDCT-window side-lobe leakage. Without the widening, side-lobe
+/// lines whose scaled magnitude lands at ~0.5..1 round up to ±1 and
+/// then dequantise to ±step^(4/3), injecting spurious off-tone
+/// energy at frequencies the source signal does not contain. The
+/// Goertzel ratio of the source-tone reconstruction drops by 5-10×
+/// even though the band-integrated PSNR is unchanged. Widening the
+/// dead-zone to `(target_max/baseline)^(4/3) · 0.503` (the implicit
+/// dead-zone threshold of the baseline-`target_max=7` quantiser
+/// expressed in the fine-step's scaled units) restores the
+/// per-line tone purity while keeping the fine-step precision on
+/// the dominant lines. See round-27 CHANGELOG entry for the
+/// derivation.
+fn quantise_band_widen_dead_zone(
+    band: &[f32],
+    sf: i32,
+    extra_dead_zone_scaled: f32,
+) -> (Vec<i32>, bool) {
     let inv_gain = 2.0f32.powf(-(sf as f32 - 100.0) / 4.0);
     let mut out = Vec::with_capacity(band.len());
     let mut ok = true;
@@ -1864,7 +1941,13 @@ fn quantise_band(band: &[f32], sf: i32) -> (Vec<i32>, bool) {
             continue;
         }
         let scaled = x * inv_gain;
-        let q_abs = scaled.abs().powf(3.0 / 4.0) + QUANT_MAGIC;
+        let abs_scaled = scaled.abs();
+        // Widened dead-zone: zero out lines below the extra threshold.
+        if extra_dead_zone_scaled > 0.0 && abs_scaled < extra_dead_zone_scaled {
+            out.push(0);
+            continue;
+        }
+        let q_abs = abs_scaled.powf(3.0 / 4.0) + QUANT_MAGIC;
         let q = q_abs.floor() as i32;
         let signed = if scaled < 0.0 { -q } else { q };
         if signed.abs() > 8191 {
