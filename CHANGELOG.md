@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-aac/compare/v0.1.0...v0.1.1) - 2026-05-05
+
+### Other
+
+- fix FIL escape-count off-by-one (esc_count=0 case)
+- M/S CPE side-lobe fix + HE-AAC stereo default-on (round 27)
+- release v0.1.0 ([#10](https://github.com/OxideAV/oxideav-aac/pull/10))
+
 ### Fixed
 
 - `decoder::AacDecoder` — `fill_element()` `count == 15` escape now
