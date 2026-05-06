@@ -17,6 +17,16 @@ use std::sync::OnceLock;
 pub const LONG_INPUT: usize = 1024;
 /// Short IMDCT input length (= 128); output length is 256.
 pub const SHORT_INPUT: usize = 128;
+/// AAC-LD / AAC-ELD long-window IMDCT input length (= 512); output is 1024.
+///
+/// ISO/IEC 14496-3 §4.6.18 — LD's filterbank uses a 512-sample (or 480-
+/// sample) IMDCT instead of the 2048-sample one used by AAC-LC. Output
+/// is `2 * input_n` samples = 1024 for the 512-input case (480-input
+/// case yields 960; see `LD_480_INPUT`). Same direct cosine kernel as
+/// long/short — see `imdct_n`.
+pub const LD_512_INPUT: usize = 512;
+/// AAC-LD 480-sample IMDCT input length; output is 960 samples.
+pub const LD_480_INPUT: usize = 480;
 
 /// Cache of cosine tables, one per N.
 struct CosTable {
@@ -47,6 +57,8 @@ impl CosTable {
 
 static LONG_COS: OnceLock<CosTable> = OnceLock::new();
 static SHORT_COS: OnceLock<CosTable> = OnceLock::new();
+static LD_512_COS: OnceLock<CosTable> = OnceLock::new();
+static LD_480_COS: OnceLock<CosTable> = OnceLock::new();
 
 fn long_cos() -> &'static CosTable {
     LONG_COS.get_or_init(|| CosTable::new(LONG_INPUT))
@@ -54,6 +66,14 @@ fn long_cos() -> &'static CosTable {
 
 fn short_cos() -> &'static CosTable {
     SHORT_COS.get_or_init(|| CosTable::new(SHORT_INPUT))
+}
+
+fn ld_512_cos() -> &'static CosTable {
+    LD_512_COS.get_or_init(|| CosTable::new(LD_512_INPUT))
+}
+
+fn ld_480_cos() -> &'static CosTable {
+    LD_480_COS.get_or_init(|| CosTable::new(LD_480_INPUT))
 }
 
 /// Compute the IMDCT of `spec[0..input_n]` into `out[0..2*input_n]`.
@@ -93,6 +113,21 @@ pub fn imdct_short(spec: &[f32], out: &mut [f32]) {
     imdct_direct(spec, out, short_cos(), SHORT_INPUT);
 }
 
+/// AAC-LD 512-sample IMDCT (512 in, 1024 out).
+///
+/// Same direct cosine kernel as `imdct_long`, just sized to N/2 = 512
+/// per ISO/IEC 14496-3 §4.6.18. Used by both AAC-LD (objectType 23)
+/// and AAC-ELD (objectType 39) when `frame_length_flag = 0`.
+pub fn imdct_ld_512(spec: &[f32], out: &mut [f32]) {
+    imdct_direct(spec, out, ld_512_cos(), LD_512_INPUT);
+}
+
+/// AAC-LD 480-sample IMDCT (480 in, 960 out) for broadcast LD/ELD profiles
+/// where `frame_length_flag = 1`.
+pub fn imdct_ld_480(spec: &[f32], out: &mut [f32]) {
+    imdct_direct(spec, out, ld_480_cos(), LD_480_INPUT);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +153,51 @@ mod tests {
         // Sum of magnitudes shouldn't be zero.
         let mag: f32 = out.iter().map(|&v| v.abs()).sum();
         assert!(mag > 0.0);
+    }
+
+    /// Sanity: the LD-512 IMDCT runs and produces 2N=1024 samples.
+    #[test]
+    fn imdct_ld_512_runs() {
+        let spec = [0.0f32; LD_512_INPUT];
+        let mut out = vec![0.0f32; 2 * LD_512_INPUT];
+        imdct_ld_512(&spec, &mut out);
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    /// Sanity: the LD-480 IMDCT runs and produces 960 samples.
+    #[test]
+    fn imdct_ld_480_runs() {
+        let spec = [0.0f32; LD_480_INPUT];
+        let mut out = vec![0.0f32; 2 * LD_480_INPUT];
+        imdct_ld_480(&spec, &mut out);
+        for v in &out {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    /// LD-512 IMDCT(δ_0) must produce a non-zero pattern (DC bin smear).
+    #[test]
+    fn imdct_ld_512_dc_bin_nonzero() {
+        let mut spec = [0.0f32; LD_512_INPUT];
+        spec[0] = 1.0;
+        let mut out = vec![0.0f32; 2 * LD_512_INPUT];
+        imdct_ld_512(&spec, &mut out);
+        let mag: f32 = out.iter().map(|&v| v.abs()).sum();
+        assert!(mag > 0.0, "LD-512 DC bin should produce non-zero output");
+    }
+
+    /// LD-480 IMDCT(δ_k) for a few different bins.
+    #[test]
+    fn imdct_ld_480_random_bins_nonzero() {
+        for k in [0usize, 7, 60, 239, 479] {
+            let mut spec = [0.0f32; LD_480_INPUT];
+            spec[k] = 1.0;
+            let mut out = vec![0.0f32; 2 * LD_480_INPUT];
+            imdct_ld_480(&spec, &mut out);
+            let mag: f32 = out.iter().map(|&v| v.abs()).sum();
+            assert!(mag > 0.0, "LD-480 IMDCT(δ_{k}) magnitude is zero");
+        }
     }
 }

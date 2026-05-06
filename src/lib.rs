@@ -107,6 +107,22 @@
 //! - IPD/OPD, allpass-chain decorrelator, and true QMF-domain upmix are
 //!   not yet implemented.
 //!
+//! AAC-LD / AAC-ELD / USAC scaffolding:
+//! - LD/ELD AudioSpecificConfig is parsed end-to-end (`asc.ld_config` /
+//!   `asc.eld_config`); 480- and 512-sample MDCT/IMDCT kernels +
+//!   sine half-windows + `LdChannelState`-driven overlap-add filterbank
+//!   (`crate::ld_eld::imdct_and_overlap_ld`) are TDAC-validated against
+//!   sine inputs at both frame sizes (max error < 5e-3). The ER
+//!   raw_data_block decoder + LD-SBR / ELD low-overlap window paths are
+//!   not yet implemented; `make_decoder` returns `Error::Unsupported`
+//!   for AOT 23 / 39 with a message pointing to the available kernels.
+//! - USAC / xHE-AAC (AOT 42) `UsacConfig` scaffold parse:
+//!   `crate::usac::parse_usac_config` captures `usacSamplingFrequencyIndex`
+//!   (incl. 24-bit explicit escape), `coreSbrFrameLengthIndex`,
+//!   `channelConfigurationIndex`, and the first `usacElementType`
+//!   (SCE/CPE/LFE/Ext, ISO/IEC 23003-3 Table 9). Frame decode of USAC
+//!   is not implemented.
+//!
 //! Not implemented (returns `Error::Unsupported` or stubbed to zeros):
 //! - Gain control (§4.6.12)
 //! - CCE elements (parsed / emitted as unsupported)
@@ -153,6 +169,7 @@ pub mod synth;
 pub mod tns;
 pub mod tns_analyse;
 pub mod transient;
+pub mod usac;
 pub mod window;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};

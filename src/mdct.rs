@@ -11,7 +11,7 @@
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
-use crate::imdct::{LONG_INPUT, SHORT_INPUT};
+use crate::imdct::{LD_480_INPUT, LD_512_INPUT, LONG_INPUT, SHORT_INPUT};
 
 /// Cosine table cached per `input_n`. `tbl[k * (2*input_n) + n]` —
 /// inner loop iterates over `n` for a fixed `k`.
@@ -43,6 +43,8 @@ impl CosTable {
 
 static LONG_COS: OnceLock<CosTable> = OnceLock::new();
 static SHORT_COS: OnceLock<CosTable> = OnceLock::new();
+static LD_512_COS: OnceLock<CosTable> = OnceLock::new();
+static LD_480_COS: OnceLock<CosTable> = OnceLock::new();
 
 fn long_cos() -> &'static CosTable {
     LONG_COS.get_or_init(|| CosTable::new(LONG_INPUT))
@@ -50,6 +52,14 @@ fn long_cos() -> &'static CosTable {
 
 fn short_cos() -> &'static CosTable {
     SHORT_COS.get_or_init(|| CosTable::new(SHORT_INPUT))
+}
+
+fn ld_512_cos() -> &'static CosTable {
+    LD_512_COS.get_or_init(|| CosTable::new(LD_512_INPUT))
+}
+
+fn ld_480_cos() -> &'static CosTable {
+    LD_480_COS.get_or_init(|| CosTable::new(LD_480_INPUT))
 }
 
 fn mdct_direct(time: &[f32], spec: &mut [f32], cos: &CosTable, input_n: usize) {
@@ -83,6 +93,16 @@ pub fn mdct_long(time: &[f32], spec: &mut [f32]) {
 /// Short-block MDCT (256 in, 128 out).
 pub fn mdct_short(time: &[f32], spec: &mut [f32]) {
     mdct_direct(time, spec, short_cos(), SHORT_INPUT);
+}
+
+/// AAC-LD 512-sample MDCT (1024 in, 512 out).
+pub fn mdct_ld_512(time: &[f32], spec: &mut [f32]) {
+    mdct_direct(time, spec, ld_512_cos(), LD_512_INPUT);
+}
+
+/// AAC-LD 480-sample MDCT (960 in, 480 out).
+pub fn mdct_ld_480(time: &[f32], spec: &mut [f32]) {
+    mdct_direct(time, spec, ld_480_cos(), LD_480_INPUT);
 }
 
 /// Compute the 1024-coefficient spectrum for an EightShort block.
@@ -319,5 +339,123 @@ mod tests {
             let recon = o0[n + i] + o1[i];
             assert!((recon - 1.0).abs() < 1e-3, "short OLA at {i}: {recon}");
         }
+    }
+
+    /// LD-512 MDCT/IMDCT/sine-OLA round-trip — the AAC-LD filterbank
+    /// must reconstruct a known sine signal in the overlap region just
+    /// like the long-block path does. This locks in the bit-correctness
+    /// of the new 512-sample cosine kernel + sine_ld_512 window.
+    #[test]
+    fn ld_512_round_trip_with_sine_ola() {
+        use crate::imdct::{imdct_ld_512, LD_512_INPUT};
+        use crate::window::{sine_ld_512, LD_512_LEN};
+        let n = LD_512_LEN; // 512
+        let n2 = 2 * n;
+        let total = 3 * n;
+        let mut x = vec![0.0f32; total];
+        for i in 0..total {
+            x[i] = (2.0 * PI * 5.0 * i as f64 / n as f64).sin() as f32;
+        }
+        let win = sine_ld_512();
+        let mut t0 = vec![0.0f32; n2];
+        let mut t1 = vec![0.0f32; n2];
+        for i in 0..n {
+            t0[i] = x[i] * win[i];
+            t0[n + i] = x[n + i] * win[n - 1 - i];
+            t1[i] = x[n + i] * win[i];
+            t1[n + i] = x[2 * n + i] * win[n - 1 - i];
+        }
+        let mut s0 = vec![0.0f32; LD_512_INPUT];
+        let mut s1 = vec![0.0f32; LD_512_INPUT];
+        mdct_ld_512(&t0, &mut s0);
+        mdct_ld_512(&t1, &mut s1);
+        let mut o0 = vec![0.0f32; n2];
+        let mut o1 = vec![0.0f32; n2];
+        imdct_ld_512(&s0, &mut o0);
+        imdct_ld_512(&s1, &mut o1);
+        for i in 0..n {
+            o0[i] *= win[i];
+            o0[n + i] *= win[n - 1 - i];
+            o1[i] *= win[i];
+            o1[n + i] *= win[n - 1 - i];
+        }
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            let recon = o0[n + i] + o1[i];
+            let want = x[n + i];
+            let err = (recon - want).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(max_err < 5e-3, "LD-512 round-trip max err {max_err}");
+    }
+
+    /// LD-480 round-trip — same TDAC test, broadcast frame size.
+    #[test]
+    fn ld_480_round_trip_with_sine_ola() {
+        use crate::imdct::{imdct_ld_480, LD_480_INPUT};
+        use crate::window::{sine_ld_480, LD_480_LEN};
+        let n = LD_480_LEN; // 480
+        let n2 = 2 * n;
+        let total = 3 * n;
+        let mut x = vec![0.0f32; total];
+        for i in 0..total {
+            x[i] = (2.0 * PI * 7.0 * i as f64 / n as f64).sin() as f32;
+        }
+        let win = sine_ld_480();
+        let mut t0 = vec![0.0f32; n2];
+        let mut t1 = vec![0.0f32; n2];
+        for i in 0..n {
+            t0[i] = x[i] * win[i];
+            t0[n + i] = x[n + i] * win[n - 1 - i];
+            t1[i] = x[n + i] * win[i];
+            t1[n + i] = x[2 * n + i] * win[n - 1 - i];
+        }
+        let mut s0 = vec![0.0f32; LD_480_INPUT];
+        let mut s1 = vec![0.0f32; LD_480_INPUT];
+        mdct_ld_480(&t0, &mut s0);
+        mdct_ld_480(&t1, &mut s1);
+        let mut o0 = vec![0.0f32; n2];
+        let mut o1 = vec![0.0f32; n2];
+        imdct_ld_480(&s0, &mut o0);
+        imdct_ld_480(&s1, &mut o1);
+        for i in 0..n {
+            o0[i] *= win[i];
+            o0[n + i] *= win[n - 1 - i];
+            o1[i] *= win[i];
+            o1[n + i] *= win[n - 1 - i];
+        }
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            let recon = o0[n + i] + o1[i];
+            let want = x[n + i];
+            let err = (recon - want).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(max_err < 5e-3, "LD-480 round-trip max err {max_err}");
+    }
+
+    /// MDCT(IMDCT(δ_k)) on the LD kernel must equal 2·δ_k (same factor-
+    /// of-2 as the long path).
+    #[test]
+    fn ld_512_round_trip_unit_basis_gives_2x() {
+        use crate::imdct::{imdct_ld_512, LD_512_INPUT};
+        let mut spec = vec![0.0f32; LD_512_INPUT];
+        spec[12] = 1.0;
+        let mut time = vec![0.0f32; 2 * LD_512_INPUT];
+        imdct_ld_512(&spec, &mut time);
+        let mut spec2 = vec![0.0f32; LD_512_INPUT];
+        mdct_ld_512(&time, &mut spec2);
+        let on = spec2[12];
+        let off: f32 = (0..LD_512_INPUT)
+            .filter(|&k| k != 12)
+            .map(|k| spec2[k].abs())
+            .sum::<f32>()
+            / (LD_512_INPUT as f32 - 1.0);
+        assert!((on - 2.0).abs() < 0.05, "LD-512 on bin = {on}, want 2");
+        assert!(off < 0.05, "LD-512 off energy {off}");
     }
 }

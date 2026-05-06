@@ -21,11 +21,17 @@ use std::sync::OnceLock;
 pub const LONG_LEN: usize = 1024;
 /// Short-window length.
 pub const SHORT_LEN: usize = 128;
+/// AAC-LD 512-sample window length (= IMDCT 2N divided by 2 with N=512).
+pub const LD_512_LEN: usize = 512;
+/// AAC-LD 480-sample window length.
+pub const LD_480_LEN: usize = 480;
 
 static SINE_LONG: OnceLock<Vec<f32>> = OnceLock::new();
 static SINE_SHORT: OnceLock<Vec<f32>> = OnceLock::new();
 static KBD_LONG: OnceLock<Vec<f32>> = OnceLock::new();
 static KBD_SHORT: OnceLock<Vec<f32>> = OnceLock::new();
+static SINE_LD_512: OnceLock<Vec<f32>> = OnceLock::new();
+static SINE_LD_480: OnceLock<Vec<f32>> = OnceLock::new();
 
 /// Build the AAC/MLT sine window — first half only (length `n`).
 ///
@@ -107,6 +113,31 @@ pub fn kbd_long() -> &'static [f32] {
 
 pub fn kbd_short() -> &'static [f32] {
     KBD_SHORT.get_or_init(|| build_kbd(SHORT_LEN, 6.0))
+}
+
+/// Rising half (length `LD_512_LEN` = 512) of the AAC-LD sine window.
+///
+/// ISO/IEC 14496-3 §4.6.18.2.2 defines the LD window as the same sine
+/// shape as AAC-LC, just sized to N=512 (or 480) instead of N=1024.
+/// The doubling scheme (`[w, reverse(w)]`) used by `synth.rs` for the
+/// long window applies identically here.
+pub fn sine_ld_512() -> &'static [f32] {
+    SINE_LD_512.get_or_init(|| build_sine(LD_512_LEN))
+}
+
+/// Rising half (length `LD_480_LEN` = 480) of the AAC-LD sine window for
+/// the broadcast-profile 480-sample frame size.
+pub fn sine_ld_480() -> &'static [f32] {
+    SINE_LD_480.get_or_init(|| build_sine(LD_480_LEN))
+}
+
+/// Resolve a [`crate::ld_eld::LdFrameLength`] to the LD sine half-window.
+/// Used by the LD/ELD frame decoder to fetch the right window size.
+pub fn sine_ld_for(frame_length: crate::ld_eld::LdFrameLength) -> &'static [f32] {
+    match frame_length {
+        crate::ld_eld::LdFrameLength::Samples512 => sine_ld_512(),
+        crate::ld_eld::LdFrameLength::Samples480 => sine_ld_480(),
+    }
 }
 
 /// Resolve a `WindowShape` to its long half-window table.

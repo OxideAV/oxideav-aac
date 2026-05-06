@@ -15,6 +15,9 @@ pub const AOT_ER_AAC_LC: u8 = 17;
 pub const AOT_ER_AAC_LD: u8 = 23;
 /// AAC Enhanced Low-Delay (ELD) — ISO/IEC 14496-3 Table 1.17.
 pub const AOT_AAC_ELD: u8 = 39;
+/// USAC (Unified Speech and Audio Coding, xHE-AAC) — ISO/IEC 14496-3
+/// Table 1.17 amend / ISO/IEC 23003-3.
+pub const AOT_USAC: u8 = 42;
 
 /// Sampling Frequency Index → sample rate (Hz). Table 1.16.
 pub const SAMPLE_RATES: [u32; 13] = [

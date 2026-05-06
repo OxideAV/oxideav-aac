@@ -35,8 +35,9 @@ use crate::ld_eld::{
 use crate::pce::{parse_program_config_element, ProgramConfigElement};
 use crate::syntax::{
     sample_rate, AOT_AAC_ELD, AOT_AAC_LC, AOT_AAC_LTP, AOT_AAC_MAIN, AOT_AAC_SCALABLE, AOT_AAC_SSR,
-    AOT_ER_AAC_LD, AOT_PS, AOT_SBR,
+    AOT_ER_AAC_LD, AOT_PS, AOT_SBR, AOT_USAC,
 };
+use crate::usac::{parse_usac_config_from_bitreader, UsacConfig};
 use oxideav_core::bits::BitReader;
 
 /// Backward-compatible SBR-signalling sync extension type
@@ -65,6 +66,10 @@ pub struct AudioSpecificConfig {
     /// Carries `frame_length`, resilience flags, and LD-SBR signalling.
     /// Dispatch hook for the ELD frame decoder (not yet implemented).
     pub eld_config: Option<EldSpecificConfig>,
+    /// Parsed `UsacConfig` — present when `object_type == AOT_USAC` (42).
+    /// Carries top-level USAC fields (sample rate, cc index, element types).
+    /// Frame decode is NOT implemented; this scaffold lets ASC parse succeed.
+    pub usac_config: Option<UsacConfig>,
 }
 
 impl AudioSpecificConfig {
@@ -253,6 +258,32 @@ pub fn parse_asc(data: &[u8]) -> Result<AudioSpecificConfig> {
 /// the call). Behaviour is otherwise identical to [`parse_asc`].
 pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificConfig> {
     let mut object_type = read_audio_object_type(br)?;
+
+    // USAC (AOT 42) has a special ASC layout: there is NO outer
+    // samplingFrequencyIndex / channelConfiguration field — both come
+    // from inside `UsacConfig()`. ISO/IEC 14496-3 amend / ISO/IEC
+    // 23003-3. Surface a UsacConfig + the rate/channels it implies and
+    // return early; backward-compat SBR sync extension does not apply.
+    if object_type == AOT_USAC {
+        let cfg = parse_usac_config_from_bitreader(br)?;
+        let cc = cfg.channel_configuration_index;
+        let sf_hz = cfg.sampling_frequency;
+        let sf_idx = cfg.sampling_frequency_index;
+        return Ok(AudioSpecificConfig {
+            object_type,
+            sampling_frequency_index: sf_idx,
+            sampling_frequency: sf_hz,
+            channel_configuration: cc,
+            ext_sampling_frequency: None,
+            sbr_present: false,
+            ps_present: false,
+            pce: None,
+            ld_config: None,
+            eld_config: None,
+            usac_config: Some(cfg),
+        });
+    }
+
     let (mut sampling_frequency_index, mut sampling_frequency) = read_sampling_frequency(br)?;
     let channel_configuration = br.read_u32(4)? as u8;
 
@@ -380,6 +411,7 @@ pub fn parse_asc_from_bitreader(br: &mut BitReader<'_>) -> Result<AudioSpecificC
         pce,
         ld_config,
         eld_config,
+        usac_config: None,
     })
 }
 
@@ -711,6 +743,34 @@ mod tests {
         // 0 (PCE-defined) and 8 are both out of the supported range.
         assert!(AscBuilder::lc(48_000, 0).is_err());
         assert!(AscBuilder::lc(48_000, 8).is_err());
+    }
+
+    #[test]
+    fn aot42_usac_asc_round_trip_through_parser() {
+        // AOT=42 needs the 5-bit escape (=31) + 6-bit (42-32=10).
+        // Then a minimal UsacConfig: sf_idx=4 (44.1k), coreSbrFrameLengthIndex=0,
+        // cc_idx=2 (stereo), numElements=1 (escapedValue 0), one CPE element.
+        let mut bw = BitWriter::new();
+        bw.write_u32(31, 5); // AOT escape
+        bw.write_u32(42 - 32, 6); // AOT 42
+        bw.write_u32(4, 5); // usacSamplingFrequencyIndex = 4 (44.1 kHz)
+        bw.write_u32(0, 3); // coreSbrFrameLengthIndex = 0
+        bw.write_u32(2, 5); // channelConfigurationIndex = 2 (stereo)
+        bw.write_u32(0, 4); // numElements escapedValue level 1: 0 → 1 element
+        bw.write_u32(1, 2); // first element type = CPE
+        let bytes = bw.finish();
+        let asc = parse_asc(&bytes).expect("AOT 42 USAC ASC must parse");
+        assert_eq!(asc.object_type, crate::syntax::AOT_USAC);
+        assert_eq!(asc.sampling_frequency, 44_100);
+        assert_eq!(asc.channel_configuration, 2);
+        assert!(asc.usac_config.is_some());
+        let cfg = asc.usac_config.unwrap();
+        assert_eq!(cfg.elements.len(), 1);
+        assert_eq!(
+            cfg.elements[0],
+            crate::usac::UsacElementType::Cpe,
+            "first usacElementType should be CPE"
+        );
     }
 
     #[test]

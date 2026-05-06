@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **AAC-LD / AAC-ELD filterbank kernels (round 39).** Brand-new
+  `crate::imdct::imdct_ld_512` / `imdct_ld_480` and
+  `crate::mdct::mdct_ld_512` / `mdct_ld_480` direct-cosine kernels matching
+  the existing AAC-LC long/short kernel pattern but sized to N = 512 and
+  N = 480 per ISO/IEC 14496-3 §4.6.18. Cosine tables are cached in static
+  `OnceLock` slots; cost is one allocation per process (~1 MB for the 512
+  table). Paired with new sine half-windows in `crate::window::sine_ld_512`
+  / `sine_ld_480` plus a `sine_ld_for(LdFrameLength)` lookup helper.
+  TDAC round-trip verified for both frame sizes (max error < 5e-3 on a
+  3-frame sine-modulated signal).
+
+- **AAC-LD overlap-add filterbank.** `crate::ld_eld::imdct_and_overlap_ld`
+  drives a per-channel `LdChannelState` (single `prev` overlap buffer; no
+  window-sequence state machine — every LD block is a single sine-windowed
+  long block at N=512 or N=480). Frame-by-frame OLA round-trip <5e-3 max
+  error on sine input at both frame sizes; cold-start zero-spec produces
+  zero PCM; mismatched length errors out instead of panicking.
+
+- **USAC / xHE-AAC ASC scaffold (round 39).** New `crate::usac` module
+  provides `parse_usac_config()` / `parse_usac_config_from_bitreader()`
+  capturing `usacSamplingFrequencyIndex` (incl. the 5b-escape + 24b
+  explicit fallback), `coreSbrFrameLengthIndex`, `channelConfigurationIndex`,
+  and the first `usacElementType` (SCE / CPE / LFE / Ext per
+  ISO/IEC 23003-3 Table 9). The ASC parser routes `audioObjectType == 42`
+  into the USAC special-case (no outer SF index / channelConfiguration —
+  both come from inside `UsacConfig()`) and surfaces it via
+  `asc.usac_config: Option<UsacConfig>`. Frame decode of USAC remains
+  unimplemented; `make_decoder` returns a clear `Error::Unsupported`
+  message pointing at the scaffold.
+
+- **`AOT_USAC = 42` constant** added to `crate::syntax`, alongside the
+  existing AOT family.
+
 ### Changed
+
+- **Decoder dispatch error messages clarified.** AOT 23 (LD), AOT 39 (ELD),
+  and AOT 42 (USAC) each return `Error::Unsupported` with a message that
+  names the available kernel/scaffold the caller can use directly
+  (`crate::ld_eld::imdct_and_overlap_ld`, `crate::usac::parse_usac_config`
+  etc.) instead of just a generic "not yet implemented" string.
 
 - **TNS adaptive filter-order selection (round 37).** `tns_analyse::analyse_long`
   now calls `select_tns_order(band, max_allowed)` instead of using a fixed

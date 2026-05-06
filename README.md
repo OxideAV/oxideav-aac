@@ -69,6 +69,8 @@ read it instead of looking for an ADTS sync word on the first packet.
 | Pulse data (§4.6.5)                    | Yes (long-window only); short-window rejects as non-conformant |
 | Fill / DSE elements                    | Skipped cleanly; FIL `count==15, esc_count==0` off-by-one fixed (v0.1.1) |
 | LD/ELD AudioSpecificConfig             | `asc.ld_config` / `asc.eld_config` populated for AOT 23/39; `SWB_LD_512` / `SWB_LD_480` tables in `ld_eld` module |
+| LD/ELD filterbank kernels              | 480- and 512-sample MDCT/IMDCT (`crate::mdct::mdct_ld_512` / `crate::imdct::imdct_ld_480`) + sine half-windows (`crate::window::sine_ld_512` / `sine_ld_480`) + `crate::ld_eld::imdct_and_overlap_ld` overlap-add filterbank with `LdChannelState`. Two-frame TDAC round-trip <5e-3 max err on sine input at both frame sizes. ER raw_data_block decoder pending. |
+| USAC / xHE-AAC AudioSpecificConfig     | `asc.usac_config` populated for AOT 42; `crate::usac::parse_usac_config` captures sample rate (incl. 24-bit explicit escape), `coreSbrFrameLengthIndex`, `channelConfigurationIndex`, and the first `usacElementType` (SCE/CPE/LFE/Ext, ISO/IEC 23003-3 Table 9). Frame decode pending. |
 | LFE element (§4.6.10)                  | Yes (long-window SCE-like path)         |
 | PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
 | Gain control / SSR / Main / LTP        | Refused (`Error::Unsupported`)          |

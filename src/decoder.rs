@@ -27,7 +27,9 @@ use crate::sbr::decode::{
 };
 use crate::sbr::ps::{apply_ps_simple, PsFrame};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
-use crate::syntax::{ElementType, WindowSequence, AOT_AAC_ELD, AOT_AAC_LC, AOT_ER_AAC_LD};
+use crate::syntax::{
+    ElementType, WindowSequence, AOT_AAC_ELD, AOT_AAC_LC, AOT_ER_AAC_LD, AOT_USAC,
+};
 use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
 use crate::tns::{apply_tns_long, apply_tns_short, parse_tns_data, TnsData};
 use oxideav_core::bits::BitReader;
@@ -45,12 +47,22 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
             // only the actual frame-decode path is gated.
             if asc.object_type == AOT_ER_AAC_LD {
                 return Err(Error::unsupported(
-                    "AAC: AAC-LD (objectType 23) frame decode not yet implemented",
+                    "AAC: AAC-LD (objectType 23) frame decode not yet implemented \
+                     (LD MDCT/IMDCT/window kernels available via crate::imdct::imdct_ld_512 / \
+                     crate::ld_eld::imdct_and_overlap_ld; ER raw_data_block decode pending)",
                 ));
             }
             if asc.object_type == AOT_AAC_ELD {
                 return Err(Error::unsupported(
-                    "AAC: AAC-ELD (objectType 39) frame decode not yet implemented",
+                    "AAC: AAC-ELD (objectType 39) frame decode not yet implemented \
+                     (LD-SBR + low-overlap window pending; AudioSpecificConfig parse and \
+                     LD-size kernels available)",
+                ));
+            }
+            if asc.object_type == AOT_USAC {
+                return Err(Error::unsupported(
+                    "AAC: USAC / xHE-AAC (objectType 42) frame decode not yet implemented \
+                     (UsacConfig scaffold parse available via crate::usac::parse_usac_config)",
                 ));
             }
             if asc.object_type != AOT_AAC_LC {

@@ -321,6 +321,87 @@ pub fn swb_ld_for(sf_index: u8, frame_length: LdFrameLength) -> &'static [u16] {
     }
 }
 
+// ── LD per-channel filterbank state ──────────────────────────────────────────
+
+/// Per-channel state for the LD/ELD overlap-add filterbank.
+///
+/// LD's IMDCT outputs `2N` samples for an `N`-sample frame; the first
+/// `N` samples are PCM after OLA against the previous block's stored
+/// second half, and the second `N` are stashed as the next block's
+/// `prev` overlap. There is no window-sequence state machine for
+/// LD — every block is a single sine-windowed long block at N=512 (or
+/// N=480) per ISO/IEC 14496-3 §4.6.18.2.
+#[derive(Clone, Debug)]
+pub struct LdChannelState {
+    /// Stored second-half (already windowed) of the previous block, used
+    /// to OLA against the current block's windowed first half.
+    pub prev: Vec<f32>,
+}
+
+impl LdChannelState {
+    pub fn new(frame_len: usize) -> Self {
+        Self {
+            prev: vec![0.0f32; frame_len],
+        }
+    }
+}
+
+impl Default for LdChannelState {
+    fn default() -> Self {
+        Self::new(512)
+    }
+}
+
+/// Run an LD-IMDCT (`spec` length = N, OLA against `state.prev`) and
+/// produce `frame_len` samples of PCM into `pcm`.
+///
+/// `frame_len` must equal `spec.len()` and `state.prev.len()`. The
+/// helper picks the 512- or 480-sample IMDCT kernel + sine window
+/// based on `frame_len`.
+pub fn imdct_and_overlap_ld(
+    spec: &[f32],
+    state: &mut LdChannelState,
+    pcm: &mut [f32],
+    frame_length: LdFrameLength,
+) -> Result<()> {
+    use crate::imdct::{imdct_ld_480, imdct_ld_512};
+    use crate::window::{sine_ld_480, sine_ld_512};
+
+    let n = frame_length.samples() as usize;
+    if spec.len() != n || pcm.len() != n || state.prev.len() != n {
+        return Err(oxideav_core::Error::invalid(
+            "LD IMDCT: spec / pcm / prev length must equal frame_length",
+        ));
+    }
+    let mut tmp = vec![0.0f32; 2 * n];
+    let win: &[f32] = match frame_length {
+        LdFrameLength::Samples512 => {
+            imdct_ld_512(spec, &mut tmp);
+            sine_ld_512()
+        }
+        LdFrameLength::Samples480 => {
+            imdct_ld_480(spec, &mut tmp);
+            sine_ld_480()
+        }
+    };
+    // Apply the doubling-scheme window: full window has rising half = win,
+    // falling half = reverse(win), so position i in the second half uses
+    // win[N-1-i].
+    for i in 0..n {
+        tmp[i] *= win[i];
+        tmp[n + i] *= win[n - 1 - i];
+    }
+    // pcm = prev + tmp[0..N]
+    for i in 0..n {
+        pcm[i] = state.prev[i] + tmp[i];
+    }
+    // new prev = tmp[N..2N]
+    for i in 0..n {
+        state.prev[i] = tmp[n + i];
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +615,137 @@ mod tests {
         // With ldSbrSamplingRate=false (same rate), sbr_present is still
         // propagated into the ASC struct.
         assert!(asc.sbr_present, "LD-SBR must set sbr_present in ASC");
+    }
+
+    /// LD overlap-add filterbank: a forward MDCT followed by
+    /// `imdct_and_overlap_ld` over two consecutive 512-sample blocks must
+    /// reconstruct a known sine-modulated signal in the first block's
+    /// PCM output region. This is the headline LD-decode integration test
+    /// and validates that the kernel + window + state plumbing all line up.
+    #[test]
+    fn ld_512_overlap_add_filterbank_round_trip() {
+        use crate::mdct::mdct_ld_512;
+        use crate::window::sine_ld_512;
+        use std::f64::consts::PI;
+
+        let n = 512usize;
+        // 3 frames worth of input — frame 0 covers [0, 2N), frame 1 covers
+        // [N, 3N). After OLA, samples [N, 2N) in the *output* of frame 1
+        // reconstruct samples [N, 2N) of the input.
+        let total = 3 * n;
+        let mut x = vec![0.0f32; total];
+        for i in 0..total {
+            x[i] = (2.0 * PI * 9.0 * i as f64 / n as f64).sin() as f32;
+        }
+        let win = sine_ld_512();
+
+        // Encoder side: forward MDCT on each (windowed) 2N-sample block.
+        let make_spec = |start: usize| {
+            let mut t = vec![0.0f32; 2 * n];
+            for i in 0..n {
+                t[i] = x[start + i] * win[i];
+                t[n + i] = x[start + n + i] * win[n - 1 - i];
+            }
+            let mut s = vec![0.0f32; n];
+            mdct_ld_512(&t, &mut s);
+            s
+        };
+        let s0 = make_spec(0);
+        let s1 = make_spec(n);
+
+        // Decoder side: feed both blocks through imdct_and_overlap_ld.
+        let mut state = LdChannelState::new(n);
+        let mut pcm0 = vec![0.0f32; n];
+        let mut pcm1 = vec![0.0f32; n];
+        imdct_and_overlap_ld(&s0, &mut state, &mut pcm0, LdFrameLength::Samples512).unwrap();
+        imdct_and_overlap_ld(&s1, &mut state, &mut pcm1, LdFrameLength::Samples512).unwrap();
+
+        // pcm1 covers reconstructed samples [N, 2N) of x — by then both
+        // frames have contributed their windowed halves and the OLA is
+        // valid.
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            let recon = pcm1[i];
+            let want = x[n + i];
+            let err = (recon - want).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(
+            max_err < 5e-3,
+            "LD-512 OLA filterbank max err {max_err} (want < 5e-3)"
+        );
+    }
+
+    /// LD-480 overlap-add filterbank round-trip — same shape as the 512
+    /// variant. Locks in the broadcast-profile (480-sample) frame size.
+    #[test]
+    fn ld_480_overlap_add_filterbank_round_trip() {
+        use crate::mdct::mdct_ld_480;
+        use crate::window::sine_ld_480;
+        use std::f64::consts::PI;
+
+        let n = 480usize;
+        let total = 3 * n;
+        let mut x = vec![0.0f32; total];
+        for i in 0..total {
+            x[i] = (2.0 * PI * 11.0 * i as f64 / n as f64).sin() as f32;
+        }
+        let win = sine_ld_480();
+        let make_spec = |start: usize| {
+            let mut t = vec![0.0f32; 2 * n];
+            for i in 0..n {
+                t[i] = x[start + i] * win[i];
+                t[n + i] = x[start + n + i] * win[n - 1 - i];
+            }
+            let mut s = vec![0.0f32; n];
+            mdct_ld_480(&t, &mut s);
+            s
+        };
+        let s0 = make_spec(0);
+        let s1 = make_spec(n);
+        let mut state = LdChannelState::new(n);
+        let mut pcm0 = vec![0.0f32; n];
+        let mut pcm1 = vec![0.0f32; n];
+        imdct_and_overlap_ld(&s0, &mut state, &mut pcm0, LdFrameLength::Samples480).unwrap();
+        imdct_and_overlap_ld(&s1, &mut state, &mut pcm1, LdFrameLength::Samples480).unwrap();
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            let recon = pcm1[i];
+            let want = x[n + i];
+            let err = (recon - want).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        assert!(
+            max_err < 5e-3,
+            "LD-480 OLA filterbank max err {max_err} (want < 5e-3)"
+        );
+    }
+
+    /// LD overlap-add: a zero-spectrum frame must produce all-zero PCM
+    /// when the previous block was also zeros (cold-start condition).
+    #[test]
+    fn ld_512_zero_input_produces_zero_pcm() {
+        let n = 512usize;
+        let spec = vec![0.0f32; n];
+        let mut state = LdChannelState::new(n);
+        let mut pcm = vec![0.0f32; n];
+        imdct_and_overlap_ld(&spec, &mut state, &mut pcm, LdFrameLength::Samples512).unwrap();
+        for &v in &pcm {
+            assert_eq!(v, 0.0, "cold-start zero-spec frame must give zero PCM");
+        }
+    }
+
+    /// `imdct_and_overlap_ld` must reject mismatched lengths.
+    #[test]
+    fn ld_overlap_add_rejects_length_mismatch() {
+        let spec = vec![0.0f32; 512];
+        let mut state = LdChannelState::new(480); // wrong size
+        let mut pcm = vec![0.0f32; 512];
+        let res = imdct_and_overlap_ld(&spec, &mut state, &mut pcm, LdFrameLength::Samples512);
+        assert!(res.is_err());
     }
 }
