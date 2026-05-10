@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-aac/compare/v0.1.1...v0.1.2) - 2026-05-06
+
+### Other
+
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `registers_via_distributed_slice`
+- drop dead `linkme` dep
+- decoder round 39: AAC-LD/ELD 480/512 IMDCT+MDCT+sine-window kernels + LD overlap-add filterbank + USAC AOT 42 ASC scaffold
+- encoder round 37: TNS adaptive order, PSY self-mask, M/S sign-agree, SBR noise-floor, PNS pre-TNS classify
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- run cargo fmt to fix rustfmt CI failure
+- add LD/ELD parse scaffold (objectType 23/39) + note FIL bitreader fix
+- PNS SFM gate + trimmed-mean gain, M/S activity gate, IS sign-agreement ([#523](https://github.com/OxideAV/oxideav-aac/pull/523))
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-aac/pull/502))
+
 ### Added
 
 - **AAC-LD / AAC-ELD filterbank kernels (round 39).** Brand-new
