@@ -1,0 +1,24 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
+# 30-minute total budget across the 3 targets (~10 min each). The
+# `ffmpeg_oracle_decode` harness dlopens libavcodec at runtime via
+# libloading; the CI runner needs `ffmpeg` installed so the oracle
+# actually validates instead of silently skipping. We deliberately
+# install the distro `ffmpeg` package (not `libfdk-aac-dev` — fdk-aac
+# is NDA-encumbered per workspace memory and we never ask libavcodec
+# for `libfdk_aac`; the harness asks for `AV_CODEC_ID_AAC` (id 86018)
+# which always returns the built-in float-MDCT AAC decoder).
+
+on:
+  schedule:
+    - cron: "23 6 * * *"   # daily 06:23 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      extra_packages_apt: "ffmpeg"
+      time_budget_seconds: 1800
+    secrets: inherit

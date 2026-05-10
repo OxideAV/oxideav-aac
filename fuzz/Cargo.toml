@@ -1,0 +1,53 @@
+[package]
+name = "oxideav-aac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libavcodec interop: the ffmpeg oracle harness
+# `dlopen`s the system-installed libavcodec shared library at startup.
+# No `*-sys` crate, no libavcodec / fdk-aac / faad2 source pulled into
+# the dep tree. The harness skips silently when the shared library
+# isn't installed (see fuzz/src/lib.rs). Workspace policy bars
+# vendoring libavcodec / fdk-aac / faad2 source — we only inspect the
+# public C header (`<libavcodec/avcodec.h>` + `<libavutil/frame.h>`)
+# for function signatures + struct layouts.
+libloading = "0.8"
+
+[dependencies.oxideav-aac]
+path = ".."
+
+[lib]
+name = "oxideav_aac_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "panic_free_decode"
+path = "fuzz_targets/panic_free_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ffmpeg_oracle_decode"
+path = "fuzz_targets/ffmpeg_oracle_decode.rs"
+test = false
+doc = false
