@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SBR `hf_adjust` underflow on non-monotonic envelope grid.** A
+  malformed SBR frame whose `t_e[env+1] < t_e[env]` (e.g. via
+  `bs_freq_res` / `bs_var_bord_*` flips not caught by grid
+  construction) caused `decode_sbr_frame` to panic with
+  `attempt to subtract with overflow` at
+  `src/sbr/hf_adjust.rs:249` (`l_end - l_start`). The mono-envelope
+  loop now skips the envelope when `l_end ≤ l_start`. The
+  stereo path was already loop-bounded so it was unaffected.
+  Regression: `tests/fuzz_regressions.rs::sbr_hf_adjust_underflow_does_not_panic`.
+- **`gain_control_data_present` rejection on non-conformant AAC-LC.**
+  `decode_ics` returned `Error::Unsupported("AAC: gain_control in
+  LC stream")` whenever the bit was set, even though libavcodec
+  tolerates non-zero and emits PCM. The fuzz oracle treated the
+  consequent "ours produced 0 frames" as a hard panic. We now
+  silently accept the bit (matching libavcodec); the rest of the
+  spectral_data may parse as garbage on a truly-non-conformant
+  stream, but the codec keeps producing frames so downstream
+  consumers don't see a stall.
 - **SBR bitstream OOB on malformed `bs_noise_bands` (workspace task #743).**
   `parse_sbr_noise` indexed past the fixed-size `noise_sf[..][5]` row when
   the freq-table builder produced `NQ > 5`, panicking with

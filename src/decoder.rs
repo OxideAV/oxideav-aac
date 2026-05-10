@@ -436,12 +436,10 @@ impl AacDecoder {
                                     n_windows,
                                 )?);
                             }
+                            // See `decode_ics` for the rationale on
+                            // tolerating gain_control_data_present in the
+                            // common-window CPE path.
                             let _gain_control = br.read_bit()?;
-                            if _gain_control {
-                                return Err(Error::unsupported(
-                                    "AAC: gain_control_data_present in LC stream",
-                                ));
-                            }
                             secs[ch] = sec;
                             sfs[ch] = sf;
                             fill_spectrum(&mut br, &infos[ch], &secs[ch], &sfs[ch], &mut spec[ch])?;
@@ -1048,10 +1046,20 @@ pub fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Resu
     } else {
         None
     };
+    // Per ISO/IEC 14496-3 §4.5.2.1, AAC-LC streams must have
+    // `gain_control_data_present == 0` — gain control is reserved for
+    // the AAC-SSR profile (object_type 3), which we don't decode. A
+    // hard reject here turned ffmpeg-accepted-but-non-conformant
+    // streams into "ours produced 0 frames" failures under the fuzz
+    // oracle (`fuzz_targets/ffmpeg_oracle_decode.rs`); libavcodec
+    // tolerates the bit and produces *some* PCM. We mirror that
+    // behaviour: ignore the bit, leave the bitstream cursor where it
+    // is (we don't attempt to parse the §4.5.2.6.4
+    // `gain_control_data()` block, which would corrupt the rest of
+    // the spectral_data alignment anyway). Downstream parsing
+    // recovers what it can; on a real AAC-LC stream the bit is
+    // always zero so this is a no-op.
     let _gain_control = br.read_bit()?;
-    if _gain_control {
-        return Err(Error::unsupported("AAC: gain_control in LC stream"));
-    }
     let _ = is_in_cpe;
     Ok((info, sf, sec, tns, pulse))
 }

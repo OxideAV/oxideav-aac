@@ -16,14 +16,22 @@
 //! (ISO/IEC 14496-3 §4.6.18.3.2.2 constrains NQ to `[1, 5]`).
 //!
 //! Bug 2 (workspace task #744) — 88.2 kHz / 5.1-channel ADTS
-//! produced 0 output frames vs ffmpeg's 1. Sample-rate-index 1
-//! (88200 Hz) maps to `SWB_LONG_96` / `SWB_SHORT_96` whose
-//! length is 41/12; `parse_ics_info` allowed `max_sfb` up to 63
-//! (long) / 15 (short) without checking against the active
-//! `num_swb`, so a non-conformant frame in the run forced an OOB
-//! at `decode_spectrum_long` line 263 (`swb_offsets[max_sfb]`).
-//! Fix: `parse_ics_info` rejects out-of-range `max_sfb` per
-//! ISO/IEC 14496-3 Table 4.110.
+//! produced 0 output frames vs ffmpeg's 1. Two contributing
+//! issues, both surfaced by the same fuzz oracle:
+//!   (a) sample-rate-index 1 (88200 Hz) maps to `SWB_LONG_96` /
+//!       `SWB_SHORT_96` whose length is 41/12; `parse_ics_info`
+//!       allowed `max_sfb` up to 63 (long) / 15 (short) without
+//!       checking against the active `num_swb`, so a non-
+//!       conformant frame OOB'd `decode_spectrum_long` (line 263:
+//!       `swb_offsets[max_sfb]`). Fix: `parse_ics_info` rejects
+//!       out-of-range `max_sfb` per ISO/IEC 14496-3 Table 4.110.
+//!   (b) `decode_ics` returned `Error::Unsupported("AAC: gain_control
+//!       in LC stream")` whenever the `gain_control_data_present`
+//!       bit was set on an AAC-LC stream. The bit MUST be zero
+//!       per §4.5.2.1, but libavcodec tolerates non-zero and
+//!       emits PCM anyway, leaving the fuzz oracle to fire on
+//!       the "ours produced 0" condition. We now mirror
+//!       libavcodec's tolerance and silently accept the bit.
 //!
 //! Bug 3 (workspace task #742) — investigated 5814-LSB second-frame
 //! divergence against ffmpeg on
@@ -117,6 +125,94 @@ fn ics_info_rejects_oversized_max_sfb_long_744() {
         r.is_err(),
         "out-of-range max_sfb=63 (sf_index=1) must be rejected, got {r:?}"
     );
+}
+
+/// Bug 2 (#744) — replays the second 2026-05-10 fuzz crash artifact
+/// (`crash-037e514390aeeb1a27c4d13469b09ef1fc5b4d12`, 43 bytes). Same
+/// "0-frame divergence" class as the 113-byte artifact, but the
+/// embedded 88.2 kHz / 5.1 ADTS frame trips a different malformed-
+/// element path: ICS with `gain_control_data_present == 1`. AAC-LC
+/// is supposed to keep that bit zero (gain control is reserved for
+/// the AAC-SSR profile), but libavcodec tolerates it and produces
+/// PCM anyway. `decode_ics` previously rejected with
+/// `Error::Unsupported`, leaving the fuzz oracle's "ffmpeg emitted a
+/// frame but oxideav-aac produced 0" assertion firing. We now
+/// silently ignore the bit (matching libavcodec) and produce *some*
+/// frame for downstream consumers.
+#[test]
+fn ffmpeg_oracle_88200_5_1_adts_emits_frame_744_b() {
+    let data: [u8; 43] = [
+        255, 105, 249, 140, 140, 140, 140, 140, 255, 0, 0, 255, 249, 71, 140, 3, 0, 128, 0, 249, 1,
+        140, 114, 8, 255, 254, 254, 255, 249, 71, 140, 1, 185, 160, 140, 255, 249, 71, 208, 255,
+        255, 191, 255,
+    ];
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let mut got_audio = 0usize;
+    let mut off = 0usize;
+    while off + 7 <= data.len() {
+        if data[off] != 0xFF || (data[off + 1] & 0xF0) != 0xF0 {
+            off += 1;
+            continue;
+        }
+        let h = match parse_adts_header(&data[off..]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        if h.frame_length == 0 || off + h.frame_length > data.len() {
+            break;
+        }
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, h.sample_rate().unwrap_or(44_100) as i64),
+            data[off..off + h.frame_length].to_vec(),
+        );
+        let _ = dec.send_packet(&pkt);
+        if let Ok(Frame::Audio(_)) = dec.receive_frame() {
+            got_audio += 1;
+        }
+        off += h.frame_length;
+    }
+    assert!(
+        got_audio >= 1,
+        "expected ≥1 audio frame from libavcodec-accepted (88.2 kHz / 5.1) input \
+         (got {got_audio}); the fuzz oracle treats 0 frames as a hard panic."
+    );
+}
+
+/// Bug — SBR `hf_adjust` underflow on malformed envelope grid
+/// (`crash-b996ddb4401e20a581a3c900cab3c4b7c2e72f7c`, 16 bytes).
+/// `l_end - l_start` panicked with "attempt to subtract with
+/// overflow" when a non-monotonic `t_e[env+1] < t_e[env]` slipped
+/// through grid construction. `decode_sbr_frame` now skips the
+/// envelope when `l_end ≤ l_start` rather than panicking.
+#[test]
+fn sbr_hf_adjust_underflow_does_not_panic() {
+    let data: [u8; 16] = [
+        209, 188, 167, 167, 167, 167, 167, 167, 167, 167, 167, 167, 188, 0, 0, 0,
+    ];
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+    let _ = dec.send_packet(&pkt);
+    for _ in 0..4 {
+        if dec.receive_frame().is_err() {
+            break;
+        }
+    }
+    // Also exercise the synthetic-ASC path (panic_free_decode harness path 2).
+    let mut params2 = CodecParameters::audio(CodecId::new("aac"));
+    params2.sample_rate = Some(44_100);
+    params2.channels = Some(2);
+    params2.extradata = vec![0x12, 0x10];
+    let mut dec2 = make_decoder(&params2).expect("ASC valid");
+    let pkt2 = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+    let _ = dec2.send_packet(&pkt2);
+    for _ in 0..4 {
+        if dec2.receive_frame().is_err() {
+            break;
+        }
+    }
 }
 
 /// Bug 2 (#744) — replays the exact `ffmpeg_oracle_decode` fuzz crash

@@ -184,6 +184,13 @@ pub fn apply_envelope_with_limiter(
             continue;
         }
         let l_end = l_end_raw.min(x_high.len());
+        // A non-monotonic `t_e[env]..t_e[env+1]` (which a malformed bitstream
+        // can synthesise via SBR grid bs_freq_res / bs_var_bord_0..1) yields
+        // l_end < l_start, which would underflow `l_end - l_start`.
+        // Skip the envelope rather than panic.
+        if l_end <= l_start {
+            continue;
+        }
 
         // 1) Dequantise envelope + noise scalefactors and compute per-QMF-
         //    subband (E_orig, Q_orig, S_mask) triples.
