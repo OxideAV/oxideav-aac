@@ -99,16 +99,21 @@ pub fn parse_ics_info(br: &mut BitReader<'_>, sf_index: u8) -> Result<IcsInfo> {
     // num_swb(sf_index)+1 offsets. A non-conformant stream that codes
     // max_sfb beyond this bound would later index past
     // SWB_LONG[sf_index] / SWB_SHORT[sf_index] in the spectrum-decode
-    // path. Reject up-front so the decoder produces a clean
-    // `Error::InvalidData` instead of silently truncating or, worse,
-    // panicking under fuzz inputs (workspace task #744 — 88.2 kHz / 5.1
-    // ADTS frames produced 0 output frames vs ffmpeg's 1, traced back
-    // to a single non-conformant max_sfb in the sequence).
+    // path.
+    //
+    // Workspace task #744 added a hard reject here. Task #759 then
+    // revealed a follow-up case: an 88.2 kHz / 5.1 ADTS run where the
+    // *second* element (a CPE per-channel ICS) codes max_sfb=60 with
+    // sf_index=1 (num_swb_long = 41). libavcodec emits a frame for
+    // this stream — it tolerates the overrun by clamping max_sfb to
+    // num_swb, which leaves the unreachable upper bands silent. We
+    // mirror that behaviour so any libavcodec-accepted ADTS frame
+    // also produces output here. Rejecting outright traps the same
+    // class of malformed-but-tolerated streams that motivated the
+    // gain_control tolerance fix in `decode_ics`.
     let num_swb = info.num_swb();
     if info.max_sfb as usize > num_swb {
-        return Err(Error::invalid(
-            "AAC: max_sfb exceeds num_swb for the active sampling frequency",
-        ));
+        info.max_sfb = num_swb as u8;
     }
 
     Ok(info)

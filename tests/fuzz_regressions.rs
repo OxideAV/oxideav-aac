@@ -84,12 +84,21 @@ fn sbr_bitstream_oob_does_not_panic_743() {
 }
 
 #[test]
-fn ics_info_rejects_oversized_max_sfb_long_744() {
+fn ics_info_clamps_oversized_max_sfb_long_744() {
     // Build a malformed AAC-LC raw_data_block: SCE with
     // ICS_INFO that codes max_sfb = 63 on sf_index = 1
     // (88200 Hz, num_swb_long = 41). Without the bound check,
     // parse_section_data + decode_spectrum_long index past
-    // SWB_LONG_96. Now this returns Error::InvalidData.
+    // SWB_LONG_96 and panic. Workspace task #744 added a hard
+    // reject; task #759 then revealed that libavcodec tolerates
+    // the overrun and produces output, so a hard reject leaves
+    // the fuzz oracle firing "ffmpeg emitted a frame but we
+    // produced 0". `parse_ics_info` now clamps `max_sfb` to
+    // `num_swb` so the remainder of the frame stays
+    // bitstream-aligned and the spectrum decode runs over the
+    // representable bands only. The contract here is just
+    // "doesn't panic" — the decoder may still error out further
+    // along the bitstream depending on what bytes follow.
     use oxideav_core::bits::BitWriter;
     let mut bw = BitWriter::new();
     // SCE element: id=0 (3 bits) + element_instance_tag (4 bits),
@@ -119,12 +128,10 @@ fn ics_info_rejects_oversized_max_sfb_long_744() {
     params.extradata = vec![0x10, 0x88];
     let mut dec = make_decoder(&params).expect("synthetic ASC valid");
     let pkt = Packet::new(0, TimeBase::new(1, 88_200), payload);
+    // The contract here is "no panic on arbitrary bytes"; we
+    // only assert the decoder doesn't unwind.
     let _ = dec.send_packet(&pkt);
-    let r = dec.receive_frame();
-    assert!(
-        r.is_err(),
-        "out-of-range max_sfb=63 (sf_index=1) must be rejected, got {r:?}"
-    );
+    let _ = dec.receive_frame();
 }
 
 /// Bug 2 (#744) — replays the second 2026-05-10 fuzz crash artifact
@@ -177,6 +184,128 @@ fn ffmpeg_oracle_88200_5_1_adts_emits_frame_744_b() {
         got_audio >= 1,
         "expected ≥1 audio frame from libavcodec-accepted (88.2 kHz / 5.1) input \
          (got {got_audio}); the fuzz oracle treats 0 frames as a hard panic."
+    );
+}
+
+/// Bug (workspace task #760) — `decode_packet` panicked at
+/// `src/decoder.rs:316` with "range start index 9 out of range for
+/// slice of length 7" when an ADTS packet declared
+/// `protection_absent = 0` (CRC follows → header is 9 bytes) but
+/// the packet itself was only 7 bytes long. `parse_adts_header`
+/// only reads 7 bytes so it succeeded; the subsequent
+/// `data[header_length()..frame_end]` indexed past the packet
+/// because `header_length() == 9 > data.len() == 7`. Fix: reject
+/// such packets with `Error::InvalidData` before the slice index.
+#[test]
+fn adts_short_packet_with_crc_does_not_panic_760() {
+    // Exact 7 bytes from
+    // fuzz/artifacts/panic_free_decode/crash-ac1b31b983778f1fbf5196fcef999aecc9a4a951
+    // `prot_abs = 0` (CRC indicated) so header length is 9 bytes,
+    // but only 7 bytes are available.
+    let data: [u8; 7] = [0xFF, 0xF8, 0x59, 0xBE, 0xBE, 0x28, 0x28];
+
+    // Path 1: ADTS streaming — bootstraps from first frame.
+    {
+        let params = CodecParameters::audio(CodecId::new("aac"));
+        let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+        let _ = dec.send_packet(&pkt);
+        for _ in 0..4 {
+            if dec.receive_frame().is_err() {
+                break;
+            }
+        }
+    }
+    // Path 2: synthetic ASC — exercises the same `decode_packet`
+    // code path on a pre-configured decoder.
+    {
+        let mut params = CodecParameters::audio(CodecId::new("aac"));
+        params.sample_rate = Some(44_100);
+        params.channels = Some(2);
+        params.extradata = vec![0x12, 0x10];
+        let mut dec = make_decoder(&params).expect("synthetic ASC valid");
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+        let _ = dec.send_packet(&pkt);
+        for _ in 0..4 {
+            if dec.receive_frame().is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Bug (workspace task #759) — replays the exact 159-byte
+/// `ffmpeg_oracle_decode` artifact that surfaced after #744. The
+/// embedded 88.2 kHz / 5.1 ADTS frame at byte offset 112 codes a
+/// silent SCE (max_sfb=0) followed by a non-conformant trailing
+/// CPE whose per-channel ICS_INFO has `max_sfb = 60` on
+/// `sf_index = 1` (88200 Hz, `num_swb_long = 41`). The SCE itself
+/// has `pulse_data_present = 1` with `pulse_start_sfb` beyond its
+/// own (zero) max_sfb. libavcodec tolerates all three issues and
+/// emits PCM; before this round we hard-rejected the
+/// pulse-out-of-range and the max_sfb-overrun, leaving us at
+/// 0 frames and tripping the fuzz oracle's "ffmpeg emitted a frame
+/// but oxideav-aac produced 0" assertion. The fix combines:
+///   (a) `apply_pulse_long` clamps to a no-op on out-of-range
+///       `pulse_start_sfb` (silent SCE stays silent).
+///   (b) `parse_ics_info` clamps `max_sfb` to `num_swb` instead
+///       of erroring (mirrors libavcodec).
+///   (c) the element-decode loop in `decode_packet` keeps
+///       partial PCM when a *later* element fails after at
+///       least one element has been fully decoded.
+#[test]
+fn ffmpeg_oracle_88200_5_1_clamps_max_sfb_759() {
+    // Exact 159-byte input from
+    // fuzz/artifacts/ffmpeg_oracle_decode/crash-9f8b60a1917e6087d80d04bd514ec3ca4d4cfc5e
+    let data: [u8; 159] = [
+        0xff, 0xf9, 0x2f, 0x00, 0x8c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xf9,
+        0x9c, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xf9, 0x47, 0x8c, 0x01, 0xf9, 0xa0, 0x01,
+        0x00, 0x00, 0x21, 0xff, 0xf9, 0x47, 0x8c, 0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0xf9, 0xa0,
+        0x8c, 0x00, 0x00, 0xff, 0xf9, 0x8c, 0x04, 0x00, 0xa0, 0xff, 0xf9, 0x00, 0x08, 0xa0, 0x8c,
+        0xff, 0xfe, 0x01, 0x00, 0x00, 0xa0, 0xff, 0x73, 0xab,
+    ];
+    // Walk the same find_adts_run the oracle harness uses: stop
+    // at the first AAC-LC frame found. This is the frame whose
+    // 0-output divergence triggered the fuzz crash.
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let mut got = 0usize;
+    for off in 0..data.len().saturating_sub(7) {
+        if data[off] != 0xFF || (data[off + 1] & 0xF0) != 0xF0 {
+            continue;
+        }
+        let h = match parse_adts_header(&data[off..]) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if h.frame_length == 0
+            || off + h.frame_length > data.len()
+            || h.object_type != 2
+            || h.number_of_raw_blocks_minus_one != 0
+        {
+            continue;
+        }
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, h.sample_rate().unwrap_or(44_100) as i64),
+            data[off..off + h.frame_length].to_vec(),
+        );
+        let _ = dec.send_packet(&pkt);
+        if let Ok(Frame::Audio(_)) = dec.receive_frame() {
+            got += 1;
+        }
+        break;
+    }
+    assert!(
+        got >= 1,
+        "expected ≥1 audio frame from libavcodec-accepted (88.2 kHz / 5.1) input \
+         (got {got}); the fuzz oracle treats 0 frames as a hard panic."
     );
 }
 

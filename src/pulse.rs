@@ -17,7 +17,7 @@
 //! It is rarely emitted by mainstream encoders but is part of AAC-LC and
 //! shows up in test vectors.
 
-use oxideav_core::{Error, Result};
+use oxideav_core::Result;
 
 use crate::ics::{inv_quant, sf_to_gain, SPEC_LEN};
 use crate::sfband::SWB_LONG;
@@ -67,8 +67,16 @@ pub fn apply_pulse_long(
 ) -> Result<()> {
     let swb = SWB_LONG[sf_index as usize];
     let start_sfb = pd.pulse_start_sfb as usize;
-    if start_sfb >= max_sfb as usize {
-        return Err(Error::invalid("AAC: pulse_start_sfb beyond max_sfb"));
+    // Workspace task #759: a malformed AAC-LC frame coded
+    // pulse_data_present=1 with pulse_start_sfb beyond max_sfb on a
+    // frame whose ICS_INFO had max_sfb=0 (silent SCE). libavcodec
+    // tolerates this and emits the silent SCE PCM unchanged; mirror
+    // that by no-op'ing the pulse application instead of erroring.
+    // Out-of-range pulse_start_sfb has no defined effect per spec
+    // §4.6.5.2 (pulses are added inside the active spectrum), so
+    // skipping is the conservative interpretation.
+    if start_sfb >= max_sfb as usize || start_sfb >= swb.len() {
+        return Ok(());
     }
     let mut k = swb[start_sfb] as usize;
     // Track the current sfb so we know which scalefactor's gain applies.
@@ -76,7 +84,9 @@ pub fn apply_pulse_long(
     for i in 0..pd.number_pulse as usize {
         k = k.wrapping_add(pd.pulse_offset[i] as usize);
         if k >= SPEC_LEN {
-            return Err(Error::invalid("AAC: pulse_offset past SPEC_LEN"));
+            // Per #759 tolerance: stop applying further pulses
+            // instead of failing the entire frame.
+            return Ok(());
         }
         // Find which sfb owns this coefficient.
         while sfb_now + 1 < max_sfb as usize && (k as u16) >= swb[sfb_now + 1] {

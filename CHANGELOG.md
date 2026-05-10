@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ADTS short-packet panic (workspace task #760).** A 7-byte ADTS
+  packet that codes `protection_absent = 0` (CRC follows → header
+  is 9 bytes) caused `decode_packet` to panic with
+  `range start index 9 out of range for slice of length 7` at
+  `src/decoder.rs:316`. `parse_adts_header` only reads 7 bytes so it
+  succeeded; the subsequent `data[header_length()..frame_end]`
+  indexed past the packet because `header_length() == 9 >
+  data.len() == 7`. We now reject such packets with
+  `Error::InvalidData` per ISO/IEC 14496-3 §1.A.2 (a frame shorter
+  than its declared header is malformed). Regression:
+  `tests/fuzz_regressions.rs::adts_short_packet_with_crc_does_not_panic_760`.
+- **88.2 kHz / 5.1 ADTS 0-frame divergence (workspace task #759).**
+  A second class of "ffmpeg emitted a frame but oxideav-aac
+  produced 0" cases surfaced post-#744. The triggering frame
+  (159-byte `ffmpeg_oracle_decode` artifact, AAC-LC frame at
+  byte offset 112) carries three issues, each of which the
+  round-#744 fix alone treated as a hard reject:
+    - silent SCE (`max_sfb = 0`) coded `pulse_data_present = 1`
+      with `pulse_start_sfb` beyond its own zero-band ICS;
+      `apply_pulse_long` errored with `pulse_start_sfb beyond
+      max_sfb` instead of no-op'ing on a silent spectrum;
+    - a trailing CPE coded `max_sfb = 60` on `sf_index = 1`
+      (88200 Hz, `num_swb_long = 41`); `parse_ics_info` errored
+      instead of clamping;
+    - even with the SCE rescued, an error inside the trailing
+      CPE bailed the entire frame.
+  Fixes: (a) `apply_pulse_long` no-ops on out-of-range
+  `pulse_start_sfb` / `pulse_offset` (silent SCE stays silent);
+  (b) `parse_ics_info` clamps `max_sfb` to `num_swb` instead of
+  erroring (mirrors libavcodec); (c) `decode_packet`'s element
+  loop returns partial PCM when a trailing element fails after
+  at least one element fully decoded. Regression:
+  `tests/fuzz_regressions.rs::ffmpeg_oracle_88200_5_1_clamps_max_sfb_759`.
 - **SBR `hf_adjust` underflow on non-monotonic envelope grid.** A
   malformed SBR frame whose `t_e[env+1] < t_e[env]` (e.g. via
   `bs_freq_res` / `bs_var_bord_*` flips not caught by grid

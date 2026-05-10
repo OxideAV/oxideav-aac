@@ -304,7 +304,23 @@ impl AacDecoder {
                 self.object_type = hdr.object_type;
                 self.configured = true;
                 self.time_base = TimeBase::new(1, hdr.sample_rate().unwrap_or(44_100) as i64);
-                (hdr.header_length(), hdr.frame_length.min(data.len()))
+                // Workspace task #760: a 7-byte packet that codes
+                // `protection_absent == 0` (CRC follows) advertises a
+                // 9-byte header but the packet itself is too short to
+                // carry it. `parse_adts_header` only reads 7 bytes, so
+                // it succeeds; without the bounds check below
+                // `data[payload_offset..frame_end]` panics with
+                // "range start index 9 out of range for slice of
+                // length 7" because `payload_offset = 9 > data.len()`.
+                // Reject up-front per ISO/IEC 14496-3 §1.A.2 — a frame
+                // shorter than its declared header is malformed.
+                let header_len = hdr.header_length();
+                if data.len() < header_len || hdr.frame_length < header_len {
+                    return Err(Error::invalid(
+                        "ADTS: packet shorter than declared header length",
+                    ));
+                }
+                (header_len, hdr.frame_length.min(data.len()))
             } else {
                 if !self.configured {
                     return Err(Error::invalid(
@@ -328,471 +344,537 @@ impl AacDecoder {
         let mut last_elem_start: usize = 0;
         let mut last_elem_is_cpe: bool = false;
 
-        loop {
-            let id = br.read_u32(3)?;
+        // libavcodec is tolerant to non-conformant trailing elements:
+        // workspace task #759 surfaced an 88.2 kHz / 5.1 ADTS frame
+        // where ffmpeg emits the leading SCE output even though a
+        // follow-up CPE has out-of-range max_sfb. Mirror that
+        // behaviour by tracking whether *any* full element decoded
+        // before a parse error and, if so, returning the partial
+        // PCM rather than bailing the whole frame.
+        let mut element_loop_err: Option<Error> = None;
+        'elements: loop {
+            let id = match br.read_u32(3) {
+                Ok(v) => v,
+                Err(e) => {
+                    element_loop_err = Some(e);
+                    break 'elements;
+                }
+            };
             let kind = ElementType::from_id(id);
-            match kind {
-                ElementType::Sce => {
-                    last_elem_start = got_channels;
-                    last_elem_is_cpe = false;
-                    let _instance_tag = br.read_u32(4)?;
-                    let mut spec = [0.0f32; SPEC_LEN];
-                    let (info, sf, sec, tns, pulse) = decode_ics(&mut br, self.sf_index, false)?;
-                    fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
-                    // Pulse data: §4.6.5 — applied to long-window spectrum
-                    // before PNS / TNS.
-                    if let Some(pd) = pulse.as_ref() {
-                        // §4.6.5.2: pulse_data is only valid for long windows.
-                        // A stream with pulse_data_present=1 on EIGHT_SHORT is
-                        // non-conformant.
-                        if info.window_sequence == WindowSequence::EightShort {
-                            return Err(Error::invalid(
+            // Inner match wrapped in a Result-returning closure so any
+            // inner `?` failure on a malformed sub-element falls back
+            // to "stop here, emit what we have" rather than discarding
+            // already-decoded SCE/CPE/LFE channels.
+            let iter_result: Result<bool> = (|| -> Result<bool> {
+                match kind {
+                    ElementType::Sce => {
+                        last_elem_start = got_channels;
+                        last_elem_is_cpe = false;
+                        let _instance_tag = br.read_u32(4)?;
+                        let mut spec = [0.0f32; SPEC_LEN];
+                        let (info, sf, sec, tns, pulse) =
+                            decode_ics(&mut br, self.sf_index, false)?;
+                        fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
+                        // Pulse data: §4.6.5 — applied to long-window spectrum
+                        // before PNS / TNS.
+                        if let Some(pd) = pulse.as_ref() {
+                            // §4.6.5.2: pulse_data is only valid for long windows.
+                            // A stream with pulse_data_present=1 on EIGHT_SHORT is
+                            // non-conformant.
+                            if info.window_sequence == WindowSequence::EightShort {
+                                return Err(Error::invalid(
                                 "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
                             ));
+                            }
+                            apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
                         }
-                        apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
-                    }
-                    // PNS first: fill NOISE_HCB bands with shaped noise.
-                    if info.window_sequence == WindowSequence::EightShort {
-                        apply_pns_short(&mut spec, &info, &sec, &sf, &mut self.pns_rng);
-                    } else {
-                        apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
-                    }
-                    // TNS after PNS/IS but before IMDCT (§4.6.9.2).
-                    if let Some(tns) = tns.as_ref() {
+                        // PNS first: fill NOISE_HCB bands with shaped noise.
                         if info.window_sequence == WindowSequence::EightShort {
-                            apply_tns_short(&mut spec, tns, self.sf_index, info.max_sfb, &info);
+                            apply_pns_short(&mut spec, &info, &sec, &sf, &mut self.pns_rng);
                         } else {
+                            apply_pns_long(
+                                &mut spec,
+                                &info,
+                                &sec,
+                                &sf,
+                                &mut self.pns_rng,
+                                None,
+                                None,
+                            );
+                        }
+                        // TNS after PNS/IS but before IMDCT (§4.6.9.2).
+                        if let Some(tns) = tns.as_ref() {
+                            if info.window_sequence == WindowSequence::EightShort {
+                                apply_tns_short(&mut spec, tns, self.sf_index, info.max_sfb, &info);
+                            } else {
+                                let swb = SWB_LONG[self.sf_index as usize];
+                                apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
+                            }
+                        }
+                        if got_channels >= pcm.len() {
+                            return Err(Error::invalid(
+                                "AAC: more decoded channels than 8 slots permit",
+                            ));
+                        }
+                        let mut channel_pcm = [0.0f32; FRAME_LEN];
+                        imdct_and_overlap(
+                            &spec,
+                            info.window_sequence,
+                            info.window_shape,
+                            &mut self.chans[got_channels],
+                            &mut channel_pcm,
+                        );
+                        pcm[got_channels].copy_from_slice(&channel_pcm);
+                        got_channels += 1;
+                    }
+                    ElementType::Cpe => {
+                        last_elem_start = got_channels;
+                        last_elem_is_cpe = true;
+                        let _instance_tag = br.read_u32(4)?;
+                        let common_window = br.read_bit()?;
+                        if common_window {
+                            // Shared ICS info, then ms_mask flags.
+                            let info = parse_ics_info(&mut br, self.sf_index)?;
+                            let ms_mask_present = br.read_u32(2)? as u8;
+                            let max_sfb = info.max_sfb as usize;
+                            let groups = info.num_window_groups as usize;
+                            let mut ms_used = vec![false; groups * max_sfb];
+                            match ms_mask_present {
+                                0 => { /* ms not used */ }
+                                1 => {
+                                    for i in 0..groups * max_sfb {
+                                        ms_used[i] = br.read_bit()?;
+                                    }
+                                }
+                                2 => {
+                                    for i in 0..groups * max_sfb {
+                                        ms_used[i] = true;
+                                    }
+                                }
+                                _ => return Err(Error::invalid("AAC: reserved ms_mask_present=3")),
+                            }
+                            let mut spec = [[0.0f32; SPEC_LEN]; 2];
+                            let mut secs: [SectionData; 2] = Default::default();
+                            let mut sfs: [Vec<i32>; 2] = Default::default();
+                            let infos: [IcsInfo; 2] = [info.clone(), info.clone()];
+                            let mut tns_all: [Option<TnsData>; 2] = [None, None];
+                            let mut pulse_all: [Option<PulseData>; 2] = [None, None];
+                            for ch in 0..2 {
+                                let gg = br.read_u32(8)? as u8;
+                                let sec = parse_section_data(&mut br, &infos[ch])?;
+                                let sf = parse_scalefactors(&mut br, &infos[ch], &sec, gg)?;
+                                let pulse_present = br.read_bit()?;
+                                if pulse_present {
+                                    pulse_all[ch] = Some(parse_pulse_data(&mut br)?);
+                                }
+                                let tns_present = br.read_bit()?;
+                                if tns_present {
+                                    let n_windows = if infos[ch].window_sequence.is_eight_short() {
+                                        8
+                                    } else {
+                                        1
+                                    };
+                                    tns_all[ch] = Some(parse_tns_data(
+                                        &mut br,
+                                        infos[ch].window_sequence,
+                                        n_windows,
+                                    )?);
+                                }
+                                // See `decode_ics` for the rationale on
+                                // tolerating gain_control_data_present in the
+                                // common-window CPE path.
+                                let _gain_control = br.read_bit()?;
+                                secs[ch] = sec;
+                                sfs[ch] = sf;
+                                fill_spectrum(
+                                    &mut br,
+                                    &infos[ch],
+                                    &secs[ch],
+                                    &sfs[ch],
+                                    &mut spec[ch],
+                                )?;
+                                if let Some(pd) = pulse_all[ch].as_ref() {
+                                    if infos[ch].window_sequence == WindowSequence::EightShort {
+                                        return Err(Error::invalid(
+                                        "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
+                                    ));
+                                    }
+                                    apply_pulse_long(
+                                        &mut spec[ch],
+                                        pd,
+                                        self.sf_index,
+                                        infos[ch].max_sfb,
+                                        &sfs[ch],
+                                    )?;
+                                }
+                            }
+                            // PNS: fill NOISE_HCB bands. For correlated-noise bands
+                            // (ms_used set on a noise sfb) both channels share the
+                            // same random sequence.
+                            if infos[0].window_sequence == WindowSequence::EightShort {
+                                apply_pns_short(
+                                    &mut spec[0],
+                                    &infos[0],
+                                    &secs[0],
+                                    &sfs[0],
+                                    &mut self.pns_rng,
+                                );
+                                apply_pns_short(
+                                    &mut spec[1],
+                                    &infos[1],
+                                    &secs[1],
+                                    &sfs[1],
+                                    &mut self.pns_rng,
+                                );
+                            } else {
+                                // Apply channel 0 + optionally mirror to channel 1.
+                                let (s0, s1) = spec.split_at_mut(1);
+                                apply_pns_long(
+                                    &mut s0[0],
+                                    &infos[0],
+                                    &secs[0],
+                                    &sfs[0],
+                                    &mut self.pns_rng,
+                                    Some(&mut s1[0]),
+                                    Some(&ms_used),
+                                );
+                                // Fill any NOISE_HCB bands channel 1 has that
+                                // channel 0 did not (rare, but spec-legal).
+                                apply_pns_long_ch1_leftover(
+                                    &mut s1[0],
+                                    &infos[1],
+                                    &secs[0],
+                                    &secs[1],
+                                    &sfs[1],
+                                    &mut self.pns_rng,
+                                );
+                            }
+                            // Intensity stereo (§4.6.8.2.3): for each band whose
+                            // channel-1 codebook is INTENSITY_HCB / INTENSITY_HCB2,
+                            // synthesise spec[1] from spec[0] scaled by
+                            // sign * 2^(-is_position/4). apply_ms_stereo below
+                            // already skips IS bands, so IS must run first.
+                            apply_intensity_stereo(
+                                &infos[0],
+                                &secs,
+                                &sfs,
+                                &ms_used,
+                                ms_mask_present,
+                                &mut spec,
+                            );
+                            // M/S stereo: replace L,R with (L+R)/sqrt(2), (L-R)/sqrt(2)?
+                            // Per spec §4.6.13.3:
+                            //   L = M + S; R = M - S  (no sqrt scaling — IS-only normalisation
+                            //   uses sqrt(2), but MS as defined in 14496-3 is L=M+S, R=M-S).
+                            apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
+                            // TNS after PNS + M/S, before IMDCT.
+                            for ch in 0..2 {
+                                if let Some(tns) = tns_all[ch].as_ref() {
+                                    if infos[ch].window_sequence == WindowSequence::EightShort {
+                                        apply_tns_short(
+                                            &mut spec[ch],
+                                            tns,
+                                            self.sf_index,
+                                            infos[ch].max_sfb,
+                                            &infos[ch],
+                                        );
+                                    } else {
+                                        let swb = SWB_LONG[self.sf_index as usize];
+                                        apply_tns_long(
+                                            &mut spec[ch],
+                                            tns,
+                                            self.sf_index,
+                                            infos[ch].max_sfb,
+                                            swb,
+                                        );
+                                    }
+                                }
+                            }
+                            if got_channels + 2 > pcm.len() {
+                                return Err(Error::invalid(
+                                    "AAC: CPE would overflow 8 channel slots",
+                                ));
+                            }
+                            for ch in 0..2 {
+                                let mut channel_pcm = [0.0f32; FRAME_LEN];
+                                imdct_and_overlap(
+                                    &spec[ch],
+                                    infos[ch].window_sequence,
+                                    infos[ch].window_shape,
+                                    &mut self.chans[got_channels + ch],
+                                    &mut channel_pcm,
+                                );
+                                pcm[got_channels + ch].copy_from_slice(&channel_pcm);
+                            }
+                            got_channels += 2;
+                        } else {
+                            // Independent ICS for each channel.
+                            let mut spec = [[0.0f32; SPEC_LEN]; 2];
+                            let mut infos: [IcsInfo; 2] = Default::default();
+                            let mut tns_all: [Option<TnsData>; 2] = [None, None];
+                            for ch in 0..2 {
+                                let (info, sf, sec, tns, pulse) =
+                                    decode_ics(&mut br, self.sf_index, true)?;
+                                fill_spectrum(&mut br, &info, &sec, &sf, &mut spec[ch])?;
+                                if let Some(pd) = pulse.as_ref() {
+                                    if info.window_sequence == WindowSequence::EightShort {
+                                        return Err(Error::invalid(
+                                        "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
+                                    ));
+                                    }
+                                    apply_pulse_long(
+                                        &mut spec[ch],
+                                        pd,
+                                        self.sf_index,
+                                        info.max_sfb,
+                                        &sf,
+                                    )?;
+                                }
+                                // PNS per channel, independent (no CPE common_window
+                                // => no shared ms flags).
+                                if info.window_sequence == WindowSequence::EightShort {
+                                    apply_pns_short(
+                                        &mut spec[ch],
+                                        &info,
+                                        &sec,
+                                        &sf,
+                                        &mut self.pns_rng,
+                                    );
+                                } else {
+                                    apply_pns_long(
+                                        &mut spec[ch],
+                                        &info,
+                                        &sec,
+                                        &sf,
+                                        &mut self.pns_rng,
+                                        None,
+                                        None,
+                                    );
+                                }
+                                infos[ch] = info;
+                                tns_all[ch] = tns;
+                            }
+                            for ch in 0..2 {
+                                if let Some(tns) = tns_all[ch].as_ref() {
+                                    if infos[ch].window_sequence == WindowSequence::EightShort {
+                                        apply_tns_short(
+                                            &mut spec[ch],
+                                            tns,
+                                            self.sf_index,
+                                            infos[ch].max_sfb,
+                                            &infos[ch],
+                                        );
+                                    } else {
+                                        let swb = SWB_LONG[self.sf_index as usize];
+                                        apply_tns_long(
+                                            &mut spec[ch],
+                                            tns,
+                                            self.sf_index,
+                                            infos[ch].max_sfb,
+                                            swb,
+                                        );
+                                    }
+                                }
+                                let mut channel_pcm = [0.0f32; FRAME_LEN];
+                                imdct_and_overlap(
+                                    &spec[ch],
+                                    infos[ch].window_sequence,
+                                    infos[ch].window_shape,
+                                    &mut self.chans[got_channels + ch],
+                                    &mut channel_pcm,
+                                );
+                                pcm[got_channels + ch].copy_from_slice(&channel_pcm);
+                            }
+                            if got_channels + 2 > pcm.len() {
+                                return Err(Error::invalid(
+                                    "AAC: CPE would overflow 8 channel slots",
+                                ));
+                            }
+                            got_channels += 2;
+                        }
+                    }
+                    ElementType::Lfe => {
+                        last_elem_start = got_channels;
+                        last_elem_is_cpe = false;
+                        // LFE element (§4.6.10) has the same bitstream syntax as
+                        // an SCE but is restricted to long-window output with a
+                        // small max_sfb. Decode the same way and write to the
+                        // next channel slot.
+                        let _instance_tag = br.read_u32(4)?;
+                        let mut spec = [0.0f32; SPEC_LEN];
+                        let (info, sf, sec, tns, pulse) =
+                            decode_ics(&mut br, self.sf_index, false)?;
+                        if info.window_sequence == WindowSequence::EightShort {
+                            return Err(Error::invalid(
+                                "AAC: LFE element with EIGHT_SHORT window (non-conformant)",
+                            ));
+                        }
+                        fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
+                        if let Some(pd) = pulse.as_ref() {
+                            apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
+                        }
+                        apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
+                        if let Some(tns) = tns.as_ref() {
                             let swb = SWB_LONG[self.sf_index as usize];
                             apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
                         }
-                    }
-                    if got_channels >= pcm.len() {
-                        return Err(Error::invalid(
-                            "AAC: more decoded channels than 8 slots permit",
-                        ));
-                    }
-                    let mut channel_pcm = [0.0f32; FRAME_LEN];
-                    imdct_and_overlap(
-                        &spec,
-                        info.window_sequence,
-                        info.window_shape,
-                        &mut self.chans[got_channels],
-                        &mut channel_pcm,
-                    );
-                    pcm[got_channels].copy_from_slice(&channel_pcm);
-                    got_channels += 1;
-                }
-                ElementType::Cpe => {
-                    last_elem_start = got_channels;
-                    last_elem_is_cpe = true;
-                    let _instance_tag = br.read_u32(4)?;
-                    let common_window = br.read_bit()?;
-                    if common_window {
-                        // Shared ICS info, then ms_mask flags.
-                        let info = parse_ics_info(&mut br, self.sf_index)?;
-                        let ms_mask_present = br.read_u32(2)? as u8;
-                        let max_sfb = info.max_sfb as usize;
-                        let groups = info.num_window_groups as usize;
-                        let mut ms_used = vec![false; groups * max_sfb];
-                        match ms_mask_present {
-                            0 => { /* ms not used */ }
-                            1 => {
-                                for i in 0..groups * max_sfb {
-                                    ms_used[i] = br.read_bit()?;
-                                }
-                            }
-                            2 => {
-                                for i in 0..groups * max_sfb {
-                                    ms_used[i] = true;
-                                }
-                            }
-                            _ => return Err(Error::invalid("AAC: reserved ms_mask_present=3")),
+                        if got_channels >= pcm.len() {
+                            return Err(Error::invalid("AAC: LFE would overflow 8 channel slots"));
                         }
-                        let mut spec = [[0.0f32; SPEC_LEN]; 2];
-                        let mut secs: [SectionData; 2] = Default::default();
-                        let mut sfs: [Vec<i32>; 2] = Default::default();
-                        let infos: [IcsInfo; 2] = [info.clone(), info.clone()];
-                        let mut tns_all: [Option<TnsData>; 2] = [None, None];
-                        let mut pulse_all: [Option<PulseData>; 2] = [None, None];
-                        for ch in 0..2 {
-                            let gg = br.read_u32(8)? as u8;
-                            let sec = parse_section_data(&mut br, &infos[ch])?;
-                            let sf = parse_scalefactors(&mut br, &infos[ch], &sec, gg)?;
-                            let pulse_present = br.read_bit()?;
-                            if pulse_present {
-                                pulse_all[ch] = Some(parse_pulse_data(&mut br)?);
-                            }
-                            let tns_present = br.read_bit()?;
-                            if tns_present {
-                                let n_windows = if infos[ch].window_sequence.is_eight_short() {
-                                    8
-                                } else {
-                                    1
-                                };
-                                tns_all[ch] = Some(parse_tns_data(
-                                    &mut br,
-                                    infos[ch].window_sequence,
-                                    n_windows,
-                                )?);
-                            }
-                            // See `decode_ics` for the rationale on
-                            // tolerating gain_control_data_present in the
-                            // common-window CPE path.
-                            let _gain_control = br.read_bit()?;
-                            secs[ch] = sec;
-                            sfs[ch] = sf;
-                            fill_spectrum(&mut br, &infos[ch], &secs[ch], &sfs[ch], &mut spec[ch])?;
-                            if let Some(pd) = pulse_all[ch].as_ref() {
-                                if infos[ch].window_sequence == WindowSequence::EightShort {
-                                    return Err(Error::invalid(
-                                        "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
-                                    ));
-                                }
-                                apply_pulse_long(
-                                    &mut spec[ch],
-                                    pd,
-                                    self.sf_index,
-                                    infos[ch].max_sfb,
-                                    &sfs[ch],
-                                )?;
-                            }
-                        }
-                        // PNS: fill NOISE_HCB bands. For correlated-noise bands
-                        // (ms_used set on a noise sfb) both channels share the
-                        // same random sequence.
-                        if infos[0].window_sequence == WindowSequence::EightShort {
-                            apply_pns_short(
-                                &mut spec[0],
-                                &infos[0],
-                                &secs[0],
-                                &sfs[0],
-                                &mut self.pns_rng,
-                            );
-                            apply_pns_short(
-                                &mut spec[1],
-                                &infos[1],
-                                &secs[1],
-                                &sfs[1],
-                                &mut self.pns_rng,
-                            );
-                        } else {
-                            // Apply channel 0 + optionally mirror to channel 1.
-                            let (s0, s1) = spec.split_at_mut(1);
-                            apply_pns_long(
-                                &mut s0[0],
-                                &infos[0],
-                                &secs[0],
-                                &sfs[0],
-                                &mut self.pns_rng,
-                                Some(&mut s1[0]),
-                                Some(&ms_used),
-                            );
-                            // Fill any NOISE_HCB bands channel 1 has that
-                            // channel 0 did not (rare, but spec-legal).
-                            apply_pns_long_ch1_leftover(
-                                &mut s1[0],
-                                &infos[1],
-                                &secs[0],
-                                &secs[1],
-                                &sfs[1],
-                                &mut self.pns_rng,
-                            );
-                        }
-                        // Intensity stereo (§4.6.8.2.3): for each band whose
-                        // channel-1 codebook is INTENSITY_HCB / INTENSITY_HCB2,
-                        // synthesise spec[1] from spec[0] scaled by
-                        // sign * 2^(-is_position/4). apply_ms_stereo below
-                        // already skips IS bands, so IS must run first.
-                        apply_intensity_stereo(
-                            &infos[0],
-                            &secs,
-                            &sfs,
-                            &ms_used,
-                            ms_mask_present,
-                            &mut spec,
+                        let mut channel_pcm = [0.0f32; FRAME_LEN];
+                        imdct_and_overlap(
+                            &spec,
+                            info.window_sequence,
+                            info.window_shape,
+                            &mut self.chans[got_channels],
+                            &mut channel_pcm,
                         );
-                        // M/S stereo: replace L,R with (L+R)/sqrt(2), (L-R)/sqrt(2)?
-                        // Per spec §4.6.13.3:
-                        //   L = M + S; R = M - S  (no sqrt scaling — IS-only normalisation
-                        //   uses sqrt(2), but MS as defined in 14496-3 is L=M+S, R=M-S).
-                        apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
-                        // TNS after PNS + M/S, before IMDCT.
-                        for ch in 0..2 {
-                            if let Some(tns) = tns_all[ch].as_ref() {
-                                if infos[ch].window_sequence == WindowSequence::EightShort {
-                                    apply_tns_short(
-                                        &mut spec[ch],
-                                        tns,
-                                        self.sf_index,
-                                        infos[ch].max_sfb,
-                                        &infos[ch],
-                                    );
-                                } else {
-                                    let swb = SWB_LONG[self.sf_index as usize];
-                                    apply_tns_long(
-                                        &mut spec[ch],
-                                        tns,
-                                        self.sf_index,
-                                        infos[ch].max_sfb,
-                                        swb,
-                                    );
-                                }
-                            }
+                        pcm[got_channels].copy_from_slice(&channel_pcm);
+                        got_channels += 1;
+                    }
+                    ElementType::Cce => {
+                        return Err(Error::unsupported("AAC: CCE element not implemented"));
+                    }
+                    ElementType::Dse => {
+                        let _instance_tag = br.read_u32(4)?;
+                        let data_byte_align = br.read_bit()?;
+                        let mut count = br.read_u32(8)?;
+                        if count == 255 {
+                            count += br.read_u32(8)?;
                         }
-                        if got_channels + 2 > pcm.len() {
-                            return Err(Error::invalid("AAC: CPE would overflow 8 channel slots"));
+                        if data_byte_align {
+                            br.align_to_byte();
                         }
-                        for ch in 0..2 {
-                            let mut channel_pcm = [0.0f32; FRAME_LEN];
-                            imdct_and_overlap(
-                                &spec[ch],
-                                infos[ch].window_sequence,
-                                infos[ch].window_shape,
-                                &mut self.chans[got_channels + ch],
-                                &mut channel_pcm,
-                            );
-                            pcm[got_channels + ch].copy_from_slice(&channel_pcm);
+                        for _ in 0..count {
+                            br.read_u32(8)?;
                         }
-                        got_channels += 2;
-                    } else {
-                        // Independent ICS for each channel.
-                        let mut spec = [[0.0f32; SPEC_LEN]; 2];
-                        let mut infos: [IcsInfo; 2] = Default::default();
-                        let mut tns_all: [Option<TnsData>; 2] = [None, None];
-                        for ch in 0..2 {
-                            let (info, sf, sec, tns, pulse) =
-                                decode_ics(&mut br, self.sf_index, true)?;
-                            fill_spectrum(&mut br, &info, &sec, &sf, &mut spec[ch])?;
-                            if let Some(pd) = pulse.as_ref() {
-                                if info.window_sequence == WindowSequence::EightShort {
-                                    return Err(Error::invalid(
-                                        "AAC: pulse_data_present=1 with EIGHT_SHORT window (non-conformant)",
-                                    ));
-                                }
-                                apply_pulse_long(
-                                    &mut spec[ch],
-                                    pd,
-                                    self.sf_index,
-                                    info.max_sfb,
-                                    &sf,
-                                )?;
-                            }
-                            // PNS per channel, independent (no CPE common_window
-                            // => no shared ms flags).
-                            if info.window_sequence == WindowSequence::EightShort {
-                                apply_pns_short(&mut spec[ch], &info, &sec, &sf, &mut self.pns_rng);
-                            } else {
-                                apply_pns_long(
-                                    &mut spec[ch],
-                                    &info,
-                                    &sec,
-                                    &sf,
-                                    &mut self.pns_rng,
-                                    None,
-                                    None,
-                                );
-                            }
-                            infos[ch] = info;
-                            tns_all[ch] = tns;
+                    }
+                    ElementType::Pce => {
+                        // Parse the PCE so we stay aligned on the bitstream even
+                        // if we don't yet route the described channel layout to
+                        // the output. Multi-channel support is a separate wiring
+                        // step tracked alongside LFE element handling.
+                        let _pce = crate::pce::parse_program_config_element(&mut br)?;
+                    }
+                    ElementType::Fil => {
+                        // ISO/IEC 14496-3:2009 Table 4.11 — fill_element():
+                        //
+                        //   cnt = count;                 // 4 bits
+                        //   if (cnt == 15)
+                        //       cnt += esc_count - 1;    // 8 bits
+                        //
+                        // i.e. when the 4-bit `count` saturates at 15 the real
+                        // payload byte length is `15 + esc_count - 1`, which
+                        // simplifies to `14 + esc_count`. The earlier
+                        // `count += esc_count.saturating_sub(1)` form misread
+                        // this — for the conformant `esc_count == 0` case it
+                        // yielded `count = 15` instead of `14`, asking the
+                        // bit-reader for one extra byte and tripping
+                        // `bitreader: out of bits` on the trailing FIL of
+                        // ~1.4 % of real-world ADTS-AAC frames (e.g. the AAC
+                        // track of `congress_mtgox_coins.mp4`, where 51 of
+                        // 3711 packets carry exactly this pattern). The
+                        // correct expression is the literal spec subtraction;
+                        // `esc_count` is unsigned so it can legitimately
+                        // shrink the total by one when zero.
+                        let mut count = br.read_u32(4)?;
+                        if count == 15 {
+                            let esc_count = br.read_u32(8)?;
+                            count = 14 + esc_count;
                         }
-                        for ch in 0..2 {
-                            if let Some(tns) = tns_all[ch].as_ref() {
-                                if infos[ch].window_sequence == WindowSequence::EightShort {
-                                    apply_tns_short(
-                                        &mut spec[ch],
-                                        tns,
-                                        self.sf_index,
-                                        infos[ch].max_sfb,
-                                        &infos[ch],
-                                    );
-                                } else {
-                                    let swb = SWB_LONG[self.sf_index as usize];
-                                    apply_tns_long(
-                                        &mut spec[ch],
-                                        tns,
-                                        self.sf_index,
-                                        infos[ch].max_sfb,
-                                        swb,
-                                    );
-                                }
-                            }
-                            let mut channel_pcm = [0.0f32; FRAME_LEN];
-                            imdct_and_overlap(
-                                &spec[ch],
-                                infos[ch].window_sequence,
-                                infos[ch].window_shape,
-                                &mut self.chans[got_channels + ch],
-                                &mut channel_pcm,
-                            );
-                            pcm[got_channels + ch].copy_from_slice(&channel_pcm);
-                        }
-                        if got_channels + 2 > pcm.len() {
-                            return Err(Error::invalid("AAC: CPE would overflow 8 channel slots"));
-                        }
-                        got_channels += 2;
-                    }
-                }
-                ElementType::Lfe => {
-                    last_elem_start = got_channels;
-                    last_elem_is_cpe = false;
-                    // LFE element (§4.6.10) has the same bitstream syntax as
-                    // an SCE but is restricted to long-window output with a
-                    // small max_sfb. Decode the same way and write to the
-                    // next channel slot.
-                    let _instance_tag = br.read_u32(4)?;
-                    let mut spec = [0.0f32; SPEC_LEN];
-                    let (info, sf, sec, tns, pulse) = decode_ics(&mut br, self.sf_index, false)?;
-                    if info.window_sequence == WindowSequence::EightShort {
-                        return Err(Error::invalid(
-                            "AAC: LFE element with EIGHT_SHORT window (non-conformant)",
-                        ));
-                    }
-                    fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
-                    if let Some(pd) = pulse.as_ref() {
-                        apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
-                    }
-                    apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
-                    if let Some(tns) = tns.as_ref() {
-                        let swb = SWB_LONG[self.sf_index as usize];
-                        apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
-                    }
-                    if got_channels >= pcm.len() {
-                        return Err(Error::invalid("AAC: LFE would overflow 8 channel slots"));
-                    }
-                    let mut channel_pcm = [0.0f32; FRAME_LEN];
-                    imdct_and_overlap(
-                        &spec,
-                        info.window_sequence,
-                        info.window_shape,
-                        &mut self.chans[got_channels],
-                        &mut channel_pcm,
-                    );
-                    pcm[got_channels].copy_from_slice(&channel_pcm);
-                    got_channels += 1;
-                }
-                ElementType::Cce => {
-                    return Err(Error::unsupported("AAC: CCE element not implemented"));
-                }
-                ElementType::Dse => {
-                    let _instance_tag = br.read_u32(4)?;
-                    let data_byte_align = br.read_bit()?;
-                    let mut count = br.read_u32(8)?;
-                    if count == 255 {
-                        count += br.read_u32(8)?;
-                    }
-                    if data_byte_align {
-                        br.align_to_byte();
-                    }
-                    for _ in 0..count {
-                        br.read_u32(8)?;
-                    }
-                }
-                ElementType::Pce => {
-                    // Parse the PCE so we stay aligned on the bitstream even
-                    // if we don't yet route the described channel layout to
-                    // the output. Multi-channel support is a separate wiring
-                    // step tracked alongside LFE element handling.
-                    let _pce = crate::pce::parse_program_config_element(&mut br)?;
-                }
-                ElementType::Fil => {
-                    // ISO/IEC 14496-3:2009 Table 4.11 — fill_element():
-                    //
-                    //   cnt = count;                 // 4 bits
-                    //   if (cnt == 15)
-                    //       cnt += esc_count - 1;    // 8 bits
-                    //
-                    // i.e. when the 4-bit `count` saturates at 15 the real
-                    // payload byte length is `15 + esc_count - 1`, which
-                    // simplifies to `14 + esc_count`. The earlier
-                    // `count += esc_count.saturating_sub(1)` form misread
-                    // this — for the conformant `esc_count == 0` case it
-                    // yielded `count = 15` instead of `14`, asking the
-                    // bit-reader for one extra byte and tripping
-                    // `bitreader: out of bits` on the trailing FIL of
-                    // ~1.4 % of real-world ADTS-AAC frames (e.g. the AAC
-                    // track of `congress_mtgox_coins.mp4`, where 51 of
-                    // 3711 packets carry exactly this pattern). The
-                    // correct expression is the literal spec subtraction;
-                    // `esc_count` is unsigned so it can legitimately
-                    // shrink the total by one when zero.
-                    let mut count = br.read_u32(4)?;
-                    if count == 15 {
-                        let esc_count = br.read_u32(8)?;
-                        count = 14 + esc_count;
-                    }
-                    if count > 0 {
-                        let total_bits = 8 * count;
-                        // Peek extension_type (4 bits) without committing.
-                        let peeked = br.peek_u32(4)?;
-                        let is_sbr = peeked == 0xD || peeked == 0xE;
-                        if is_sbr {
-                            // SBR payload belongs to the most recent SCE /
-                            // CPE element (Note 1 of Table 4.57). `sf_index`
-                            // carries the core sample rate.
-                            let core_rate =
-                                crate::syntax::sample_rate(self.sf_index).unwrap_or(44_100);
-                            let target_ch = last_elem_start;
-                            let is_sce = !last_elem_is_cpe;
-                            if target_ch < self.sbr_state.len() {
-                                // Split the mutable borrow so we can hand
-                                // out two disjoint `&mut SbrChannelState`
-                                // for the CPE path.
-                                let state_state_len = self.sbr_state.len();
-                                let (state_l_slice, tail) =
-                                    self.sbr_state.split_at_mut(target_ch + 1);
-                                let state_l = &mut state_l_slice[target_ch];
-                                match try_parse_sbr_extension_ext(
-                                    &mut br, total_bits, is_sce, state_l, core_rate,
-                                )? {
-                                    Some(SbrPayload::Single { data: sbr, ps }) => {
-                                        self.sbr_data[target_ch] = Some(sbr);
-                                        self.sbr_pair[target_ch] = None;
-                                        if ps.is_some() {
-                                            self.ps_explicit = true;
+                        if count > 0 {
+                            let total_bits = 8 * count;
+                            // Peek extension_type (4 bits) without committing.
+                            let peeked = br.peek_u32(4)?;
+                            let is_sbr = peeked == 0xD || peeked == 0xE;
+                            if is_sbr {
+                                // SBR payload belongs to the most recent SCE /
+                                // CPE element (Note 1 of Table 4.57). `sf_index`
+                                // carries the core sample rate.
+                                let core_rate =
+                                    crate::syntax::sample_rate(self.sf_index).unwrap_or(44_100);
+                                let target_ch = last_elem_start;
+                                let is_sce = !last_elem_is_cpe;
+                                if target_ch < self.sbr_state.len() {
+                                    // Split the mutable borrow so we can hand
+                                    // out two disjoint `&mut SbrChannelState`
+                                    // for the CPE path.
+                                    let state_state_len = self.sbr_state.len();
+                                    let (state_l_slice, tail) =
+                                        self.sbr_state.split_at_mut(target_ch + 1);
+                                    let state_l = &mut state_l_slice[target_ch];
+                                    match try_parse_sbr_extension_ext(
+                                        &mut br, total_bits, is_sce, state_l, core_rate,
+                                    )? {
+                                        Some(SbrPayload::Single { data: sbr, ps }) => {
+                                            self.sbr_data[target_ch] = Some(sbr);
+                                            self.sbr_pair[target_ch] = None;
+                                            if ps.is_some() {
+                                                self.ps_explicit = true;
+                                            }
+                                            self.sbr_ps[target_ch] = ps;
+                                            self.sbr_explicit = true;
                                         }
-                                        self.sbr_ps[target_ch] = ps;
-                                        self.sbr_explicit = true;
-                                    }
-                                    Some(SbrPayload::Pair { l, r, coupled }) => {
-                                        // Replicate header + freq tables into
-                                        // the right-channel state so it can
-                                        // run the analysis/synthesis banks
-                                        // with matching config.
-                                        if target_ch + 1 < state_state_len {
-                                            // Right state is the first entry
-                                            // of `tail` (it was split off at
-                                            // target_ch+1).
-                                            let state_r = &mut tail[0];
-                                            state_r.header = state_l.header.clone();
-                                            state_r.freq = state_l.freq.clone();
-                                            state_r.patches = state_l.patches.clone();
-                                            state_r.header_seen = state_l.header_seen;
+                                        Some(SbrPayload::Pair { l, r, coupled }) => {
+                                            // Replicate header + freq tables into
+                                            // the right-channel state so it can
+                                            // run the analysis/synthesis banks
+                                            // with matching config.
+                                            if target_ch + 1 < state_state_len {
+                                                // Right state is the first entry
+                                                // of `tail` (it was split off at
+                                                // target_ch+1).
+                                                let state_r = &mut tail[0];
+                                                state_r.header = state_l.header.clone();
+                                                state_r.freq = state_l.freq.clone();
+                                                state_r.patches = state_l.patches.clone();
+                                                state_r.header_seen = state_l.header_seen;
+                                            }
+                                            self.sbr_data[target_ch] = Some(l);
+                                            self.sbr_pair[target_ch] = Some((r, coupled));
+                                            self.sbr_explicit = true;
                                         }
-                                        self.sbr_data[target_ch] = Some(l);
-                                        self.sbr_pair[target_ch] = Some((r, coupled));
-                                        self.sbr_explicit = true;
+                                        None => {
+                                            // Not actually SBR — bits already
+                                            // consumed.
+                                        }
                                     }
-                                    None => {
-                                        // Not actually SBR — bits already
-                                        // consumed.
+                                } else {
+                                    // No channel slot to attach this to — skip.
+                                    for _ in 0..total_bits {
+                                        let _ = br.read_u32(1)?;
                                     }
                                 }
                             } else {
-                                // No channel slot to attach this to — skip.
-                                for _ in 0..total_bits {
-                                    let _ = br.read_u32(1)?;
+                                // Non-SBR extension — skip the payload bytes.
+                                for _ in 0..count {
+                                    br.read_u32(8)?;
                                 }
-                            }
-                        } else {
-                            // Non-SBR extension — skip the payload bytes.
-                            for _ in 0..count {
-                                br.read_u32(8)?;
                             }
                         }
                     }
+                    ElementType::End => return Ok(true),
                 }
-                ElementType::End => break,
+                Ok(false)
+            })();
+            match iter_result {
+                Ok(true) => break 'elements,
+                Ok(false) => {}
+                Err(e) => {
+                    element_loop_err = Some(e);
+                    break 'elements;
+                }
+            }
+        }
+
+        // If the element loop errored before producing ANY output
+        // channel, propagate the error so callers see the
+        // bitstream failure. If at least one element decoded
+        // cleanly, we silently keep the partial PCM (mirrors
+        // libavcodec's tolerance — see comment above the loop).
+        if got_channels == 0 {
+            if let Some(e) = element_loop_err {
+                return Err(e);
             }
         }
 
