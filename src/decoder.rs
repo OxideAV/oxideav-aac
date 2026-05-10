@@ -70,9 +70,19 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
                     "AAC: only AAC-LC profile (object_type=2) supported",
                 ));
             }
+            let sf_idx = sample_rate_to_index(asc.sampling_frequency)
+                .unwrap_or(asc.sampling_frequency_index);
+            // Reject reserved (13/14) and explicit-rate escape (15)
+            // sf indices — they would OOB the SWB tables in the
+            // long-/short-window decode path. Mirrors the same
+            // guard in `decode_packet` for the ADTS path.
+            if (sf_idx as usize) >= crate::syntax::SAMPLE_RATES.len() {
+                return Err(Error::invalid(
+                    "AAC: AudioSpecificConfig sampling_frequency_index out of table",
+                ));
+            }
             (
-                sample_rate_to_index(asc.sampling_frequency)
-                    .unwrap_or(asc.sampling_frequency_index),
+                sf_idx,
                 asc.channel_configuration,
                 asc.object_type,
                 asc.sbr_present,
