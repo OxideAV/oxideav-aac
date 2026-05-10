@@ -119,6 +119,52 @@ fn ics_info_rejects_oversized_max_sfb_long_744() {
     );
 }
 
+/// Bug 2 (#744) — replays the exact `ffmpeg_oracle_decode` fuzz crash
+/// artifact (`crash-d46a936108da9568bdc9162ff307cd52cb36ba89`,
+/// 113 bytes captured from the daily Fuzz CI run on 2026-05-10).
+/// libavcodec accepts the embedded 88.2 kHz / 5.1 ADTS frame; before
+/// the `parse_ics_info` `max_sfb` check our decoder bailed mid-frame
+/// with an OOB on `SWB_LONG_96`, producing 0 frames and tripping the
+/// fuzz oracle's "ffmpeg emitted a frame but oxideav-aac produced 0"
+/// assertion. The pinned input runs the same code path that the fuzz
+/// CI exercised; we just need it to not panic.
+#[test]
+fn ffmpeg_oracle_88200_5_1_adts_does_not_panic_744() {
+    // Exact 113-byte input from the fuzz crash artifact.
+    let data: [u8; 113] = [
+        115, 101, 108, 105, 110, 117, 120, 102, 115, 160, 255, 249, 71, 140, 6, 0, 0, 0, 0, 0, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
+        14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 0, 0, 1, 0, 0, 0, 0, 8, 255, 254, 1, 255, 171,
+    ];
+    // Replay the fuzz-target's ADTS-walk + per-frame decode loop.
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let mut off = 0usize;
+    while off + 7 <= data.len() {
+        if data[off] != 0xFF || (data[off + 1] & 0xF0) != 0xF0 {
+            off += 1;
+            continue;
+        }
+        let h = match parse_adts_header(&data[off..]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        if h.frame_length == 0 || off + h.frame_length > data.len() {
+            break;
+        }
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, h.sample_rate().unwrap_or(44_100) as i64),
+            data[off..off + h.frame_length].to_vec(),
+        );
+        let _ = dec.send_packet(&pkt);
+        let _ = dec.receive_frame();
+        off += h.frame_length;
+    }
+}
+
 /// Bug 2 (#744) — exercises the ADTS 88.2 kHz / 5.1 path end-to-end
 /// against an `ffmpeg`-encoded fixture. Skips silently when ffmpeg
 /// is not on `$PATH`.
