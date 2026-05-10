@@ -299,6 +299,17 @@ impl AacDecoder {
                         "AAC: ADTS header advertises non-LC profile",
                     ));
                 }
+                // ISO/IEC 14496-3 Table 1.16: sf_index 0..=12 covers
+                // 96 kHz down to 7350 Hz; 13/14 are reserved and 15
+                // is the explicit-rate escape value (we don't support
+                // arbitrary rates outside the table). Reject up front
+                // so downstream `SWB_LONG[sf_index]` / `SWB_SHORT[..]`
+                // table lookups never see an OOB index.
+                if hdr.sampling_freq_index >= crate::syntax::SAMPLE_RATES.len() as u8 {
+                    return Err(Error::invalid(
+                        "ADTS: reserved/escape sampling_frequency_index",
+                    ));
+                }
                 self.sf_index = hdr.sampling_freq_index;
                 self.channels = hdr.channel_configuration;
                 self.object_type = hdr.object_type;

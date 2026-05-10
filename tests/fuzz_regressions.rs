@@ -309,6 +309,33 @@ fn ffmpeg_oracle_88200_5_1_clamps_max_sfb_759() {
     );
 }
 
+/// Bug (round-#759 follow-up, surfaced post-fix in same fuzz pass)
+/// — an ADTS frame with `sampling_frequency_index = 15` (the
+/// explicit-rate escape value, not in `SAMPLE_RATES[0..=12]`)
+/// reached `IcsInfo::num_swb()` and panicked at
+/// `src/sfband.rs:102` with "index out of bounds: the len is 13
+/// but the index is 15". `decode_packet` now rejects reserved
+/// (13/14) and escape (15) sf indices up front per ISO/IEC
+/// 14496-3 Table 1.16; `num_swb_long` / `num_swb_short` clamp as
+/// defence in depth.
+#[test]
+fn adts_escape_sf_index_15_rejected_cleanly() {
+    // 4-byte stub: sync + sf_idx=15 (escape) + chan_cfg=2.
+    //   0xFF 0xF9 = sync(12) id=1(MPEG-2) layer=00 prot_abs=1
+    //   0x7C 0xB4 = profile=01(LC) sf_idx=1111(15) priv=0
+    //               chan=010(stereo) orig=1 home=1 cprt_id=0 cprt_st=1
+    //               frame_len top 2 bits = 00
+    // We pad with a few bytes so the 7-byte minimum header parse
+    // succeeds; the rejection happens before any payload read.
+    let data: [u8; 8] = [0xFF, 0xF9, 0x7C, 0xB4, 0x00, 0x20, 0x1F, 0xFC];
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+    let _ = dec.send_packet(&pkt);
+    // Must not panic — error is fine.
+    let _ = dec.receive_frame();
+}
+
 /// Bug — SBR `hf_adjust` underflow on malformed envelope grid
 /// (`crash-b996ddb4401e20a581a3c900cab3c4b7c2e72f7c`, 16 bytes).
 /// `l_end - l_start` panicked with "attempt to subtract with

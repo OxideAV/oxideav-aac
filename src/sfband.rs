@@ -98,11 +98,23 @@ const SWB_SHORT_8: &[u16] = &[
 ];
 
 /// Number of scalefactor bands for the long window.
+///
+/// Out-of-range `sf_index` values (13/14 are reserved, 15 is the
+/// ADTS escape signalling an explicit-rate field that we don't
+/// support) clamp to the closest in-range entry instead of
+/// panicking on an OOB index. The decoder's outer error path
+/// rejects unsupported escape rates separately; this is a
+/// defence-in-depth bound for fuzz-found inputs that smuggle
+/// reserved indices through.
 pub fn num_swb_long(sf_index: u8) -> usize {
-    SWB_LONG[sf_index as usize].len() - 1
+    let i = (sf_index as usize).min(SWB_LONG.len() - 1);
+    SWB_LONG[i].len() - 1
 }
 
 /// Number of scalefactor bands for the short window.
+///
+/// Same out-of-range clamp behaviour as `num_swb_long`.
 pub fn num_swb_short(sf_index: u8) -> usize {
-    SWB_SHORT[sf_index as usize].len() - 1
+    let i = (sf_index as usize).min(SWB_SHORT.len() - 1);
+    SWB_SHORT[i].len() - 1
 }
