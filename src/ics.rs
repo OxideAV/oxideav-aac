@@ -93,6 +93,24 @@ pub fn parse_ics_info(br: &mut BitReader<'_>, sf_index: u8) -> Result<IcsInfo> {
         info.window_group_length[0] = 1;
     }
 
+    // Per ISO/IEC 14496-3 Table 4.110, max_sfb is bounded by
+    // num_swb(sample_rate, window_shape). The bit-field allows up to 63
+    // (long) / 15 (short), but the SWB tables only contain
+    // num_swb(sf_index)+1 offsets. A non-conformant stream that codes
+    // max_sfb beyond this bound would later index past
+    // SWB_LONG[sf_index] / SWB_SHORT[sf_index] in the spectrum-decode
+    // path. Reject up-front so the decoder produces a clean
+    // `Error::InvalidData` instead of silently truncating or, worse,
+    // panicking under fuzz inputs (workspace task #744 — 88.2 kHz / 5.1
+    // ADTS frames produced 0 output frames vs ffmpeg's 1, traced back
+    // to a single non-conformant max_sfb in the sequence).
+    let num_swb = info.num_swb();
+    if info.max_sfb as usize > num_swb {
+        return Err(Error::invalid(
+            "AAC: max_sfb exceeds num_swb for the active sampling frequency",
+        ));
+    }
+
     Ok(info)
 }
 

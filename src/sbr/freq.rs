@@ -81,11 +81,20 @@ impl FreqTables {
         let m = f_high[n_high] - kx;
 
         // NQ: max(1, NINT(bs_noise_bands * log2(k2/kx) / log2(2)))
+        //
+        // ISO/IEC 14496-3 §4.6.18.3.2.2 constrains NQ to the closed
+        // interval [1, 5]; a malformed header / master-freq combo that
+        // pushes the rounded value above 5 must be rejected instead of
+        // building over-sized noise tables (would later OOB the
+        // 5-wide `SbrChannelData::noise_sf` row in parse_sbr_noise).
         let nq = {
             let ratio = (k2 as f32 / kx as f32).max(1.0);
             let v = bs_noise_bands as f32 * (ratio.log2()) / 1.0; // log(2)/log(2)=1
             (v.round() as i32).max(1) as usize
         };
+        if nq > 5 {
+            return Err(Error::invalid("SBR: NQ > 5 (Table 4.151 / §4.6.18.3.2.2)"));
+        }
         // fTableNoise built from fTableLow: i(k) = i(k-1) + INT((NLow - i(k-1)) / (NQ + 1 - k))
         let mut i_ns: Vec<usize> = vec![0; nq + 1];
         for k in 1..=nq {

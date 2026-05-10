@@ -355,11 +355,21 @@ pub fn parse_sbr_envelope(
 ///
 /// Uses the balance-mode Huffman tables when `data.bs_coupling_balance` is
 /// set.
+///
+/// Per ISO/IEC 14496-3 §4.6.18.3.2.2, NQ (the number of noise floor bands
+/// derived from `bs_noise_bands` and the master frequency table) is
+/// constrained to the closed interval `[1, 5]`. We refuse to write past
+/// the fixed-size `noise_sf` storage and instead surface the
+/// non-conformant header/freq combo as `Error::InvalidData` rather than
+/// panicking on an OOB index.
 pub fn parse_sbr_noise(
     br: &mut BitReader<'_>,
     data: &mut SbrChannelData,
     num_noise_bands: usize,
 ) -> Result<()> {
+    if num_noise_bands > MAX_NOISE_BANDS {
+        return Err(Error::invalid("SBR: NQ > 5 (Table 4.73 violation)"));
+    }
     let (t_huff, f_huff, start_bits, lav) = if data.bs_coupling_balance {
         (
             &T_HUFFMAN_NOISE_BAL_3_0DB[..],
@@ -377,7 +387,7 @@ pub fn parse_sbr_noise(
             LAV_NOISE_3_0DB,
         )
     };
-    for n in 0..data.bs_num_noise as usize {
+    for n in 0..(data.bs_num_noise as usize).min(MAX_NOISE_FLOORS) {
         if data.bs_df_noise[n] == 0 {
             data.noise_sf[n][0] = br.read_u32(start_bits)? as i32;
             for band in 1..num_noise_bands {

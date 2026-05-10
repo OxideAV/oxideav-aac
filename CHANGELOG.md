@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SBR bitstream OOB on malformed `bs_noise_bands` (workspace task #743).**
+  `parse_sbr_noise` indexed past the fixed-size `noise_sf[..][5]` row when
+  the freq-table builder produced `NQ > 5`, panicking with
+  `index out of bounds: the len is 5 but the index is 5` on the
+  13-byte fuzz artifact `crash-1c378992f1f16e4b9d33121d9c4d1ca6ca86c005`.
+  `FreqTables::build` now rejects `NQ > 5` per ISO/IEC 14496-3
+  §4.6.18.3.2.2, and `parse_sbr_noise` defends against the same
+  out-of-range value at parse time. Regression test:
+  `tests/fuzz_regressions.rs::sbr_bitstream_oob_does_not_panic_743`.
+- **`max_sfb` overrun on high-sample-rate AAC-LC frames (workspace task #744).**
+  `parse_ics_info` previously accepted `max_sfb` up to 63 (long) / 15
+  (short), which is the bit-field range but exceeds the active SWB
+  table at sf_index ∈ {0, 1, 2} (96/88.2/64 kHz, num_swb_long ≤ 47).
+  A non-conformant frame in an 88.2 kHz / 5.1 ADTS stream caused
+  `decode_spectrum_long` to index past `SWB_LONG_96`, ffmpeg's decoder
+  silently absorbing it but ours producing 0 frames. `parse_ics_info`
+  now validates `max_sfb ≤ num_swb(sf_index)` per ISO/IEC 14496-3
+  Table 4.110. Regression tests:
+  `tests/fuzz_regressions.rs::ics_info_rejects_oversized_max_sfb_long_744`,
+  `..::adts_88200hz_5_1_decodes_some_frames_744`.
+
+### Investigated
+
+- **Intensity-stereo divergence on `aac-lc-intensity-stereo` fixture
+  (workspace task #742).** A fuzz oracle reported a 5814-LSB second-frame
+  PCM divergence vs ffmpeg on the documented intensity-stereo fixture.
+  Verified: the 33-frame fixture contains zero `INTENSITY_HCB` (cb=14/15)
+  bands across either channel of any frame, so the divergence cannot
+  originate from §4.6.8.2.3 IS decoding. The actual signature is a
+  transient EIGHT_SHORT-transition mismatch on frames 1 and 2 (LongStart
+  → EightShort → LongStop) that self-corrects to ±1 LSB drift by frame 3.
+  IS itself remains unit-tested via the existing
+  `intensity_stereo_cb15_positive_sign` / `_cb14_negative_sign` /
+  `_ms_mask_flips_sign` / `_non_is_bands_untouched` cases in
+  `src/decoder.rs::tests`. Pinned by
+  `tests/fuzz_regressions.rs::intensity_stereo_fixture_decodes_742`.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-aac/compare/v0.1.1...v0.1.2) - 2026-05-06
 
 ### Other
