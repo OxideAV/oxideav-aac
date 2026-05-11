@@ -1002,8 +1002,23 @@ impl AacDecoder {
                 }
             })
             .is_some();
+        // HE-AAC channel-configuration gate. ISO/IEC 14496-3 Table 1.19
+        // assigns channel_configuration 1 = mono, 2 = stereo; configs
+        // 3..=7 (3.0 through 7.1) are multichannel and HE-AAC SBR is
+        // explicitly NOT defined for them in §4.6.18. libavcodec
+        // ignores SBR FIL data on streams advertising channel_cfg ≥ 3
+        // and emits 1024 samples per channel. If we downgrade
+        // `channels_out` from the configured 4 (etc.) to the 2 we
+        // actually decoded, applying SBR to those 2 channels gives 2048
+        // samples while libavcodec produces 1024 — fuzz oracle crash
+        // ffmpeg_oracle_decode crash-3ecd0ba68e4c at sf_index=10
+        // (11025 Hz) ch_cfg=4. Gate `sbr_active` on the ADTS-declared
+        // channel_configuration being in {1, 2}, not on the downgraded
+        // `channels_out`.
+        let expected_cfg = expected_channels(self.channels).unwrap_or(channels_out);
         let sbr_active = (self.sbr_explicit || self.sbr_data.iter().any(|s| s.is_some()))
             && (1..=2).contains(&channels_out)
+            && (1..=2).contains(&expected_cfg)
             && sbr_doubled_rate_ok;
         if sbr_active {
             let out_samples = 2 * FRAME_LEN;

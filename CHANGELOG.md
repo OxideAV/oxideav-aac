@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SBR on multichannel ADTS — first-frame sample-count divergence
+  (workspace `ffmpeg_oracle_decode` round-next follow-up 2).** A
+  176-byte fuzz input with an ADTS frame at sf_index=10 (11025 Hz)
+  channel_configuration=4 + trailing SBR FIL data caused the
+  decoder to downgrade `channels_out` from 4 to 2 (only 2 elements
+  decoded) and then apply SBR doubling to those 2 channels —
+  emitting 2048 samples while libavcodec emits 1024 (SBR ignored
+  on multichannel ADTS). Per ISO/IEC 14496-3 §4.6.18 HE-AAC is
+  defined only for mono / stereo cores; channel_configuration ≥ 3
+  has no defined SBR upmix path. `sbr_active` now also requires
+  the ADTS-declared `channel_configuration` to be in {1, 2}, not
+  just the downgraded `channels_out`. Regression:
+  `tests/fuzz_regressions.rs::sbr_on_multichannel_adts_emits_core_only_oracle_next`.
 - **SBR FIL before first channel element — second-frame sample-count
   divergence (workspace `ffmpeg_oracle_decode` round-next follow-up).**
   A 232-byte fuzz input chained multiple ADTS frames where one

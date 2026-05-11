@@ -997,3 +997,70 @@ fn sbr_before_first_channel_element_emits_core_only_oracle_next() {
         "SBR FIL before first channel element must not produce 2048-sample HE-AACv1 output, got {max_samples}"
     );
 }
+
+/// Bug (workspace task `ffmpeg_oracle_decode` round-next, follow-up
+/// 2) — when an ADTS frame advertises a multichannel layout
+/// (channel_configuration ∈ {3..=7}) but the raw_data_block delivers
+/// only 1 or 2 SCE / CPE elements, `channels_out` was downgraded from
+/// the configured 4+ to the 2 we actually decoded. SBR then activated
+/// on those 2 channels (`sbr_active` only checked the downgraded
+/// `channels_out`) and emitted 2048 samples per channel, while
+/// libavcodec ignores SBR on multichannel ADTS streams and emits
+/// 1024 samples.
+///
+/// ISO/IEC 14496-3 §4.6.18 (SBR tool): HE-AAC is defined only for
+/// mono and stereo cores; multichannel HE-AAC requires explicit
+/// signaling through AudioSpecificConfig with `extensionAudioObject
+/// Type` (Table 1.18). An ADTS stream advertising
+/// channel_configuration ≥ 3 has no defined SBR upmix path.
+///
+/// Fix (`src/decoder.rs` near `sbr_active`): also gate on the
+/// ADTS-declared channel_configuration being in {1, 2}, not just
+/// the downgraded `channels_out`. Multichannel ADTS frames with
+/// trailing SBR FIL data now ignore the SBR payload and emit
+/// 1024-sample AAC-LC output (matching libavcodec).
+///
+/// Exact bytes from
+/// `fuzz/artifacts/ffmpeg_oracle_decode/crash-3ecd0ba68e4c2ce8e8e4c864d2adfb64ae2f8e25`.
+#[test]
+fn sbr_on_multichannel_adts_emits_core_only_oracle_next() {
+    let data: [u8; 176] = [
+        0x24, 0xb4, 0x01, 0x13, 0x00, 0x00, 0x00, 0x00, 0xb4, 0x01, 0xf7, 0x00, 0xff, 0xf9, 0x00,
+        0x00, 0x00, 0x07, 0x00, 0xb1, 0xff, 0xf9, 0x69, 0x10, 0x10, 0x00, 0x00, 0x00, 0x07, 0x00,
+        0x0d, 0xff, 0xf9, 0x72, 0xb4, 0x01, 0xf8, 0xe9, 0x85, 0x38, 0x5f, 0xc6, 0xbf, 0xc7, 0x4b,
+        0x01, 0xf7, 0x00, 0xff, 0xf9, 0x00, 0x00, 0x00, 0x07, 0x00, 0x0d, 0xff, 0xf9, 0x72, 0xb4,
+        0x01, 0x00, 0x00, 0xdf, 0x3d, 0x01, 0xf8, 0xa0, 0xc7, 0xc7, 0xc7, 0xc7, 0xc7, 0x3b, 0x38,
+        0x33, 0xc7, 0x38, 0x31, 0x38, 0xc7, 0xb4, 0xf9, 0x00, 0x01, 0x00, 0x2e, 0xb4, 0xff, 0xf9,
+        0x01, 0x04, 0xff, 0xf9, 0x2e, 0xb4, 0x72, 0xb4, 0x01, 0xf7, 0x00, 0xff, 0xf9, 0x00, 0x00,
+        0x00, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19,
+        0x19, 0x19, 0x19, 0x19, 0x19, 0x00, 0x0d, 0xff, 0xf9, 0x72, 0xb4, 0x01, 0xf8, 0xa0, 0xc7,
+        0xbf, 0xc7, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19,
+        0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0xff,
+        0xf9, 0x72, 0xb4, 0xf7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+    ];
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let Ok(mut dec) = make_decoder(&params) else {
+        return;
+    };
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+    let _ = dec.send_packet(&pkt);
+    let mut max_samples: u32 = 0;
+    for _ in 0..6 {
+        match dec.receive_frame() {
+            Ok(Frame::Audio(af)) => {
+                if af.samples > max_samples {
+                    max_samples = af.samples;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    // Contract: multichannel ADTS (channel_configuration ≥ 3) must
+    // not implicit-SBR to 2048 samples even when only 2 elements
+    // actually decode.
+    assert!(
+        max_samples <= 1024,
+        "multichannel ADTS must not produce 2048-sample SBR output, got {max_samples}"
+    );
+}
