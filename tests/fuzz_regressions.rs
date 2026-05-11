@@ -383,6 +383,142 @@ fn ics_info_tolerates_predictor_data_present_lc() {
     let _ = dec.receive_frame();
 }
 
+/// Bug (workspace task #757, follow-up to #743) — `hf_adjust.rs:182`
+/// panicked with "attempt to add with overflow" on a malformed SBR
+/// envelope grid that produced an out-of-range `t_e[env+1]` value.
+/// The previous fix added an `if l_end ≤ l_start { continue; }` guard
+/// AFTER the panicking `+`, so it could not catch the case where the
+/// `(RATE as i32 * t_e[env+1]) as usize + t_hf_adj` arithmetic itself
+/// overflowed (cargo-fuzz overrides `overflow-checks = on` in the
+/// release profile, so a wrap panics instead of producing garbage).
+///
+/// Fix: compute the slot bounds in i64 with a `< 0` early-skip before
+/// casting to usize, mirroring the same pattern in the coupled-channel
+/// path. The 25-byte input below is the exact bytes from
+/// `fuzz/artifacts/panic_free_decode/crash-58c68c99f8b1e0f83491bb2a8ce88f829442037c`
+/// captured by the daily Fuzz CI run on 2026-05-11.
+#[test]
+fn sbr_hf_adjust_overflow_does_not_panic_757() {
+    let data: [u8; 25] = [
+        0xc9, 0xbe, 0xbe, 0x70, 0xca, 0xf5, 0xc9, 0xf5, 0xca, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // Path 1: ADTS streaming (auto-bootstrap from first frame header).
+    {
+        let params = CodecParameters::audio(CodecId::new("aac"));
+        let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+        let _ = dec.send_packet(&pkt);
+        for _ in 0..4 {
+            if dec.receive_frame().is_err() {
+                break;
+            }
+        }
+    }
+    // Path 2: synthetic ASC (raw_data_block path inside decode_packet).
+    {
+        let mut params = CodecParameters::audio(CodecId::new("aac"));
+        params.sample_rate = Some(44_100);
+        params.channels = Some(2);
+        params.extradata = vec![0x12, 0x10];
+        let mut dec = make_decoder(&params).expect("ASC valid");
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+        let _ = dec.send_packet(&pkt);
+        for _ in 0..4 {
+            if dec.receive_frame().is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Bug (workspace task #771) — `ffmpeg_oracle_decode.rs:244` first-
+/// frame sample-count mismatch (oxi=1024 vs ffmpeg=2048) on an
+/// 88.2 kHz / 5.1 ch ADTS stream. ISO/IEC 14496-3 §4.6.18 lets HE-AAC
+/// encoders signal SBR implicitly via ADTS — in which case libavcodec
+/// applies a heuristic for high sample-rate indices (96/88.2/64 kHz)
+/// that interprets the ADTS rate as the SBR-doubled output rate and
+/// emits 2× samples per frame regardless of whether SBR FIL data is
+/// present. oxideav-aac does not auto-enable implicit-SBR doubling
+/// for multichannel (the SBR path is gated by `channels_out ∈ 1..=2`
+/// in `src/decoder.rs`); we emit the AAC-LC core 1024 samples.
+///
+/// Both behaviours are spec-compliant; the workspace stance is that
+/// the bitstream literally carries 1024 samples per frame and
+/// implicit-SBR doubling is an implementation choice. The fuzz oracle
+/// now skips the compare when `our_first.samples * 2 ==
+/// oracle_first.samples`. This regression test pins the exact 151-byte
+/// fuzz crash artifact and asserts that we (a) decode without
+/// panicking and (b) emit the AAC-LC core 1024 samples.
+#[test]
+fn ffmpeg_oracle_88200_5_1_implicit_sbr_771() {
+    // Exact 151-byte input from
+    // fuzz/artifacts/ffmpeg_oracle_decode/crash-d41348f30e8624bd73c01691ad262e8ba23a5c75
+    let data: [u8; 151] = [
+        0xff, 0xff, 0xff, 0xf8, 0x47, 0x8c, 0x01, 0xf6, 0xa0, 0x2c, 0xff, 0x06, 0xf9, 0x80, 0x2c,
+        0x6d, 0x6e, 0xff, 0xf8, 0x47, 0x8c, 0x01, 0xf9, 0xa0, 0x2c, 0xff, 0xc3, 0xc3, 0xc3, 0xc3,
+        0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
+        0xc3, 0xc3, 0xc3, 0x2c, 0xff, 0x06, 0xf9, 0x80, 0x24, 0x73, 0x6e, 0xff, 0xf8, 0x47, 0x8c,
+        0x01, 0xf9, 0xa0, 0x2c, 0xff, 0x06, 0xf9, 0x80, 0x01, 0x00, 0x00, 0xc3, 0xc3, 0xc3, 0xc3,
+        0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
+        0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
+        0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
+        0x83, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xc3,
+        0xc3, 0xc3, 0xc3, 0xc3, 0xc3, 0xf9, 0x49, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4b,
+        0xbf,
+    ];
+    // Walk the same find_adts_run the oracle harness uses.
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let mut got = 0usize;
+    let mut samples_per_frame: Option<u32> = None;
+    let mut off = 0usize;
+    while off + 7 <= data.len() {
+        if data[off] != 0xFF || (data[off + 1] & 0xF0) != 0xF0 {
+            off += 1;
+            continue;
+        }
+        let h = match parse_adts_header(&data[off..]) {
+            Ok(h) => h,
+            Err(_) => {
+                off += 1;
+                continue;
+            }
+        };
+        if h.frame_length == 0 || off + h.frame_length > data.len() {
+            off += 1;
+            continue;
+        }
+        if h.object_type != 2 {
+            off += h.frame_length;
+            continue;
+        }
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, h.sample_rate().unwrap_or(44_100) as i64),
+            data[off..off + h.frame_length].to_vec(),
+        );
+        let _ = dec.send_packet(&pkt);
+        if let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            samples_per_frame.get_or_insert(af.samples);
+            got += 1;
+        }
+        off += h.frame_length;
+    }
+    // We must produce ≥1 frame (the implicit-SBR mismatch fired only
+    // BECAUSE we produced a frame — the previous "0 frames" path was
+    // task #759). Each emitted frame should carry the AAC-LC core
+    // 1024 samples per channel; the oracle harness now tolerates the
+    // 1024-vs-2048 divergence rather than panicking.
+    assert!(got >= 1, "expected ≥1 audio frame, got {got}");
+    assert_eq!(
+        samples_per_frame,
+        Some(1024),
+        "AAC-LC core MUST emit 1024 samples/frame; implicit-SBR doubling \
+         is libavcodec's choice, not the bitstream's"
+    );
+}
+
 /// Bug — SBR `hf_adjust` underflow on malformed envelope grid
 /// (`crash-b996ddb4401e20a581a3c900cab3c4b7c2e72f7c`, 16 bytes).
 /// `l_end - l_start` panicked with "attempt to subtract with

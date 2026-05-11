@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SBR `hf_adjust` add-overflow on malformed envelope grid (workspace
+  task #757, post-fix follow-up).** A 25-byte fuzz input panicked at
+  `src/sbr/hf_adjust.rs:182` with "attempt to add with overflow" — the
+  prior `if l_end ≤ l_start { continue; }` guard ran AFTER the
+  panicking arithmetic and so could not catch the case where
+  `(RATE as i32 * t_e[env+1]) as usize + t_hf_adj` itself overflowed
+  (cargo-fuzz overrides `overflow-checks = on` in the release
+  profile). We now compute slot bounds in i64 with a `< 0` early-skip
+  before casting to usize, mirroring the same fix in the coupled-
+  channel path. Regression:
+  `tests/fuzz_regressions.rs::sbr_hf_adjust_overflow_does_not_panic_757`.
+- **ffmpeg-oracle implicit-SBR sample-count divergence (workspace task
+  #771).** A 151-byte ADTS run (88.2 kHz / 5.1 ch) tripped the
+  `ffmpeg_oracle_decode` harness with "first-frame sample-count
+  mismatch: oxideav=1024 ffmpeg=2048". ISO/IEC 14496-3 §4.6.18 lets
+  HE-AAC encoders signal SBR implicitly via ADTS — libavcodec
+  applies a heuristic for high sample-rate indices (96 / 88.2 / 64
+  kHz) that interprets the ADTS rate as the SBR-doubled output and
+  emits 2× samples per frame regardless of whether SBR FIL data is
+  present. oxideav-aac does not auto-enable implicit-SBR doubling
+  for multichannel (the SBR path is gated by
+  `channels_out ∈ 1..=2`); we emit the AAC-LC core 1024 samples.
+  Both behaviours are spec-compliant; the workspace stance is that
+  the bitstream literally codes 1024 samples per frame and
+  implicit-SBR doubling is an implementation choice. The fuzz oracle
+  now skips the compare when `our_first.samples * 2 ==
+  oracle_first.samples` (with a thorough docstring tying the choice
+  back to §4.6.18). Regression:
+  `tests/fuzz_regressions.rs::ffmpeg_oracle_88200_5_1_implicit_sbr_771`.
 - **ADTS short-packet panic (workspace task #760).** A 7-byte ADTS
   packet that codes `protection_absent = 0` (CRC follows → header
   is 9 bytes) caused `decode_packet` to panic with

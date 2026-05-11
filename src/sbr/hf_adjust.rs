@@ -178,16 +178,29 @@ pub fn apply_envelope_with_limiter(
         } else {
             env.min(data.bs_num_noise as usize - 1)
         };
-        let l_start = (RATE as i32 * t_e[env]) as usize + t_hf_adj;
-        let l_end_raw = (RATE as i32 * t_e[env + 1]) as usize + t_hf_adj;
+        // Compute slot bounds in i64 so a malformed bitstream can't trip the
+        // i32 multiply or the usize add (cargo-fuzz overrides
+        // `overflow-checks = on` in the release profile, so a wrap would
+        // panic instead of silently producing garbage). A non-monotonic
+        // `t_e[env]..t_e[env+1]` — which the SBR grid can synthesise from
+        // arbitrary `bs_var_bord_0/1 / bs_freq_res` bytes — also yields a
+        // negative or huge result; we treat any out-of-range slot range as
+        // "skip this envelope" rather than panic. The previous `if l_end ≤
+        // l_start` guard was after the panicking `+` and so could not catch
+        // the overflow case (#757).
+        let rate_i64 = RATE as i64;
+        let hf_adj_i64 = t_hf_adj as i64;
+        let l_start_i64 = rate_i64 * t_e[env] as i64 + hf_adj_i64;
+        let l_end_i64 = rate_i64 * t_e[env + 1] as i64 + hf_adj_i64;
+        if l_start_i64 < 0 || l_end_i64 < 0 {
+            continue;
+        }
+        let l_start = l_start_i64 as usize;
+        let l_end_raw = l_end_i64 as usize;
         if l_start >= x_high.len() {
             continue;
         }
         let l_end = l_end_raw.min(x_high.len());
-        // A non-monotonic `t_e[env]..t_e[env+1]` (which a malformed bitstream
-        // can synthesise via SBR grid bs_freq_res / bs_var_bord_0..1) yields
-        // l_end < l_start, which would underflow `l_end - l_start`.
-        // Skip the envelope rather than panic.
         if l_end <= l_start {
             continue;
         }
@@ -469,12 +482,24 @@ pub fn apply_envelope_coupled_with_limiter(
             if k1 <= k0 {
                 continue;
             }
-            let l_start = (RATE as i32 * t_e[env]) as usize + t_hf_adj;
-            let l_end = (RATE as i32 * t_e[env + 1]) as usize + t_hf_adj;
+            // Same overflow-safe slot-bound computation as the
+            // single-channel path — see comment at line 181 (#757).
+            let rate_i64 = RATE as i64;
+            let hf_adj_i64 = t_hf_adj as i64;
+            let l_start_i64 = rate_i64 * t_e[env] as i64 + hf_adj_i64;
+            let l_end_i64 = rate_i64 * t_e[env + 1] as i64 + hf_adj_i64;
+            if l_start_i64 < 0 || l_end_i64 < 0 {
+                continue;
+            }
+            let l_start = l_start_i64 as usize;
+            let l_end = l_end_i64 as usize;
             if l_start >= x_high_l.len() || l_start >= x_high_r.len() {
                 continue;
             }
             let l_end = l_end.min(x_high_l.len()).min(x_high_r.len());
+            if l_end <= l_start {
+                continue;
+            }
             let mut sum_l = 0.0f32;
             let mut sum_r = 0.0f32;
             let mut count = 0usize;
