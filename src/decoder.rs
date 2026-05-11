@@ -900,12 +900,33 @@ impl AacDecoder {
 
         // If the element loop errored before producing ANY output
         // channel, propagate the error so callers see the
-        // bitstream failure. If at least one element decoded
-        // cleanly, we silently keep the partial PCM (mirrors
-        // libavcodec's tolerance — see comment above the loop).
+        // bitstream failure — UNLESS the stream is configured (we
+        // know the channel layout from ADTS or ASC) AND the error
+        // was a bit-reader truncation. Workspace task #773
+        // (round-#759 follow-up): a 53-byte fuzz input with two
+        // 15-byte ADTS frames at 88.2 kHz / 5.1 ch carried an
+        // 8-byte payload too short to decode any element, yet
+        // libavcodec emits a silent frame per ADTS header rather
+        // than dropping the run. The fuzz `ffmpeg_oracle_decode`
+        // harness treats "ffmpeg emitted N frames, oxideav-aac
+        // emitted 0" as a hard panic. Mirror libavcodec's
+        // tolerance: when we've parsed an ADTS or ASC header and
+        // the payload is just too short, emit a silent frame at
+        // the expected channel count rather than erroring out. The
+        // pcm buffers are already zero-initialised on line 360 so
+        // the fall-through to S16 conversion below produces
+        // exactly the silent frame we want. Other (non-truncation)
+        // first-element errors still propagate so real decoder
+        // bugs surface in tests.
         if got_channels == 0 {
             if let Some(e) = element_loop_err {
-                return Err(e);
+                let is_bit_truncation = matches!(
+                    &e,
+                    Error::InvalidData(msg) if msg.contains("bitreader: out of bits")
+                );
+                if !(self.configured && is_bit_truncation) {
+                    return Err(e);
+                }
             }
         }
 
@@ -917,7 +938,14 @@ impl AacDecoder {
         // elements produced.
         let expected = expected_channels(self.channels).unwrap_or(got_channels);
         let channels_out = if got_channels == 0 {
-            1
+            // No element decoded — emit silence at the configured
+            // channel layout (workspace task #773 / #759 follow-up).
+            // Pre-#773 this hard-coded 1, but the fuzz oracle compares
+            // per-channel sample counts and a 5.1 ADTS frame whose
+            // payload was too short to decode any element should still
+            // emit 6-channel silence (matching libavcodec's fallback)
+            // rather than mono. Cap at 8 (the `pcm` Vec capacity above).
+            expected.clamp(1, 8)
         } else {
             got_channels.min(expected.max(1))
         };

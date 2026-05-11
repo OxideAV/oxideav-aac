@@ -748,6 +748,80 @@ fn intensity_stereo_fixture_decodes_742() {
     }
 }
 
+/// Bug (workspace task #773, round-#759 follow-up) — a 53-byte
+/// fuzz input with two 15-byte ADTS frames at 88.2 kHz / 5.1 ch
+/// carried an 8-byte payload too short to decode any element
+/// (CPE with instance_tag = 7 etc.). libavcodec emits a silent
+/// frame per ADTS header (logging "channel element 1.7 is not
+/// allocated") rather than dropping the run; oxideav-aac
+/// returned `InvalidData("bitreader: out of bits")` and the
+/// `ffmpeg_oracle_decode` harness panicked with "ffmpeg emitted
+/// 2 frames, oxideav-aac produced 0".
+///
+/// Per ISO/IEC 14496-3 §4.4.1 each ADTS frame is one
+/// raw_data_block; libavcodec's tolerance is documented behaviour
+/// for malformed payloads (per the same §4.6.18 implicit-SBR
+/// notes). We now mirror it: when the configured stream's first
+/// element is bit-truncated and we have NO partial PCM, fall
+/// through to emit a silent frame at the expected channel layout
+/// rather than propagating the bit-reader error. Other (non-
+/// truncation) first-element errors still propagate so real
+/// decoder bugs surface.
+///
+/// Exact bytes from
+/// `fuzz/artifacts/ffmpeg_oracle_decode/crash-d012b01aa153af5faac6b7ef737cfa28272d7ff1`
+/// captured by the daily Fuzz CI run on 2026-05-11.
+#[test]
+fn adts_short_payload_emits_silent_frame_773() {
+    let data: [u8; 53] = [
+        0xff, 0xff, 0xff, 0xf8, 0x47, 0x8c, 0x01, 0xff, 0xa0, 0x2c, 0xff, 0x06, 0xf9, 0x80, 0x09,
+        0x73, 0x6e, 0xff, 0xf8, 0x40, 0x8c, 0x01, 0xf9, 0xa0, 0x2c, 0xff, 0xd5, 0x61, 0x6c, 0x5f,
+        0xbc, 0x00, 0x00, 0x62, 0x75, 0x70, 0x2b, 0x47, 0xc4, 0x01, 0xff, 0x07, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xa0, 0x2c, 0x3a, 0xbf,
+    ];
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let mut dec = make_decoder(&params).expect("ADTS bootstrap");
+    let mut got = 0usize;
+    let mut off = 0usize;
+    while off + 7 <= data.len() {
+        if data[off] != 0xFF || (data[off + 1] & 0xF0) != 0xF0 {
+            off += 1;
+            continue;
+        }
+        let h = match parse_adts_header(&data[off..]) {
+            Ok(h) => h,
+            Err(_) => {
+                off += 1;
+                continue;
+            }
+        };
+        if h.frame_length == 0 || off + h.frame_length > data.len() || h.object_type != 2 {
+            off += 1;
+            continue;
+        }
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, h.sample_rate().unwrap_or(44_100) as i64),
+            data[off..off + h.frame_length].to_vec(),
+        );
+        if dec.send_packet(&pkt).is_ok() {
+            if let Ok(Frame::Audio(_)) = dec.receive_frame() {
+                got += 1;
+            }
+        }
+        off += h.frame_length;
+    }
+    // Both ADTS frames must emit one silent audio frame each
+    // (matching libavcodec's tolerance). Without the fix, both
+    // frames returned `Err(InvalidData("bitreader: out of bits"))`
+    // and the fuzz oracle treated the resulting "0 frames" as a
+    // hard panic.
+    assert!(
+        got >= 2,
+        "expected ≥2 silent frames from short-payload ADTS run, got {got}"
+    );
+}
+
 /// Bug (workspace task #772) — `decode_packet` panicked at
 /// `src/decoder.rs:704:52` with "index out of bounds: the len is 8
 /// but the index is 8" on a 42-byte fuzz input that chains four

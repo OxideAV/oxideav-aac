@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **88.2 kHz / 5.1 ADTS short-payload 0-frame divergence (workspace
+  task #773, round-#759 follow-up).** A 53-byte fuzz input with two
+  15-byte ADTS frames at 88.2 kHz / 5.1 ch carried an 8-byte payload
+  per frame — too short to decode any element (CPE with
+  instance_tag = 7 etc.). libavcodec emits a silent frame per ADTS
+  header (logging "channel element 1.7 is not allocated") rather
+  than dropping the run; oxideav-aac returned
+  `InvalidData("bitreader: out of bits")` and the
+  `ffmpeg_oracle_decode` harness panicked with "ffmpeg emitted 2
+  frames, oxideav-aac produced 0". When the configured stream's
+  first element is bit-truncated and we have NO partial PCM, fall
+  through to emit a silent frame at the expected channel layout
+  (clamped to the 8-slot `pcm` capacity) rather than propagating
+  the bit-reader error. Other (non-truncation) first-element
+  errors still propagate so real decoder bugs surface in tests.
+  Regression:
+  `tests/fuzz_regressions.rs::adts_short_payload_emits_silent_frame_773`.
 - **CPE independent-window OOB on >8 channels (workspace task #772).**
   A 42-byte fuzz input chaining four independent-window CPE elements
   (8 channels) followed by a fifth CPE panicked at
