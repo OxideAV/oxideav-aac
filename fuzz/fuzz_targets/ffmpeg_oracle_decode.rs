@@ -200,7 +200,13 @@ fuzz_target!(|data: &[u8]| {
 
     // Feed each frame separately so we can pull frame outputs in
     // order. oxideav-aac's send_packet/receive_frame is a 1:1 pair
-    // for ADTS-wrapped AAC-LC.
+    // for ADTS-wrapped AAC-LC. A `receive_frame` error on one
+    // frame doesn't disqualify the whole run — libavcodec is
+    // similarly permissive, and find_adts_run accepts any ADTS
+    // header that bit-parses. We `continue` past individual frame
+    // failures so a run of 2+ ADTS frames where the first has a
+    // pathologically-short payload (e.g. 1-byte raw_data_block)
+    // can still match libavcodec on the second-frame output.
     let mut our_frames: Vec<oxideav_core::AudioFrame> = Vec::new();
     for (off, hdr) in &frames {
         let pkt = Packet::new(
@@ -220,7 +226,7 @@ fuzz_target!(|data: &[u8]| {
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => our_frames.push(af),
             Ok(other) => panic!("oxideav-aac produced non-audio frame: {other:?}"),
-            Err(_) => break,
+            Err(_) => continue,
         }
     }
     if our_frames.is_empty() {

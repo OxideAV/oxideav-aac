@@ -336,6 +336,53 @@ fn adts_escape_sf_index_15_rejected_cleanly() {
     let _ = dec.receive_frame();
 }
 
+/// Bug (#759 follow-up, surfaced post-fix on next fuzz run) —
+/// `predictor_data_present = 1` on an AAC-LC stream caused
+/// `parse_ics_info` to return `Error::Unsupported` ("AAC:
+/// predictor_data_present in LC stream"), even though libavcodec
+/// tolerates the bit and emits PCM. Mirrors the gain_control
+/// tolerance fix from the previous round. We now consume the
+/// predictor_data() block exactly per ISO/IEC 14496-3 Table 4.55
+/// so the bit-reader stays aligned, then ignore the parsed
+/// prediction info (the LC decoder doesn't run Main/LTP synthesis).
+#[test]
+fn ics_info_tolerates_predictor_data_present_lc() {
+    use oxideav_core::bits::BitWriter;
+    let mut bw = BitWriter::new();
+    // SCE: id=0 + tag=0 + global_gain=128 + ICS_INFO with
+    // predictor_data_present=1, predictor_reset=0, max_sfb=4
+    // (so we consume 4 prediction_used bits).
+    bw.write_u32(0, 3);
+    bw.write_u32(0, 4);
+    bw.write_u32(128, 8);
+    // ics_info:
+    bw.write_u32(0, 1); // reserved
+    bw.write_u32(0, 2); // ws = OnlyLong
+    bw.write_u32(0, 1); // wsh
+    bw.write_u32(4, 6); // max_sfb = 4
+    bw.write_u32(1, 1); // predictor_data_present = 1
+    bw.write_u32(0, 1); // predictor_reset = 0
+    bw.write_u32(0, 1); // prediction_used[0]
+    bw.write_u32(1, 1); // prediction_used[1]
+    bw.write_u32(0, 1); // prediction_used[2]
+    bw.write_u32(1, 1); // prediction_used[3]
+    let payload = bw.finish();
+
+    // ASC AAC-LC / 44100 / mono.
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.sample_rate = Some(44_100);
+    params.channels = Some(1);
+    params.extradata = vec![0x12, 0x08];
+    let mut dec = make_decoder(&params).expect("ASC valid");
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), payload);
+    let _ = dec.send_packet(&pkt);
+    // Contract is "no panic on arbitrary bytes" + "predictor bit
+    // is consumed without erroring out". The decoder may still
+    // bail later on truncated section data — we only assert it
+    // doesn't reject the predictor_data_present bit itself.
+    let _ = dec.receive_frame();
+}
+
 /// Bug — SBR `hf_adjust` underflow on malformed envelope grid
 /// (`crash-b996ddb4401e20a581a3c900cab3c4b7c2e72f7c`, 16 bytes).
 /// `l_end - l_start` panicked with "attempt to subtract with

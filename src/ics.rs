@@ -84,10 +84,34 @@ pub fn parse_ics_info(br: &mut BitReader<'_>, sf_index: u8) -> Result<IcsInfo> {
         info.max_sfb = br.read_u32(6)? as u8;
         info.predictor_data_present = br.read_bit()?;
         if info.predictor_data_present {
-            // For AAC-LC, predictor_data_present must be 0; if it's set, refuse.
-            return Err(Error::unsupported(
-                "AAC: predictor_data_present in LC stream — Main/LTP not supported",
-            ));
+            // ISO/IEC 14496-3 §4.5.2.1: AAC-LC streams must keep
+            // `predictor_data_present == 0` (prediction is reserved
+            // for AAC-Main / AAC-LTP). Workspace task #759 follow-up
+            // surfaced an 88.2 kHz / 5.1 ADTS frame where the bit is
+            // set; libavcodec tolerates it and emits PCM. Mirror
+            // that behaviour by consuming the predictor_data() block
+            // exactly so the bit-reader stays aligned, then ignore
+            // the parsed prediction info (we don't run the Main/LTP
+            // predictor synthesis in the LC decoder). Per Table 4.55:
+            //   predictor_reset (1)
+            //   if (predictor_reset)
+            //       predictor_reset_group_number (5)
+            //   for (sfb = 0; sfb < min(max_sfb, MAX_PRED_SFB); sfb++)
+            //       prediction_used[sfb] (1)
+            // MAX_PRED_SFB depends on sf_index; per Table 4.74,
+            // max_pred_sfb = 33 for sf_index 0..=4 and decreases for
+            // lower sample rates. We bound by max_sfb for safety.
+            let predictor_reset = br.read_bit()?;
+            if predictor_reset {
+                let _predictor_reset_group_number = br.read_u32(5)?;
+            }
+            // Consume one bit per coded scalefactor band — bound by
+            // max_sfb (already clamped to num_swb above) so we never
+            // read past the spec-allowed max_pred_sfb of 40.
+            let max_pred_sfb = (info.max_sfb as usize).min(40);
+            for _ in 0..max_pred_sfb {
+                let _prediction_used = br.read_bit()?;
+            }
         }
         info.num_window_groups = 1;
         info.window_group_length[0] = 1;
