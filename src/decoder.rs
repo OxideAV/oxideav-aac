@@ -818,7 +818,27 @@ impl AacDecoder {
                             // Peek extension_type (4 bits) without committing.
                             let peeked = br.peek_u32(4)?;
                             let is_sbr = peeked == 0xD || peeked == 0xE;
-                            if is_sbr {
+                            // ISO/IEC 14496-3 §4.4.2.3 Note 1 (Table 4.57): an
+                            // SBR extension payload attaches to the immediately
+                            // preceding SCE / CPE / LFE element. If a fill_element
+                            // carrying SBR appears BEFORE any channel element in
+                            // the same raw_data_block, the bitstream is non-
+                            // conformant — libavcodec rejects with "SBR was
+                            // found before the first channel element" and emits
+                            // the AAC-LC core (no SBR upsampling). Mirror that:
+                            // skip the SBR payload bytes so trailing elements
+                            // still decode but `sbr_data[..]` stays None and the
+                            // frame emits 1024 samples per channel, matching
+                            // libavcodec on the same bytes (fuzz oracle
+                            // ffmpeg_oracle_decode crash-de1c9e6579a2 at
+                            // sf_index=8 ch=2 with leading SBR FIL).
+                            if is_sbr && got_channels == 0 {
+                                // Drop the SBR payload bytes — same treatment
+                                // as the non-SBR `else` branch below.
+                                for _ in 0..count {
+                                    br.read_u32(8)?;
+                                }
+                            } else if is_sbr {
                                 // SBR payload belongs to the most recent SCE /
                                 // CPE element (Note 1 of Table 4.57). `sf_index`
                                 // carries the core sample rate.

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SBR FIL before first channel element — second-frame sample-count
+  divergence (workspace `ffmpeg_oracle_decode` round-next follow-up).**
+  A 232-byte fuzz input chained multiple ADTS frames where one
+  raw_data_block carried an SBR-shaped fill_element BEFORE any
+  SCE / CPE element. The SBR payload routed to `last_elem_start = 0`
+  (the initial state slot); when a later CPE landed at slot 0 it
+  inherited the bogus SBR data and emitted 2048 samples per channel.
+  libavcodec rejects this with "SBR was found before the first
+  channel element" and emits the AAC-LC core (1024 samples). Per
+  ISO/IEC 14496-3 §4.4.2.3 Note 1 (Table 4.57) an SBR extension
+  payload MUST attach to the immediately-preceding SCE / CPE / LFE,
+  so the SBR-FIL-without-channel-element case is malformed. The
+  decoder now treats such fill_elements as plain (non-SBR)
+  extensions — skip the payload bytes, leave `sbr_data[..]` as
+  None, and emit the AAC-LC core. Regression:
+  `tests/fuzz_regressions.rs::sbr_before_first_channel_element_emits_core_only_oracle_next`.
 - **Implicit SBR at sf_index 9..=12 — first-frame sample-count
   divergence (workspace `ffmpeg_oracle_decode` round-next).** An
   80-byte fuzz input with an ADTS sf_index=12 (7350 Hz) AAC-LC
