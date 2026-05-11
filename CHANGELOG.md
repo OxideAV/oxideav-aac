@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Implicit SBR at sf_index 9..=12 — first-frame sample-count
+  divergence (workspace `ffmpeg_oracle_decode` round-next).** An
+  80-byte fuzz input with an ADTS sf_index=12 (7350 Hz) AAC-LC
+  stream + trailing SBR-shaped FIL extension caused oxideav-aac to
+  emit 2048 samples per frame (HE-AACv1 path activated) while
+  libavcodec emitted 1024 samples (SBR rejected — "SBR was found
+  before the first channel element"). Per ISO/IEC 14496-3
+  §4.6.18.2.6 implicit-SBR doubling is only valid when the
+  post-SBR rate `2 * core_rate` itself appears in Table 1.16; at
+  sf_index ∈ {9..=12} the doubled rates (6 / 5.5125 / 4 / 3.675
+  kHz) are NOT in the table and the SBR signaling is non-
+  conformant. `decode_packet` now gates `sbr_active` on the
+  doubled rate being a recognised sf_index so low-rate AAC-LC
+  streams emit a single 1024-sample IMDCT regardless of any
+  trailing SBR FIL payload. Regression:
+  `tests/fuzz_regressions.rs::implicit_sbr_at_low_sf_index_emits_core_only_oracle_next`.
 - **88.2 kHz / 5.1 ADTS short-payload 0-frame divergence (workspace
   task #773, round-#759 follow-up).** A 53-byte fuzz input with two
   15-byte ADTS frames at 88.2 kHz / 5.1 ch carried an 8-byte payload

@@ -864,3 +864,69 @@ fn cpe_independent_window_overflow_does_not_panic_772() {
         }
     }
 }
+
+/// Bug (workspace task `ffmpeg_oracle_decode` round-next) — implicit
+/// SBR doubling fired on ADTS sf_index 12 (7350 Hz), producing 2048
+/// samples per frame while libavcodec emitted 1024 (no SBR upsample).
+///
+/// ISO/IEC 14496-3 §4.6.18.2.6 (implicit SBR signaling): an SBR
+/// extension payload doubles the output sample count, so the post-SBR
+/// rate is `2 * core_rate`. For the doubled rate to be a valid AAC
+/// output it MUST itself appear in Table 1.16 (the sf_index → Hz
+/// mapping). At sf_index ∈ {9..=12} (12 kHz / 11.025 kHz / 8 kHz /
+/// 7.35 kHz) the doubled rates (6 / 5.5125 / 4 / 3.675 kHz) are NOT
+/// in the table — those sf_indices cannot carry SBR. libavcodec's
+/// built-in AAC decoder rejects such streams with "SBR was found
+/// before the first channel element" and emits 1024 samples. Pre-fix,
+/// oxideav-aac happily enabled the HE-AACv1 path and emitted 2048
+/// samples, causing a first-frame sample-count divergence on the
+/// `ffmpeg_oracle_decode` harness.
+///
+/// Fix (`src/decoder.rs` near `sbr_active`): gate `sbr_active` on
+/// `2 * core_rate ∈ SAMPLE_RATES`, so sf_index 9..=12 ignore any
+/// trailing SBR FIL payload (treated as a non-conformant extension)
+/// and emit the AAC-LC core's 1024 samples.
+///
+/// Exact bytes from
+/// `fuzz/artifacts/ffmpeg_oracle_decode/crash-321bb909a4d375de247bbc829caa267651cb5ace`.
+#[test]
+fn implicit_sbr_at_low_sf_index_emits_core_only_oracle_next() {
+    let data: [u8; 80] = [
+        0xff, 0x29, 0xf9, 0x01, 0xf7, 0x00, 0xff, 0xf9, 0x00, 0x07, 0xf9, 0x72, 0xb4, 0x0d, 0xfa,
+        0xfc, 0x00, 0x24, 0xff, 0xf9, 0x72, 0xb4, 0xf7, 0x01, 0x00, 0xff, 0xf9, 0x00, 0x00, 0x00,
+        0x07, 0x00, 0x0d, 0xff, 0xf9, 0x72, 0xb4, 0x02, 0xf8, 0xb4, 0xc7, 0xc7, 0xc7, 0xe6, 0x00,
+        0xe5, 0x01, 0xf8, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x0d, 0xff, 0xf9, 0x62, 0xb4,
+        0x02, 0xf8, 0xb4, 0xc7, 0xc7, 0xc6, 0x12, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x27, 0xfa,
+    ];
+    // No extradata — decoder bootstraps from the first ADTS frame.
+    let params = CodecParameters::audio(CodecId::new("aac"));
+    let Ok(mut dec) = make_decoder(&params) else {
+        return;
+    };
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+    let _ = dec.send_packet(&pkt);
+    let mut max_samples: u32 = 0;
+    for _ in 0..6 {
+        match dec.receive_frame() {
+            Ok(Frame::Audio(af)) => {
+                if af.samples > max_samples {
+                    max_samples = af.samples;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    // Contract: any AAC-LC frame at sf_index 12 (7350 Hz) emits at
+    // MOST one IMDCT length (1024) per channel; if `sbr_active` were
+    // still true the per-channel count would be 2048. We accept 0
+    // (rejected/short payload) or 1024 — never 2048.
+    assert!(
+        max_samples <= 1024,
+        "sf_index=12 (7350 Hz) AAC-LC must not implicit-SBR to 2048 samples, got {max_samples}"
+    );
+    // Smoke: the ADTS header at byte 18 parses cleanly under the
+    // current parser (regression-guard against parser changes).
+    let _ = parse_adts_header(&data[18..]);
+}

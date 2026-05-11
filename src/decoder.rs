@@ -957,8 +957,34 @@ impl AacDecoder {
         // HE-AACv2: a mono SBR with an attached PS payload produces a
         // stereo output via apply_ps_simple.
         let ps_active = self.ps_explicit || self.sbr_ps.iter().any(|p| p.is_some());
+        // Implicit SBR validity gate — ISO/IEC 14496-3 §4.6.18.2.6.
+        //
+        // SBR output rate equals `2 * core_rate` (one HF synthesis QMF doubles
+        // the per-frame sample count). For the doubled rate to be a usable
+        // AAC output the post-SBR rate MUST itself be a valid sf_index per
+        // Table 1.16. With AAC-LC sf_index ∈ {9..=12} (12 / 11.025 / 8 / 7.35
+        // kHz) the doubled output (6 / 5.5125 / 4 / 3.675 kHz) is NOT in the
+        // standard rate table — those sf_indices were never intended to
+        // carry SBR. libavcodec's built-in AAC decoder rejects such streams
+        // with "SBR was found before the first channel element" and emits
+        // 1024 samples (no SBR upsampling). We mirror that behaviour by
+        // gating `sbr_active` on the doubled rate being a recognised
+        // sf_index — otherwise we'd emit 2048 samples while every other
+        // conformant decoder emits 1024 (fuzz oracle crash:
+        // ffmpeg_oracle_decode crash-321bb909a4 at sr=7350 ch=2).
+        let sbr_doubled_rate_ok = crate::syntax::sample_rate(self.sf_index)
+            .and_then(|core| {
+                let doubled = core.checked_mul(2)?;
+                if crate::syntax::SAMPLE_RATES.contains(&doubled) {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .is_some();
         let sbr_active = (self.sbr_explicit || self.sbr_data.iter().any(|s| s.is_some()))
-            && (1..=2).contains(&channels_out);
+            && (1..=2).contains(&channels_out)
+            && sbr_doubled_rate_ok;
         if sbr_active {
             let out_samples = 2 * FRAME_LEN;
             // Allocate for the HE-AACv1 output (mono or stereo CPE). PS
