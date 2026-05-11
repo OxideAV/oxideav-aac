@@ -747,3 +747,46 @@ fn intensity_stereo_fixture_decodes_742() {
         );
     }
 }
+
+/// Bug (workspace task #772) — `decode_packet` panicked at
+/// `src/decoder.rs:704:52` with "index out of bounds: the len is 8
+/// but the index is 8" on a 42-byte fuzz input that chains four
+/// independent-window CPE elements (8 channels) followed by a fifth
+/// CPE. The CPE-`else` (independent-window) branch had its
+/// `got_channels + 2 > pcm.len()` guard placed AFTER the
+/// IMDCT/copy loop, while the same guard in the
+/// `common_window` branch above sits before the loop. The fifth CPE
+/// indexed `self.chans[8]` and `pcm[8]` (both length 8) before the
+/// guard could fire. Fix: hoist the guard above the loop so the
+/// independent-window path mirrors the common-window path.
+///
+/// ISO/IEC 14496-3 §4.4.1.1 (Table 4.3, channel_configuration) caps
+/// CCE-less raw_data_block output at 8 channels (7.1); chaining
+/// further channel_pair_elements is non-conformant and we reject
+/// with `Error::Invalid("AAC: CPE would overflow 8 channel slots")`.
+///
+/// Exact bytes from
+/// `fuzz/artifacts/panic_free_decode/crash-97881f260b59ccd0e62f809e954e97438506232f`.
+#[test]
+fn cpe_independent_window_overflow_does_not_panic_772() {
+    let data: [u8; 42] = [
+        0x20, 0x7d, 0x40, 0x04, 0xa3, 0xc3, 0x85, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // Path 2: synthetic ASC AAC-LC / 44.1 kHz / stereo (the panic_free
+    // harness's raw_data_block path that the original crash hit).
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.sample_rate = Some(44_100);
+    params.channels = Some(2);
+    params.extradata = vec![0x12, 0x10];
+    let mut dec = make_decoder(&params).expect("ASC valid");
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), data.to_vec());
+    let _ = dec.send_packet(&pkt);
+    // Contract: must not panic. Returning Err is the desired outcome.
+    for _ in 0..4 {
+        if dec.receive_frame().is_err() {
+            break;
+        }
+    }
+}

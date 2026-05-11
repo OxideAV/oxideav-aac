@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CPE independent-window OOB on >8 channels (workspace task #772).**
+  A 42-byte fuzz input chaining four independent-window CPE elements
+  (8 channels) followed by a fifth CPE panicked at
+  `src/decoder.rs:704:52` with "index out of bounds: the len is 8
+  but the index is 8". The CPE-`else` (independent-window) branch
+  placed its `got_channels + 2 > pcm.len()` guard AFTER the
+  IMDCT/copy loop, while the symmetric guard in the
+  `common_window` branch above sits before the loop. The fifth CPE
+  indexed `self.chans[8]` and `pcm[8]` (both length 8) before the
+  guard could fire. We hoist the guard above the loop so the
+  independent-window path mirrors the common-window path. Per
+  ISO/IEC 14496-3 §4.4.1.1 (Table 4.3, channel_configuration) a
+  CCE-less raw_data_block caps at 8 output channels (7.1); chaining
+  further channel_pair_elements is non-conformant. Regression:
+  `tests/fuzz_regressions.rs::cpe_independent_window_overflow_does_not_panic_772`.
 - **SBR `hf_adjust` add-overflow on malformed envelope grid (workspace
   task #757, post-fix follow-up).** A 25-byte fuzz input panicked at
   `src/sbr/hf_adjust.rs:182` with "attempt to add with overflow" — the

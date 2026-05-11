@@ -675,6 +675,21 @@ impl AacDecoder {
                                 infos[ch] = info;
                                 tns_all[ch] = tns;
                             }
+                            // Bounds check BEFORE the IMDCT loop — the loop
+                            // body indexes `self.chans[got_channels + ch]` and
+                            // `pcm[got_channels + ch]`, both of which would
+                            // panic for `got_channels + ch >= 8`. Workspace
+                            // task #759 follow-up: a fuzz input that chains
+                            // four CPE elements (8 channels) followed by a
+                            // fifth CPE used to OOB-panic at decoder.rs:704
+                            // because the guard sat *after* the loop
+                            // (mirrors the symmetric guard in the
+                            // `common_window` branch above at line 614).
+                            if got_channels + 2 > pcm.len() {
+                                return Err(Error::invalid(
+                                    "AAC: CPE would overflow 8 channel slots",
+                                ));
+                            }
                             for ch in 0..2 {
                                 if let Some(tns) = tns_all[ch].as_ref() {
                                     if infos[ch].window_sequence == WindowSequence::EightShort {
@@ -705,11 +720,6 @@ impl AacDecoder {
                                     &mut channel_pcm,
                                 );
                                 pcm[got_channels + ch].copy_from_slice(&channel_pcm);
-                            }
-                            if got_channels + 2 > pcm.len() {
-                                return Err(Error::invalid(
-                                    "AAC: CPE would overflow 8 channel slots",
-                                ));
                             }
                             got_channels += 2;
                         }
