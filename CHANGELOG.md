@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder: TNS on CPE (stereo) long blocks (round-28).** Per AAC
+  §4.6.9 / §4.6.13 the decoder applies the inverse in the order
+  "reverse M/S per band → reverse TNS per channel", so the encoder now
+  computes a TNS forward filter per channel BEFORE the per-band M/S
+  decision. Each channel's filter is emitted in its own `tns_data()`
+  block; M/S decisions are taken on the TNS-flattened spectra and the
+  decoder's reconstruction is bit-exact. A sparse-spectrum gate
+  (≥ 3 scalefactor bands with magnitude ≥ 10 % of channel peak)
+  keeps TNS off on single-tone CPE fixtures where prediction-induced
+  side-lobes would smear under inverse-filter dequant on the 7.1
+  ffmpeg roundtrip (440/550/880/1100/1320/1540/1760/330 Hz). Internal
+  helper `analyse_and_quantise_opts` switched from `use_tns: bool` to
+  `tns_mode: TnsMode { Run, Skip, Preflattened }` so the CPE callsite
+  can hand the analyser already-flattened spectra without re-running
+  TNS analysis. New env knob `OXIDEAV_AAC_DISABLE_CPE_TNS=1` reverts to
+  the pre-round-28 behaviour for A/B measurement. Tests:
+  `tests/encode_tns.rs::encoder_emits_tns_on_cpe_transients`,
+  `::encoder_skips_cpe_tns_on_pure_stereo_tones`,
+  `::cpe_tns_ab_transient_size_and_psnr` (measures
+  +0.65 / +0.95 dB PSNR L / R at +7.5 % encoded size on a 0.5 s
+  transient stereo fixture).
+
 ### Fixed
 
 - **SBR on multichannel ADTS — first-frame sample-count divergence

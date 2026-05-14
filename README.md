@@ -99,7 +99,7 @@ The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in
 | Section data                           | Run-length compressed; merges adjacent same-cb bands |
 | Scalefactors                           | Huffman-coded deltas with global_gain anchor; 3-accumulator path (g_gain / g_noise / g_is) for NOISE / IS bands |
 | M/S stereo (§4.6.13)                   | Per-band L/R-vs-M/S decision by bit cost + activity gate (energy-balance ∈ [1/8, 8] AND \|corr\| ≥ 0.4) + magnitude-weighted sign-agreement gate (≥ 55 % per-line polarity agreement); blocks M/S on partially anti-phased bands |
-| TNS (§4.6.9)                           | LPC analysis on SCE long blocks; 4-bit parcor quantisation; adaptive filter order 2–8 per Spectral Flatness Measure (SFM); adaptive gain threshold 1.38–1.80 (raises on noise-like bands to suppress low-value parcor spend) |
+| TNS (§4.6.9)                           | LPC analysis on SCE long blocks AND CPE long blocks (round-28; per-channel forward filter applied before the per-band M/S decision, mirroring the decoder's "reverse M/S → reverse TNS" order in §4.6.13). 4-bit parcor quantisation; adaptive filter order 2–8 per Spectral Flatness Measure (SFM); adaptive gain threshold 1.38–1.80 (raises on noise-like bands to suppress low-value parcor spend). CPE-side sparse-spectrum gate (≥ 3 active bands per channel) keeps TNS off on single-tone fixtures where prediction-induced side-lobes would smear under inverse-filter dequant. Override via env `OXIDEAV_AAC_DISABLE_CPE_TNS=1`. |
 | PNS encode (§4.6.12)                   | Yes (long windows; peak-to-RMS ≤ 2.6 + SFM ≥ 0.25 noise gate, ≥ 4 kHz band-centre gate; trimmed-mean energy gain matches source RMS within ±1 dB) |
 | Intensity stereo encode (§4.6.8.1.4)   | Yes (long windows; \|corr\| ≥ 0.95 + per-line sign-agreement ≥ 80 % + energy ratio ∈ [1/256, 256] in CPE common-window path; ≥ 4 kHz band-centre gate; corpus PSNR delta +1.7 dB on `aac-lc-intensity-stereo` after round-#523 tuning) |
 | Pulse data encode (§4.6.10)            | Yes (up to 4 per frame; sign-preserving outlier extraction, amp capped at `\|residual\| - 1`) |
@@ -114,8 +114,12 @@ The encoder advertises `max_channels = 8` and `max_sample_rate = 48_000`.
 Multi-channel output emits elements in AAC element order (C, L, R for
 3.0; C, L, R, Ls, Rs, LFE for 5.1; etc.) — round-trip validated via the
 self-decoder for 5.1 and 7.1 layouts in `tests/encode_roundtrip.rs`.
-TNS on stereo (CPE) is gated off until per-band M/S decisions can run on
-TNS-flattened coefficients.
+TNS on stereo (CPE) is on by default as of round-28: each channel's
+forward filter runs before the per-band M/S decision, and the decoder's
+inverse path (reverse M/S → reverse TNS per channel) reconstructs L, R
+exactly. Measured A/B on a 0.5 s transient stereo fixture
+(`tests/encode_tns.rs::cpe_tns_ab_transient_size_and_psnr`):
++0.65 / +0.95 dB PSNR L / R at +7.5 % encoded size vs CPE-TNS-off.
 
 ## Round-trip verification
 

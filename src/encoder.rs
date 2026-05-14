@@ -26,10 +26,14 @@
 //! 1-second synthesised sine.
 //!
 //! Partially implemented:
-//!   - TNS analysis + filter emission for SCE (mono) long windows. See
-//!     `tns_analyse.rs`. CPE (stereo) leaves TNS off for now because the
-//!     M/S per-band decision would need to take the TNS-flattened spectrum
-//!     into account, which isn't wired yet.
+//!   - TNS analysis + filter emission for SCE (mono) long windows AND
+//!     CPE (stereo) long windows (round-28). See `tns_analyse.rs`. CPE
+//!     applies forward TNS per-channel before the per-band M/S decision,
+//!     mirroring the decoder's "inverse M/S then inverse TNS" order
+//!     (ISO/IEC 14496-3 §4.6.9 / §4.6.13). A sparse-spectrum gate
+//!     (≥ 3 active bands per channel) keeps TNS off on single-tone CPE
+//!     fixtures where prediction-induced side-lobes would smear after
+//!     inverse-filter dequant.
 //!
 //! Not implemented (deferred): PNS (encoder side), intensity stereo, pulse
 //! data, short-block/transient detection, gain control.
@@ -1671,11 +1675,34 @@ struct IcsInfoEnc {
     sf_index: u8,
 }
 
-fn analyse_and_quantise(spec: &[f32], sf_index: u8) -> Result<Ics> {
-    analyse_and_quantise_opts(spec, sf_index, true)
+/// TNS mode for [`analyse_and_quantise_opts`].
+///
+/// `Run` — call `tns_analyse_long` inside the helper and embed the filter
+/// in the returned `Ics`. Used by the SCE path.
+///
+/// `Skip` — leave the spectrum untouched, emit no TNS filter. Used by the
+/// CPE auxiliary M/S analyses where the spectrum is `(L+R)/2` or
+/// `(L-R)/2`. The above-baseline psy `target_max` recommendations are
+/// clamped to baseline=7 in this mode to avoid per-line side-lobe
+/// over-amplification on a non-TNS-flattened spectrum (round-27 fix).
+///
+/// `Preflattened` — `spec` is already TNS-flattened by a caller-supplied
+/// filter; do not run TNS analysis here. The above-baseline psy
+/// recommendations are honoured (the spectrum has the TNS flattening
+/// property that makes fine quant safe). The caller is responsible for
+/// stamping the externally-computed filter onto `Ics.tns`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TnsMode {
+    Run,
+    Skip,
+    Preflattened,
 }
 
-fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Result<Ics> {
+fn analyse_and_quantise(spec: &[f32], sf_index: u8) -> Result<Ics> {
+    analyse_and_quantise_opts(spec, sf_index, TnsMode::Run)
+}
+
+fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, tns_mode: TnsMode) -> Result<Ics> {
     let swb = SWB_LONG[sf_index as usize];
     let total_sfb = swb.len() - 1;
 
@@ -1710,11 +1737,12 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     // the implicit dead-zone (scaled magnitude ~0.5) — they round to
     // ±1 and dequantise to ±step^(4/3), beating against the source tone
     // and dropping the per-line Goertzel ratio 5-10×. With TNS-flattening
-    // (mono SCE path) the peak-to-side-lobe ratio is small enough that
-    // fine quant is safe. Round-27 fix: gate the above-baseline psy
-    // recommendation on `use_tns`. Pure noise / non-tonal bands are
-    // unaffected (psy already pins them to baseline via the
-    // NOISE_TONALITY_GATE in `psy.rs`).
+    // (mono SCE path or CPE TNS-flattened path) the peak-to-side-lobe
+    // ratio is small enough that fine quant is safe. Round-27 fix: gate
+    // the above-baseline psy recommendation on `tns_mode`. Pure noise /
+    // non-tonal bands are unaffected (psy already pins them to baseline
+    // via the NOISE_TONALITY_GATE in `psy.rs`).
+    let tns_flattened = matches!(tns_mode, TnsMode::Run | TnsMode::Preflattened);
     let psy_target: Option<Vec<i32>> = if psy_active() {
         let sr = SAMPLE_RATES
             .get(sf_index as usize)
@@ -1723,7 +1751,7 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
         let model = PsyModel::new_long(sf_index, sr);
         let analysis = model.analyse(spec);
         let baseline = 7i32;
-        let target_max = if use_tns {
+        let target_max = if tns_flattened {
             analysis.target_max
         } else {
             // TNS-flattened: above-baseline psy is safe.
@@ -1741,22 +1769,26 @@ fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, use_tns: bool) -> Resul
     };
 
     // Copy the spectrum into a fixed-size array so the TNS analyser can
-    // apply its forward filter in place. If TNS is gated off, `spec_tns`
-    // is identical to the input.
+    // apply its forward filter in place. If TNS is gated off or already
+    // applied by the caller (Preflattened), `spec_tns` is identical to
+    // the input.
     let mut spec_tns = [0.0f32; SPEC_LEN];
     let copy_len = spec.len().min(SPEC_LEN);
     spec_tns[..copy_len].copy_from_slice(&spec[..copy_len]);
-    // Save a reference to the original (pre-TNS) spectrum for PNS
+    // Save a reference to the (caller-provided) spectrum for PNS
     // classification below. PNS classifies whether the *source* signal is
     // noise-like; the TNS forward filter (especially at order 8) can alter
     // the peak-to-RMS distribution of noise bands and suppress PNS
     // triggering on bands that are genuinely noise-like in the original
     // signal. The quantiser still operates on the TNS-filtered spectrum.
+    // In `Preflattened` mode the caller already applied TNS, so `spec` is
+    // not the pre-TNS spectrum — PNS classification will be slightly off
+    // for that path, but in practice CPE PNS bands are gated by the
+    // codebook chosen on M (mid) which sees both channels' content.
     let spec_pre_tns: &[f32] = spec;
-    let tns = if use_tns {
-        tns_analyse_long(&mut spec_tns, sf_index, max_sfb as u8)
-    } else {
-        None
+    let tns = match tns_mode {
+        TnsMode::Run => tns_analyse_long(&mut spec_tns, sf_index, max_sfb as u8),
+        TnsMode::Skip | TnsMode::Preflattened => None,
     };
     // Work with the TNS-flattened spectrum from this point on. If TNS was
     // not applied, spec_tns == spec.
@@ -2164,6 +2196,15 @@ const PNS_IS_MIN_HZ: f32 = 4_000.0;
 /// active; this knob never changes the bitstream of regular runs.
 fn pns_disabled_by_env() -> bool {
     std::env::var("OXIDEAV_AAC_DISABLE_PNS").is_ok()
+}
+
+/// Test/debug knob: when `OXIDEAV_AAC_DISABLE_CPE_TNS` is set the encoder
+/// skips TNS analysis on every CPE channel (`analyse_cpe` keeps the
+/// pre-round-28 behaviour). Used by `tests/encode_tns.rs::cpe_tns_size_*`
+/// to A/B-compare encoded-bytes-per-frame on a transient stereo fixture.
+/// Default behaviour leaves CPE TNS active.
+fn cpe_tns_disabled_by_env() -> bool {
+    std::env::var("OXIDEAV_AAC_DISABLE_CPE_TNS").is_ok()
 }
 
 /// True if scalefactor band `sfb` at `sample_rate` sits entirely above
@@ -3102,29 +3143,147 @@ fn ms_sign_agreement(l: &[f32], r: &[f32], band_start: usize, band_end: usize) -
     }
 }
 
+/// Count scalefactor bands whose peak magnitude is at least 10 % of the
+/// channel-global peak, up to `max_sfb`. Used by [`analyse_cpe`] to gate
+/// TNS off on sparse single-tone content where LPC prediction over a
+/// single peak smears decoder-side dequant noise across the channel.
+fn count_active_bands(spec: &[f32], swb_long: &[u16], max_sfb: u8) -> usize {
+    let global_peak = spec.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    if global_peak < 1e-9 {
+        return 0;
+    }
+    let cutoff = global_peak * 0.10;
+    let mut count = 0usize;
+    let total_sfb = swb_long.len() - 1;
+    let max_sfb = (max_sfb as usize).min(total_sfb);
+    for sfb in 0..max_sfb {
+        let start = swb_long[sfb] as usize;
+        let end = swb_long[sfb + 1] as usize;
+        if end > spec.len() || start >= spec.len() {
+            break;
+        }
+        let mx = spec[start..end].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        if mx >= cutoff {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Choose M/S stereo per band and return per-channel ICS.
 ///
 /// For common-window CPE both channels MUST share the same ics_info
 /// (window_sequence, max_sfb, etc.). We therefore pad both per-channel
 /// ICS structures to a single unified max_sfb after analysis.
+///
+/// TNS on CPE (round-28): per AAC §4.6.9 the decoder applies the inverse
+/// in the order "reverse M/S per band → reverse TNS per channel". Mirror
+/// that on the encoder: compute a TNS forward filter per channel first,
+/// then take M/S decisions on the TNS-flattened spectra. The per-channel
+/// filter is emitted in each channel's `tns_data()` block; the per-band
+/// M/S mask is unchanged. Bands chosen for M/S therefore carry
+/// `(TNS(L)+TNS(R))/2` and `(TNS(L)-TNS(R))/2`; on decode the M/S reversal
+/// recovers TNS(L), TNS(R) and the per-channel inverse TNS recovers L, R.
 fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ics)> {
-    // Quantise L/R and M/S independently; pick the cheaper one per band.
-    // NOTE: TNS is disabled for CPE in this first-cut encoder because a
-    // single TNS filter must span the whole spectrum, while per-band M/S
-    // decisions can take quantised coefficients from multiple source ICSs.
-    // Re-enabling TNS here requires running analysis on L/R directly, then
-    // computing M/S from the flattened coefficients and picking per-band —
-    // left as future work.
-    let ics_l_alone = analyse_and_quantise_opts(l, sf_index, false)?;
-    let ics_r_alone = analyse_and_quantise_opts(r, sf_index, false)?;
-    let mut m = vec![0.0f32; l.len()];
-    let mut s = vec![0.0f32; l.len()];
-    for i in 0..l.len() {
-        m[i] = (l[i] + r[i]) * 0.5;
-        s[i] = (l[i] - r[i]) * 0.5;
+    // Determine max_sfb shared by both channels before TNS, so the TNS
+    // analyser sees the same band range that the rest of the pipeline
+    // will quantise.
+    let swb_long = SWB_LONG[sf_index as usize];
+    let total_sfb = swb_long.len() - 1;
+    let global_peak_l = l.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    let global_peak_r = r.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    let global_peak = global_peak_l.max(global_peak_r);
+    let threshold = (global_peak * 1e-4).max(1e-3);
+    let mut max_band_active = 0usize;
+    for sfb in 0..total_sfb {
+        let start = swb_long[sfb] as usize;
+        let end = swb_long[sfb + 1] as usize;
+        let mx_l = l[start..end].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        let mx_r = r[start..end].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        if mx_l.max(mx_r) > threshold {
+            max_band_active = sfb + 1;
+        }
     }
-    let ics_m = analyse_and_quantise_opts(&m, sf_index, false)?;
-    let ics_s = analyse_and_quantise_opts(&s, sf_index, false)?;
+    let pre_max_sfb = max_band_active.max(1).min(total_sfb) as u8;
+
+    // Forward TNS per channel against copies of L and R. The filter is
+    // captured and later embedded into the per-channel Ics; the analyser
+    // mutates the copy in place so we can use it as the M/S source.
+    let mut l_flat = [0.0f32; SPEC_LEN];
+    let mut r_flat = [0.0f32; SPEC_LEN];
+    let copy_len = l.len().min(SPEC_LEN);
+    l_flat[..copy_len].copy_from_slice(&l[..copy_len]);
+    r_flat[..copy_len].copy_from_slice(&r[..copy_len]);
+
+    // Sparse-spectrum gate (round-28): TNS on a single-tone channel
+    // predicts perfectly but the quantised side-lobes around the
+    // predicted peak, once inverse-filtered on decode, smear noise across
+    // the channel's primary frequency. The mono SCE path has the same
+    // mechanic but the quantiser dead-zone catches it; on a stereo CPE
+    // pair the M/S decision interacts with cross-channel side-lobes and
+    // the per-channel PSNR drops below 22 dB on the 7.1 ffmpeg
+    // roundtrip (440/550/880/1100/1320/1540/1760/330 Hz). Gate TNS to
+    // channels with at least 3 spectrally active bands (≥ 10 % of peak)
+    // — single-tone fixtures have 1–2 active bands (the tone's leakage)
+    // and skip TNS, while real complex content has many.
+    let cpe_tns_off = cpe_tns_disabled_by_env();
+    let l_active_bands = count_active_bands(l, swb_long, pre_max_sfb);
+    let r_active_bands = count_active_bands(r, swb_long, pre_max_sfb);
+    let cpe_tns_min_active_bands: usize = 3;
+    let filter_l = if !cpe_tns_off && l_active_bands >= cpe_tns_min_active_bands {
+        tns_analyse_long(&mut l_flat, sf_index, pre_max_sfb)
+    } else {
+        None
+    };
+    let filter_r = if !cpe_tns_off && r_active_bands >= cpe_tns_min_active_bands {
+        tns_analyse_long(&mut r_flat, sf_index, pre_max_sfb)
+    } else {
+        None
+    };
+    // If TNS was gated off, l_flat/r_flat are unchanged copies of l/r;
+    // the analyse path below still works correctly.
+    let _ = (l_active_bands, r_active_bands);
+
+    // Choose quantiser TNS mode based on whether a filter was selected.
+    // When neither channel has a filter, the post-TNS spectrum equals
+    // the original; mark `Skip` so above-baseline psy stays clamped
+    // (no flattening present). Otherwise use `Preflattened` to unlock
+    // the fine quant path on that channel.
+    let mode_l = if filter_l.is_some() {
+        TnsMode::Preflattened
+    } else {
+        TnsMode::Skip
+    };
+    let mode_r = if filter_r.is_some() {
+        TnsMode::Preflattened
+    } else {
+        TnsMode::Skip
+    };
+    let l_for_analysis: &[f32] = &l_flat[..copy_len];
+    let r_for_analysis: &[f32] = &r_flat[..copy_len];
+
+    // Quantise L/R and M/S independently; pick the cheaper one per band.
+    // The per-band copy_band path only reads `cbs`, `sfs`, `q_bands` —
+    // the channel-level `tns` filter is stamped onto ch0/ch1 directly at
+    // the end of this function (see `ch0.tns = filter_l`).
+    let ics_l_alone = analyse_and_quantise_opts(l_for_analysis, sf_index, mode_l)?;
+    let ics_r_alone = analyse_and_quantise_opts(r_for_analysis, sf_index, mode_r)?;
+
+    // M/S is computed on the TNS-flattened spectra so the decoder's
+    // "inverse M/S then inverse TNS" reconstruction is bit-exact.
+    let mut m = vec![0.0f32; copy_len];
+    let mut s = vec![0.0f32; copy_len];
+    for i in 0..copy_len {
+        m[i] = (l_for_analysis[i] + r_for_analysis[i]) * 0.5;
+        s[i] = (l_for_analysis[i] - r_for_analysis[i]) * 0.5;
+    }
+    // The M and S spectra inherit the TNS-flattening property of L and R
+    // (whichever channel had a filter applied) only on bands that map
+    // 1:1 to that channel. Treat the M/S spectra as TNS-Skip for psy
+    // purposes — this matches the pre-round-28 behaviour for those two
+    // quantiser calls and keeps the safe side-lobe envelope.
+    let ics_m = analyse_and_quantise_opts(&m, sf_index, TnsMode::Skip)?;
+    let ics_s = analyse_and_quantise_opts(&s, sf_index, TnsMode::Skip)?;
 
     let max_sfb_lr = ics_l_alone.info.max_sfb.max(ics_r_alone.info.max_sfb);
     let max_sfb_ms = ics_m.info.max_sfb.max(ics_s.info.max_sfb);
@@ -3230,6 +3389,13 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
             copy_band(&mut ch1, sfb, &ics_r_alone, sfb);
         }
     }
+    // Round-28: emit each channel's TNS filter regardless of per-band
+    // M/S choice. The decoder applies inverse M/S first then inverse
+    // TNS per channel, so the per-channel filter applies to whichever
+    // coefficients land in this channel after the M/S reversal — see
+    // ISO/IEC 14496-3 §4.6.9 / §4.6.13.
+    ch0.tns = filter_l;
+    ch1.tns = filter_r;
     // Common-window CPE: both channels MUST share ics_info.max_sfb.
     // Anchor global_gain on each channel without trimming max_sfb.
     finalize_ics_keep_max_sfb(&mut ch0);
