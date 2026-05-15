@@ -31,8 +31,9 @@
 //!     applies forward TNS per-channel before the per-band M/S decision,
 //!     mirroring the decoder's "inverse M/S then inverse TNS" order
 //!     (ISO/IEC 14496-3 §4.6.9 / §4.6.13). A sparse-spectrum gate
-//!     (≥ 3 active bands per channel) keeps TNS off on single-tone CPE
-//!     fixtures where prediction-induced side-lobes would smear after
+//!     (≥ 3 active bands per channel) on BOTH the CPE per-channel and
+//!     SCE (round-29) paths keeps TNS off on single-tone fixtures
+//!     where prediction-induced side-lobes would smear after
 //!     inverse-filter dequant.
 //!
 //! Not implemented (deferred): PNS (encoder side), intensity stereo, pulse
@@ -1578,6 +1579,51 @@ fn build_adts_frame_with_fullness(
 
 // ==================== SCE / CPE writers ====================
 
+/// Sparse-spectrum gate for SCE (mono) TNS, mirroring the round-28 CPE
+/// gate. TNS forward-filter on a sparse single-tone spectrum predicts the
+/// peak well, but the small quantised side-lobes around the predicted peak
+/// are inverse-filtered on decode and smear noise back across the channel's
+/// primary bin. The dead-zone in the per-line quantiser catches most of
+/// this on mono, but a sharp percussive transient on top of a tonal
+/// background pulls `target_max` higher and re-introduces the smear path.
+///
+/// Round-29: gate SCE TNS on the same activity criterion used for CPE
+/// (≥ 3 scalefactor bands carrying ≥ 10 % of channel peak), so genuine
+/// wideband transients still run TNS while pure-tone fixtures skip it
+/// regardless of psy `target_max` decisions. Returns the [`TnsMode`] to
+/// pass to [`analyse_and_quantise_opts`]. The env knob
+/// `OXIDEAV_AAC_DISABLE_SCE_TNS` forces `TnsMode::Skip` for A/B testing.
+const SCE_TNS_MIN_ACTIVE_BANDS: usize = 3;
+
+fn should_run_sce_tns(spec: &[f32], sf_index: u8) -> TnsMode {
+    if sce_tns_disabled_by_env() {
+        return TnsMode::Skip;
+    }
+    let swb = SWB_LONG[sf_index as usize];
+    let total_sfb = swb.len() - 1;
+    let global_peak = spec.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    if global_peak < 1e-9 {
+        return TnsMode::Skip;
+    }
+    let threshold = (global_peak * 1e-4).max(1e-3);
+    let mut max_band_active = 0usize;
+    for sfb in 0..total_sfb {
+        let start = swb[sfb] as usize;
+        let end = swb[sfb + 1] as usize;
+        let mx = spec[start..end].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        if mx > threshold {
+            max_band_active = sfb + 1;
+        }
+    }
+    let pre_max_sfb = max_band_active.max(1).min(total_sfb) as u8;
+    let active = count_active_bands(spec, swb, pre_max_sfb);
+    if active >= SCE_TNS_MIN_ACTIVE_BANDS {
+        TnsMode::Run
+    } else {
+        TnsMode::Skip
+    }
+}
+
 fn write_single_ics(
     bw: &mut BitWriter,
     spec: &[f32],
@@ -1589,7 +1635,12 @@ fn write_single_ics(
     // Design: we need to pick scalefactors first so we know the gain, then
     // write the full ICS in one pass. We encode everything into a temp
     // structure and emit at the end.
-    let ics = analyse_and_quantise(spec, sf_index)?;
+    //
+    // Round-29: route through `analyse_and_quantise_opts` with a
+    // sparse-spectrum-gated [`TnsMode`] so single-tone mono content
+    // skips TNS the same way single-tone CPE channels do (round-28).
+    let mode = should_run_sce_tns(spec, sf_index);
+    let ics = analyse_and_quantise_opts(spec, sf_index, mode)?;
     write_ics(bw, &ics, seq, false)?;
     Ok(())
 }
@@ -1696,10 +1747,6 @@ enum TnsMode {
     Run,
     Skip,
     Preflattened,
-}
-
-fn analyse_and_quantise(spec: &[f32], sf_index: u8) -> Result<Ics> {
-    analyse_and_quantise_opts(spec, sf_index, TnsMode::Run)
 }
 
 fn analyse_and_quantise_opts(spec: &[f32], sf_index: u8, tns_mode: TnsMode) -> Result<Ics> {
@@ -2205,6 +2252,16 @@ fn pns_disabled_by_env() -> bool {
 /// Default behaviour leaves CPE TNS active.
 fn cpe_tns_disabled_by_env() -> bool {
     std::env::var("OXIDEAV_AAC_DISABLE_CPE_TNS").is_ok()
+}
+
+/// Test/debug knob: when `OXIDEAV_AAC_DISABLE_SCE_TNS` is set the encoder
+/// skips TNS analysis on the SCE (mono) long path. Used by
+/// `tests/encode_tns.rs::sce_tns_ab_transient_size_and_psnr` to
+/// A/B-compare reconstruction PSNR on a transient mono fixture.
+/// Default behaviour leaves SCE TNS active (subject to the
+/// sparse-spectrum gate — see [`should_run_sce_tns`]).
+fn sce_tns_disabled_by_env() -> bool {
+    std::env::var("OXIDEAV_AAC_DISABLE_SCE_TNS").is_ok()
 }
 
 /// True if scalefactor band `sfb` at `sample_rate` sits entirely above
@@ -3144,9 +3201,10 @@ fn ms_sign_agreement(l: &[f32], r: &[f32], band_start: usize, band_end: usize) -
 }
 
 /// Count scalefactor bands whose peak magnitude is at least 10 % of the
-/// channel-global peak, up to `max_sfb`. Used by [`analyse_cpe`] to gate
-/// TNS off on sparse single-tone content where LPC prediction over a
-/// single peak smears decoder-side dequant noise across the channel.
+/// channel-global peak, up to `max_sfb`. Used by [`analyse_cpe`] and the
+/// SCE path ([`should_run_sce_tns`]) to gate TNS off on sparse
+/// single-tone content where LPC prediction over a single peak smears
+/// decoder-side dequant noise across the channel.
 fn count_active_bands(spec: &[f32], swb_long: &[u16], max_sfb: u8) -> usize {
     let global_peak = spec.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
     if global_peak < 1e-9 {

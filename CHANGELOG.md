@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder: sparse-spectrum gate for SCE (mono) TNS (round-29).**
+  Mirrors the round-28 CPE work: SCE long blocks now route through a
+  shared `should_run_sce_tns` helper that counts scalefactor bands
+  carrying ≥ 10 % of the channel-global peak (`count_active_bands`)
+  and returns `TnsMode::Skip` when fewer than 3 are active. Single-tone
+  mono fixtures (one spectral peak + leakage = ≤ 2 active bands) skip
+  TNS, avoiding the prediction-induced side-lobe smear that the CPE
+  gate also catches; genuine wideband transients still run the LPC
+  predictor as before. The pre-r29 `analyse_and_quantise` wrapper that
+  always forced `TnsMode::Run` was retired in favour of dispatching
+  through `analyse_and_quantise_opts(spec, sf_index, mode)` directly
+  from the `write_single_ics` SCE writer. New env knob
+  `OXIDEAV_AAC_DISABLE_SCE_TNS=1` reverts the SCE path to TNS-off for
+  A/B measurement (parallel to `OXIDEAV_AAC_DISABLE_CPE_TNS`). Tests:
+  `tests/encode_tns.rs::sce_tns_ab_transient_size_and_psnr` (measures
+  +0.92 dB PSNR on the immediate-post-attack region of a 1 s drum
+  fixture at +3.3 % encoded size vs SCE-TNS-off — the temporal-masking
+  tail where the inverse-TNS filter concentrates quant noise back
+  onto the attack envelope rather than smearing it across the frame),
+  `::encoder_skips_sce_tns_on_pure_mono_tone` (≤ 20 % of pure-tone
+  frames carry tns_data_present=1, sparse-spectrum gate verified).
 - **Encoder: TNS on CPE (stereo) long blocks (round-28).** Per AAC
   §4.6.9 / §4.6.13 the decoder applies the inverse in the order
   "reverse M/S per band → reverse TNS per channel", so the encoder now
