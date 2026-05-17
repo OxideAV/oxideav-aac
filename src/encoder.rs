@@ -2264,6 +2264,16 @@ fn sce_tns_disabled_by_env() -> bool {
     std::env::var("OXIDEAV_AAC_DISABLE_SCE_TNS").is_ok()
 }
 
+/// Test/debug knob: when `OXIDEAV_AAC_DISABLE_CPE_PSY_MS` is set, the
+/// CPE per-band M/S decision falls back to the round-29 bit-cost-only
+/// path (with the existing energy-balance + correlation + sign-agreement
+/// gates) and the round-30 perceptual PE arbiter is bypassed. Used by
+/// `tests/encode_perceptual_ms.rs::ms_psy_ab_psnr` for A/B measurement.
+/// Default behaviour leaves the perceptual M/S decision active.
+fn cpe_psy_ms_disabled_by_env() -> bool {
+    std::env::var("OXIDEAV_AAC_DISABLE_CPE_PSY_MS").is_ok()
+}
+
 /// True if scalefactor band `sfb` at `sample_rate` sits entirely above
 /// `PNS_IS_MIN_HZ`. Used as a hard gate on PNS and intensity-stereo —
 /// we never want to flip a tonal LF band to either of those tools.
@@ -3200,6 +3210,77 @@ fn ms_sign_agreement(l: &[f32], r: &[f32], band_start: usize, band_end: usize) -
     }
 }
 
+/// Round-30 perceptual M/S decision per ISO/IEC 13818-7 §6.6.1.3.
+///
+/// The standard test for selecting M/S vs L/R coding compares the per-band
+/// perceptual entropy (PE) needed to keep quantisation noise below the
+/// listener's masking threshold.
+///
+/// Crucial: the per-channel masking threshold is computed from what the
+/// LISTENER hears, which is always `L` and `R` — even when we transmit
+/// `M = (L+R)/2` and `S = (L-R)/2`. Quantisation noise added to the
+/// transmitted M or S signal reconstructs as full-amplitude noise on
+/// both L (`= M+S`) and R (`= M-S`) channels. The perceptually-correct
+/// threshold for BOTH M and S transmissions is therefore the tighter of
+/// the L and R per-channel thresholds, NOT the threshold computed from
+/// the M or S spectra in isolation. (Following Johnston's stereo masking
+/// thresholds derivation: ASMR_M = ASMR_S = min(thr_L, thr_R).)
+///
+/// PE per band:
+///   pe_lr = nlines · log2(1 + e_L / thr_L) + log2(1 + e_R / thr_R)
+///   pe_ms = nlines · log2(1 + e_M / thr_stereo) + log2(1 + e_S / thr_stereo)
+/// where `thr_stereo = min(thr_L, thr_R)` is the binaural masking floor.
+///
+/// Returns `(pe_lr, pe_ms)`. The caller combines these with the existing
+/// bit-cost arbiter and activity gates: see the call-site in
+/// [`analyse_cpe`] for the full decision logic.
+fn ms_perceptual_pe(
+    psy_l: &crate::psy::PsyAnalysis,
+    psy_r: &crate::psy::PsyAnalysis,
+    psy_m: &crate::psy::PsyAnalysis,
+    psy_s: &crate::psy::PsyAnalysis,
+    sfb: usize,
+    nlines: f32,
+) -> (f32, f32) {
+    if sfb >= psy_l.threshold.len()
+        || sfb >= psy_r.threshold.len()
+        || sfb >= psy_m.energy.len()
+        || sfb >= psy_s.energy.len()
+        || sfb >= psy_l.energy.len()
+        || sfb >= psy_r.energy.len()
+    {
+        return (0.0, 0.0);
+    }
+    // psy.threshold[b] is a per-line amplitude bound; the per-line
+    // energy bound is its square. energy[b] is already mean-squared
+    // magnitude per line, so the ratio energy / threshold² is the
+    // per-line SNR in linear units.
+    let thr_l_e = (psy_l.threshold[sfb] * psy_l.threshold[sfb]).max(1e-18);
+    let thr_r_e = (psy_r.threshold[sfb] * psy_r.threshold[sfb]).max(1e-18);
+
+    // L/R PE: each channel coded against its own threshold (independent
+    // listeners on each channel hear their own quant noise).
+    let e_l = psy_l.energy[sfb].max(0.0);
+    let e_r = psy_r.energy[sfb].max(0.0);
+    let pe_l = nlines * (1.0 + e_l / thr_l_e).log2();
+    let pe_r = nlines * (1.0 + e_r / thr_r_e).log2();
+    let pe_lr = pe_l + pe_r;
+
+    // M/S PE: both M and S coded against the BINAURAL threshold —
+    // min(thr_L, thr_R). Per Johnston: noise added to M leaks to both
+    // L' and R'; noise added to S leaks to both L' and R'. Each
+    // listener-side band can only tolerate quant noise up to its own
+    // threshold, so both transmissions must respect the tighter side.
+    let thr_stereo = thr_l_e.min(thr_r_e);
+    let e_m = psy_m.energy[sfb].max(0.0);
+    let e_s = psy_s.energy[sfb].max(0.0);
+    let pe_m = nlines * (1.0 + e_m / thr_stereo).log2();
+    let pe_s = nlines * (1.0 + e_s / thr_stereo).log2();
+    let pe_ms = pe_m + pe_s;
+
+    (pe_lr, pe_ms)
+}
+
 /// Count scalefactor bands whose peak magnitude is at least 10 % of the
 /// channel-global peak, up to `max_sfb`. Used by [`analyse_cpe`] and the
 /// SCE path ([`should_run_sce_tns`]) to gate TNS off on sparse
@@ -3242,6 +3323,12 @@ fn count_active_bands(spec: &[f32], swb_long: &[u16], max_sfb: u8) -> usize {
 /// M/S mask is unchanged. Bands chosen for M/S therefore carry
 /// `(TNS(L)+TNS(R))/2` and `(TNS(L)-TNS(R))/2`; on decode the M/S reversal
 /// recovers TNS(L), TNS(R) and the per-channel inverse TNS recovers L, R.
+///
+/// Perceptual M/S arbiter (round-30, ISO/IEC 13818-7 §6.6.1.3): in
+/// addition to the bit-cost test + activity gates, a per-band PE
+/// comparison computed via [`ms_perceptual_pe`] layers a perceptual
+/// VETO (reject bit-cost-cheap M/S when MS-PE > 1.25·LR-PE) and a
+/// PROMOTE (override LR in a cost tie when MS-PE ≤ 0.75·LR-PE).
 fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ics)> {
     // Determine max_sfb shared by both channels before TNS, so the TNS
     // analyser sees the same band range that the rest of the pipeline
@@ -3353,6 +3440,39 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
     let cost_ms: Vec<u64> = (0..max_sfb)
         .map(|sfb| band_bit_cost(sfb, &ics_m) + band_bit_cost(sfb, &ics_s))
         .collect();
+
+    // Round-30: perceptual M/S decision per ISO/IEC 13818-7 §6.6.1.3.
+    // Run the psy model on the TNS-flattened L, R, M, S spectra so the
+    // per-band masking thresholds reflect what the bit allocator will
+    // actually quantise. The arbiter combines per-band bit-cost with
+    // per-band PE: M/S is chosen when bit-cost is cheaper AND the PE
+    // metric agrees, OR when the PE delta is large enough to outweigh
+    // a slightly more expensive bit-cost. This catches bands where
+    // L/R coding is bit-cheaper but the stereo image collapses under
+    // M/S noise leak (PE blocks it), and bands where L/R is marginally
+    // cheaper but M/S exploits cross-channel masking (PE upgrades).
+    //
+    // The psy-MS path is gated by both the global psy switch
+    // (`psy_active`) and the per-knob `cpe_psy_ms_disabled_by_env` —
+    // when either is off the path collapses to the round-29 bit-cost
+    // arbiter (with sign-agreement + energy-balance + correlation
+    // gates intact).
+    let psy_ms_active = psy_active() && !cpe_psy_ms_disabled_by_env();
+    let psy_ms_data = if psy_ms_active {
+        let sr = SAMPLE_RATES
+            .get(sf_index as usize)
+            .copied()
+            .unwrap_or(44_100);
+        let model = PsyModel::new_long(sf_index, sr);
+        Some((
+            model.analyse(l_for_analysis),
+            model.analyse(r_for_analysis),
+            model.analyse(&m),
+            model.analyse(&s),
+        ))
+    } else {
+        None
+    };
     // Per-band decision: pick the cheapest representation.
     //
     //   LR:   ch0 = L quantised, ch1 = R quantised.
@@ -3399,7 +3519,49 @@ fn analyse_cpe(l: &[f32], r: &[f32], sf_index: u8) -> Result<(Vec<bool>, Ics, Ic
         // channels for no bit-savings benefit. Skip M/S when sign agreement
         // is below the threshold even if the cost metric prefers M/S.
         let sign_agree = ms_sign_agreement(l, r, band_start, band_end);
-        if cost_ms[sfb] < best_cost && ms_band_safe(e_l, e_r, corr_lr) && sign_agree >= 0.55 {
+
+        // Round-30 perceptual M/S arbiter (ISO/IEC 13818-7 §6.6.1.3):
+        // when the psy data is available, compute the per-band PE
+        // estimate for LR and MS coding and use it as a *tie-breaker*
+        // around the bit-cost arbiter. The bit-cost test remains the
+        // primary decision, with the perceptual gates layered on top:
+        //
+        //   (i) **VETO** — when bit-cost picks M/S but the M/S
+        //       representation has substantially worse PE than LR
+        //       (pe_ms > pe_lr · 1.25), reject the M/S pick. This
+        //       catches bands where bit-cost prefers M/S because
+        //       quantisation collapses the side channel (cost ≈ 0)
+        //       but the listener would hear the stereo image bleed
+        //       through into the dominant channel as quant noise.
+        //  (ii) **PROMOTE** — when the bit-cost test is approximately
+        //       a tie (cost_ms within 5 % of cost_lr) and the PE
+        //       favours M/S by a clear margin (pe_ms ≤ pe_lr · 0.75),
+        //       switch to M/S. This catches bands where the two
+        //       arbiters lean opposite directions on small margins;
+        //       the perceptual side is the correct tie-breaker.
+        //
+        // The activity gates (energy-balance, |corr| ≥ 0.4,
+        // sign-agreement ≥ 0.55) remain mandatory: PE alone cannot
+        // override a band where M/S is structurally unsafe.
+        let (pe_lr, pe_ms) = if let Some((psy_l, psy_r, psy_m, psy_s)) = psy_ms_data.as_ref() {
+            let nlines = (band_end - band_start) as f32;
+            ms_perceptual_pe(psy_l, psy_r, psy_m, psy_s, sfb, nlines)
+        } else {
+            (0.0, 0.0)
+        };
+        let activity_ok = ms_band_safe(e_l, e_r, corr_lr) && sign_agree >= 0.55;
+        let perceptual_veto = psy_ms_data.is_some() && pe_lr > 0.0 && pe_ms > pe_lr * 1.25;
+        // Tie window: cost_ms within 5 % of cost_lr (≤ 5 % cheaper OR up
+        // to 5 % more expensive).
+        let cost_tie = cost_ms[sfb] >= (cost_lr[sfb].saturating_mul(95) / 100)
+            && cost_ms[sfb] <= (cost_lr[sfb].saturating_mul(105) / 100).max(1);
+        let perceptual_promotion = psy_ms_data.is_some()
+            && activity_ok
+            && pe_lr > 1.0
+            && pe_ms <= pe_lr * 0.75
+            && cost_tie;
+        let ms_chosen_by_cost = cost_ms[sfb] < best_cost && activity_ok && !perceptual_veto;
+        if ms_chosen_by_cost || perceptual_promotion {
             best_cost = cost_ms[sfb];
             choice = 1;
         }

@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder: perceptual per-band M/S decision per ISO/IEC 13818-7 §6.6.1.3
+  (round-30).** The CPE M/S arbiter now layers a perceptual-entropy (PE)
+  comparison on top of the round-29 bit-cost + activity-gate path.
+  `ms_perceptual_pe` computes per-band PE for both LR and MS coding using
+  the Johnston binaural masking threshold (`thr_stereo = min(thr_L,
+  thr_R)`): noise added to the transmitted M or S band reconstructs at
+  full amplitude in both `L' = M + S` and `R' = M - S`, so both
+  transmissions must respect the tighter per-channel threshold of the
+  listener-side L and R signals (NOT thresholds computed in isolation
+  from the M / S spectra themselves, which would be wrong on
+  near-silent S). The arbiter combines this with the bit-cost test in
+  two new gates:
+    * **VETO** — when bit-cost picks M/S but `pe_ms > pe_lr · 1.25`,
+      reject the M/S pick (the stereo image would degrade under
+      side-channel quant-noise leak).
+    * **PROMOTE** — when bit-cost is approximately a tie
+      (`cost_ms ∈ [0.95·cost_lr, 1.05·cost_lr]`) and the PE favours
+      M/S by a clear margin (`pe_ms ≤ pe_lr · 0.75`), switch to M/S
+      (the perceptual side is the correct tie-breaker).
+  The existing energy-balance + correlation + sign-agreement activity
+  gates remain mandatory on both pathways. New env knob
+  `OXIDEAV_AAC_DISABLE_CPE_PSY_MS=1` reverts to the round-29
+  bit-cost-only arbiter for A/B measurement. Test:
+  `tests/encode_perceptual_ms.rs::ms_psy_ab_psnr_and_size_on_perceptual_fixture`
+  on a centred-stereo three-tone fixture (440 + 880 + 1760 Hz triad
+  with a 5 % per-channel amplitude tilt — the canonical MS-friendly
+  stereo image) measures **R +2.50 dB / L +0.03 dB PSNR at -1.14 %
+  encoded size** vs the round-29 bit-cost-only baseline.
+  `::perceptual_ms_does_not_regress_round27_fixture` pins the
+  440/880 anti-correlated regression fixture: the activity gates
+  (sign-agreement < 0.55) keep M/S off on both arbiters, so the
+  perceptual layer has zero effect there.
+
 - **Encoder: sparse-spectrum gate for SCE (mono) TNS (round-29).**
   Mirrors the round-28 CPE work: SCE long blocks now route through a
   shared `should_run_sce_tns` helper that counts scalefactor bands
