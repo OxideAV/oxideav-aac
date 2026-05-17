@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gapless: iTunSMPB tag parser (round-73).** `GaplessInfo::parse_itunsmpb`
+  takes the canonical Apple iTunes-style ASCII tag string (the same shape
+  `GaplessInfo::format_itunsmpb` emits) and reconstructs the
+  (encoder_delay, padding_samples, valid_samples) triple. Closes the
+  round-trip gap on the gapless module: container code (MP4 `ilst` reader
+  with `com.apple.iTunes:iTunSMPB` named atom, ID3v2 `TXXX:iTunSMPB`
+  reader) can now recover the priming + tail-padding sample counts from
+  an iTunes-tagged AAC source for sample-accurate trimming downstream.
+  Tolerant parsing: leading whitespace stripped, any ASCII-whitespace
+  run accepted as field separator (multi-space / tab / CRLF-padded
+  variants observed in the wild from different MP4 ilst chunk readers),
+  upper- AND lower-case hex digits accepted, words 4..11 (the eight
+  reserved zero-fill words iTunes always writes) tolerated as optional.
+  Word 0 (the reserved/version word) is parsed but its value discarded
+  so non-zero values from third-party taggers don't trip the parser.
+  Rejection cases return a typed `GaplessParseError` enum (no panic):
+  `TooFewFields { found }` for `< 4` fields, `InvalidHex { field }` for
+  any of the first 4 fields failing hex parse (incl. u32 / u64
+  capacity overflow). 14 new tests in `src/gapless.rs::tests`:
+  round-trip LC + HE-AAC, canonical 12-word layout, minimum 4-word
+  layout, lowercase hex, multi-space + mixed-whitespace separators,
+  empty / `< 4` rejections, non-hex rejections at each field index,
+  u32 overflow on delay word, non-zero reserved word tolerance,
+  `Display` impl message coverage.
+
 - **Encoder: perceptual per-band M/S decision per ISO/IEC 13818-7 §6.6.1.3
   (round-30).** The CPE M/S arbiter now layers a perceptual-entropy (PE)
   comparison on top of the round-29 bit-cost + activity-gate path.

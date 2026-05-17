@@ -166,7 +166,92 @@ impl GaplessInfo {
             0u32,
         )
     }
+
+    /// Parse an Apple iTunSMPB tag string back into a `GaplessInfo`.
+    ///
+    /// Accepts the same layout produced by [`format_itunsmpb`]: optional
+    /// leading whitespace, then 4+ space-separated uppercase or lowercase
+    /// hexadecimal words. Only words 1, 2, and 3 are decoded
+    /// (`encoder_delay`, `padding_samples`, `valid_samples`); word 0 and
+    /// trailing words 4..11 are accepted and discarded so vendor-specific
+    /// zero-fill round-trips correctly.
+    ///
+    /// Returns `Err` on:
+    /// - fewer than 4 hex words
+    /// - any of words 0..3 failing hex parse
+    /// - word 1 (delay) or word 2 (padding) exceeding `u32::MAX`
+    /// - word 3 (valid_samples) exceeding `u64::MAX`
+    /// - any non-hex characters inside a word
+    ///
+    /// Whitespace tolerance: leading whitespace is trimmed (per the
+    /// iTunes-emitted leading-space convention), and any run of ASCII
+    /// whitespace is treated as a single field separator (multiple
+    /// spaces between words, tab-separated variants, and CR/LF-padded
+    /// strings from some MP4 chunk readers all parse equivalently).
+    ///
+    /// Used by ID3v2 `TXXX:iTunSMPB` readers and MP4 `meta/ilst` parsers
+    /// that need to recover gapless-playback metadata from an
+    /// iTunes-tagged AAC source for sample-accurate trimming downstream.
+    pub fn parse_itunsmpb(s: &str) -> std::result::Result<Self, GaplessParseError> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(GaplessParseError::TooFewFields { found: 0 });
+        }
+        // Split on any run of ASCII whitespace.
+        let words: Vec<&str> = trimmed.split_ascii_whitespace().collect();
+        if words.len() < 4 {
+            return Err(GaplessParseError::TooFewFields { found: words.len() });
+        }
+        // Word 0: 32-bit reserved/version; we accept any value but require
+        // it parses as hex so a malformed first field surfaces early
+        // rather than silently treating padding bytes as delay.
+        let _reserved = u32::from_str_radix(words[0], 16)
+            .map_err(|_| GaplessParseError::InvalidHex { field: 0 })?;
+        let encoder_delay = u32::from_str_radix(words[1], 16)
+            .map_err(|_| GaplessParseError::InvalidHex { field: 1 })?;
+        let padding_samples = u32::from_str_radix(words[2], 16)
+            .map_err(|_| GaplessParseError::InvalidHex { field: 2 })?;
+        let valid_samples = u64::from_str_radix(words[3], 16)
+            .map_err(|_| GaplessParseError::InvalidHex { field: 3 })?;
+        Ok(Self {
+            encoder_delay,
+            padding_samples,
+            valid_samples,
+        })
+    }
 }
+
+/// Errors returned by [`GaplessInfo::parse_itunsmpb`].
+///
+/// All variants are recoverable at the caller — a parse failure simply
+/// means "no gapless metadata present" and the caller should fall back
+/// to the no-trim default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GaplessParseError {
+    /// The iTunSMPB string did not contain at least 4 whitespace-separated
+    /// hex words. `found` is the actual count (0 for empty / whitespace-
+    /// only input).
+    TooFewFields { found: usize },
+    /// A whitespace-separated field at index `field` (0..=3) contained
+    /// non-hex characters or overflowed its u32 / u64 capacity.
+    InvalidHex { field: usize },
+}
+
+impl std::fmt::Display for GaplessParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFewFields { found } => write!(
+                f,
+                "iTunSMPB: too few fields, need >= 4 hex words (got {found})",
+            ),
+            Self::InvalidHex { field } => {
+                write!(f, "iTunSMPB: field {field} is not a valid hex word")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GaplessParseError {}
 
 #[cfg(test)]
 mod tests {
@@ -228,5 +313,144 @@ mod tests {
         assert!(s.contains("00000A40"), "{s}");
         assert!(s.contains("00000420"), "{s}"); // 1056 == 0x420
         assert!(s.contains("000000000000BB80"), "{s}"); // 48000 == 0xBB80
+    }
+
+    /// Round-trip an emitted iTunSMPB tag through the parser — the
+    /// triple must reconstruct exactly.
+    #[test]
+    fn itunsmpb_roundtrip_lc() {
+        let info = GaplessInfo::new(ENCODER_DELAY_AAC_LC, 420, 44_100);
+        let s = info.format_itunsmpb();
+        let parsed = GaplessInfo::parse_itunsmpb(&s).expect("emitted tag must parse");
+        assert_eq!(parsed, info);
+    }
+
+    /// Round-trip an HE-AAC iTunSMPB tag (priming = 2624) through the
+    /// parser — verifies the higher-rate delay value path.
+    #[test]
+    fn itunsmpb_roundtrip_he_aac() {
+        let info = GaplessInfo::new(ENCODER_DELAY_HE_AAC, 1056, 96_000);
+        let s = info.format_itunsmpb();
+        let parsed = GaplessInfo::parse_itunsmpb(&s).expect("emitted tag must parse");
+        assert_eq!(parsed, info);
+    }
+
+    /// Parse a real-world iTunSMPB shape (leading space + 12 hex words).
+    /// Verifies word 0 (reserved) is accepted at any value and tailing
+    /// vendor zero-fill words are tolerated.
+    #[test]
+    fn itunsmpb_parses_canonical_layout() {
+        // Same shape as `format_itunsmpb` emits.
+        let s = " 00000000 00000840 000001A4 000000000000AC44 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000";
+        let info = GaplessInfo::parse_itunsmpb(s).expect("canonical iTunes tag must parse");
+        assert_eq!(info.encoder_delay, 0x840); // 2112
+        assert_eq!(info.padding_samples, 0x1A4); // 420
+        assert_eq!(info.valid_samples, 0xAC44); // 44100
+    }
+
+    /// The parser tolerates words 4..11 being absent — only the first
+    /// four fields are mandatory.
+    #[test]
+    fn itunsmpb_parses_minimal_four_words() {
+        let s = "00000000 00000840 000001A4 000000000000AC44";
+        let info = GaplessInfo::parse_itunsmpb(s).expect("4-word minimum must parse");
+        assert_eq!(info.encoder_delay, 2112);
+        assert_eq!(info.padding_samples, 420);
+        assert_eq!(info.valid_samples, 44_100);
+    }
+
+    /// Lower-case hex digits parse — iTunes always emits upper-case but
+    /// some third-party taggers emit lower-case.
+    #[test]
+    fn itunsmpb_accepts_lowercase_hex() {
+        let s = " 00000000 00000840 000001a4 000000000000ac44";
+        let info = GaplessInfo::parse_itunsmpb(s).expect("lowercase hex must parse");
+        assert_eq!(info.encoder_delay, 2112);
+        assert_eq!(info.padding_samples, 420);
+        assert_eq!(info.valid_samples, 44_100);
+    }
+
+    /// Multi-space separators between words are tolerated (some MP4
+    /// chunk readers emit aligned padding spaces).
+    #[test]
+    fn itunsmpb_tolerates_multi_space_separators() {
+        let s = "00000000  00000840   000001A4 000000000000AC44";
+        let info = GaplessInfo::parse_itunsmpb(s).expect("multi-space must parse");
+        assert_eq!(info.encoder_delay, 2112);
+    }
+
+    /// Tab + newline whitespace between fields parses (CR/LF-padded
+    /// taggers).
+    #[test]
+    fn itunsmpb_tolerates_mixed_whitespace() {
+        let s = "\t00000000\t00000840\n000001A4 000000000000AC44";
+        let info = GaplessInfo::parse_itunsmpb(s).expect("mixed whitespace must parse");
+        assert_eq!(info.encoder_delay, 2112);
+        assert_eq!(info.valid_samples, 44_100);
+    }
+
+    /// Empty / whitespace-only string returns `TooFewFields { found: 0 }`.
+    #[test]
+    fn itunsmpb_rejects_empty_string() {
+        let err = GaplessInfo::parse_itunsmpb("").unwrap_err();
+        assert_eq!(err, GaplessParseError::TooFewFields { found: 0 });
+        let err2 = GaplessInfo::parse_itunsmpb("   \t  ").unwrap_err();
+        assert_eq!(err2, GaplessParseError::TooFewFields { found: 0 });
+    }
+
+    /// Fewer than 4 fields returns `TooFewFields` with the actual count.
+    #[test]
+    fn itunsmpb_rejects_too_few_fields() {
+        let err = GaplessInfo::parse_itunsmpb("00000000 00000840 000001A4").unwrap_err();
+        assert_eq!(err, GaplessParseError::TooFewFields { found: 3 });
+    }
+
+    /// Non-hex characters in any of the first 4 fields return the
+    /// matching `InvalidHex { field }` error.
+    #[test]
+    fn itunsmpb_rejects_non_hex_in_required_fields() {
+        // Word 0 invalid.
+        let e0 = GaplessInfo::parse_itunsmpb("XX 0 0 0").unwrap_err();
+        assert_eq!(e0, GaplessParseError::InvalidHex { field: 0 });
+        // Word 1 invalid.
+        let e1 = GaplessInfo::parse_itunsmpb("00000000 XYZ 0 0").unwrap_err();
+        assert_eq!(e1, GaplessParseError::InvalidHex { field: 1 });
+        // Word 2 invalid.
+        let e2 = GaplessInfo::parse_itunsmpb("00000000 0 ZZZZ 0").unwrap_err();
+        assert_eq!(e2, GaplessParseError::InvalidHex { field: 2 });
+        // Word 3 invalid (note: this also exercises the 64-bit path).
+        let e3 = GaplessInfo::parse_itunsmpb("00000000 0 0 NOTHEX").unwrap_err();
+        assert_eq!(e3, GaplessParseError::InvalidHex { field: 3 });
+    }
+
+    /// Overflow on word 1 (u32) returns `InvalidHex`.
+    #[test]
+    fn itunsmpb_rejects_u32_overflow_in_delay() {
+        // 17 hex digits = > 64 bits.
+        let s = "0 100000000 0 0"; // 0x100000000 == 2^32, overflows u32.
+        let err = GaplessInfo::parse_itunsmpb(s).unwrap_err();
+        assert_eq!(err, GaplessParseError::InvalidHex { field: 1 });
+    }
+
+    /// The reserved word 0 may take any value — readers must not reject
+    /// non-zero word 0.
+    #[test]
+    fn itunsmpb_accepts_nonzero_reserved_word() {
+        let s = "DEADBEEF 00000840 000001A4 000000000000AC44";
+        let info = GaplessInfo::parse_itunsmpb(s).expect("nonzero reserved must parse");
+        assert_eq!(info.encoder_delay, 2112);
+    }
+
+    /// `GaplessParseError` implements `Display` for user-facing messages.
+    #[test]
+    fn parse_error_display_messages() {
+        let e = GaplessParseError::TooFewFields { found: 2 };
+        let s = format!("{e}");
+        assert!(s.contains("too few fields"), "{s}");
+        assert!(s.contains("got 2"), "{s}");
+
+        let e2 = GaplessParseError::InvalidHex { field: 3 };
+        let s2 = format!("{e2}");
+        assert!(s2.contains("field 3"), "{s2}");
     }
 }
