@@ -115,8 +115,9 @@ impl GaplessInfo {
     ///
     /// Returns the canonical
     /// `frames_emitted * frame_len - encoder_delay - input_samples`
-    /// value, saturating at zero. This is the formulation used by both
-    /// the iTunes / Apple encoder and FFmpeg's libfdk_aac wrapper.
+    /// value, saturating at zero. This is the formulation observed in
+    /// the output of mainstream HE-AAC encoders (iTunes / Apple,
+    /// FFmpeg's HE-AAC pipeline) used as black-box validators.
     pub fn compute_padding(
         encoder_delay: u32,
         frames_emitted: u64,

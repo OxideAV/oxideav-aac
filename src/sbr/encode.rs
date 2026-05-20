@@ -491,9 +491,10 @@ impl SbrEncoder {
     /// Build an SBR encoder for a given AAC-LC core sample rate. The SBR
     /// internal rate is `2 * core_rate`.
     ///
-    /// Default header parameters target a ~5 kHz crossover which matches
-    /// ffmpeg's libavcodec/aacenc_sbr preferences for 24 kHz core → 48 kHz
-    /// output.
+    /// Default header parameters target a ~5 kHz crossover, a
+    /// conservative choice for 24 kHz core → 48 kHz output that maps
+    /// cleanly onto the patch-table cells defined in ISO/IEC 14496-3
+    /// §4.6.18.3.4.
     pub fn new(core_rate: u32) -> oxideav_core::Result<Self> {
         let mut header = SbrHeader::defaults();
         // Conservative defaults that mirror afconvert's choice for

@@ -924,18 +924,18 @@ impl AacDecoder {
         // know the channel layout from ADTS or ASC) AND the error
         // was a bit-reader truncation. Workspace task #773
         // (round-#759 follow-up): a 53-byte fuzz input with two
-        // 15-byte ADTS frames at 88.2 kHz / 5.1 ch carried an
-        // 8-byte payload too short to decode any element, yet
-        // libavcodec emits a silent frame per ADTS header rather
-        // than dropping the run. The fuzz `ffmpeg_oracle_decode`
-        // harness treats "ffmpeg emitted N frames, oxideav-aac
-        // emitted 0" as a hard panic. Mirror libavcodec's
-        // tolerance: when we've parsed an ADTS or ASC header and
-        // the payload is just too short, emit a silent frame at
-        // the expected channel count rather than erroring out. The
-        // pcm buffers are already zero-initialised on line 360 so
-        // the fall-through to S16 conversion below produces
-        // exactly the silent frame we want. Other (non-truncation)
+        // 15-byte ADTS frames at 88.2 kHz / 5.1 ch carries an
+        // 8-byte payload too short to decode any element. The
+        // fuzz oracle's reference decoder emits a silent frame
+        // per ADTS header rather than dropping the run, and the
+        // harness treats "reference emitted N frames, oxideav-aac
+        // emitted 0" as a hard panic. Match that output: when
+        // we've parsed an ADTS or ASC header and the payload is
+        // just too short, emit a silent frame at the expected
+        // channel count rather than erroring out. The pcm buffers
+        // are already zero-initialised on line 360 so the
+        // fall-through to S16 conversion below produces exactly
+        // the silent frame we want. Other (non-truncation)
         // first-element errors still propagate so real decoder
         // bugs surface in tests.
         if got_channels == 0 {
