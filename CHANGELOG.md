@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SBR upsample-only boundary path per ISO/IEC 14496-3 §4.6.18.5
+  (round-91, task #771).** `decode_sbr_upsample_only` runs the
+  32-channel analysis QMF followed directly by the 64-channel synthesis
+  QMF with the high band (`k = 32..63`) held at zero, exactly as the
+  spec prescribes for the case *"if the SBR tool is used for pure
+  upsampling without SBR processing"* (§4.6.18.5 bullet). The decoder
+  now invokes this path on every SBR-active frame whose
+  `raw_data_block()` carries no `EXT_SBR_DATA` / `EXT_SBR_DATA_CRC`
+  FIL extension — the canonical trailing-frame case, plus any
+  payload-missing SBR frame produced by an encoder that ran out of
+  bit-budget mid-stream. Replaces the pre-r91 zero-order-hold (ZOH)
+  doubler fallback that collapsed to nearest-neighbour aliasing on
+  the boundary frame and corrupted the synthesis QMF polyphase
+  history for the next full-SBR frame in the stream. Output sample
+  count stays exactly `2 * FRAME_LEN = 2048` per channel per the
+  §4.6.18.5 contract. Same plumbing in the SCE, CPE-decode-failed,
+  and per-channel no-payload fallback paths in `src/decoder.rs`.
+  Tests: 8 new unit tests in `src/sbr/decode.rs::boundary_tests`
+  (sample-count invariant, short-input / short-output rejection,
+  silence-in / silence-out at QMF tail, no-header-required path,
+  low-frequency tone energy preservation, frame counter advance,
+  `x_low_tail` carry-forward) + 2 new integration tests in
+  `tests/sbr_boundary_trim_r91.rs` (every-frame 2048-sample invariant
+  across a real HE-AAC encode-decode loop including the trailing
+  frame; trailing-frame output is not bit-identical to ZOH doubling
+  of the AAC-LC core, proving the QMF path engaged).
+
 - **Gapless: iTunSMPB tag parser (round-73).** `GaplessInfo::parse_itunsmpb`
   takes the canonical Apple iTunes-style ASCII tag string (the same shape
   `GaplessInfo::format_itunsmpb` emits) and reconstructs the

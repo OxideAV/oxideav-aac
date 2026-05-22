@@ -75,7 +75,7 @@ read it instead of looking for an ADTS sync word on the first packet.
 | PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
 | Gain control / SSR / Main / LTP        | Refused (`Error::Unsupported`)          |
 | CCE elements                           | Refused (`Error::Unsupported`)          |
-| HE-AAC v1 (SBR) decode (mono + CPE)    | Yes (independent + coupled CPE)         |
+| HE-AAC v1 (SBR) decode (mono + CPE)    | Yes (independent + coupled CPE); §4.6.18.5 upsample-only QMF path engaged on payload-missing frames (trailing-frame / boundary case, round-91 task #771) so output stays at `2 * FRAME_LEN = 2048` samples per channel and the synthesis QMF polyphase history stays seamless across an SBR-with-FIL → SBR-without-FIL → SBR-with-FIL transition |
 | HE-AAC v2 (PS) decode                  | Yes (QMF-domain upmix incl. IPD/OPD)    |
 
 The decoder advertises `max_channels = 8` and `max_sample_rate = 96_000` in

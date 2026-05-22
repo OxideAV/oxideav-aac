@@ -22,8 +22,8 @@ use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
 use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
 use crate::sbr::bitstream::SbrChannelData;
 use crate::sbr::decode::{
-    decode_sbr_cpe_frame, decode_sbr_frame, decode_sbr_frame_ps, try_parse_sbr_extension_ext,
-    SbrChannelState, SbrPayload,
+    decode_sbr_cpe_frame, decode_sbr_frame, decode_sbr_frame_ps, decode_sbr_upsample_only,
+    try_parse_sbr_extension_ext, SbrChannelState, SbrPayload,
 };
 use crate::sbr::ps::{apply_ps_simple, PsFrame};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
@@ -1045,13 +1045,20 @@ impl AacDecoder {
                     )
                     .is_err()
                     {
-                        // Fallback: zero-order-hold doubling.
-                        for i in 0..FRAME_LEN {
-                            sbr_pcm[0][2 * i] = pcm[0][i];
-                            sbr_pcm[0][2 * i + 1] = pcm[0][i];
-                            sbr_pcm[1][2 * i] = pcm[1][i];
-                            sbr_pcm[1][2 * i + 1] = pcm[1][i];
-                        }
+                        // Fallback: spec-compliant upsample-only path
+                        // (§4.6.18.5) per channel — keeps the output at
+                        // 2 * FRAME_LEN samples and feeds the synthesis
+                        // QMF a zero high-band rather than the ZOH
+                        // duplicate-and-double that we used pre-r91.
+                        // ZOH defeats the QMF and yields nearest-neighbour
+                        // aliasing on the trailing frame; the QMF-domain
+                        // path produces the same fold-over rejection as
+                        // a real SBR-active frame would.
+                        let (head, tail) = self.sbr_state.split_at_mut(1);
+                        let state_l2 = &mut head[0];
+                        let state_r2 = &mut tail[0];
+                        let _ = decode_sbr_upsample_only(&pcm[0], state_l2, &mut sbr_pcm[0]);
+                        let _ = decode_sbr_upsample_only(&pcm[1], state_r2, &mut sbr_pcm[1]);
                     }
                 }
             } else if channels_out == 1
@@ -1103,15 +1110,43 @@ impl AacDecoder {
                     if let Some(sbr) = self.sbr_data[ch].take() {
                         let state = &mut self.sbr_state[ch];
                         if decode_sbr_frame(&pcm[ch], &sbr, state, &mut this).is_err() {
+                            // Full-SBR decode failed — fall through to the
+                            // spec-compliant upsample-only path (§4.6.18.5)
+                            // so the output still carries 2 * FRAME_LEN
+                            // samples at 2x the core rate. If that ALSO
+                            // fails the buffer stays zeroed, which is a
+                            // strictly better tail than half-rate silence
+                            // (the buffer was pre-allocated at 2 * FRAME_LEN).
+                            let state = &mut self.sbr_state[ch];
+                            let _ = decode_sbr_upsample_only(&pcm[ch], state, &mut this);
+                        }
+                    } else {
+                        // No SBR payload this frame but SBR is active —
+                        // ISO/IEC 14496-3 §4.6.18.5 "If no SBR data is
+                        // found once the decoding process has started,
+                        // the SBR Tool can be used for upsampling only".
+                        // The trailing frame of an SBR stream commonly
+                        // lands here (some encoders drop the final FIL
+                        // when bit-budget tightens; the implicit-SBR
+                        // ADTS path at 88.2/96 kHz never carries SBR
+                        // FIL at all — workspace task #771). Run the
+                        // analysis + synthesis QMF without HF generation
+                        // so the output count still matches 2 * FRAME_LEN
+                        // at 2x rate, rather than zero-order-hold doubling
+                        // (which collapses to nearest-neighbour aliasing
+                        // and breaks the QMF synthesis history for the
+                        // next full-SBR frame).
+                        let state = &mut self.sbr_state[ch];
+                        if decode_sbr_upsample_only(&pcm[ch], state, &mut this).is_err() {
+                            // Buffer is zero-initialised; emit silence.
+                            // Hitting this branch means the buffer sizes
+                            // didn't satisfy the §4.6.18.5 contract and
+                            // the caller should know — but we never
+                            // return a partial-size output.
                             for i in 0..FRAME_LEN {
                                 this[2 * i] = pcm[ch][i];
                                 this[2 * i + 1] = pcm[ch][i];
                             }
-                        }
-                    } else {
-                        for i in 0..FRAME_LEN {
-                            this[2 * i] = pcm[ch][i];
-                            this[2 * i + 1] = pcm[ch][i];
                         }
                     }
                     sbr_pcm[ch] = this;

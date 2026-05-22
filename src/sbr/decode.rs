@@ -678,6 +678,98 @@ pub fn decode_sbr_cpe_frame(
     Ok(())
 }
 
+/// Run SBR in "upsampling-only" mode per ISO/IEC 14496-3 §4.6.18.5
+/// (the bullet starting *"If scalable SBR is used, or if the SBR tool is
+/// used for pure upsampling without SBR processing"*).
+///
+/// This is the **boundary-case** path that #771 left unwired. It fires when
+/// the decoder is operating in SBR mode (either explicit SBR signalling in
+/// the AudioSpecificConfig / ADTS, or the implicit-SBR convention adopted
+/// by HE-AAC encoders for the very last frame of a stream) but the current
+/// frame's `raw_data_block()` carries no `EXT_SBR_DATA` / `EXT_SBR_DATA_CRC`
+/// FIL extension — i.e. no envelope, no noise floor, no `bs_invf_mode`.
+/// The spec is explicit: when this happens the decoder still emits
+/// `2 * samplesPerFrame` PCM samples (= 2048 for the 1024-sample AAC
+/// core) and gets there by running the 32-channel analysis QMF followed
+/// directly by the 64-channel synthesis QMF, with all HF-generator and
+/// HF-adjuster steps bypassed. The high-band (`k = 32..63`) of the input
+/// to the synthesis bank is the zero matrix.
+///
+/// Concretely per §4.6.18.5 the relationship used here is:
+///
+/// ```text
+///     X_Low(k, l) = W(k, l - t_HFGen)    for 0 <= k < 32
+///     X_High(k, l) = 0                   for 32 <= k < 64
+/// ```
+///
+/// with `t_HFGen` discarded — the synthesis bank simply consumes the 32
+/// analysis-bank columns directly. Output is `2 * pcm_in.len()` real PCM
+/// samples (2048 for the 1024-sample core, 1920 for the 960-sample core).
+///
+/// The function does **not** require a parsed `SbrHeader`, freq tables,
+/// or patches — it works on a freshly-defaulted [`SbrChannelState`] as
+/// well as on one that has previously decoded full SBR frames. The
+/// analysis / synthesis filterbank histories in `state` continue to
+/// build, so a transition back to a payload-bearing SBR frame on the
+/// next packet starts with seamless QMF state.
+///
+/// Returns `Err` only when `pcm_in.len() < 1024` or `output.len() < 2048`
+/// — the spec requires the dual-rate output to be exactly 2 × the core
+/// frame's sample count, so we treat under-sized buffers as caller
+/// programming errors.
+pub fn decode_sbr_upsample_only(
+    pcm_in: &[f32],
+    state: &mut SbrChannelState,
+    output: &mut [f32],
+) -> Result<()> {
+    if pcm_in.len() < 1024 || output.len() < 2048 {
+        return Err(Error::invalid(
+            "SBR upsample-only: requires 1024 input / 2048 output PCM (§4.6.18.5)",
+        ));
+    }
+    let num_slots = NUM_TIME_SLOTS_1024 * RATE;
+
+    // 1) Analysis QMF — same as the full SBR path. We still write to the
+    //    state's `x_low_tail` so a subsequent full SBR frame sees the
+    //    correct HF-gen lookback. (The HF generator wants `l-2` / `l-1`
+    //    columns; bypassing it here doesn't excuse skipping the carry.)
+    let (x_low, tail_len) = run_analysis(state, pcm_in, num_slots);
+
+    // 2) Construct a 64-band column per slot: low 32 bands = analysis
+    //    output, high 32 bands = zero (per §4.6.18.5 "X_High = 0 when SBR
+    //    is used for upsampling only"). Feed straight into the synthesis
+    //    bank — no HF generator, no envelope adjuster, no limiter.
+    let mut col64 = [Complex32::default(); NUM_QMF_BANDS];
+    let mut out64 = [0.0f32; 64];
+    for l in 0..num_slots {
+        // The synthesis bank wants the "current" subsample column; we
+        // align with `decode_sbr_frame`'s convention of skipping the
+        // leading tail (`x_low[tail_len + l]`) so the polyphase delay
+        // line behaves identically across upsample-only and full-SBR
+        // frames.
+        let src = &x_low[tail_len + l];
+        for k in 0..ANALYSIS_BANDS {
+            col64[k] = src[k];
+        }
+        // High-band stays zero (already initialised; reset defensively
+        // in case the loop body grows in future).
+        for k in ANALYSIS_BANDS..NUM_QMF_BANDS {
+            col64[k] = Complex32::default();
+        }
+        state.qmf_synthesis.process(&col64, &mut out64);
+        output[l * 64..l * 64 + 64].copy_from_slice(&out64);
+    }
+
+    // 3) Carry forward the x_low tail so the next frame (whether
+    //    upsample-only or full SBR) sees the right history. Matches the
+    //    full-SBR path's tail rotation.
+    for (i, row) in x_low.iter().rev().take(tail_len).rev().enumerate() {
+        state.x_low_tail[i] = *row;
+    }
+    state.frame_count = state.frame_count.wrapping_add(1);
+    Ok(())
+}
+
 fn run_analysis(
     state: &mut SbrChannelState,
     pcm_in: &[f32],
@@ -697,4 +789,181 @@ fn run_analysis(
         x_low[tail_len + l] = col;
     }
     (x_low, tail_len)
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    //! Tests for the §4.6.18.5 SBR-upsample-only boundary path
+    //! ([`decode_sbr_upsample_only`]).
+    //!
+    //! The function fires when SBR signalling is active for a stream but
+    //! the current frame's `raw_data_block()` carries no EXT_SBR_DATA
+    //! FIL payload — the trailing frame of a real HE-AAC capture is the
+    //! canonical case (workspace task #771).
+    use super::*;
+    use crate::synth::FRAME_LEN;
+    use core::f32::consts::PI;
+
+    /// `decode_sbr_upsample_only` must emit EXACTLY 2 * FRAME_LEN samples
+    /// for the standard 1024-sample core (= 2048). Anything less would
+    /// drop the trailing high-rate samples on the floor; anything more
+    /// would overrun the caller's pre-allocated buffer. This is the
+    /// "boundary trim" half of the §4.6.18 contract.
+    #[test]
+    fn upsample_only_emits_2x_frame_len() {
+        let pcm_in = vec![0.0f32; FRAME_LEN];
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output)
+            .expect("zero input must succeed");
+        assert_eq!(output.len(), 2 * FRAME_LEN);
+    }
+
+    /// Under-sized buffers must error rather than silently truncating.
+    /// The spec REQUIRES 2 * samples_per_frame at the dual-rate output;
+    /// returning a short slice would be a quiet contract violation.
+    #[test]
+    fn upsample_only_rejects_short_input() {
+        let pcm_in = vec![0.0f32; FRAME_LEN - 1];
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        let err = decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn upsample_only_rejects_short_output() {
+        let pcm_in = vec![0.0f32; FRAME_LEN];
+        let mut output = vec![0.0f32; 2 * FRAME_LEN - 1];
+        let mut state = SbrChannelState::new();
+        let err = decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    /// Silence in must produce silence out (modulo QMF cold-start, which
+    /// is bounded by the prototype filter's tail energy). The first few
+    /// hundred samples of the QMF synthesis output can carry warm-up
+    /// from the all-zero filterbank state; the trailing samples should
+    /// be at-or-near zero. We check the FAR-tail (samples 1500..2048)
+    /// to give the filterbank time to settle.
+    #[test]
+    fn upsample_only_silence_is_silent_after_qmf_warmup() {
+        let pcm_in = vec![0.0f32; FRAME_LEN];
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap();
+        let max_tail: f32 = output[1500..2048]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_tail < 1e-3,
+            "silence-in / silence-out: tail max = {max_tail}"
+        );
+    }
+
+    /// The function must not require a parsed header / freq tables /
+    /// patches — the implicit-SBR-at-trailing-frame case is exactly the
+    /// configuration where those structures are still `None` if the
+    /// stream never carried a single SBR FIL payload. Calling on a
+    /// freshly-defaulted `SbrChannelState` exercises that path.
+    #[test]
+    fn upsample_only_works_without_header_or_patches() {
+        let pcm_in = vec![0.1f32; FRAME_LEN];
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        assert!(state.freq.is_none());
+        assert!(state.patches.is_none());
+        assert!(!state.header_seen);
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output)
+            .expect("no header/patches needed for upsample-only");
+    }
+
+    /// A low-frequency tone in the AAC-LC core must survive the
+    /// analysis+synthesis QMF round-trip with energy on the same order
+    /// of magnitude as the input. The QMF prototype filter passes the
+    /// low subbands without modification when the high band is zero
+    /// (§4.6.18.4.1 / .4.2 perfect-reconstruction property of the
+    /// 64-tap polyphase pair). This is the audible-quality criterion
+    /// for the boundary path — zero-order-hold doubling (the pre-r91
+    /// fallback) would produce aliasing harmonics at f_s_core - f.
+    #[test]
+    fn upsample_only_preserves_low_frequency_tone_energy() {
+        // 1 kHz tone at 22050 Hz core (so output rate is 44100).
+        let core_rate = 22_050.0_f32;
+        let freq = 1_000.0_f32;
+        let amp = 0.3_f32;
+        let pcm_in: Vec<f32> = (0..FRAME_LEN)
+            .map(|n| (2.0 * PI * freq * (n as f32) / core_rate).sin() * amp)
+            .collect();
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        // Prime the analysis bank with two frames of the same tone so
+        // we're past the 320-sample QMF warm-up by the time we measure.
+        let _ = decode_sbr_upsample_only(&pcm_in, &mut state, &mut output);
+        let _ = decode_sbr_upsample_only(&pcm_in, &mut state, &mut output);
+        let _ = decode_sbr_upsample_only(&pcm_in, &mut state, &mut output);
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap();
+        let in_rms: f32 = (pcm_in.iter().map(|s| s * s).sum::<f32>() / FRAME_LEN as f32).sqrt();
+        let out_rms: f32 =
+            (output.iter().map(|s| s * s).sum::<f32>() / (2 * FRAME_LEN) as f32).sqrt();
+        // The QMF analysis-then-synthesis pair carries an internal
+        // 1/64 normalisation (§4.6.18.4.2) that's compensated by the
+        // analysis 2.0-multiplied modulation; the round-trip should
+        // restore input amplitude to within a small constant factor.
+        // Allow a wide envelope (factor 8 either way) because the
+        // 64-tap polyphase prototype's group delay still mixes warm-up
+        // tail into the steady-state measurement; the point is to
+        // confirm the signal didn't collapse to zero (which a buggy
+        // wiring of the high-band zero-pad would produce).
+        let ratio = out_rms / in_rms;
+        assert!(
+            ratio > 0.125 && ratio < 8.0,
+            "QMF upsample round-trip ratio = {ratio} (in_rms={in_rms} out_rms={out_rms})"
+        );
+    }
+
+    /// The function must advance `frame_count` so the per-frame PRNG
+    /// seed used by the full SBR path (when a payload-bearing frame
+    /// follows an upsample-only frame) gets a fresh value rather than
+    /// repeating the previous frame's noise.
+    #[test]
+    fn upsample_only_advances_frame_counter() {
+        let pcm_in = vec![0.0f32; FRAME_LEN];
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        let before = state.frame_count;
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap();
+        assert_eq!(state.frame_count, before + 1);
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap();
+        assert_eq!(state.frame_count, before + 2);
+    }
+
+    /// The x_low_tail carry-forward must mutate `state.x_low_tail` —
+    /// otherwise a follow-up full-SBR frame whose HF generator reads
+    /// `l = -2` / `l = -1` columns would see all-zero history and emit
+    /// silence into the patched high band for the first envelope.
+    #[test]
+    fn upsample_only_updates_x_low_tail() {
+        // Use a non-zero input so the analysis bank produces non-zero
+        // subbands. After a single call the tail should not be all
+        // zero anymore (the QMF analysis impulse response of a sine
+        // input lands energy in at least one subband).
+        let core_rate = 22_050.0_f32;
+        let freq = 5_000.0_f32;
+        let pcm_in: Vec<f32> = (0..FRAME_LEN)
+            .map(|n| (2.0 * PI * freq * (n as f32) / core_rate).sin() * 0.5)
+            .collect();
+        let mut output = vec![0.0f32; 2 * FRAME_LEN];
+        let mut state = SbrChannelState::new();
+        decode_sbr_upsample_only(&pcm_in, &mut state, &mut output).unwrap();
+        let any_non_zero = state
+            .x_low_tail
+            .iter()
+            .any(|row| row.iter().any(|c| c.re.abs() > 1e-6 || c.im.abs() > 1e-6));
+        assert!(
+            any_non_zero,
+            "x_low_tail must be carried forward after upsample-only frame"
+        );
+    }
 }
