@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AAC-LD (objectType 23, AOT_ER_AAC_LD) frame decode bootstrap
+  (round-95).** The decoder now recognises AOT 23 in the
+  `AudioSpecificConfig` and dispatches to a new
+  `decode_packet_ld` path that walks `er_raw_data_block()` per
+  ISO/IEC 14496-3 §4.4.2.3 Table 4.19 (single_channel_element() for
+  channelConfiguration 1, channel_pair_element() for 2). The
+  element bodies use the existing AAC-LC ICS infrastructure
+  (section_data / scalefactors / pulse / TNS / spectrum-Huffman) but
+  feed the LD-specific scalefactor-band table
+  (`ld_eld::SWB_LD_512` / `SWB_LD_480`) and the 512/480-sample LD
+  IMDCT + sine-windowed overlap-add filterbank
+  (`ld_eld::imdct_and_overlap_ld`). Restricted in this round to
+  channel configurations 1 and 2; configs 3..=7 (multichannel LD,
+  spec-permitted) error up-front so callers see the limitation rather
+  than a corrupted decode. The §4.6.17.2.3 low-overlap window
+  (`window_shape == 1`) is consumed by `parse_ics_info_ld` but
+  treated as sine for the OLA pass — proper low-overlap windowing is
+  a round-N+1 task. LTP (`predictor_data_present == 1`) is
+  surfaced as `Unsupported` rather than silently corrupting the
+  cursor. SBR-on-LD (LD-SBR) is rejected — that combination is
+  AAC-ELD territory (AOT 39), not part of AOT 23. New
+  `decode_ics_ld` helper mirrors `decode_ics` for the LD ICS
+  side-info layout; new `decode_spectrum_long_with_swb` accepts an
+  explicit SWB offset table + spectrum length so the LC long-spectrum
+  decoder is reused without duplication. Tests
+  (`tests/ld_decode_round_trip.rs`, 7 new cases): AOT 23 mono /
+  stereo / CPE common_window 512-sample silence frames at 44.1 kHz;
+  AOT 23 mono 480-sample silence frame at 48 kHz; two consecutive
+  zero-spec frames through the LD overlap-add state; unsupported
+  channel-configuration rejection; AOT constant cross-check.
+
 - **SBR upsample-only boundary path per ISO/IEC 14496-3 §4.6.18.5
   (round-91, task #771).** `decode_sbr_upsample_only` runs the
   32-channel analysis QMF followed directly by the 64-channel synthesis

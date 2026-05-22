@@ -48,6 +48,60 @@ impl IcsInfo {
     }
 }
 
+/// LD-specific variant of [`parse_ics_info`] — ISO/IEC 14496-3 §4.6.17.
+///
+/// AAC-LD always uses long blocks (no `EIGHT_SHORT_SEQUENCE`), uses the
+/// LD SWB table at the given frame length, and replaces the
+/// AAC-Main / LTP `predictor_data` block with the LD-specific LTP-lag
+/// stream. We don't decode LTP in round 95 — if the
+/// `predictor_data_present` bit is set we surface an `Unsupported`
+/// error rather than corrupting the cursor.
+///
+/// `swb_offsets` is the LD-specific scalefactor-band offset table for the
+/// (sf_index, frame_length) pair (see `ld_eld::swb_ld_for`). The
+/// resulting `IcsInfo::max_sfb` is clamped to fit inside the table.
+pub fn parse_ics_info_ld(
+    br: &mut BitReader<'_>,
+    sf_index: u8,
+    swb_offsets: &[u16],
+) -> Result<IcsInfo> {
+    let _ics_reserved_bit = br.read_bit()?;
+    let window_sequence = WindowSequence::from_u32(br.read_u32(2)?);
+    let window_shape = WindowShape::from_bit(br.read_u32(1)?);
+    // §4.6.17.2.2: block switching is disabled in the low-delay codec.
+    // Only `OnlyLong` is conformant. A non-zero window_sequence in an
+    // LD bitstream is malformed; reject up-front so we never try to
+    // decode 8 short windows through the 512-sample LD filterbank.
+    if !matches!(window_sequence, WindowSequence::OnlyLong) {
+        return Err(Error::invalid(
+            "AAC-LD: ics_info.window_sequence must be OnlyLong (§4.6.17.2.2)",
+        ));
+    }
+    let max_sfb_raw = br.read_u32(6)? as u8;
+    let predictor_data_present = br.read_bit()?;
+    if predictor_data_present {
+        // LD's `predictor_data_present` carries LTP side info (Table
+        // 4.171 follow-up); we don't implement LTP decode this round.
+        return Err(Error::unsupported(
+            "AAC-LD: LTP / predictor_data not yet implemented (objectType 23)",
+        ));
+    }
+    let num_swb = swb_offsets.len().saturating_sub(1);
+    let max_sfb = (max_sfb_raw as usize).min(num_swb) as u8;
+    let mut info = IcsInfo {
+        window_sequence,
+        window_shape,
+        sf_index,
+        max_sfb,
+        predictor_data_present,
+        num_window_groups: 1,
+        window_group_length: [1u8, 0, 0, 0, 0, 0, 0, 0],
+        ..Default::default()
+    };
+    info.window_group_length[0] = 1;
+    Ok(info)
+}
+
 pub fn parse_ics_info(br: &mut BitReader<'_>, sf_index: u8) -> Result<IcsInfo> {
     let _ics_reserved_bit = br.read_bit()?;
     let window_sequence = WindowSequence::from_u32(br.read_u32(2)?);
@@ -272,7 +326,34 @@ pub fn decode_spectrum_long(
     coef: &mut [f32; SPEC_LEN],
 ) -> Result<()> {
     let swb_offsets = SWB_LONG[info.sf_index as usize];
+    decode_spectrum_long_with_swb(br, info, sec, sf, swb_offsets, coef, SPEC_LEN)
+}
+
+/// Generalised long-spectrum decoder: same algorithm as
+/// [`decode_spectrum_long`], but with an explicit SWB offset table and
+/// explicit total spectrum length. Used by AAC-LD (objectType 23) where
+/// the spectrum is 512 (or 480) coefficients long with its own
+/// scalefactor-band layout (§4.5.4 Tables 4.137-4.156).
+///
+/// `coef` is a fixed-size 1024-coefficient buffer; the LD path zero-fills
+/// the unused tail so the rest of the decoder pipeline (TNS / PNS / IS /
+/// IMDCT) sees a consistent layout. The IMDCT helper only reads the first
+/// `spec_len` slots.
+pub fn decode_spectrum_long_with_swb(
+    br: &mut BitReader<'_>,
+    info: &IcsInfo,
+    sec: &SectionData,
+    sf: &[i32],
+    swb_offsets: &[u16],
+    coef: &mut [f32; SPEC_LEN],
+    spec_len: usize,
+) -> Result<()> {
     let max_sfb = info.max_sfb as usize;
+    if max_sfb >= swb_offsets.len() {
+        return Err(Error::invalid(
+            "AAC: max_sfb exceeds SWB table length (LD/LC spectrum decode)",
+        ));
+    }
     for sfb in 0..max_sfb {
         let cb = sec.sfb_cb[sfb];
         let start = swb_offsets[sfb] as usize;
@@ -306,9 +387,13 @@ pub fn decode_spectrum_long(
             s += dim;
         }
     }
-    // Fill any unused trailing bands with zero.
+    // Fill any unused trailing bands with zero (within the spectrum
+    // range) plus zero the unused tail past `spec_len`.
     let last = swb_offsets[max_sfb] as usize;
-    for s in last..SPEC_LEN {
+    for s in last..spec_len.min(SPEC_LEN) {
+        coef[s] = 0.0;
+    }
+    for s in spec_len.min(SPEC_LEN)..SPEC_LEN {
         coef[s] = 0.0;
     }
     Ok(())

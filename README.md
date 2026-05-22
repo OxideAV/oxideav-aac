@@ -54,7 +54,7 @@ read it instead of looking for an ADTS sync word on the first packet.
 
 | Feature                                | Status                                  |
 |----------------------------------------|-----------------------------------------|
-| Object types                           | AAC-LC (`AOT 2`) decode + encode; AAC-LD (`AOT 23`) / AAC-ELD (`AOT 39`) ASC parse only (frame decode deferred) |
+| Object types                           | AAC-LC (`AOT 2`) decode + encode; AAC-LD (`AOT 23`) decode of `er_raw_data_block()` for channelConfiguration 1 (mono) and 2 (stereo, common-window or independent ICS) at 512- and 480-sample frame lengths (LTP + multichannel LD + low-overlap window pending); AAC-ELD (`AOT 39`) ASC parse only |
 | Containers                             | ADTS (with or without CRC) and raw + ASC|
 | Channel configurations                 | 1..=7 (mono, stereo, 3.0, 4.0, 5.0, 5.1, 7.1) |
 | Sample rates                           | All 13 standard SF indices (96k - 7350) |
@@ -69,7 +69,8 @@ read it instead of looking for an ADTS sync word on the first packet.
 | Pulse data (§4.6.5)                    | Yes (long-window only); short-window rejects as non-conformant |
 | Fill / DSE elements                    | Skipped cleanly; FIL `count==15, esc_count==0` off-by-one fixed (v0.1.1) |
 | LD/ELD AudioSpecificConfig             | `asc.ld_config` / `asc.eld_config` populated for AOT 23/39; `SWB_LD_512` / `SWB_LD_480` tables in `ld_eld` module |
-| LD/ELD filterbank kernels              | 480- and 512-sample MDCT/IMDCT (`crate::mdct::mdct_ld_512` / `crate::imdct::imdct_ld_480`) + sine half-windows (`crate::window::sine_ld_512` / `sine_ld_480`) + `crate::ld_eld::imdct_and_overlap_ld` overlap-add filterbank with `LdChannelState`. Two-frame TDAC round-trip <5e-3 max err on sine input at both frame sizes. ER raw_data_block decoder pending. |
+| LD/ELD filterbank kernels              | 480- and 512-sample MDCT/IMDCT (`crate::mdct::mdct_ld_512` / `crate::imdct::imdct_ld_480`) + sine half-windows (`crate::window::sine_ld_512` / `sine_ld_480`) + `crate::ld_eld::imdct_and_overlap_ld` overlap-add filterbank with `LdChannelState`. Two-frame TDAC round-trip <5e-3 max err on sine input at both frame sizes. |
+| LD `er_raw_data_block()` decode        | Round-95 bootstrap: AOT 23 (`AOT_ER_AAC_LD`) recognised in the ASC and dispatched to `decode_packet_ld` per §4.4.2.3 Table 4.19; SCE (channelConfiguration 1) and CPE (channelConfiguration 2, common-window or independent-ICS) elements decoded through `decode_ics_ld` + `decode_spectrum_long_with_swb` (LD-aware spectrum decoder reading `ld_eld::SWB_LD_512` / `SWB_LD_480`) + per-channel `imdct_and_overlap_ld`. PNS / IS / M/S / TNS apply on the LD spectrum the same way as the LC long path (codebook semantics are identical; §4.6.17 only changes the SWB layout and IMDCT size). Multichannel LD (channelConfiguration 3..=7), LTP (predictor_data), low-overlap window shape, and LD-SBR are deferred. |
 | USAC / xHE-AAC AudioSpecificConfig     | `asc.usac_config` populated for AOT 42; `crate::usac::parse_usac_config` captures sample rate (incl. 24-bit explicit escape), `coreSbrFrameLengthIndex`, `channelConfigurationIndex`, and the first `usacElementType` (SCE/CPE/LFE/Ext, ISO/IEC 23003-3 Table 9). Frame decode pending. |
 | LFE element (§4.6.10)                  | Yes (long-window SCE-like path)         |
 | PCE (Program Config Element)           | Parsed (channel mapping reserved for future use) |
