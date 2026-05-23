@@ -1,10 +1,10 @@
 //! ADTS `number_of_raw_data_blocks_in_frame > 0` (multi-RDB) decode.
 //!
 //! ISO/IEC 13818-7 §6.2, Table 5: an `adts_frame()` may multiplex up to
-//! four `raw_data_block()`s. The common case (and the only one FFmpeg's
-//! native encoder and libfdk_aac emit) is a single block, but the
-//! bitstream legitimately allows 2..4 (e.g. "VLB " audio in NSV, some
-//! DTV multiplexers). These tests synthesise multi-RDB frames by wrapping
+//! four `raw_data_block()`s. The common case (and the only one most
+//! encoders emit) is a single block, but the bitstream legitimately
+//! allows 2..4 (e.g. "VLB " audio in NSV, some DTV multiplexers). These
+//! tests synthesise multi-RDB frames by wrapping
 //! several of our own encoder's single-RDB payloads and confirm the
 //! decoder drains one `Frame::Audio` per block, byte-identical to decoding
 //! the single-RDB frames individually.
