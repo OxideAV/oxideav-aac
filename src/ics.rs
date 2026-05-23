@@ -112,6 +112,115 @@ pub fn parse_ltp_data_ld(
     })
 }
 
+/// Maximum number of scalefactor bands over which long-term prediction can
+/// be signalled in a non-LD long window — ISO/IEC 14496-3 §4.6.7.3. The
+/// `ltp_long_used[]` flags are read for `min(max_sfb, MAX_LTP_LONG_SFB)`
+/// bands; bands beyond this index are never predicted regardless of
+/// `max_sfb` (they hold no `ltp_long_used` bit in the bitstream).
+pub const MAX_LTP_LONG_SFB: usize = 40;
+
+/// Parsed `ltp_data()` for the non-LD audio object types (AAC-LTP /
+/// AOT 4, and the AAC-Scalable / ER variants that share the same syntax) —
+/// ISO/IEC 14496-3 §4.6.7 / Table 4.49 (the `else` branch, i.e.
+/// `AudioObjectType != ER AAC LD`).
+///
+/// Unlike the LD branch (see [`LtpData`]) the lag is an 11-bit value
+/// (range 0..2047) transmitted unconditionally — there is no
+/// `ltp_lag_update` previous-frame reuse. For long windows the per-sfb
+/// `long_used` flags select which bands receive the predicted spectrum;
+/// for short windows the per-window `short_used` / `short_lag` fields
+/// drive the per-subframe predictor instead (§4.6.7.3 short-window path).
+#[derive(Clone, Debug, Default)]
+pub struct LtpDataNonLd {
+    /// 11-bit long-term-prediction lag in samples (0..2047). For short
+    /// windows the effective per-window lag is `lag + short_lag[w]`.
+    pub lag: u16,
+    /// Predictor gain from [`LTP_COEF`] (the resolved `ltp_coef` table
+    /// value). The same coefficient applies to all short windows in the
+    /// frame (§4.6.7.2).
+    pub coef: f32,
+    /// `ltp_long_used[sfb]` — one flag per coded scalefactor band, read
+    /// for `min(max_sfb, MAX_LTP_LONG_SFB)` bands on long windows. Empty
+    /// when the frame uses short windows.
+    pub long_used: Vec<bool>,
+    /// `ltp_short_used[w]` — one flag per window on short blocks. Empty on
+    /// long windows.
+    pub short_used: Vec<bool>,
+    /// Per-window relative lag offset (`ltp_short_lag[w]`, range −8..7) for
+    /// short blocks; 0 where `ltp_short_lag_present[w] == 0` or
+    /// `ltp_short_used[w] == 0`. Empty on long windows. The effective
+    /// per-window read offset is `lag + short_lag[w]` (§4.6.7.3).
+    pub short_lag: Vec<i8>,
+}
+
+/// Parse the non-LD variant of `ltp_data()` (ISO/IEC 14496-3 §4.6.7,
+/// Table 4.49, `AudioObjectType != ER AAC LD` branch):
+///
+/// ```text
+/// ltp_lag                                       11  uimsbf
+/// ltp_coef                                      3   uimsbf
+/// if (window_sequence == EIGHT_SHORT_SEQUENCE) {
+///     for (w = 0; w < num_windows; w++) {
+///         ltp_short_used[w]                     1   uimsbf
+///         if (ltp_short_used[w]) {
+///             ltp_short_lag_present[w]          1   uimsbf
+///             if (ltp_short_lag_present[w])
+///                 ltp_short_lag[w]              4   uimsbf
+///         }
+///     }
+/// } else {
+///     for (sfb = 0; sfb < max_sfb; sfb++)
+///         ltp_long_used[sfb]                    1   uimsbf
+/// }
+/// ```
+///
+/// `ltp_short_lag[w]` is a 4-bit field decoded as a signed relative delay
+/// from −8 to 7 (§4.6.7.2: *"relative delay … from −8 to 7"*), i.e.
+/// `short_lag = ltp_short_lag - 8`. `is_short` selects the short-window
+/// path and `num_windows` is the per-group window count (8 for an
+/// EIGHT_SHORT block). `max_sfb` bounds the long-window flag count and is
+/// additionally clamped to [`MAX_LTP_LONG_SFB`] per §4.6.7.3.
+pub fn parse_ltp_data(
+    br: &mut BitReader<'_>,
+    is_short: bool,
+    num_windows: usize,
+    max_sfb: usize,
+) -> Result<LtpDataNonLd> {
+    let lag = br.read_u32(11)? as u16;
+    let coef_idx = br.read_u32(3)? as usize;
+    let coef = LTP_COEF[coef_idx];
+    let mut long_used = Vec::new();
+    let mut short_used = Vec::new();
+    let mut short_lag = Vec::new();
+    if is_short {
+        short_used = vec![false; num_windows];
+        short_lag = vec![0i8; num_windows];
+        for w in 0..num_windows {
+            short_used[w] = br.read_bit()?;
+            if short_used[w] {
+                let short_lag_present = br.read_bit()?;
+                if short_lag_present {
+                    // 4-bit field, signed relative delay −8..7.
+                    short_lag[w] = br.read_u32(4)? as i8 - 8;
+                }
+            }
+        }
+    } else {
+        let count = max_sfb.min(MAX_LTP_LONG_SFB);
+        long_used = vec![false; count];
+        for slot in long_used.iter_mut() {
+            *slot = br.read_bit()?;
+        }
+    }
+    Ok(LtpDataNonLd {
+        lag,
+        coef,
+        long_used,
+        short_used,
+        short_lag,
+    })
+}
+
 /// LD-specific variant of [`parse_ics_info`] — ISO/IEC 14496-3 §4.6.17.
 ///
 /// AAC-LD always uses long blocks (no `EIGHT_SHORT_SEQUENCE`), uses the
@@ -599,5 +708,83 @@ mod tests {
         assert!((sf_to_gain(100) - 1.0).abs() < 1e-6);
         // sf=104 -> gain=2.
         assert!((sf_to_gain(104) - 2.0).abs() < 1e-3);
+    }
+
+    /// `parse_ltp_data` (non-LD long-window branch) consumes Table 4.49's
+    /// `else` path exactly: `ltp_lag`(11) + `ltp_coef`(3) + per-sfb
+    /// `ltp_long_used`(1). Note the 11-bit lag (range 0..2047) and the
+    /// absence of the LD-only `ltp_lag_update` reuse bit.
+    #[test]
+    fn parse_ltp_data_long_roundtrip() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_u32(1500, 11); // ltp_lag (> 1023 — only reachable with 11 bits)
+        bw.write_u32(6, 3); // ltp_coef index 6
+                            // 5 long_used flags: 1,0,1,1,0
+        for b in [true, false, true, true, false] {
+            bw.write_bit(b);
+        }
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let ltp = parse_ltp_data(&mut br, false, 1, 5).unwrap();
+        assert_eq!(ltp.lag, 1500);
+        assert_eq!(ltp.coef, LTP_COEF[6]);
+        assert_eq!(ltp.long_used, vec![true, false, true, true, false]);
+        assert!(ltp.short_used.is_empty());
+        assert!(ltp.short_lag.is_empty());
+    }
+
+    /// The long-window flag count is clamped to `MAX_LTP_LONG_SFB` (40)
+    /// even when `max_sfb` exceeds it — §4.6.7.3. Bands beyond index 40
+    /// carry no `ltp_long_used` bit.
+    #[test]
+    fn parse_ltp_data_long_clamps_to_max_ltp_sfb() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 11);
+        bw.write_u32(0, 3);
+        // Write exactly MAX_LTP_LONG_SFB used bits (all true) plus a sentinel.
+        for _ in 0..MAX_LTP_LONG_SFB {
+            bw.write_bit(true);
+        }
+        bw.write_bit(false); // sentinel that must NOT be consumed
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        // max_sfb = 51 (worst case) but only 40 flags should be read.
+        let ltp = parse_ltp_data(&mut br, false, 1, 51).unwrap();
+        assert_eq!(ltp.long_used.len(), MAX_LTP_LONG_SFB);
+        assert!(ltp.long_used.iter().all(|&b| b));
+        // The sentinel bit is still unread — confirm by reading it now.
+        assert!(!br.read_bit().unwrap());
+    }
+
+    /// `parse_ltp_data` (short-window branch) walks the per-window
+    /// `ltp_short_used` / `ltp_short_lag_present` / `ltp_short_lag` nest of
+    /// Table 4.49 and decodes the 4-bit `ltp_short_lag` as a signed
+    /// relative delay (−8..7 = field − 8).
+    #[test]
+    fn parse_ltp_data_short_roundtrip() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_u32(42, 11); // ltp_lag
+        bw.write_u32(2, 3); // ltp_coef
+                            // 3 windows:
+                            //  w0: used=1, lag_present=1, short_lag field=12 (-> +4)
+                            //  w1: used=0
+                            //  w2: used=1, lag_present=0  (short_lag stays 0)
+        bw.write_bit(true); // w0 used
+        bw.write_bit(true); // w0 lag_present
+        bw.write_u32(12, 4); // w0 short_lag field (12-8 = +4)
+        bw.write_bit(false); // w1 used
+        bw.write_bit(true); // w2 used
+        bw.write_bit(false); // w2 lag_present = 0
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let ltp = parse_ltp_data(&mut br, true, 3, 0).unwrap();
+        assert_eq!(ltp.lag, 42);
+        assert_eq!(ltp.coef, LTP_COEF[2]);
+        assert_eq!(ltp.short_used, vec![true, false, true]);
+        assert_eq!(ltp.short_lag, vec![4i8, 0, 0]);
+        assert!(ltp.long_used.is_empty());
     }
 }

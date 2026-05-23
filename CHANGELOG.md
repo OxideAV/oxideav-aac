@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Non-LD AAC-LTP (`AOT 4`) `ltp_data()` parser + long-window predictor
+  (round-104).** The non-LD branch of ISO/IEC 14496-3 §4.6.7 / Table 4.49
+  (`AudioObjectType != ER AAC LD`) is now available as self-contained,
+  unit-tested decoder tools, complementing the AOT 23 (ER AAC LD) variant
+  that landed r101/r102. New `ics::parse_ltp_data` consumes the non-LD
+  layout exactly: an unconditional **11-bit** `ltp_lag` (range 0..2047 —
+  contrast the LD branch's 10-bit lag with `ltp_lag_update` previous-frame
+  reuse), a 3-bit `ltp_coef` indexing Table 4.98, and then either the
+  per-sfb `ltp_long_used[]` flags (long window, clamped to the new
+  `ics::MAX_LTP_LONG_SFB = 40` per §4.6.7.3) or, for an
+  EIGHT_SHORT_SEQUENCE, the per-window `ltp_short_used[w]` /
+  `ltp_short_lag_present[w]` / 4-bit `ltp_short_lag[w]` nest (decoded as a
+  signed −8..7 relative delay, `field − 8`). New `ics::LtpDataNonLd`
+  carries both the long-window and short-window side info. The long-window
+  predictor `synth::apply_ltp` runs the single-tap time-domain IIR
+  `x_est(i) = ltp_coef · x_rec(i − M − ltp_lag)` with **`M = 0`** and
+  `N = 2·FRAME_LEN = 2048` (the non-LD value; ER AAC LD uses `M = N/2`),
+  reading `x_rec(0…N/2−1)` from the aliased IMDCT half (`ChannelState.prev`),
+  `x_rec(N/2…N−1)` as zero, and `x_rec(i<0)` from a new per-channel
+  `ChannelState.ltp_hist` time-domain history ring; the predicted signal is
+  long-windowed (sine/KBD, `prev_shape` rising half / `shape` falling half)
+  and forward-MDCT'd, and the resulting `X_est` is added to the residual
+  `Y_rec` on every `ltp_long_used` band except PNS / IS bands (those take
+  precedence per §4.6.7.4.2). `ChannelState` gains `ltp_hist` /
+  `push_ltp_history` (newest-last ring sized to `LTP_HISTORY_LEN = 2048`,
+  covering the deepest lag-2047 read). Tests: `ics::tests`
+  (`parse_ltp_data_long_roundtrip`, `parse_ltp_data_long_clamps_to_max_ltp_sfb`,
+  `parse_ltp_data_short_roundtrip`) and `synth::ltp_tests`
+  (`push_ltp_history_orders_newest_last`,
+  `push_ltp_history_truncates_overlong_push`,
+  `apply_ltp_predicts_lagged_history_through_filterbank` — headline check
+  that `apply_ltp` equals the analysis-MDCT of the windowed
+  `ltp_coef × history` on enabled bands and leaves disabled bands untouched —
+  and `apply_ltp_skips_pns_is_bands`). The AOT 4 full frame-decode path
+  (SCE/CPE dispatch wiring these tools into a complete decode) and the
+  short-window predictor synthesis remain follow-ups; the `make_decoder`
+  dispatch still gates AOT 4 as unsupported.
+
 - **AAC-LD long-term prediction (LTP) decode (round-101).** The AOT 23
   (`AOT_ER_AAC_LD`) decode path now honours `predictor_data_present == 1`
   instead of erroring: it parses the `ltp_data()` block (ISO/IEC
