@@ -17,8 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layout exactly: an unconditional **11-bit** `ltp_lag` (range 0..2047 —
   contrast the LD branch's 10-bit lag with `ltp_lag_update` previous-frame
   reuse), a 3-bit `ltp_coef` indexing Table 4.98, and then either the
-  per-sfb `ltp_long_used[]` flags (long window, clamped to the new
-  `ics::MAX_LTP_LONG_SFB = 40` per §4.6.7.3) or, for an
+  per-sfb `ltp_long_used[]` flags (long window, exactly `max_sfb` bits per
+  the Table 4.49 loop bound) or, for an
   EIGHT_SHORT_SEQUENCE, the per-window `ltp_short_used[w]` /
   `ltp_short_lag_present[w]` / 4-bit `ltp_short_lag[w]` nest (decoded as a
   signed −8..7 relative delay, `field − 8`). New `ics::LtpDataNonLd`
@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   precedence per §4.6.7.4.2). `ChannelState` gains `ltp_hist` /
   `push_ltp_history` (newest-last ring sized to `LTP_HISTORY_LEN = 2048`,
   covering the deepest lag-2047 read). Tests: `ics::tests`
-  (`parse_ltp_data_long_roundtrip`, `parse_ltp_data_long_clamps_to_max_ltp_sfb`,
+  (`parse_ltp_data_long_roundtrip`, `parse_ltp_data_long_reads_exactly_max_sfb_flags`,
   `parse_ltp_data_short_roundtrip`) and `synth::ltp_tests`
   (`push_ltp_history_orders_newest_last`,
   `push_ltp_history_truncates_overlong_push`,

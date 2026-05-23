@@ -112,13 +112,6 @@ pub fn parse_ltp_data_ld(
     })
 }
 
-/// Maximum number of scalefactor bands over which long-term prediction can
-/// be signalled in a non-LD long window — ISO/IEC 14496-3 §4.6.7.3. The
-/// `ltp_long_used[]` flags are read for `min(max_sfb, MAX_LTP_LONG_SFB)`
-/// bands; bands beyond this index are never predicted regardless of
-/// `max_sfb` (they hold no `ltp_long_used` bit in the bitstream).
-pub const MAX_LTP_LONG_SFB: usize = 40;
-
 /// Parsed `ltp_data()` for the non-LD audio object types (AAC-LTP /
 /// AOT 4, and the AAC-Scalable / ER variants that share the same syntax) —
 /// ISO/IEC 14496-3 §4.6.7 / Table 4.49 (the `else` branch, i.e.
@@ -140,8 +133,8 @@ pub struct LtpDataNonLd {
     /// frame (§4.6.7.2).
     pub coef: f32,
     /// `ltp_long_used[sfb]` — one flag per coded scalefactor band, read
-    /// for `min(max_sfb, MAX_LTP_LONG_SFB)` bands on long windows. Empty
-    /// when the frame uses short windows.
+    /// for `max_sfb` bands on long windows (Table 4.49 non-LD branch
+    /// loop bound). Empty when the frame uses short windows.
     pub long_used: Vec<bool>,
     /// `ltp_short_used[w]` — one flag per window on short blocks. Empty on
     /// long windows.
@@ -178,8 +171,9 @@ pub struct LtpDataNonLd {
 /// from −8 to 7 (§4.6.7.2: *"relative delay … from −8 to 7"*), i.e.
 /// `short_lag = ltp_short_lag - 8`. `is_short` selects the short-window
 /// path and `num_windows` is the per-group window count (8 for an
-/// EIGHT_SHORT block). `max_sfb` bounds the long-window flag count and is
-/// additionally clamped to [`MAX_LTP_LONG_SFB`] per §4.6.7.3.
+/// EIGHT_SHORT block). `max_sfb` is the loop bound for the long-window
+/// `ltp_long_used[]` flags per Table 4.49 (the caller's responsibility to
+/// supply the already-clamped value from `ics_info`).
 pub fn parse_ltp_data(
     br: &mut BitReader<'_>,
     is_short: bool,
@@ -206,8 +200,7 @@ pub fn parse_ltp_data(
             }
         }
     } else {
-        let count = max_sfb.min(MAX_LTP_LONG_SFB);
-        long_used = vec![false; count];
+        long_used = vec![false; max_sfb];
         for slot in long_used.iter_mut() {
             *slot = br.read_bit()?;
         }
@@ -734,25 +727,25 @@ mod tests {
         assert!(ltp.short_lag.is_empty());
     }
 
-    /// The long-window flag count is clamped to `MAX_LTP_LONG_SFB` (40)
-    /// even when `max_sfb` exceeds it — §4.6.7.3. Bands beyond index 40
-    /// carry no `ltp_long_used` bit.
+    /// `parse_ltp_data` reads exactly `max_sfb` long-window flags per the
+    /// Table 4.49 non-LD-branch loop `for (sfb = 0; sfb < max_sfb; sfb++)`
+    /// — no implicit bound. The caller (`ics_info`) is responsible for
+    /// clamping `max_sfb` to `num_swb` first.
     #[test]
-    fn parse_ltp_data_long_clamps_to_max_ltp_sfb() {
+    fn parse_ltp_data_long_reads_exactly_max_sfb_flags() {
         use oxideav_core::bits::BitWriter;
         let mut bw = BitWriter::new();
         bw.write_u32(0, 11);
         bw.write_u32(0, 3);
-        // Write exactly MAX_LTP_LONG_SFB used bits (all true) plus a sentinel.
-        for _ in 0..MAX_LTP_LONG_SFB {
+        // Write 17 used bits (all true) plus a sentinel false bit.
+        for _ in 0..17 {
             bw.write_bit(true);
         }
         bw.write_bit(false); // sentinel that must NOT be consumed
         let bytes = bw.into_bytes();
         let mut br = BitReader::new(&bytes);
-        // max_sfb = 51 (worst case) but only 40 flags should be read.
-        let ltp = parse_ltp_data(&mut br, false, 1, 51).unwrap();
-        assert_eq!(ltp.long_used.len(), MAX_LTP_LONG_SFB);
+        let ltp = parse_ltp_data(&mut br, false, 1, 17).unwrap();
+        assert_eq!(ltp.long_used.len(), 17);
         assert!(ltp.long_used.iter().all(|&b| b));
         // The sentinel bit is still unread — confirm by reading it now.
         assert!(!br.read_bit().unwrap());
