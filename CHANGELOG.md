@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multi-RDB ADTS decode (round-98).** The decoder now honours
+  `number_of_raw_data_blocks_in_frame > 0` (ISO/IEC 13818-7 §6.2,
+  Table 5): an `adts_frame()` may multiplex 1..4 `raw_data_block()`s
+  and each now drains as its own `Frame::Audio` (previously only the
+  first block was decoded and blocks 2..4 were silently dropped). Both
+  transport variants are handled — `protection_absent == 1` (no CRC)
+  blocks sit back-to-back and are located by post-END byte alignment
+  (Tables 6 & 7 are empty), while `protection_absent == 0` blocks are
+  split via the `raw_data_block_position[i]` pointers in
+  `adts_header_error_check()` (the per-block `adts_raw_data_block_
+  error_check` CRC bytes are skipped — CRC is not validated). The
+  trailing blocks ride a small `adts_rdb_pending` queue that mirrors
+  the existing LATM sub-frame drain. `tests/multi_rdb_adts.rs`
+  synthesises 2/3/4-block frames from the encoder's own single-RDB
+  payloads and confirms each block decodes byte-exact against a
+  sequential single-RDB decode (shared overlap-add state).
 - **AAC-LD (objectType 23, AOT_ER_AAC_LD) frame decode bootstrap
   (round-95).** The decoder now recognises AOT 23 in the
   `AudioSpecificConfig` and dispatches to a new

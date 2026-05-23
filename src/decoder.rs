@@ -130,6 +130,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         time_base: TimeBase::new(1, params.sample_rate.unwrap_or(44_100) as i64),
         pending: None,
         latm_pending: Vec::new(),
+        adts_rdb_pending: Vec::new(),
+        adts_rdb_remaining: 0,
         latm_ctx: LatmContext::new(),
         eof: false,
         sf_index,
@@ -162,6 +164,19 @@ struct AacDecoder {
     /// that carried more than one sub-frame per LOAS audio_sync_stream.
     /// `decode_packet` drains this before touching `pending`.
     latm_pending: Vec<Vec<u8>>,
+    /// Trailing bytes of an ADTS frame whose
+    /// `number_of_raw_data_blocks_in_frame` field (ISO/IEC 13818-7
+    /// §6.2, Table 5) packs more than one `raw_data_block()`. This holds
+    /// the byte range starting at the *next* undecoded raw_data_block.
+    /// `receive_frame` decodes one block from the head of this slice per
+    /// call, then re-slices the remainder until `adts_rdb_remaining`
+    /// drops to zero — so a 2..4-RDB ADTS frame produces 2..4 output
+    /// `Frame::Audio`s. Drained before `latm_pending`.
+    adts_rdb_pending: Vec<Vec<u8>>,
+    /// Count of raw_data_blocks still to be drained from
+    /// `adts_rdb_pending` (the multi-RDB ADTS tail). Zero outside a
+    /// multi-RDB frame.
+    adts_rdb_remaining: usize,
     /// Persistent LATM/LOAS demux state — caches the last
     /// `StreamMuxConfig` so frames marked `useSameStreamMux=1` reuse it.
     latm_ctx: LatmContext,
@@ -206,7 +221,10 @@ impl Decoder for AacDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() || !self.latm_pending.is_empty() {
+        if self.pending.is_some()
+            || !self.latm_pending.is_empty()
+            || !self.adts_rdb_pending.is_empty()
+        {
             return Err(Error::other(
                 "AAC decoder: receive_frame must be called before sending another packet",
             ));
@@ -281,6 +299,17 @@ impl Decoder for AacDecoder {
         if let Some(pkt) = self.pending.take() {
             return self.decode_packet(&pkt);
         }
+        // Drain trailing ADTS raw_data_blocks (ISO/IEC 13818-7 §6.2,
+        // `number_of_raw_data_blocks_in_frame > 0`). These were split off
+        // the multi-RDB ADTS frame in `decode_packet`; each is a bare
+        // raw_data_block payload, decoded via the no-sync (MP4-like)
+        // branch. The decoder is already `configured` from the ADTS
+        // header that carried them.
+        if !self.adts_rdb_pending.is_empty() {
+            let payload = self.adts_rdb_pending.remove(0);
+            let pkt = Packet::new(0, self.time_base, payload);
+            return self.decode_packet(&pkt);
+        }
         if !self.latm_pending.is_empty() {
             let payload = self.latm_pending.remove(0);
             // Reuse the time_base set when the LOAS frame was parsed.
@@ -319,6 +348,8 @@ impl Decoder for AacDecoder {
         }
         self.pending = None;
         self.latm_pending.clear();
+        self.adts_rdb_pending.clear();
+        self.adts_rdb_remaining = 0;
         // Drop the cached LATM StreamMuxConfig — after a seek the next
         // LOAS frame is required to either re-emit a config or be
         // already configured at the muxer's choice. The conservative
@@ -397,7 +428,82 @@ impl AacDecoder {
                         "ADTS: packet shorter than declared header length",
                     ));
                 }
-                (header_len, hdr.frame_length.min(data.len()))
+                let frame_end = hdr.frame_length.min(data.len());
+                // ISO/IEC 13818-7 §6.2, Table 5 — adts_frame() multiplexes
+                // `number_of_raw_data_blocks_in_frame + 1` raw_data_block()s.
+                // The common case is 0 (one block); when > 0 the trailing
+                // blocks are split off here and drained one-per-frame.
+                let n_extra = hdr.number_of_raw_blocks_minus_one as usize;
+                if n_extra > 0 {
+                    if hdr.protection_absent {
+                        // No CRC ⇒ no adts_header_error_check, no per-block
+                        // CRCs (Tables 6 & 7 are empty when protection_absent
+                        // == 1). raw_data_block()s sit back-to-back, each
+                        // byte-aligned (§4.4.2.1 byte_alignment() after END).
+                        // There are no position pointers, so the boundaries
+                        // are discovered by parsing each block: rdb0 decodes
+                        // from `header_len`, and the post-END byte position
+                        // (captured below the element loop) locates rdb1, and
+                        // so on via `adts_rdb_remaining`.
+                        self.adts_rdb_remaining = n_extra;
+                        (header_len, frame_end)
+                    } else {
+                        // CRC present ⇒ adts_header_error_check (Table 6)
+                        // carries `raw_data_block_position[i]` (16 bits each,
+                        // i = 1..=n_extra) followed by a 16-bit crc_check.
+                        // The fixed+variable header is 7 bytes; the position
+                        // array + header CRC adds `(n_extra + 1) * 2` bytes
+                        // before the first raw_data_block. Each trailing
+                        // block is followed by a 2-byte adts_raw_data_block_
+                        // error_check CRC (Table 7), but the position pointers
+                        // (offsets from rdb0's start) already skip past them,
+                        // so we split purely on the pointers and ignore the
+                        // CRC bytes (we do not validate CRC anywhere).
+                        let hdr_ec_bytes = (n_extra + 1) * 2;
+                        let rdb0_off = 7 + hdr_ec_bytes;
+                        if frame_end < rdb0_off {
+                            return Err(Error::invalid(
+                                "ADTS: multi-RDB frame shorter than header error check",
+                            ));
+                        }
+                        // Read the position pointers from the header error
+                        // check region (immediately after the 7-byte header).
+                        let mut pos_reader = BitReader::with_position(data, 7);
+                        let mut positions = Vec::with_capacity(n_extra);
+                        for _ in 0..n_extra {
+                            positions.push(pos_reader.read_u32(16)? as usize);
+                        }
+                        // Split blocks 1..=n_extra into the pending queue.
+                        // positions[i] is rdb(i+1)'s byte offset from rdb0's
+                        // start. The final block runs to frame_end.
+                        for i in 0..n_extra {
+                            let start = rdb0_off + positions[i];
+                            let end = if i + 1 < n_extra {
+                                rdb0_off + positions[i + 1]
+                            } else {
+                                frame_end
+                            };
+                            if start > frame_end || end > frame_end || start > end {
+                                return Err(Error::invalid(
+                                    "ADTS: raw_data_block_position out of range",
+                                ));
+                            }
+                            self.adts_rdb_pending.push(data[start..end].to_vec());
+                        }
+                        // rdb0 spans from rdb0_off up to the first pointer.
+                        let rdb0_end = rdb0_off + positions[0];
+                        if rdb0_end > frame_end {
+                            return Err(Error::invalid(
+                                "ADTS: raw_data_block_position[1] out of range",
+                            ));
+                        }
+                        // Pre-split path: everything queued, no recursion.
+                        self.adts_rdb_remaining = 0;
+                        (rdb0_off, rdb0_end)
+                    }
+                } else {
+                    (header_len, frame_end)
+                }
             } else {
                 if !self.configured {
                     return Err(Error::invalid(
@@ -971,6 +1077,28 @@ impl AacDecoder {
                     element_loop_err = Some(e);
                     break 'elements;
                 }
+            }
+        }
+
+        // Multi-RDB ADTS, no-CRC tail (ISO/IEC 13818-7 §6.2): the trailing
+        // raw_data_block()s are not length-prefixed, so locate the next
+        // block by the post-END byte position (each block is byte-aligned
+        // per §4.4.2.1) and queue the remaining bytes for the next
+        // `receive_frame`. `adts_rdb_remaining` counts blocks still to
+        // come AFTER the one just decoded; each pass queues one more block
+        // and decrements. Only fires while draining a `protection_absent
+        // == 1` multi-RDB frame; the CRC path pre-splits via position
+        // pointers and leaves `adts_rdb_remaining == 0`.
+        if self.adts_rdb_remaining > 0 {
+            br.align_to_byte();
+            let next = br.byte_position();
+            if next < payload.len() {
+                self.adts_rdb_pending.push(payload[next..].to_vec());
+                self.adts_rdb_remaining -= 1;
+            } else {
+                // Ran out of bytes before the declared block count —
+                // stop draining rather than queue an empty tail.
+                self.adts_rdb_remaining = 0;
             }
         }
 

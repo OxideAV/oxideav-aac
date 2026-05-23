@@ -55,7 +55,8 @@ read it instead of looking for an ADTS sync word on the first packet.
 | Feature                                | Status                                  |
 |----------------------------------------|-----------------------------------------|
 | Object types                           | AAC-LC (`AOT 2`) decode + encode; AAC-LD (`AOT 23`) decode of `er_raw_data_block()` for channelConfiguration 1 (mono) and 2 (stereo, common-window or independent ICS) at 512- and 480-sample frame lengths (LTP + multichannel LD + low-overlap window pending); AAC-ELD (`AOT 39`) ASC parse only |
-| Containers                             | ADTS (with or without CRC) and raw + ASC|
+| Containers                             | ADTS (with or without CRC, single- AND multi-RDB) and raw + ASC|
+| Multi-RDB ADTS (§6.2 13818-7)          | `number_of_raw_data_blocks_in_frame` 0..3 (1..4 blocks/frame). No-CRC tail located by post-END byte alignment; CRC tail split via `raw_data_block_position[i]` pointers. Each block drains as its own `Frame::Audio`, byte-exact vs sequential single-RDB decode (`tests/multi_rdb_adts.rs`). |
 | Channel configurations                 | 1..=7 (mono, stereo, 3.0, 4.0, 5.0, 5.1, 7.1) |
 | Sample rates                           | All 13 standard SF indices (96k - 7350) |
 | Window sequences                       | Long, LongStart, LongStop, EightShort   |
