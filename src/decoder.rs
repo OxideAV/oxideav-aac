@@ -13,8 +13,9 @@ use crate::adts::parse_adts_header;
 use crate::asc::parse_asc;
 use crate::ics::{
     decode_spectrum_long, decode_spectrum_long_with_swb, decode_spectrum_short, parse_ics_info,
-    parse_ics_info_ld, parse_scalefactors, parse_section_data, IcsInfo, LtpData, SectionData,
-    INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, SPEC_LEN, ZERO_HCB,
+    parse_ics_info_ld, parse_ics_info_with_ltp, parse_scalefactors, parse_section_data, IcsInfo,
+    LtpData, LtpDataNonLd, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, SPEC_LEN,
+    ZERO_HCB,
 };
 use crate::latm::{AudioMuxElement, LatmContext};
 use crate::ld_eld::{
@@ -31,9 +32,9 @@ use crate::sbr::decode::{
 use crate::sbr::ps::{apply_ps_simple, PsFrame};
 use crate::sfband::{SWB_LONG, SWB_SHORT};
 use crate::syntax::{
-    ElementType, WindowSequence, AOT_AAC_ELD, AOT_AAC_LC, AOT_ER_AAC_LD, AOT_USAC,
+    ElementType, WindowSequence, AOT_AAC_ELD, AOT_AAC_LC, AOT_AAC_LTP, AOT_ER_AAC_LD, AOT_USAC,
 };
-use crate::synth::{imdct_and_overlap, ChannelState, FRAME_LEN};
+use crate::synth::{apply_ltp, imdct_and_overlap, ChannelState, FRAME_LEN};
 use crate::tns::{apply_tns_long, apply_tns_short, parse_tns_data, TnsData};
 use oxideav_core::bits::BitReader;
 
@@ -60,9 +61,21 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
                      (UsacConfig scaffold parse available via crate::usac::parse_usac_config)",
                 ));
             }
-            if asc.object_type != AOT_AAC_LC && asc.object_type != AOT_ER_AAC_LD {
+            // AOT 4 (AAC-LTP) shares AAC-LC's GASpecificConfig and
+            // raw_data_block() syntax; the only bitstream difference is
+            // that ics_info's `predictor_data_present` body carries
+            // ltp_data() (Table 4.6 `audioObjectType != 1` branch)
+            // instead of the AAC-Main backward predictor, and the
+            // long-term predictor runs in the §4.6.7 tool chain. It
+            // therefore decodes through the LC `decode_packet` path with
+            // LTP threading enabled.
+            if asc.object_type != AOT_AAC_LC
+                && asc.object_type != AOT_AAC_LTP
+                && asc.object_type != AOT_ER_AAC_LD
+            {
                 return Err(Error::unsupported(
-                    "AAC: only AAC-LC (objectType 2) and AAC-LD (objectType 23) supported",
+                    "AAC: only AAC-LC (objectType 2), AAC-LTP (objectType 4) and \
+                     AAC-LD (objectType 23) supported",
                 ));
             }
             let sf_idx = sample_rate_to_index(asc.sampling_frequency)
@@ -516,6 +529,13 @@ impl AacDecoder {
             };
         let payload = &data[payload_offset..frame_end];
 
+        // AOT 4 (AAC-LTP) shares the LC raw_data_block syntax but the
+        // ics_info predictor body carries ltp_data() and the §4.6.7
+        // long-term predictor runs between PNS/IS and TNS. `is_ltp`
+        // selects the LTP-aware ics_info parse and the apply_ltp /
+        // history-update steps in the SCE / CPE / LFE element decoders.
+        let is_ltp = self.object_type == AOT_AAC_LTP;
+
         // Decode raw_data_block.
         let mut br = BitReader::new(payload);
         // Up to 8 output channels (7.1). Individual SCE / CPE / LFE
@@ -557,8 +577,15 @@ impl AacDecoder {
                         last_elem_is_cpe = false;
                         let _instance_tag = br.read_u32(4)?;
                         let mut spec = [0.0f32; SPEC_LEN];
-                        let (info, sf, sec, tns, pulse) =
-                            decode_ics(&mut br, self.sf_index, false)?;
+                        let (info, sf, sec, tns, pulse, ltp) = if is_ltp {
+                            let ((info, sf, sec, tns, pulse), ltp) =
+                                decode_ics_ltp(&mut br, self.sf_index)?;
+                            (info, sf, sec, tns, pulse, ltp)
+                        } else {
+                            let (info, sf, sec, tns, pulse) =
+                                decode_ics(&mut br, self.sf_index, false)?;
+                            (info, sf, sec, tns, pulse, None)
+                        };
                         fill_spectrum(&mut br, &info, &sec, &sf, &mut spec)?;
                         // Pulse data: §4.6.5 — applied to long-window spectrum
                         // before PNS / TNS.
@@ -587,7 +614,32 @@ impl AacDecoder {
                                 None,
                             );
                         }
-                        // TNS after PNS/IS but before IMDCT (§4.6.9.2).
+                        // LTP (§4.6.7) sits between PNS/IS and TNS in the
+                        // GA tool chain (Figure 4.2). Long windows only;
+                        // for AOT 4 ics_info only carries ltp_data() on the
+                        // long-window arm of Table 4.6, so a short block
+                        // never has LTP side info to apply.
+                        if got_channels >= pcm.len() {
+                            return Err(Error::invalid(
+                                "AAC: more decoded channels than 8 slots permit",
+                            ));
+                        }
+                        if let Some(ltp) = ltp.as_ref() {
+                            if info.window_sequence != WindowSequence::EightShort {
+                                let skip = ltp_skip_bands(&sec, info.max_sfb as usize);
+                                let swb = SWB_LONG[self.sf_index as usize];
+                                apply_ltp(
+                                    &mut spec[..FRAME_LEN],
+                                    &self.chans[got_channels],
+                                    ltp,
+                                    info.window_shape,
+                                    self.chans[got_channels].prev_shape,
+                                    swb,
+                                    &skip,
+                                );
+                            }
+                        }
+                        // TNS after PNS/IS/LTP but before IMDCT (§4.6.9.2).
                         if let Some(tns) = tns.as_ref() {
                             if info.window_sequence == WindowSequence::EightShort {
                                 apply_tns_short(&mut spec, tns, self.sf_index, info.max_sfb, &info);
@@ -595,11 +647,6 @@ impl AacDecoder {
                                 let swb = SWB_LONG[self.sf_index as usize];
                                 apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
                             }
-                        }
-                        if got_channels >= pcm.len() {
-                            return Err(Error::invalid(
-                                "AAC: more decoded channels than 8 slots permit",
-                            ));
                         }
                         let mut channel_pcm = [0.0f32; FRAME_LEN];
                         imdct_and_overlap(
@@ -609,6 +656,12 @@ impl AacDecoder {
                             &mut self.chans[got_channels],
                             &mut channel_pcm,
                         );
+                        // LTP history (§4.6.7.3): retain this frame's
+                        // reconstructed time-domain output as x_rec(i<0)
+                        // for the next frame's predictor.
+                        if is_ltp {
+                            self.chans[got_channels].push_ltp_history(&channel_pcm);
+                        }
                         pcm[got_channels].copy_from_slice(&channel_pcm);
                         got_channels += 1;
                     }
@@ -618,8 +671,15 @@ impl AacDecoder {
                         let _instance_tag = br.read_u32(4)?;
                         let common_window = br.read_bit()?;
                         if common_window {
-                            // Shared ICS info, then ms_mask flags.
-                            let info = parse_ics_info(&mut br, self.sf_index)?;
+                            // Shared ICS info, then ms_mask flags. For
+                            // AOT 4 the shared ics_info carries both
+                            // channels' ltp_data() (Table 4.6 common_window
+                            // branch).
+                            let (info, ltp_pair) = if is_ltp {
+                                parse_ics_info_with_ltp(&mut br, self.sf_index, true)?
+                            } else {
+                                (parse_ics_info(&mut br, self.sf_index)?, [None, None])
+                            };
                             let ms_mask_present = br.read_u32(2)? as u8;
                             let max_sfb = info.max_sfb as usize;
                             let groups = info.num_window_groups as usize;
@@ -752,7 +812,34 @@ impl AacDecoder {
                             //   L = M + S; R = M - S  (no sqrt scaling — IS-only normalisation
                             //   uses sqrt(2), but MS as defined in 14496-3 is L=M+S, R=M-S).
                             apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
-                            // TNS after PNS + M/S, before IMDCT.
+                            // LTP (§4.6.7) per channel — after PNS/IS/M-S,
+                            // before TNS (Figure 4.2). Long windows only;
+                            // AOT 4 common-window CPE carries each channel's
+                            // ltp_data() in the shared ics_info.
+                            if got_channels + 2 > pcm.len() {
+                                return Err(Error::invalid(
+                                    "AAC: CPE would overflow 8 channel slots",
+                                ));
+                            }
+                            for ch in 0..2 {
+                                if let Some(ltp) = ltp_pair[ch].as_ref() {
+                                    if infos[ch].window_sequence != WindowSequence::EightShort {
+                                        let skip =
+                                            ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
+                                        let swb = SWB_LONG[self.sf_index as usize];
+                                        apply_ltp(
+                                            &mut spec[ch][..FRAME_LEN],
+                                            &self.chans[got_channels + ch],
+                                            ltp,
+                                            infos[ch].window_shape,
+                                            self.chans[got_channels + ch].prev_shape,
+                                            swb,
+                                            &skip,
+                                        );
+                                    }
+                                }
+                            }
+                            // TNS after PNS + M/S + LTP, before IMDCT.
                             for ch in 0..2 {
                                 if let Some(tns) = tns_all[ch].as_ref() {
                                     if infos[ch].window_sequence == WindowSequence::EightShort {
@@ -789,6 +876,9 @@ impl AacDecoder {
                                     &mut self.chans[got_channels + ch],
                                     &mut channel_pcm,
                                 );
+                                if is_ltp {
+                                    self.chans[got_channels + ch].push_ltp_history(&channel_pcm);
+                                }
                                 pcm[got_channels + ch].copy_from_slice(&channel_pcm);
                             }
                             got_channels += 2;
@@ -797,9 +887,18 @@ impl AacDecoder {
                             let mut spec = [[0.0f32; SPEC_LEN]; 2];
                             let mut infos: [IcsInfo; 2] = Default::default();
                             let mut tns_all: [Option<TnsData>; 2] = [None, None];
+                            let mut ltp_all: [Option<LtpDataNonLd>; 2] = [None, None];
+                            let mut secs_indep: [SectionData; 2] = Default::default();
                             for ch in 0..2 {
-                                let (info, sf, sec, tns, pulse) =
-                                    decode_ics(&mut br, self.sf_index, true)?;
+                                let (info, sf, sec, tns, pulse, ltp) = if is_ltp {
+                                    let ((info, sf, sec, tns, pulse), ltp) =
+                                        decode_ics_ltp(&mut br, self.sf_index)?;
+                                    (info, sf, sec, tns, pulse, ltp)
+                                } else {
+                                    let (info, sf, sec, tns, pulse) =
+                                        decode_ics(&mut br, self.sf_index, true)?;
+                                    (info, sf, sec, tns, pulse, None)
+                                };
                                 fill_spectrum(&mut br, &info, &sec, &sf, &mut spec[ch])?;
                                 if let Some(pd) = pulse.as_ref() {
                                     if info.window_sequence == WindowSequence::EightShort {
@@ -838,6 +937,8 @@ impl AacDecoder {
                                 }
                                 infos[ch] = info;
                                 tns_all[ch] = tns;
+                                ltp_all[ch] = ltp;
+                                secs_indep[ch] = sec;
                             }
                             // Bounds check BEFORE the IMDCT loop — the loop
                             // body indexes `self.chans[got_channels + ch]` and
@@ -853,6 +954,30 @@ impl AacDecoder {
                                 return Err(Error::invalid(
                                     "AAC: CPE would overflow 8 channel slots",
                                 ));
+                            }
+                            // LTP (§4.6.7) per channel — after PNS, before
+                            // TNS. Independent-ICS CPE has no M/S; each
+                            // channel's ltp_data() lives in its own ics_info
+                            // (decode_ics_ltp). Long windows only.
+                            for ch in 0..2 {
+                                if let Some(ltp) = ltp_all[ch].as_ref() {
+                                    if infos[ch].window_sequence != WindowSequence::EightShort {
+                                        let skip = ltp_skip_bands(
+                                            &secs_indep[ch],
+                                            infos[ch].max_sfb as usize,
+                                        );
+                                        let swb = SWB_LONG[self.sf_index as usize];
+                                        apply_ltp(
+                                            &mut spec[ch][..FRAME_LEN],
+                                            &self.chans[got_channels + ch],
+                                            ltp,
+                                            infos[ch].window_shape,
+                                            self.chans[got_channels + ch].prev_shape,
+                                            swb,
+                                            &skip,
+                                        );
+                                    }
+                                }
                             }
                             for ch in 0..2 {
                                 if let Some(tns) = tns_all[ch].as_ref() {
@@ -883,6 +1008,9 @@ impl AacDecoder {
                                     &mut self.chans[got_channels + ch],
                                     &mut channel_pcm,
                                 );
+                                if is_ltp {
+                                    self.chans[got_channels + ch].push_ltp_history(&channel_pcm);
+                                }
                                 pcm[got_channels + ch].copy_from_slice(&channel_pcm);
                             }
                             got_channels += 2;
@@ -897,8 +1025,19 @@ impl AacDecoder {
                         // next channel slot.
                         let _instance_tag = br.read_u32(4)?;
                         let mut spec = [0.0f32; SPEC_LEN];
-                        let (info, sf, sec, tns, pulse) =
-                            decode_ics(&mut br, self.sf_index, false)?;
+                        // AOT 4: an LFE ics_info still carries the
+                        // ltp_data() predictor body (Table 4.6), so parse
+                        // it through decode_ics_ltp to keep the bit cursor
+                        // exact even though LFE is long-window only.
+                        let (info, sf, sec, tns, pulse, ltp) = if is_ltp {
+                            let ((info, sf, sec, tns, pulse), ltp) =
+                                decode_ics_ltp(&mut br, self.sf_index)?;
+                            (info, sf, sec, tns, pulse, ltp)
+                        } else {
+                            let (info, sf, sec, tns, pulse) =
+                                decode_ics(&mut br, self.sf_index, false)?;
+                            (info, sf, sec, tns, pulse, None)
+                        };
                         if info.window_sequence == WindowSequence::EightShort {
                             return Err(Error::invalid(
                                 "AAC: LFE element with EIGHT_SHORT window (non-conformant)",
@@ -909,12 +1048,25 @@ impl AacDecoder {
                             apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
                         }
                         apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
+                        if got_channels >= pcm.len() {
+                            return Err(Error::invalid("AAC: LFE would overflow 8 channel slots"));
+                        }
+                        if let Some(ltp) = ltp.as_ref() {
+                            let skip = ltp_skip_bands(&sec, info.max_sfb as usize);
+                            let swb = SWB_LONG[self.sf_index as usize];
+                            apply_ltp(
+                                &mut spec[..FRAME_LEN],
+                                &self.chans[got_channels],
+                                ltp,
+                                info.window_shape,
+                                self.chans[got_channels].prev_shape,
+                                swb,
+                                &skip,
+                            );
+                        }
                         if let Some(tns) = tns.as_ref() {
                             let swb = SWB_LONG[self.sf_index as usize];
                             apply_tns_long(&mut spec, tns, self.sf_index, info.max_sfb, swb);
-                        }
-                        if got_channels >= pcm.len() {
-                            return Err(Error::invalid("AAC: LFE would overflow 8 channel slots"));
                         }
                         let mut channel_pcm = [0.0f32; FRAME_LEN];
                         imdct_and_overlap(
@@ -924,6 +1076,9 @@ impl AacDecoder {
                             &mut self.chans[got_channels],
                             &mut channel_pcm,
                         );
+                        if is_ltp {
+                            self.chans[got_channels].push_ltp_history(&channel_pcm);
+                        }
                         pcm[got_channels].copy_from_slice(&channel_pcm);
                         got_channels += 1;
                     }
@@ -1818,6 +1973,46 @@ pub fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Resu
     let _gain_control = br.read_bit()?;
     let _ = is_in_cpe;
     Ok((info, sf, sec, tns, pulse))
+}
+
+/// LTP-aware variant of [`decode_ics`] for AOT 4 (AAC-LTP) — identical to
+/// `decode_ics` except the ics_info is parsed with
+/// [`parse_ics_info_with_ltp`] (Table 4.6 `audioObjectType != 1` branch),
+/// returning the channel's long-term-prediction side info alongside the
+/// usual `(info, sf, sec, tns, pulse)` tuple. `common_window` is always
+/// `false` here — this is the single-channel (SCE / LFE / independent-ICS
+/// CPE) entry point, so only channel 0's `ltp_data()` can appear in the
+/// ics_info.
+pub fn decode_ics_ltp(
+    br: &mut BitReader<'_>,
+    sf_index: u8,
+) -> Result<(DecodedIcs, Option<LtpDataNonLd>)> {
+    let global_gain = br.read_u32(8)? as u8;
+    let (info, ltp_pair) = parse_ics_info_with_ltp(br, sf_index, false)?;
+    let sec = parse_section_data(br, &info)?;
+    let sf = parse_scalefactors(br, &info, &sec, global_gain)?;
+    let pulse_present = br.read_bit()?;
+    let pulse = if pulse_present {
+        Some(parse_pulse_data(br)?)
+    } else {
+        None
+    };
+    let tns_present = br.read_bit()?;
+    let tns = if tns_present {
+        let n_windows = if info.window_sequence.is_eight_short() {
+            8
+        } else {
+            1
+        };
+        Some(parse_tns_data(br, info.window_sequence, n_windows)?)
+    } else {
+        None
+    };
+    // gain_control_data_present — reserved for AAC-SSR; tolerated as in
+    // `decode_ics`.
+    let _gain_control = br.read_bit()?;
+    let [ltp0, _ltp1] = ltp_pair;
+    Ok(((info, sf, sec, tns, pulse), ltp0))
 }
 
 /// Build the per-sfb mask of bands that LTP must NOT predict (long

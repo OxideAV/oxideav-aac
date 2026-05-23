@@ -392,6 +392,118 @@ pub fn parse_ics_info(br: &mut BitReader<'_>, sf_index: u8) -> Result<IcsInfo> {
     Ok(info)
 }
 
+/// LTP-aware variant of [`parse_ics_info`] for AOT 4 (AAC-LTP) and the
+/// other non-Main, non-LD object types — ISO/IEC 14496-3 Table 4.6,
+/// `audioObjectType != 1` branch.
+///
+/// The bitstream layout is identical to [`parse_ics_info`] up to and
+/// including `predictor_data_present`; the difference is the body that
+/// follows when the bit is set. Where AAC-Main (AOT 1) carries the
+/// backward-adaptive `predictor_data()` (predictor_reset + per-sfb
+/// `prediction_used`), AOT 4 and friends carry long-term prediction:
+///
+/// ```text
+/// if (predictor_data_present) {
+///     ltp_data_present                      1   uimsbf
+///     if (ltp_data_present) ltp_data();
+///     if (common_window) {
+///         ltp_data_present                  1   uimsbf  (second channel)
+///         if (ltp_data_present) ltp_data();
+///     }
+/// }
+/// ```
+///
+/// The second `ltp_data()` only appears in the CPE common-window case,
+/// where the shared ics_info carries both channels' LTP side info; pass
+/// `common_window = true` there and `false` for an SCE / LFE / the
+/// independent-ICS CPE branch (where each channel has its own ics_info).
+///
+/// `ltp_data()` itself is the non-LD branch of Table 4.49 (an
+/// unconditional 11-bit `ltp_lag`, 3-bit `ltp_coef`, then either the
+/// per-sfb `ltp_long_used[]` flags for long windows or the per-window
+/// `ltp_short_used` / `ltp_short_lag` nest for an EIGHT_SHORT block) —
+/// see [`parse_ltp_data`]. The returned `[Option<LtpDataNonLd>; 2]`
+/// holds channel 0's LTP (and channel 1's when `common_window`); entries
+/// are `None` when `ltp_data_present == 0` for that channel.
+///
+/// The long-window `ltp_long_used[]` loop is bounded by the
+/// bitstream-coded `max_sfb` (Table 4.49 loop bound) read *before* the
+/// `max_sfb`→`num_swb` clamp, so the bit cursor stays exact even on a
+/// stream whose coded `max_sfb` overruns the SWB table; the clamped
+/// `IcsInfo::max_sfb` is what callers use for band application.
+pub fn parse_ics_info_with_ltp(
+    br: &mut BitReader<'_>,
+    sf_index: u8,
+    common_window: bool,
+) -> Result<(IcsInfo, [Option<LtpDataNonLd>; 2])> {
+    let _ics_reserved_bit = br.read_bit()?;
+    let window_sequence = WindowSequence::from_u32(br.read_u32(2)?);
+    let window_shape = WindowShape::from_bit(br.read_u32(1)?);
+    let mut info = IcsInfo {
+        window_sequence,
+        window_shape,
+        sf_index,
+        ..Default::default()
+    };
+
+    let mut ltp: [Option<LtpDataNonLd>; 2] = [None, None];
+    let is_short = window_sequence.is_eight_short();
+
+    if is_short {
+        info.max_sfb = br.read_u32(4)? as u8;
+        info.scale_factor_grouping = br.read_u32(7)? as u8;
+        let mut groups = 1u8;
+        let mut lengths = [1u8; 8];
+        let mut cur_len = 1u8;
+        for w in 1..8 {
+            let bit = (info.scale_factor_grouping >> (6 - (w - 1))) & 1;
+            if bit == 1 {
+                cur_len += 1;
+            } else {
+                lengths[(groups - 1) as usize] = cur_len;
+                groups += 1;
+                cur_len = 1;
+            }
+        }
+        lengths[(groups - 1) as usize] = cur_len;
+        info.num_window_groups = groups;
+        info.window_group_length = lengths;
+        // EIGHT_SHORT blocks carry no predictor_data_present field
+        // (Table 4.6 reads it only in the `else` long-window arm), so no
+        // LTP side info is present for short windows here.
+    } else {
+        info.max_sfb = br.read_u32(6)? as u8;
+        info.predictor_data_present = br.read_bit()?;
+        if info.predictor_data_present {
+            // Table 4.6 `audioObjectType != 1` branch: long-term
+            // prediction side info, not the AAC-Main backward predictor.
+            // The `ltp_long_used[]` loop bound is the bitstream-coded
+            // max_sfb (read before the clamp below).
+            let coded_max_sfb = info.max_sfb as usize;
+            let ltp_data_present = br.read_bit()?;
+            if ltp_data_present {
+                ltp[0] = Some(parse_ltp_data(br, false, 1, coded_max_sfb)?);
+            }
+            if common_window {
+                let ltp_data_present_1 = br.read_bit()?;
+                if ltp_data_present_1 {
+                    ltp[1] = Some(parse_ltp_data(br, false, 1, coded_max_sfb)?);
+                }
+            }
+        }
+        info.num_window_groups = 1;
+        info.window_group_length[0] = 1;
+    }
+
+    // Clamp max_sfb to the SWB table size (see `parse_ics_info`).
+    let num_swb = info.num_swb();
+    if info.max_sfb as usize > num_swb {
+        info.max_sfb = num_swb as u8;
+    }
+
+    Ok((info, ltp))
+}
+
 /// Section data: codebook + length-in-sfbs per (group, section).
 #[derive(Clone, Debug, Default)]
 pub struct SectionData {
@@ -779,5 +891,109 @@ mod tests {
         assert_eq!(ltp.short_used, vec![true, false, true]);
         assert_eq!(ltp.short_lag, vec![4i8, 0, 0]);
         assert!(ltp.long_used.is_empty());
+    }
+
+    /// `parse_ics_info_with_ltp` (AOT 4 / Table 4.6 `audioObjectType != 1`
+    /// branch) reads the long-window ics_info header then, when
+    /// `predictor_data_present == 1`, the `ltp_data_present` + `ltp_data()`
+    /// body — not the AAC-Main backward predictor. For an SCE
+    /// (`common_window == false`) only channel 0's ltp_data() can appear.
+    #[test]
+    fn parse_ics_info_with_ltp_sce_long() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // ics_reserved_bit
+        bw.write_u32(0, 2); // window_sequence = OnlyLong
+        bw.write_bit(false); // window_shape = sine
+        bw.write_u32(3, 6); // max_sfb = 3
+        bw.write_bit(true); // predictor_data_present = 1
+        bw.write_bit(true); // ltp_data_present = 1 (channel 0)
+                            // ltp_data() non-LD long branch:
+        bw.write_u32(900, 11); // ltp_lag
+        bw.write_u32(5, 3); // ltp_coef index 5
+        for b in [true, false, true] {
+            bw.write_bit(b); // ltp_long_used[0..3]
+        }
+        // sentinel bit (would be section_data) — must remain unread.
+        bw.write_bit(true);
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        // sf_index 4 (44.1/48 kHz long table): num_swb >= 3 so max_sfb=3
+        // is unclamped.
+        let (info, ltp) = parse_ics_info_with_ltp(&mut br, 4, false).unwrap();
+        assert_eq!(info.max_sfb, 3);
+        assert!(info.predictor_data_present);
+        let l0 = ltp[0].as_ref().expect("channel 0 LTP present");
+        assert_eq!(l0.lag, 900);
+        assert_eq!(l0.coef, LTP_COEF[5]);
+        assert_eq!(l0.long_used, vec![true, false, true]);
+        assert!(ltp[1].is_none(), "SCE has no second-channel LTP");
+        // The sentinel bit is intact — confirms the parse stopped at the
+        // right place.
+        assert!(br.read_bit().unwrap());
+    }
+
+    /// In the CPE common-window case the shared ics_info carries *both*
+    /// channels' `ltp_data_present` + `ltp_data()` (Table 4.6
+    /// `if (common_window)` clause). `parse_ics_info_with_ltp` with
+    /// `common_window == true` returns both.
+    #[test]
+    fn parse_ics_info_with_ltp_cpe_common_window_dual() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // ics_reserved_bit
+        bw.write_u32(0, 2); // window_sequence = OnlyLong
+        bw.write_bit(false); // window_shape
+        bw.write_u32(2, 6); // max_sfb = 2
+        bw.write_bit(true); // predictor_data_present = 1
+                            // channel 0 ltp_data
+        bw.write_bit(true); // ltp_data_present[0]
+        bw.write_u32(100, 11);
+        bw.write_u32(1, 3);
+        bw.write_bit(true); // long_used[0]
+        bw.write_bit(false); // long_used[1]
+                             // channel 1 ltp_data
+        bw.write_bit(true); // ltp_data_present[1]
+        bw.write_u32(200, 11);
+        bw.write_u32(7, 3);
+        bw.write_bit(false); // long_used[0]
+        bw.write_bit(true); // long_used[1]
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let (info, ltp) = parse_ics_info_with_ltp(&mut br, 4, true).unwrap();
+        assert_eq!(info.max_sfb, 2);
+        let l0 = ltp[0].as_ref().expect("ch0 LTP");
+        let l1 = ltp[1].as_ref().expect("ch1 LTP");
+        assert_eq!(l0.lag, 100);
+        assert_eq!(l0.coef, LTP_COEF[1]);
+        assert_eq!(l0.long_used, vec![true, false]);
+        assert_eq!(l1.lag, 200);
+        assert_eq!(l1.coef, LTP_COEF[7]);
+        assert_eq!(l1.long_used, vec![false, true]);
+    }
+
+    /// An EIGHT_SHORT ics_info in the AOT 4 path carries no
+    /// `predictor_data_present` field at all (Table 4.6 reads it only in
+    /// the long-window `else` arm), so `parse_ics_info_with_ltp` returns
+    /// no LTP for short blocks and leaves the bit cursor immediately after
+    /// `scale_factor_grouping`.
+    #[test]
+    fn parse_ics_info_with_ltp_short_has_no_predictor_field() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // ics_reserved_bit
+        bw.write_u32(2, 2); // window_sequence = EIGHT_SHORT
+        bw.write_bit(false); // window_shape
+        bw.write_u32(3, 4); // max_sfb (4 bits on short)
+        bw.write_u32(0, 7); // scale_factor_grouping = 0 -> 8 groups
+        bw.write_bit(true); // sentinel (first section_data bit)
+        let bytes = bw.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let (info, ltp) = parse_ics_info_with_ltp(&mut br, 4, false).unwrap();
+        assert!(info.window_sequence.is_eight_short());
+        assert!(ltp[0].is_none());
+        assert!(ltp[1].is_none());
+        // No predictor field consumed — the sentinel section bit is next.
+        assert!(br.read_bit().unwrap());
     }
 }

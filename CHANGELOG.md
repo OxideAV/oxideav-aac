@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AAC-LTP (`AOT 4`) full frame decode (round-108).** The non-LD
+  long-term-prediction object type is now decoded end-to-end, wiring the
+  round-104 `ltp_data()` parser and `synth::apply_ltp` predictor into the
+  AAC-LC `raw_data_block()` element walk. `make_decoder` accepts an AOT 4
+  AudioSpecificConfig (previously `Error::Unsupported`) and routes it
+  through the LC `decode_packet` path; AOT 4 shares AAC-LC's
+  GASpecificConfig and `raw_data_block()` syntax, the only bitstream
+  difference being that ics_info's `predictor_data_present` body carries
+  `ltp_data()` (ISO/IEC 14496-3 Table 4.6 `audioObjectType != 1` branch)
+  instead of the AAC-Main backward predictor. New
+  `ics::parse_ics_info_with_ltp` parses that branch — `ltp_data_present`
+  then the non-LD `ltp_data()` (11-bit `ltp_lag`, 3-bit `ltp_coef`,
+  per-sfb `ltp_long_used[]`), plus the second channel's `ltp_data()` in
+  the CPE common-window case — and new `decoder::decode_ics_ltp` returns
+  the channel's LTP side info alongside the usual ICS tuple for the SCE /
+  LFE / independent-ICS CPE elements. The §4.6.7.3 single-tap predictor
+  `synth::apply_ltp` (`x_est(i) = ltp_coef · x_rec(i − M − ltp_lag)`,
+  `M = 0`, `N = 2·FRAME_LEN = 2048`) runs between PNS/IS (and M/S, in
+  CPE) and TNS per Figure 4.2, adding the windowed-and-forward-MDCT'd
+  predicted spectrum `X_est` to the residual on every `ltp_long_used`
+  band except PNS/IS bands (those take precedence, §4.6.7.4.2); each
+  channel's reconstructed PCM is pushed back into `ChannelState.ltp_hist`
+  after IMDCT to seed the next frame's `x_rec(i<0)`. AOT 4 is
+  long-window-only by construction — Table 4.6 reads
+  `predictor_data_present` only in the long-window `else` arm, so a plain
+  SCE/CPE never carries short-window LTP (that variant exists only in the
+  scalable profile, which the crate does not decode); the
+  `ltp_short_used` / `ltp_short_lag` parsing in `ics::parse_ltp_data`
+  stays available but unwired. Tests: `ics::tests`
+  (`parse_ics_info_with_ltp_sce_long`,
+  `parse_ics_info_with_ltp_cpe_common_window_dual`,
+  `parse_ics_info_with_ltp_short_has_no_predictor_field`) plus a new
+  `tests/ltp_aot4_decode.rs` integration suite that builds synthetic
+  AOT 4 SCE frames (codebook-1 single-band) by hand and verifies
+  `make_decoder` acceptance, 1024-sample decode, that enabling
+  `ltp_long_used[0]` on a second frame changes the decoded PCM (the
+  predictor actually contributes), and that an AOT 4 frame with no
+  prediction decodes byte-identically to AAC-LC.
+
 - **Non-LD AAC-LTP (`AOT 4`) `ltp_data()` parser + long-window predictor
   (round-104).** The non-LD branch of ISO/IEC 14496-3 §4.6.7 / Table 4.49
   (`AudioObjectType != ER AAC LD`) is now available as self-contained,
