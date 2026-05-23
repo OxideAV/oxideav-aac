@@ -269,6 +269,114 @@ fn ld_decoder_rejects_aot23_with_unsupported_channel_config() {
     );
 }
 
+/// Build an LTP-bearing SCE frame: `predictor_data_present = 1`,
+/// `ltp_data_present = 1`, then `ltp_data()` (ER AAC LD branch) with the
+/// given lag / coef / per-sfb `long_used` flags, followed by a
+/// single-band ZERO_HCB spectrum. Exercises the `ltp_data()` parse +
+/// cursor alignment through the rest of the channel element.
+///
+/// Layout (§4.4.2.2 + §4.6.2 Table 4.6 + §4.6.7 Table 4.49):
+///   element_instance_tag (4)
+///   global_gain          (8)
+///   ── ics_info() ──
+///   ics_reserved_bit     (1)
+///   window_sequence      (2)  = OnlyLong
+///   window_shape         (1)
+///   max_sfb              (6)  = 1
+///   predictor_data_present (1) = 1
+///     ltp_data_present   (1)  = 1
+///       ltp_lag_update   (1)  = 1
+///       ltp_lag          (10)
+///       ltp_coef         (3)
+///       ltp_long_used[0] (1)
+///   ── section_data ── one section: ZERO_HCB covering the 1 band
+///   ── scalefactors ── (none for ZERO_HCB)
+///   pulse / tns / gain bits (1 + 1 + 1) = 0
+///   ── spectral_data ── ZERO_HCB ⇒ no bits
+fn build_ld_ltp_sce(lag: u16, coef_idx: u8, long_used0: bool) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 4); // element_instance_tag
+    bw.write_u32(0, 8); // global_gain
+                        // ics_info()
+    bw.write_bit(false); // ics_reserved_bit
+    bw.write_u32(0, 2); // window_sequence = OnlyLong
+    bw.write_bit(false); // window_shape = sine
+    bw.write_u32(1, 6); // max_sfb = 1
+    bw.write_bit(true); // predictor_data_present = 1
+    bw.write_bit(true); // ltp_data_present = 1
+                        // ltp_data() — ER AAC LD branch
+    bw.write_bit(true); // ltp_lag_update = 1
+    bw.write_u32(lag as u32, 10); // ltp_lag
+    bw.write_u32(coef_idx as u32, 3); // ltp_coef
+    bw.write_bit(long_used0); // ltp_long_used[0]
+                              // section_data: one section, ZERO_HCB (cb=0), length 1.
+    bw.write_u32(0, 4); // sect_cb = ZERO_HCB
+    bw.write_u32(1, 5); // sect_len_incr = 1 (one band)
+                        // scalefactors: ZERO_HCB band carries no scalefactor.
+                        // pulse / tns / gain_control
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    // spectral_data: ZERO_HCB ⇒ no coefficients coded.
+    bw.finish()
+}
+
+#[test]
+fn ld_decoder_consumes_ltp_data_block() {
+    // The decoder must parse predictor_data_present=1 + ltp_data() and
+    // keep the bit-cursor aligned through the rest of the SCE. With a
+    // ZERO_HCB spectrum and cold-start (all-zero) history the LTP
+    // prediction is zero, so the frame decodes to silence — the point of
+    // the test is that the new ltp_data() parse path is reached and the
+    // trailing section/pulse/tns/gain bits land at the correct offsets.
+    let asc = build_ld_asc(4, 1, false);
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.sample_rate = Some(44_100);
+    params.channels = Some(1);
+    params.extradata = asc;
+    let mut dec = oxideav_aac::decoder::make_decoder(&params)
+        .expect("LD-mono LTP make_decoder should succeed");
+
+    let payload = build_ld_ltp_sce(300, 5, true);
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), payload);
+    dec.send_packet(&pkt).unwrap();
+    let frame = dec
+        .receive_frame()
+        .expect("LD LTP frame should decode without cursor misalignment");
+    match frame {
+        Frame::Audio(af) => {
+            assert_eq!(af.samples, 512);
+            assert_eq!(af.data[0].len(), 1024);
+            // Cold-start zero history ⇒ zero prediction ⇒ silence.
+            for &b in &af.data[0] {
+                assert_eq!(b, 0, "cold-start LTP frame must be silent");
+            }
+        }
+        _ => panic!("expected Frame::Audio"),
+    }
+}
+
+#[test]
+fn ld_decoder_ltp_disabled_band_decodes() {
+    // ltp_long_used[0] = 0: prediction parsed but not applied to the band.
+    // Still must decode cleanly (cursor alignment with the flag cleared).
+    let asc = build_ld_asc(4, 1, false);
+    let mut params = CodecParameters::audio(CodecId::new("aac"));
+    params.sample_rate = Some(44_100);
+    params.channels = Some(1);
+    params.extradata = asc;
+    let mut dec = oxideav_aac::decoder::make_decoder(&params).unwrap();
+    let payload = build_ld_ltp_sce(0, 0, false);
+    let pkt = Packet::new(0, TimeBase::new(1, 44_100), payload);
+    dec.send_packet(&pkt).unwrap();
+    let frame = dec.receive_frame().expect("LTP-disabled band must decode");
+    if let Frame::Audio(af) = frame {
+        assert_eq!(af.samples, 512);
+    } else {
+        panic!("expected Frame::Audio");
+    }
+}
+
 #[test]
 fn ld_decoder_aot_constant_is_23() {
     // Cross-check the syntax module constant; if this ever changes the

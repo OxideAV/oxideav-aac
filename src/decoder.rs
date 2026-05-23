@@ -13,11 +13,13 @@ use crate::adts::parse_adts_header;
 use crate::asc::parse_asc;
 use crate::ics::{
     decode_spectrum_long, decode_spectrum_long_with_swb, decode_spectrum_short, parse_ics_info,
-    parse_ics_info_ld, parse_scalefactors, parse_section_data, IcsInfo, SectionData, INTENSITY_HCB,
-    INTENSITY_HCB2, NOISE_HCB, SPEC_LEN, ZERO_HCB,
+    parse_ics_info_ld, parse_scalefactors, parse_section_data, IcsInfo, LtpData, SectionData,
+    INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, SPEC_LEN, ZERO_HCB,
 };
 use crate::latm::{AudioMuxElement, LatmContext};
-use crate::ld_eld::{imdct_and_overlap_ld, swb_ld_for, LdChannelState, LdFrameLength};
+use crate::ld_eld::{
+    apply_ltp_ld, imdct_and_overlap_ld, swb_ld_for, LdChannelState, LdFrameLength,
+};
 use crate::loas::parse_loas_frame;
 use crate::pns::{apply_pns_long, apply_pns_short, PnsRng};
 use crate::pulse::{apply_pulse_long, parse_pulse_data, PulseData};
@@ -1469,7 +1471,10 @@ impl AacDecoder {
             1 => {
                 // single_channel_element() — §4.4.2.2 Table 4.4.
                 let _instance_tag = br.read_u32(4)?;
-                let (info, sf, sec, tns, pulse) = decode_ics_ld(&mut br, self.sf_index, swb)?;
+                let mut prev_lag = self.ld_chans[0].ltp_prev_lag;
+                let ((info, sf, sec, tns, pulse), ltp) =
+                    decode_ics_ld(&mut br, self.sf_index, swb, &mut prev_lag)?;
+                self.ld_chans[0].ltp_prev_lag = prev_lag;
                 let mut spec = [0.0f32; SPEC_LEN];
                 decode_spectrum_long_with_swb(&mut br, &info, &sec, &sf, swb, &mut spec, n)?;
                 if let Some(pd) = pulse.as_ref() {
@@ -1477,6 +1482,23 @@ impl AacDecoder {
                 }
                 // PNS — LD reuses the same NOISE_HCB convention.
                 apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
+                // LTP (§4.6.7.3) sits between PNS and TNS in the GA
+                // decoder tool chain (§4.1.1.1 Figure 4.2: PNS →
+                // prediction → intensity → long-term prediction → TNS).
+                // The predicted spectrum is added on enabled bands; PNS /
+                // IS bands are skipped because those tools take precedence
+                // over prediction (§4.6.7.4.2).
+                if let Some(ltp) = ltp.as_ref() {
+                    let skip = ltp_skip_bands(&sec, info.max_sfb as usize);
+                    apply_ltp_ld(
+                        &mut spec[..n],
+                        &self.ld_chans[0],
+                        ltp,
+                        swb,
+                        frame_length,
+                        &skip,
+                    );
+                }
                 // TNS uses the LD SWB table; same per-band signalling.
                 if let Some(tns_data) = tns.as_ref() {
                     apply_tns_long(&mut spec, tns_data, self.sf_index, info.max_sfb, swb);
@@ -1485,6 +1507,10 @@ impl AacDecoder {
                 let mut tmp = vec![0.0f32; n];
                 let spec_slice = &spec[..n];
                 imdct_and_overlap_ld(spec_slice, &mut self.ld_chans[0], &mut tmp, frame_length)?;
+                // Update the LTP time-domain history with this frame's
+                // reconstructed output (§4.6.7.3 — the "previous fully
+                // reconstructed time domain samples").
+                self.ld_chans[0].push_ltp_history(&tmp);
                 pcm[0].copy_from_slice(&tmp);
             }
             2 => {
@@ -1492,7 +1518,12 @@ impl AacDecoder {
                 let _instance_tag = br.read_u32(4)?;
                 let common_window = br.read_bit()?;
                 if common_window {
-                    let info = parse_ics_info_ld(&mut br, self.sf_index, swb)?;
+                    let mut prev_lags =
+                        [self.ld_chans[0].ltp_prev_lag, self.ld_chans[1].ltp_prev_lag];
+                    let (info, ltp) =
+                        parse_ics_info_ld(&mut br, self.sf_index, swb, true, &mut prev_lags)?;
+                    self.ld_chans[0].ltp_prev_lag = prev_lags[0];
+                    self.ld_chans[1].ltp_prev_lag = prev_lags[1];
                     let ms_mask_present = br.read_u32(2)? as u8;
                     let max_sfb = info.max_sfb as usize;
                     let groups = info.num_window_groups as usize;
@@ -1588,6 +1619,25 @@ impl AacDecoder {
                         &mut spec,
                     );
                     apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
+                    // LTP per channel (§4.6.7.3) — after M/S + intensity,
+                    // before TNS (§4.1.1.1 Figure 4.2). Each channel
+                    // predicts from its own reconstructed-output history,
+                    // so the X_est add operates on the de-matrixed L / R
+                    // spectrum. PNS / IS bands are skipped (those tools
+                    // take precedence per §4.6.7.4.2).
+                    for ch in 0..2 {
+                        if let Some(ltp) = ltp[ch].as_ref() {
+                            let skip = ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
+                            apply_ltp_ld(
+                                &mut spec[ch][..n],
+                                &self.ld_chans[ch],
+                                ltp,
+                                swb,
+                                frame_length,
+                                &skip,
+                            );
+                        }
+                    }
                     // TNS per channel.
                     for ch in 0..2 {
                         if let Some(tns) = tns_all[ch].as_ref() {
@@ -1610,6 +1660,7 @@ impl AacDecoder {
                             &mut tmp,
                             frame_length,
                         )?;
+                        self.ld_chans[ch].push_ltp_history(&tmp);
                         pcm[ch].copy_from_slice(&tmp);
                     }
                 } else {
@@ -1617,10 +1668,14 @@ impl AacDecoder {
                     // !common_window CPE branch but with LD ICS info.
                     let mut spec = [[0.0f32; SPEC_LEN]; 2];
                     let mut infos: [IcsInfo; 2] = Default::default();
+                    let mut secs: [SectionData; 2] = Default::default();
                     let mut tns_all: [Option<TnsData>; 2] = [None, None];
+                    let mut ltp_all: [Option<LtpData>; 2] = [None, None];
                     for ch in 0..2 {
-                        let (info, sf, sec, tns, pulse) =
-                            decode_ics_ld(&mut br, self.sf_index, swb)?;
+                        let mut prev_lag = self.ld_chans[ch].ltp_prev_lag;
+                        let ((info, sf, sec, tns, pulse), ltp) =
+                            decode_ics_ld(&mut br, self.sf_index, swb, &mut prev_lag)?;
+                        self.ld_chans[ch].ltp_prev_lag = prev_lag;
                         decode_spectrum_long_with_swb(
                             &mut br,
                             &info,
@@ -1643,9 +1698,24 @@ impl AacDecoder {
                             None,
                         );
                         infos[ch] = info;
+                        secs[ch] = sec;
                         tns_all[ch] = tns;
+                        ltp_all[ch] = ltp;
                     }
                     for ch in 0..2 {
+                        // LTP after PNS, before TNS (no M/S on independent
+                        // ICS) — §4.1.1.1 Figure 4.2 tool order.
+                        if let Some(ltp) = ltp_all[ch].as_ref() {
+                            let skip = ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
+                            apply_ltp_ld(
+                                &mut spec[ch][..n],
+                                &self.ld_chans[ch],
+                                ltp,
+                                swb,
+                                frame_length,
+                                &skip,
+                            );
+                        }
                         if let Some(tns) = tns_all[ch].as_ref() {
                             apply_tns_long(
                                 &mut spec[ch],
@@ -1663,6 +1733,7 @@ impl AacDecoder {
                             &mut tmp,
                             frame_length,
                         )?;
+                        self.ld_chans[ch].push_ltp_history(&tmp);
                         pcm[ch].copy_from_slice(&tmp);
                     }
                 }
@@ -1749,13 +1820,44 @@ pub fn decode_ics(br: &mut BitReader<'_>, sf_index: u8, is_in_cpe: bool) -> Resu
     Ok((info, sf, sec, tns, pulse))
 }
 
+/// Build the per-sfb mask of bands that LTP must NOT predict (long
+/// window). Per ISO/IEC 14496-3 §4.6.7.4.2, when both LTP and PNS are
+/// enabled on the same band PNS takes precedence (no prediction), and
+/// likewise intensity stereo takes precedence over LTP. Those bands are
+/// already reconstructed by the PNS / IS passes that run *before* LTP in
+/// the GA decoder tool chain, so adding the predicted spectrum on top
+/// would corrupt them. Long-window LD has a single window group, so the
+/// mask is simply per-sfb.
+fn ltp_skip_bands(sec: &SectionData, max_sfb: usize) -> Vec<bool> {
+    let mut skip = vec![false; max_sfb];
+    for (sfb, slot) in skip.iter_mut().enumerate() {
+        let cb = sec.sfb_cb.get(sfb).copied().unwrap_or(0);
+        *slot = matches!(cb, NOISE_HCB | INTENSITY_HCB | INTENSITY_HCB2);
+    }
+    skip
+}
+
 /// LD variant of [`decode_ics`] — uses `parse_ics_info_ld` for the
 /// header and the LD SWB offset table for max_sfb clamping. The rest of
 /// the per-channel side-info layout (global_gain, section_data,
 /// scalefactors, pulse, TNS, gain_control) matches AAC-LC bit-for-bit.
-pub fn decode_ics_ld(br: &mut BitReader<'_>, sf_index: u8, swb: &[u16]) -> Result<DecodedIcs> {
+///
+/// This is the single-channel (`common_window == false`) entry point, so
+/// at most one `ltp_data()` block can appear in the ics_info; the parsed
+/// long-term-prediction side info (if any) is returned alongside the rest
+/// of the ICS. `prev_lag` carries the channel's previous-frame LTP lag
+/// for the `ltp_lag_update == 0` reuse case and is updated in place.
+pub fn decode_ics_ld(
+    br: &mut BitReader<'_>,
+    sf_index: u8,
+    swb: &[u16],
+    prev_lag: &mut u16,
+) -> Result<(DecodedIcs, Option<LtpData>)> {
     let global_gain = br.read_u32(8)? as u8;
-    let info = parse_ics_info_ld(br, sf_index, swb)?;
+    let mut prev_lags = [*prev_lag, 0];
+    let (info, ltp) = parse_ics_info_ld(br, sf_index, swb, false, &mut prev_lags)?;
+    *prev_lag = prev_lags[0];
+    let ltp = ltp[0].clone();
     let sec = parse_section_data(br, &info)?;
     let sf = parse_scalefactors(br, &info, &sec, global_gain)?;
     let pulse_present = br.read_bit()?;
@@ -1775,7 +1877,7 @@ pub fn decode_ics_ld(br: &mut BitReader<'_>, sf_index: u8, swb: &[u16]) -> Resul
     // gain-control on LD). Consume the bit defensively to keep the
     // cursor aligned even on a non-conformant encoder.
     let _gain_control = br.read_bit()?;
-    Ok((info, sf, sec, tns, pulse))
+    Ok(((info, sf, sec, tns, pulse), ltp))
 }
 
 /// Fill the spectrum coefficients into `spec` from the bit-stream `br`.

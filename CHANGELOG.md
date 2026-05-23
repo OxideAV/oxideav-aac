@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AAC-LD long-term prediction (LTP) decode (round-101).** The AOT 23
+  (`AOT_ER_AAC_LD`) decode path now honours `predictor_data_present == 1`
+  instead of erroring: it parses the `ltp_data()` block (ISO/IEC
+  14496-3 §4.6.7, Table 4.49, ER AAC LD branch — `ltp_lag_update` /
+  10-bit `ltp_lag` with previous-frame reuse, 3-bit `ltp_coef` indexing
+  Table 4.98, and per-sfb `ltp_long_used` flags) and runs the
+  single-tap long-window predictor from §4.6.7.3:
+  `x_est(i) = ltp_coef · x_rec(i − N/2 − ltp_lag)` with the
+  transform-window length `N = 2·frame_len` and `M = N/2` for ER AAC LD.
+  The reconstructed-sample buffer `x_rec` is arranged per spec —
+  `x_rec(0…N/2−1)` is the aliased IMDCT half (`LdChannelState.prev`),
+  `x_rec(N/2…N−1)` is zero, and `x_rec(i<0)` is the prior decoder output
+  held in a new per-channel `LdChannelState.time_hist` ring. The
+  predicted time signal is run through the analysis filterbank (windowed
+  forward LD MDCT) and the resulting `X_est` is added to the dequantised
+  residual `Y_rec` on every enabled scalefactor band. LTP slots between
+  PNS and TNS in the GA decoder tool chain (§4.1.1.1 Figure 4.2:
+  M/S → PNS → prediction → intensity → long-term prediction → TNS), and
+  PNS / intensity-stereo bands are skipped because those tools take
+  precedence over prediction (§4.6.7.4.2). Wired into all three LD
+  element paths: SCE, CPE common-window (shared ics_info carries a
+  second channel's `ltp_data` per Table 4.6), and CPE independent-ICS.
+  New `ics::parse_ltp_data_ld` + `ics::LtpData` + `ics::LTP_COEF`;
+  `ld_eld::apply_ltp_ld`; `LdChannelState` gains `time_hist` /
+  `ltp_prev_lag` + `push_ltp_history`. `parse_ics_info_ld` now takes
+  `common_window` + per-channel `prev_lags` and returns the parsed LTP
+  side info. Tests: `ld_eld::tests::ltp_data_ld_parse_roundtrip`
+  (Table 4.49 bit layout + lag-reuse), `ltp_history_push_orders_newest_last`,
+  `ltp_predicts_lagged_history_through_filterbank` (headline arithmetic
+  check — `apply_ltp_ld` spectrum equals the analysis MDCT of the
+  windowed `ltp_coef × history`, and the predicted signal reconstructs
+  through the OLA filterbank to < 5e-3); `tests/ld_decode_round_trip.rs`
+  adds `ld_decoder_consumes_ltp_data_block` +
+  `ld_decoder_ltp_disabled_band_decodes` (end-to-end cursor alignment
+  through `ltp_data()`). Short-window LTP and the non-LD (AOT 4
+  AAC-LTP) 11-bit-lag variant remain out of scope.
+
 - **Multi-RDB ADTS decode (round-98).** The decoder now honours
   `number_of_raw_data_blocks_in_frame > 0` (ISO/IEC 13818-7 §6.2,
   Table 5): an `adts_frame()` may multiplex 1..4 `raw_data_block()`s

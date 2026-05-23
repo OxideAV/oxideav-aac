@@ -48,23 +48,107 @@ impl IcsInfo {
     }
 }
 
+/// LTP coefficient table — ISO/IEC 14496-3 §4.6.7.2 Table 4.98. The 3-bit
+/// `ltp_coef` index selects the single-tap predictor gain applied to the
+/// lagged time-domain history.
+pub const LTP_COEF: [f32; 8] = [
+    0.570_829, 0.696_616, 0.813_004, 0.911_304, 0.984_900, 1.067_894, 1.194_601, 1.369_533,
+];
+
+/// Parsed `ltp_data()` for AAC-LD (objectType 23) — ISO/IEC 14496-3
+/// §4.6.7 / Table 4.49 (the `AudioObjectType == ER AAC LD` branch).
+///
+/// LD is long-window-only, so only the per-sfb `ltp_long_used` flags are
+/// present (no `ltp_short_used` / `ltp_short_lag`). The lag is a 10-bit
+/// value (range 0..1023); when `ltp_lag_update == 0` the previous frame's
+/// lag is reused, which the caller resolves via the per-channel
+/// `ltp_prev_lag` state before constructing this struct.
+#[derive(Clone, Debug, Default)]
+pub struct LtpData {
+    /// Resolved long-term-prediction lag in samples (0..1023 for LD).
+    pub lag: u16,
+    /// Predictor gain from [`LTP_COEF`] (the resolved `ltp_coef` table value).
+    pub coef: f32,
+    /// `ltp_long_used[sfb]` — one flag per coded scalefactor band.
+    pub long_used: Vec<bool>,
+}
+
+/// Parse the AAC-LD variant of `ltp_data()` (ISO/IEC 14496-3 §4.6.7,
+/// Table 4.49, `AudioObjectType == ER AAC LD` branch):
+///
+/// ```text
+/// ltp_lag_update                            1   uimsbf
+/// if (ltp_lag_update) ltp_lag               10  uimsbf
+/// else                ltp_lag = ltp_prev_lag
+/// ltp_coef                                  3   uimsbf
+/// for (sfb = 0; sfb < max_sfb; sfb++)
+///     ltp_long_used[sfb]                    1   uimsbf
+/// ```
+///
+/// `prev_lag` carries the channel's previous-frame lag for the
+/// `ltp_lag_update == 0` reuse case; it is updated in place to the
+/// resolved lag so the next frame can reuse it again.
+pub fn parse_ltp_data_ld(
+    br: &mut BitReader<'_>,
+    max_sfb: usize,
+    prev_lag: &mut u16,
+) -> Result<LtpData> {
+    let lag = if br.read_bit()? {
+        br.read_u32(10)? as u16
+    } else {
+        *prev_lag
+    };
+    *prev_lag = lag;
+    let coef_idx = br.read_u32(3)? as usize;
+    let coef = LTP_COEF[coef_idx];
+    let mut long_used = vec![false; max_sfb];
+    for slot in long_used.iter_mut() {
+        *slot = br.read_bit()?;
+    }
+    Ok(LtpData {
+        lag,
+        coef,
+        long_used,
+    })
+}
+
 /// LD-specific variant of [`parse_ics_info`] — ISO/IEC 14496-3 §4.6.17.
 ///
 /// AAC-LD always uses long blocks (no `EIGHT_SHORT_SEQUENCE`), uses the
 /// LD SWB table at the given frame length, and replaces the
-/// AAC-Main / LTP `predictor_data` block with the LD-specific LTP-lag
-/// stream. We don't decode LTP in round 95 — if the
-/// `predictor_data_present` bit is set we surface an `Unsupported`
-/// error rather than corrupting the cursor.
+/// AAC-Main backward predictor's `predictor_data` block with the LD
+/// long-term-prediction (LTP) side-info stream.
+///
+/// Per ISO/IEC 14496-3 Table 4.6, when `predictor_data_present == 1` and
+/// `audioObjectType != 1` the body is the LTP path:
+///
+/// ```text
+/// ltp_data_present                          1   uimsbf
+/// if (ltp_data_present) ltp_data();
+/// if (common_window) {
+///     ltp_data_present                      1   uimsbf  (second channel)
+///     if (ltp_data_present) ltp_data();
+/// }
+/// ```
 ///
 /// `swb_offsets` is the LD-specific scalefactor-band offset table for the
 /// (sf_index, frame_length) pair (see `ld_eld::swb_ld_for`). The
 /// resulting `IcsInfo::max_sfb` is clamped to fit inside the table.
+///
+/// `common_window` selects whether the shared ics_info carries a second
+/// channel's `ltp_data` (the CPE common_window case). `prev_lags` carries
+/// the per-channel previous-frame LTP lag for the `ltp_lag_update == 0`
+/// reuse case and is updated in place. The returned `[Option<LtpData>; 2]`
+/// holds the parsed LTP side info for channel 0 (and channel 1 when
+/// `common_window`); entries are `None` when LTP is disabled for that
+/// channel this frame.
 pub fn parse_ics_info_ld(
     br: &mut BitReader<'_>,
     sf_index: u8,
     swb_offsets: &[u16],
-) -> Result<IcsInfo> {
+    common_window: bool,
+    prev_lags: &mut [u16; 2],
+) -> Result<(IcsInfo, [Option<LtpData>; 2])> {
     let _ics_reserved_bit = br.read_bit()?;
     let window_sequence = WindowSequence::from_u32(br.read_u32(2)?);
     let window_shape = WindowShape::from_bit(br.read_u32(1)?);
@@ -78,16 +162,25 @@ pub fn parse_ics_info_ld(
         ));
     }
     let max_sfb_raw = br.read_u32(6)? as u8;
-    let predictor_data_present = br.read_bit()?;
-    if predictor_data_present {
-        // LD's `predictor_data_present` carries LTP side info (Table
-        // 4.171 follow-up); we don't implement LTP decode this round.
-        return Err(Error::unsupported(
-            "AAC-LD: LTP / predictor_data not yet implemented (objectType 23)",
-        ));
-    }
     let num_swb = swb_offsets.len().saturating_sub(1);
     let max_sfb = (max_sfb_raw as usize).min(num_swb) as u8;
+    let predictor_data_present = br.read_bit()?;
+    let mut ltp: [Option<LtpData>; 2] = [None, None];
+    if predictor_data_present {
+        // §4.6.7 / Table 4.49 — LTP side info. The per-sfb
+        // `ltp_long_used` flags are bounded by the (clamped) max_sfb so a
+        // non-conformant max_sfb can never read past the SWB table.
+        let ltp_data_present = br.read_bit()?;
+        if ltp_data_present {
+            ltp[0] = Some(parse_ltp_data_ld(br, max_sfb as usize, &mut prev_lags[0])?);
+        }
+        if common_window {
+            let ltp_data_present_1 = br.read_bit()?;
+            if ltp_data_present_1 {
+                ltp[1] = Some(parse_ltp_data_ld(br, max_sfb as usize, &mut prev_lags[1])?);
+            }
+        }
+    }
     let mut info = IcsInfo {
         window_sequence,
         window_shape,
@@ -99,7 +192,7 @@ pub fn parse_ics_info_ld(
         ..Default::default()
     };
     info.window_group_length[0] = 1;
-    Ok(info)
+    Ok((info, ltp))
 }
 
 pub fn parse_ics_info(br: &mut BitReader<'_>, sf_index: u8) -> Result<IcsInfo> {
