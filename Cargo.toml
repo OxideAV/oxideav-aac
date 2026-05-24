@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-aac"
+version = "0.1.2"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-aac"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust AAC-LC decoder and encoder for oxideav — ADTS framing, Huffman books 1-11, IMDCT, M/S stereo, TNS, PNS"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-aac"
+keywords = ["multimedia", "audio", "aac", "codec", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
