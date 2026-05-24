@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-aac/compare/v0.1.2...v0.1.3) - 2026-05-24
+
+### Other
+
+- AAC-LD multichannel er_raw_data_block() for channelConfiguration 3..=7 (round-111)
+- wire AOT 4 (AAC-LTP) full frame decode (round-108)
+- drop unfounded MAX_LTP_LONG_SFB clamp from parse_ltp_data
+- non-LD AAC-LTP (AOT 4) ltp_data() parser + long-window predictor
+- AAC-LD long-term prediction (LTP) decode (round-101)
+- drop external-encoder name from multi-RDB doc comment
+- multi-RDB ADTS decode (round-98)
+- wire AOT 23 er_raw_data_block decode (round-95)
+- wire §4.6.18.5 upsample-only path for boundary frames ([#771](https://github.com/OxideAV/oxideav-aac/pull/771))
+- rewrite three source-citation comments to remove ffmpeg/libavcodec/libfdk_aac path references
+- iTunSMPB tag parser (round-73)
+- perceptual M/S decision per §6.6.1.3 (round-30)
+- sparse-spectrum gate for SCE TNS (round-29)
+- TNS on CPE long blocks (round-28)
+- SBR on multichannel ADTS — sample-count divergence
+- SBR fill_element before first channel element
+- implicit-SBR sample-count divergence at sf_index 9..=12
+- oracle skip PCM compare on silent-fallback frame (#773 follow-up)
+- 88.2k 5.1 ADTS short-payload 0-frame divergence ([#773](https://github.com/OxideAV/oxideav-aac/pull/773))
+- CPE independent-window OOB on >8 channels ([#772](https://github.com/OxideAV/oxideav-aac/pull/772))
+- SBR hf_adjust add-overflow ([#757](https://github.com/OxideAV/oxideav-aac/pull/757)) + implicit-SBR oracle skip ([#771](https://github.com/OxideAV/oxideav-aac/pull/771))
+- tolerate predictor_data_present on AAC-LC + survive multi-frame run
+- also reject ASC sf_index 13/14/15 in make_decoder
+- reject ADTS sf_index 13/14/15 + clamp num_swb_* OOB
+- ADTS short-packet panic ([#760](https://github.com/OxideAV/oxideav-aac/pull/760)) + 88.2k 5.1 0-frame divergence ([#759](https://github.com/OxideAV/oxideav-aac/pull/759))
+- SBR hf_adjust underflow + tolerate gain_control on AAC-LC
+- pin the exact 113-byte fuzz crash bytes for #744
+- fix SBR-noise OOB ([#743](https://github.com/OxideAV/oxideav-aac/pull/743)) + max_sfb overrun ([#744](https://github.com/OxideAV/oxideav-aac/pull/744)); verify IS divergence ([#742](https://github.com/OxideAV/oxideav-aac/pull/742))
+- cargo-fuzz scaffolding + ffmpeg libavcodec oracle
+
 ### Added
 
 - **AAC-LD multichannel `er_raw_data_block()` decode for channelConfiguration
