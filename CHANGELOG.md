@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AAC-LD multichannel `er_raw_data_block()` decode for channelConfiguration
+  3..=7 (round-111).** The AAC-LD top-level payload (`AOT_ER_AAC_LD`, AOT 23)
+  now decodes the full ISO/IEC 14496-3 §4.4.2.3 Table 4.19 channel-config
+  matrix: 3 = SCE + CPE (3.0), 4 = SCE + CPE + SCE (4.0), 5 = SCE + CPE + CPE
+  (5.0), 6 = SCE + CPE + CPE + LFE (5.1), and 7 = SCE + CPE + CPE + CPE +
+  LFE (7.1, 8 PCM channels) — previously only configs 1 and 2 (mono / stereo)
+  were wired. Unlike the LC `raw_data_block()`, the LD top-level payload has
+  **no** `id_syn_ele` 3-bit element-type dispatch loop: the element sequence
+  is fixed entirely by `channelConfiguration` per Table 4.19, so the new
+  private `ld_element_layout()` enumerates the SCE/CPE/LFE sequence (with
+  base-channel offsets) and `decode_packet_ld` drives the new
+  `decode_sce_ld` / `decode_cpe_ld` per-element helpers (refactored out of
+  the previous mono+stereo body for reuse — LFE shares the SCE bitstream
+  syntax and is long-window-only, which LD already is, so the same helper
+  serves both). Each element reuses the existing LD tools end-to-end:
+  `decode_ics_ld` + `decode_spectrum_long_with_swb` (LD SWB tables via
+  `swb_ld_for`) + per-channel `imdct_and_overlap_ld`; PNS / IS / M/S / TNS
+  / LTP all fire per channel, with per-channel `LdChannelState` (the `ld_chans`
+  array was already sized to 8) and `push_ltp_history` keeping the LTP
+  time-domain ring seeded across multichannel frames. The earlier
+  `Error::Unsupported` up-front gate (config ∈ {1,2}) is lifted to 1..=7;
+  config 0 (PCE-defined topology) and 8.. (reserved) keep the unsupported
+  rejection. Tests: `tests/ld_multichannel_decode.rs` (7 new) — one
+  silence-frame test per config 3..=7 (asserts the produced PCM channel
+  count and 512-sample frame length per channel and that zero-spectrum
+  elements decode to all-zero output) plus two content-placement tests
+  (`ld_config3_places_content_in_front_channel_only` — a non-zero
+  codebook-1 band in the leading SCE produces energy in channel 0 with the
+  trailing CPE channels silent, proving the SCE→0 / CPE→1,2 mapping; and
+  `ld_config5_places_content_in_surround_pair_only` — a non-zero band on
+  the **second** CPE's left channel produces energy in channel 3 with the
+  preceding SCE and first CPE silent, proving the base-channel offset of
+  the third element is 3 = 1 + 2). The pre-existing
+  `ld_decoder_rejects_aot23_with_unsupported_channel_config` test was
+  rewritten in place (per the no-`#[ignore]` rule) to use config 8 — a
+  still-reserved value — and renamed
+  `ld_decoder_rejects_aot23_with_reserved_channel_config`. Short-window
+  LTP, low-overlap window shape, LD-SBR, and ELD frame decode remain
+  follow-ups.
+
 - **AAC-LTP (`AOT 4`) full frame decode (round-108).** The non-LD
   long-term-prediction object type is now decoded end-to-end, wiring the
   round-104 `ltp_data()` parser and `synth::apply_ltp` predictor into the

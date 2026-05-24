@@ -253,19 +253,21 @@ fn ld_decoder_two_frames_produce_continuous_silence() {
 }
 
 #[test]
-fn ld_decoder_rejects_aot23_with_unsupported_channel_config() {
-    // channelConfiguration = 6 (5.1) is permitted by §4.4.2.3 but
-    // wired-out in round 95 — verify the unsupported error fires
-    // up-front rather than during decode.
-    let asc = build_ld_asc(4, 6, false);
+fn ld_decoder_rejects_aot23_with_reserved_channel_config() {
+    // channelConfiguration 1..=7 are now all decoded (§4.4.2.3
+    // Table 4.19). Config 0 (PCE-defined) and 8.. (reserved) remain
+    // unsupported — verify the up-front error still fires for a
+    // reserved config rather than during decode. (Round-111 lifted the
+    // earlier 1..=2-only gate that previously rejected config 6 here.)
+    let asc = build_ld_asc(4, 8, false);
     let mut params = CodecParameters::audio(CodecId::new("aac"));
     params.sample_rate = Some(44_100);
-    params.channels = Some(6);
+    params.channels = Some(8);
     params.extradata = asc;
     let res = oxideav_aac::decoder::make_decoder(&params);
     assert!(
         res.is_err(),
-        "LD with channelConfiguration=6 must currently error out"
+        "LD with reserved channelConfiguration=8 must error out"
     );
 }
 

@@ -89,17 +89,16 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
                     "AAC: AudioSpecificConfig sampling_frequency_index out of table",
                 ));
             }
-            // AAC-LD is restricted to channelConfiguration ∈ {1, 2} in
-            // this round (§4.4.2.3 Table 4.19 also defines 3..=7, but
-            // those layouts add multiple SCE/CPE/LFE elements per
-            // er_raw_data_block which is a larger wiring step deferred
-            // to round-N+1). Reject up-front so callers see the
-            // limitation rather than a corrupted decode.
+            // AAC-LD supports channelConfiguration 1..=7 (§4.4.2.3
+            // Table 4.19 — the er_raw_data_block element layout is fixed
+            // by the channel configuration). Reject 0 (PCE-defined) and
+            // the reserved 8.. up-front so callers see the limitation
+            // rather than a corrupted decode.
             let ld_frame_length = if asc.object_type == AOT_ER_AAC_LD {
-                if !(1..=2).contains(&asc.channel_configuration) {
+                if !(1..=7).contains(&asc.channel_configuration) {
                     return Err(Error::unsupported(
-                        "AAC-LD: only channelConfiguration 1 (mono) and 2 (stereo) \
-                         supported in this round (multichannel LD deferred)",
+                        "AAC-LD: channelConfiguration must be 1..=7 (config 0 \
+                         PCE-defined and 8.. reserved are unsupported)",
                     ));
                 }
                 // SBR is not part of AAC-LD itself — that's AAC-ELD's
@@ -389,6 +388,55 @@ fn expected_channels(config: u8) -> Option<usize> {
         7 => Some(8),
         _ => None,
     }
+}
+
+/// One element in an AAC-LD `er_raw_data_block()` element list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LdElement {
+    /// `single_channel_element()` — one channel.
+    Sce,
+    /// `channel_pair_element()` — two channels.
+    Cpe,
+    /// `lfe_channel_element()` — one channel, SCE-syntax, long-window only.
+    Lfe,
+}
+
+/// Build the fixed element layout for an AAC-LD `er_raw_data_block()` from
+/// its `channelConfiguration` per ISO/IEC 14496-3 §4.4.2.3 Table 4.19.
+///
+/// Unlike the LC `raw_data_block()`, the LD top-level payload has **no**
+/// `id_syn_ele` dispatch — the element sequence is implied entirely by the
+/// channel configuration. Each tuple pairs an element with the base PCM
+/// channel slot its output occupies; the element order also defines the
+/// output channel order (config 6 → C, L, R, Ls, Rs, LFE; config 7 → C,
+/// L, R, Ls, Rs, Lrs, Rrs, LFE).
+fn ld_element_layout(config: u8) -> Result<Vec<(LdElement, usize)>> {
+    use LdElement::{Cpe, Lfe, Sce};
+    let layout: &[LdElement] = match config {
+        1 => &[Sce],
+        2 => &[Cpe],
+        3 => &[Sce, Cpe],
+        4 => &[Sce, Cpe, Sce],
+        5 => &[Sce, Cpe, Cpe],
+        6 => &[Sce, Cpe, Cpe, Lfe],
+        7 => &[Sce, Cpe, Cpe, Cpe, Lfe],
+        _ => {
+            return Err(Error::unsupported(
+                "AAC-LD: only channelConfiguration 1..=7 supported",
+            ));
+        }
+    };
+    // Assign base channel slots in element order.
+    let mut out = Vec::with_capacity(layout.len());
+    let mut base = 0usize;
+    for &elem in layout {
+        out.push((elem, base));
+        base += match elem {
+            Sce | Lfe => 1,
+            Cpe => 2,
+        };
+    }
+    Ok(out)
 }
 
 impl AacDecoder {
@@ -1610,290 +1658,29 @@ impl AacDecoder {
         let payload = &pkt.data;
         let mut br = BitReader::new(payload);
 
-        // PCM buffers per channel — sized to LD frame length (n).
-        let channel_count = match self.channels {
-            1 => 1,
-            2 => 2,
-            _ => {
-                return Err(Error::unsupported(
-                    "AAC-LD: only channelConfiguration 1/2 supported in this round",
-                ));
-            }
-        };
+        // §4.4.2.3 Table 4.19 — the element layout in `er_raw_data_block()`
+        // is fixed by `channelConfiguration` (there is no `id_syn_ele`
+        // dispatch loop as in the LC `raw_data_block()`); each entry below
+        // names the element and the base channel slot its output lands in.
+        let layout = ld_element_layout(self.channels)?;
+        let channel_count = expected_channels(self.channels)
+            .ok_or_else(|| Error::unsupported("AAC-LD: unsupported channelConfiguration"))?;
         let mut pcm: Vec<Vec<f32>> = (0..channel_count).map(|_| vec![0.0f32; n]).collect();
 
-        match channel_count {
-            1 => {
-                // single_channel_element() — §4.4.2.2 Table 4.4.
-                let _instance_tag = br.read_u32(4)?;
-                let mut prev_lag = self.ld_chans[0].ltp_prev_lag;
-                let ((info, sf, sec, tns, pulse), ltp) =
-                    decode_ics_ld(&mut br, self.sf_index, swb, &mut prev_lag)?;
-                self.ld_chans[0].ltp_prev_lag = prev_lag;
-                let mut spec = [0.0f32; SPEC_LEN];
-                decode_spectrum_long_with_swb(&mut br, &info, &sec, &sf, swb, &mut spec, n)?;
-                if let Some(pd) = pulse.as_ref() {
-                    apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
+        for (elem, base) in layout {
+            match elem {
+                LdElement::Sce | LdElement::Lfe => {
+                    // single_channel_element() — §4.4.2.2 Table 4.4. An
+                    // lfe_channel_element() (§4.6.10) shares the SCE
+                    // bitstream syntax and is long-window only, which LD
+                    // already is, so the same path serves both.
+                    self.decode_sce_ld(&mut br, swb, n, frame_length, base, &mut pcm)?;
                 }
-                // PNS — LD reuses the same NOISE_HCB convention.
-                apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
-                // LTP (§4.6.7.3) sits between PNS and TNS in the GA
-                // decoder tool chain (§4.1.1.1 Figure 4.2: PNS →
-                // prediction → intensity → long-term prediction → TNS).
-                // The predicted spectrum is added on enabled bands; PNS /
-                // IS bands are skipped because those tools take precedence
-                // over prediction (§4.6.7.4.2).
-                if let Some(ltp) = ltp.as_ref() {
-                    let skip = ltp_skip_bands(&sec, info.max_sfb as usize);
-                    apply_ltp_ld(
-                        &mut spec[..n],
-                        &self.ld_chans[0],
-                        ltp,
-                        swb,
-                        frame_length,
-                        &skip,
-                    );
-                }
-                // TNS uses the LD SWB table; same per-band signalling.
-                if let Some(tns_data) = tns.as_ref() {
-                    apply_tns_long(&mut spec, tns_data, self.sf_index, info.max_sfb, swb);
-                }
-                // LD IMDCT + overlap-add → n samples of PCM.
-                let mut tmp = vec![0.0f32; n];
-                let spec_slice = &spec[..n];
-                imdct_and_overlap_ld(spec_slice, &mut self.ld_chans[0], &mut tmp, frame_length)?;
-                // Update the LTP time-domain history with this frame's
-                // reconstructed output (§4.6.7.3 — the "previous fully
-                // reconstructed time domain samples").
-                self.ld_chans[0].push_ltp_history(&tmp);
-                pcm[0].copy_from_slice(&tmp);
-            }
-            2 => {
-                // channel_pair_element() — §4.4.2.3 Table 4.5.
-                let _instance_tag = br.read_u32(4)?;
-                let common_window = br.read_bit()?;
-                if common_window {
-                    let mut prev_lags =
-                        [self.ld_chans[0].ltp_prev_lag, self.ld_chans[1].ltp_prev_lag];
-                    let (info, ltp) =
-                        parse_ics_info_ld(&mut br, self.sf_index, swb, true, &mut prev_lags)?;
-                    self.ld_chans[0].ltp_prev_lag = prev_lags[0];
-                    self.ld_chans[1].ltp_prev_lag = prev_lags[1];
-                    let ms_mask_present = br.read_u32(2)? as u8;
-                    let max_sfb = info.max_sfb as usize;
-                    let groups = info.num_window_groups as usize;
-                    let mut ms_used = vec![false; groups * max_sfb];
-                    match ms_mask_present {
-                        0 => {}
-                        1 => {
-                            for slot in ms_used.iter_mut() {
-                                *slot = br.read_bit()?;
-                            }
-                        }
-                        2 => {
-                            for slot in ms_used.iter_mut() {
-                                *slot = true;
-                            }
-                        }
-                        _ => {
-                            return Err(Error::invalid("AAC-LD: reserved ms_mask_present=3"));
-                        }
-                    }
-                    let infos = [info.clone(), info.clone()];
-                    let mut spec = [[0.0f32; SPEC_LEN]; 2];
-                    let mut secs: [SectionData; 2] = Default::default();
-                    let mut sfs: [Vec<i32>; 2] = Default::default();
-                    let mut tns_all: [Option<TnsData>; 2] = [None, None];
-                    let mut pulse_all: [Option<PulseData>; 2] = [None, None];
-                    for ch in 0..2 {
-                        let gg = br.read_u32(8)? as u8;
-                        let sec = parse_section_data(&mut br, &infos[ch])?;
-                        let sf = parse_scalefactors(&mut br, &infos[ch], &sec, gg)?;
-                        let pulse_present = br.read_bit()?;
-                        if pulse_present {
-                            pulse_all[ch] = Some(parse_pulse_data(&mut br)?);
-                        }
-                        let tns_present = br.read_bit()?;
-                        if tns_present {
-                            tns_all[ch] =
-                                Some(parse_tns_data(&mut br, infos[ch].window_sequence, 1)?);
-                        }
-                        // gain_control_data_present — reserved 0 for LD,
-                        // tolerated for resilience the same way LC does.
-                        let _gain_control = br.read_bit()?;
-                        decode_spectrum_long_with_swb(
-                            &mut br,
-                            &infos[ch],
-                            &sec,
-                            &sf,
-                            swb,
-                            &mut spec[ch],
-                            n,
-                        )?;
-                        if let Some(pd) = pulse_all[ch].as_ref() {
-                            apply_pulse_long(
-                                &mut spec[ch],
-                                pd,
-                                self.sf_index,
-                                infos[ch].max_sfb,
-                                &sf,
-                            )?;
-                        }
-                        secs[ch] = sec;
-                        sfs[ch] = sf;
-                    }
-                    // PNS — channel 0 first (with mirror to ch1 for
-                    // correlated-noise bands), then leftover ch1 bands.
-                    let (s0, s1) = spec.split_at_mut(1);
-                    apply_pns_long(
-                        &mut s0[0],
-                        &infos[0],
-                        &secs[0],
-                        &sfs[0],
-                        &mut self.pns_rng,
-                        Some(&mut s1[0]),
-                        Some(&ms_used),
-                    );
-                    apply_pns_long_ch1_leftover(
-                        &mut s1[0],
-                        &infos[1],
-                        &secs[0],
-                        &secs[1],
-                        &sfs[1],
-                        &mut self.pns_rng,
-                    );
-                    // IS (§4.6.8.2.3) then M/S (§4.6.8.1.3) — long-only;
-                    // the LD path runs the same helpers as the LC long
-                    // path because the codebook semantics are identical.
-                    apply_intensity_stereo(
-                        &infos[0],
-                        &secs,
-                        &sfs,
-                        &ms_used,
-                        ms_mask_present,
-                        &mut spec,
-                    );
-                    apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
-                    // LTP per channel (§4.6.7.3) — after M/S + intensity,
-                    // before TNS (§4.1.1.1 Figure 4.2). Each channel
-                    // predicts from its own reconstructed-output history,
-                    // so the X_est add operates on the de-matrixed L / R
-                    // spectrum. PNS / IS bands are skipped (those tools
-                    // take precedence per §4.6.7.4.2).
-                    for ch in 0..2 {
-                        if let Some(ltp) = ltp[ch].as_ref() {
-                            let skip = ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
-                            apply_ltp_ld(
-                                &mut spec[ch][..n],
-                                &self.ld_chans[ch],
-                                ltp,
-                                swb,
-                                frame_length,
-                                &skip,
-                            );
-                        }
-                    }
-                    // TNS per channel.
-                    for ch in 0..2 {
-                        if let Some(tns) = tns_all[ch].as_ref() {
-                            apply_tns_long(
-                                &mut spec[ch],
-                                tns,
-                                self.sf_index,
-                                infos[ch].max_sfb,
-                                swb,
-                            );
-                        }
-                    }
-                    // LD IMDCT + overlap per channel.
-                    for ch in 0..2 {
-                        let mut tmp = vec![0.0f32; n];
-                        let spec_slice = &spec[ch][..n];
-                        imdct_and_overlap_ld(
-                            spec_slice,
-                            &mut self.ld_chans[ch],
-                            &mut tmp,
-                            frame_length,
-                        )?;
-                        self.ld_chans[ch].push_ltp_history(&tmp);
-                        pcm[ch].copy_from_slice(&tmp);
-                    }
-                } else {
-                    // Independent ICS per channel — same shape as the LC
-                    // !common_window CPE branch but with LD ICS info.
-                    let mut spec = [[0.0f32; SPEC_LEN]; 2];
-                    let mut infos: [IcsInfo; 2] = Default::default();
-                    let mut secs: [SectionData; 2] = Default::default();
-                    let mut tns_all: [Option<TnsData>; 2] = [None, None];
-                    let mut ltp_all: [Option<LtpData>; 2] = [None, None];
-                    for ch in 0..2 {
-                        let mut prev_lag = self.ld_chans[ch].ltp_prev_lag;
-                        let ((info, sf, sec, tns, pulse), ltp) =
-                            decode_ics_ld(&mut br, self.sf_index, swb, &mut prev_lag)?;
-                        self.ld_chans[ch].ltp_prev_lag = prev_lag;
-                        decode_spectrum_long_with_swb(
-                            &mut br,
-                            &info,
-                            &sec,
-                            &sf,
-                            swb,
-                            &mut spec[ch],
-                            n,
-                        )?;
-                        if let Some(pd) = pulse.as_ref() {
-                            apply_pulse_long(&mut spec[ch], pd, self.sf_index, info.max_sfb, &sf)?;
-                        }
-                        apply_pns_long(
-                            &mut spec[ch],
-                            &info,
-                            &sec,
-                            &sf,
-                            &mut self.pns_rng,
-                            None,
-                            None,
-                        );
-                        infos[ch] = info;
-                        secs[ch] = sec;
-                        tns_all[ch] = tns;
-                        ltp_all[ch] = ltp;
-                    }
-                    for ch in 0..2 {
-                        // LTP after PNS, before TNS (no M/S on independent
-                        // ICS) — §4.1.1.1 Figure 4.2 tool order.
-                        if let Some(ltp) = ltp_all[ch].as_ref() {
-                            let skip = ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
-                            apply_ltp_ld(
-                                &mut spec[ch][..n],
-                                &self.ld_chans[ch],
-                                ltp,
-                                swb,
-                                frame_length,
-                                &skip,
-                            );
-                        }
-                        if let Some(tns) = tns_all[ch].as_ref() {
-                            apply_tns_long(
-                                &mut spec[ch],
-                                tns,
-                                self.sf_index,
-                                infos[ch].max_sfb,
-                                swb,
-                            );
-                        }
-                        let mut tmp = vec![0.0f32; n];
-                        let spec_slice = &spec[ch][..n];
-                        imdct_and_overlap_ld(
-                            spec_slice,
-                            &mut self.ld_chans[ch],
-                            &mut tmp,
-                            frame_length,
-                        )?;
-                        self.ld_chans[ch].push_ltp_history(&tmp);
-                        pcm[ch].copy_from_slice(&tmp);
-                    }
+                LdElement::Cpe => {
+                    // channel_pair_element() — §4.4.2.3 Table 4.5.
+                    self.decode_cpe_ld(&mut br, swb, n, frame_length, base, &mut pcm)?;
                 }
             }
-            _ => unreachable!(),
         }
 
         // Convert to interleaved S16. Reuse the same /2 IMDCT scale-back
@@ -1913,6 +1700,269 @@ impl AacDecoder {
             pts: pkt.pts,
             data: vec![out_bytes],
         }))
+    }
+
+    /// Decode one AAC-LD `single_channel_element()` (or, identically, an
+    /// `lfe_channel_element()`) into PCM channel slot `ch`.
+    ///
+    /// Body of §4.4.2.2 Table 4.4: instance tag, ICS (LD ics_info + LTP),
+    /// spectrum, pulse, PNS, LTP, TNS, then the 512/480-sample LD IMDCT +
+    /// overlap-add. PNS / IS bands are skipped for LTP (§4.6.7.4.2); the
+    /// reconstructed PCM is pushed into the channel's LTP history.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_sce_ld(
+        &mut self,
+        br: &mut BitReader<'_>,
+        swb: &[u16],
+        n: usize,
+        frame_length: LdFrameLength,
+        ch: usize,
+        pcm: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let _instance_tag = br.read_u32(4)?;
+        let mut prev_lag = self.ld_chans[ch].ltp_prev_lag;
+        let ((info, sf, sec, tns, pulse), ltp) =
+            decode_ics_ld(br, self.sf_index, swb, &mut prev_lag)?;
+        self.ld_chans[ch].ltp_prev_lag = prev_lag;
+        let mut spec = [0.0f32; SPEC_LEN];
+        decode_spectrum_long_with_swb(br, &info, &sec, &sf, swb, &mut spec, n)?;
+        if let Some(pd) = pulse.as_ref() {
+            apply_pulse_long(&mut spec, pd, self.sf_index, info.max_sfb, &sf)?;
+        }
+        // PNS — LD reuses the same NOISE_HCB convention.
+        apply_pns_long(&mut spec, &info, &sec, &sf, &mut self.pns_rng, None, None);
+        // LTP (§4.6.7.3) sits between PNS and TNS in the GA decoder tool
+        // chain (§4.1.1.1 Figure 4.2: PNS → prediction → intensity →
+        // long-term prediction → TNS). The predicted spectrum is added on
+        // enabled bands; PNS / IS bands are skipped (§4.6.7.4.2).
+        if let Some(ltp) = ltp.as_ref() {
+            let skip = ltp_skip_bands(&sec, info.max_sfb as usize);
+            apply_ltp_ld(
+                &mut spec[..n],
+                &self.ld_chans[ch],
+                ltp,
+                swb,
+                frame_length,
+                &skip,
+            );
+        }
+        // TNS uses the LD SWB table; same per-band signalling.
+        if let Some(tns_data) = tns.as_ref() {
+            apply_tns_long(&mut spec, tns_data, self.sf_index, info.max_sfb, swb);
+        }
+        // LD IMDCT + overlap-add → n samples of PCM.
+        let mut tmp = vec![0.0f32; n];
+        let spec_slice = &spec[..n];
+        imdct_and_overlap_ld(spec_slice, &mut self.ld_chans[ch], &mut tmp, frame_length)?;
+        // Update the LTP time-domain history with this frame's
+        // reconstructed output (§4.6.7.3 — the "previous fully
+        // reconstructed time domain samples").
+        self.ld_chans[ch].push_ltp_history(&tmp);
+        pcm[ch].copy_from_slice(&tmp);
+        Ok(())
+    }
+
+    /// Decode one AAC-LD `channel_pair_element()` into PCM channel slots
+    /// `base` (left) and `base + 1` (right).
+    ///
+    /// §4.4.2.3 Table 4.5: instance tag, `common_window`, then either the
+    /// shared-ics_info common-window path (ms_mask, IS, M/S) or two
+    /// independent ICS. Both variants feed the per-channel LD IMDCT +
+    /// overlap. The tool order matches Figure 4.2: PNS → IS → M/S → LTP →
+    /// TNS → filterbank.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cpe_ld(
+        &mut self,
+        br: &mut BitReader<'_>,
+        swb: &[u16],
+        n: usize,
+        frame_length: LdFrameLength,
+        base: usize,
+        pcm: &mut [Vec<f32>],
+    ) -> Result<()> {
+        let c0 = base;
+        let c1 = base + 1;
+        let _instance_tag = br.read_u32(4)?;
+        let common_window = br.read_bit()?;
+        if common_window {
+            let mut prev_lags = [
+                self.ld_chans[c0].ltp_prev_lag,
+                self.ld_chans[c1].ltp_prev_lag,
+            ];
+            let (info, ltp) = parse_ics_info_ld(br, self.sf_index, swb, true, &mut prev_lags)?;
+            self.ld_chans[c0].ltp_prev_lag = prev_lags[0];
+            self.ld_chans[c1].ltp_prev_lag = prev_lags[1];
+            let ms_mask_present = br.read_u32(2)? as u8;
+            let max_sfb = info.max_sfb as usize;
+            let groups = info.num_window_groups as usize;
+            let mut ms_used = vec![false; groups * max_sfb];
+            match ms_mask_present {
+                0 => {}
+                1 => {
+                    for slot in ms_used.iter_mut() {
+                        *slot = br.read_bit()?;
+                    }
+                }
+                2 => {
+                    for slot in ms_used.iter_mut() {
+                        *slot = true;
+                    }
+                }
+                _ => {
+                    return Err(Error::invalid("AAC-LD: reserved ms_mask_present=3"));
+                }
+            }
+            let infos = [info.clone(), info.clone()];
+            let mut spec = [[0.0f32; SPEC_LEN]; 2];
+            let mut secs: [SectionData; 2] = Default::default();
+            let mut sfs: [Vec<i32>; 2] = Default::default();
+            let mut tns_all: [Option<TnsData>; 2] = [None, None];
+            let mut pulse_all: [Option<PulseData>; 2] = [None, None];
+            for ch in 0..2 {
+                let gg = br.read_u32(8)? as u8;
+                let sec = parse_section_data(br, &infos[ch])?;
+                let sf = parse_scalefactors(br, &infos[ch], &sec, gg)?;
+                let pulse_present = br.read_bit()?;
+                if pulse_present {
+                    pulse_all[ch] = Some(parse_pulse_data(br)?);
+                }
+                let tns_present = br.read_bit()?;
+                if tns_present {
+                    tns_all[ch] = Some(parse_tns_data(br, infos[ch].window_sequence, 1)?);
+                }
+                // gain_control_data_present — reserved 0 for LD,
+                // tolerated for resilience the same way LC does.
+                let _gain_control = br.read_bit()?;
+                decode_spectrum_long_with_swb(br, &infos[ch], &sec, &sf, swb, &mut spec[ch], n)?;
+                if let Some(pd) = pulse_all[ch].as_ref() {
+                    apply_pulse_long(&mut spec[ch], pd, self.sf_index, infos[ch].max_sfb, &sf)?;
+                }
+                secs[ch] = sec;
+                sfs[ch] = sf;
+            }
+            // PNS — channel 0 first (with mirror to ch1 for correlated-noise
+            // bands), then leftover ch1 bands.
+            let (s0, s1) = spec.split_at_mut(1);
+            apply_pns_long(
+                &mut s0[0],
+                &infos[0],
+                &secs[0],
+                &sfs[0],
+                &mut self.pns_rng,
+                Some(&mut s1[0]),
+                Some(&ms_used),
+            );
+            apply_pns_long_ch1_leftover(
+                &mut s1[0],
+                &infos[1],
+                &secs[0],
+                &secs[1],
+                &sfs[1],
+                &mut self.pns_rng,
+            );
+            // IS (§4.6.8.2.3) then M/S (§4.6.8.1.3) — long-only; the LD path
+            // runs the same helpers as the LC long path because the codebook
+            // semantics are identical.
+            apply_intensity_stereo(&infos[0], &secs, &sfs, &ms_used, ms_mask_present, &mut spec);
+            apply_ms_stereo(&infos[0], &secs, &ms_used, &mut spec);
+            // LTP per channel (§4.6.7.3) — after M/S + intensity, before TNS
+            // (§4.1.1.1 Figure 4.2). PNS / IS bands are skipped
+            // (§4.6.7.4.2).
+            let cs = [c0, c1];
+            for ch in 0..2 {
+                if let Some(ltp) = ltp[ch].as_ref() {
+                    let skip = ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
+                    apply_ltp_ld(
+                        &mut spec[ch][..n],
+                        &self.ld_chans[cs[ch]],
+                        ltp,
+                        swb,
+                        frame_length,
+                        &skip,
+                    );
+                }
+            }
+            // TNS per channel.
+            for ch in 0..2 {
+                if let Some(tns) = tns_all[ch].as_ref() {
+                    apply_tns_long(&mut spec[ch], tns, self.sf_index, infos[ch].max_sfb, swb);
+                }
+            }
+            // LD IMDCT + overlap per channel.
+            for ch in 0..2 {
+                let mut tmp = vec![0.0f32; n];
+                let spec_slice = &spec[ch][..n];
+                imdct_and_overlap_ld(
+                    spec_slice,
+                    &mut self.ld_chans[cs[ch]],
+                    &mut tmp,
+                    frame_length,
+                )?;
+                self.ld_chans[cs[ch]].push_ltp_history(&tmp);
+                pcm[cs[ch]].copy_from_slice(&tmp);
+            }
+        } else {
+            // Independent ICS per channel — same shape as the LC
+            // !common_window CPE branch but with LD ics_info.
+            let cs = [c0, c1];
+            let mut spec = [[0.0f32; SPEC_LEN]; 2];
+            let mut infos: [IcsInfo; 2] = Default::default();
+            let mut secs: [SectionData; 2] = Default::default();
+            let mut tns_all: [Option<TnsData>; 2] = [None, None];
+            let mut ltp_all: [Option<LtpData>; 2] = [None, None];
+            for ch in 0..2 {
+                let mut prev_lag = self.ld_chans[cs[ch]].ltp_prev_lag;
+                let ((info, sf, sec, tns, pulse), ltp) =
+                    decode_ics_ld(br, self.sf_index, swb, &mut prev_lag)?;
+                self.ld_chans[cs[ch]].ltp_prev_lag = prev_lag;
+                decode_spectrum_long_with_swb(br, &info, &sec, &sf, swb, &mut spec[ch], n)?;
+                if let Some(pd) = pulse.as_ref() {
+                    apply_pulse_long(&mut spec[ch], pd, self.sf_index, info.max_sfb, &sf)?;
+                }
+                apply_pns_long(
+                    &mut spec[ch],
+                    &info,
+                    &sec,
+                    &sf,
+                    &mut self.pns_rng,
+                    None,
+                    None,
+                );
+                infos[ch] = info;
+                secs[ch] = sec;
+                tns_all[ch] = tns;
+                ltp_all[ch] = ltp;
+            }
+            for ch in 0..2 {
+                // LTP after PNS, before TNS (no M/S on independent ICS) —
+                // §4.1.1.1 Figure 4.2 tool order.
+                if let Some(ltp) = ltp_all[ch].as_ref() {
+                    let skip = ltp_skip_bands(&secs[ch], infos[ch].max_sfb as usize);
+                    apply_ltp_ld(
+                        &mut spec[ch][..n],
+                        &self.ld_chans[cs[ch]],
+                        ltp,
+                        swb,
+                        frame_length,
+                        &skip,
+                    );
+                }
+                if let Some(tns) = tns_all[ch].as_ref() {
+                    apply_tns_long(&mut spec[ch], tns, self.sf_index, infos[ch].max_sfb, swb);
+                }
+                let mut tmp = vec![0.0f32; n];
+                let spec_slice = &spec[ch][..n];
+                imdct_and_overlap_ld(
+                    spec_slice,
+                    &mut self.ld_chans[cs[ch]],
+                    &mut tmp,
+                    frame_length,
+                )?;
+                self.ld_chans[cs[ch]].push_ltp_history(&tmp);
+                pcm[cs[ch]].copy_from_slice(&tmp);
+            }
+        }
+        Ok(())
     }
 }
 
