@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 121 — Phase 1 syntactic skeleton)
+
+- `adts` module: ISO/IEC 13818-7 §1.A.2.2.1–.2 ADTS fixed + variable
+  header parser. Surfaces sync, ID, `protection_absent`, profile,
+  `sampling_frequency_index`, `channel_configuration`,
+  `aac_frame_length`, `adts_buffer_fullness`, and the resolved
+  `number_of_raw_data_blocks_in_frame` (decoded as `N`, not the wire
+  `N − 1`). Reserved `sampling_frequency_index` values are rejected;
+  CRC presence is confirmed but the CRC value is not validated yet.
+- `raw_data_block` module: ISO/IEC 14496-3 §4.4.2.1 syntactic walker
+  that iterates `id_syn_ele` and recognises all eight element types
+  (SCE / CPE / CCE / LFE / DSE / PCE / FIL / END). FIL and DSE bodies
+  are fully skipped per §4.4.2.7 / §4.4.2.5; SCE/CPE/CCE/LFE emit
+  the element header (`kind`, `element_instance_tag`) without
+  parsing the body; PCE returns `Error::UnsupportedElementSkip`;
+  END byte-aligns the reader and terminates the block.
+- 23 unit/integration tests covering the new surface, including a
+  synthetic SCE-FIL-END round-trip that wraps the walker inside a
+  real ADTS frame.
+
 ### Erased
 
 - Prior master history was force-erased on **2026-05-24** under

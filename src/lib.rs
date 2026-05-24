@@ -1,44 +1,65 @@
 //! # oxideav-aac
 //!
-//! **Status:** orphan-rebuild scaffold (reset 2026-05-24).
+//! Pure-Rust AAC (Advanced Audio Coding) parsing — currently **Phase 1**
+//! of the post-r111 orphan-rebuild lineage. Decode and encode bodies are
+//! *not* wired up yet; this crate's public surface is limited to:
 //!
-//! The prior implementation was retired under the workspace clean-room
-//! policy: comments in the encoder source described matching an
-//! external reference encoder's behaviour by citing a specific source
-//! file of that implementation. The clean-room policy forbids
-//! consulting any external implementation's source for any reason, so
-//! the provenance could not be defended. The crate will be
-//! re-implemented from scratch against the staged ISO/IEC 14496-3 /
-//! 13818-7 specification in a future clean-room round.
+//! * The [`adts`] module — ISO/IEC 13818-7 §1.A.2 *Audio Data Transport
+//!   Stream* fixed-header parser (sync, profile, sampling-frequency
+//!   index, channel configuration, frame length, raw-data-block count,
+//!   CRC presence flag).
+//! * The [`raw_data_block`] module — ISO/IEC 14496-3 §4.4.2.1 syntactic
+//!   *raw_data_block()* walker that visits each `id_syn_ele` in order
+//!   and stops cleanly at `END (0b111)`. Per-element bodies for
+//!   SCE / CPE / CCE / LFE are **not** parsed yet — the walker emits an
+//!   element-header event and the consumer is responsible for
+//!   advancing the bit-reader past the body (subsequent rounds will
+//!   internalise this).
 //!
-//! Every public API currently returns [`Error::NotImplemented`].
+//! Public API surface that requires a decoder or encoder body still
+//! returns [`Error::NotImplemented`]; the syntactic skeleton lives
+//! entirely in the modules above.
+//!
+//! ## Provenance
+//!
+//! No external implementation (FFmpeg / `libavcodec`, FDK-AAC, FAAD,
+//! Nero AAC, libfaac, …) was consulted at any stage. Every numeric
+//! constant, bit layout, and clause reference in this crate is sourced
+//! from the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 PDFs under
+//! `docs/audio/aac/`. The fixture descriptions in
+//! `docs/audio/aac/aac-fixtures-and-traces.md` were consulted as a
+//! cross-reference against the spec wording.
+//!
+//! ## Status (Phase 1)
+//!
+//! * ADTS fixed header parsing: **complete** (sync + 7-byte body).
+//! * ADTS CRC validation: deferred; the parser surfaces the
+//!   `protection_absent` flag but does not validate the trailing
+//!   16-bit CRC when present.
+//! * `raw_data_block()` walker: **iterates `id_syn_ele` and stops at
+//!   `END`**; element-body skipping is implemented for `FIL` /
+//!   `DSE` only. SCE / CPE / CCE / LFE / PCE bodies are deferred to
+//!   subsequent rounds.
 
 #![warn(missing_debug_implementations)]
+#![warn(missing_docs)]
 
 use oxideav_core::RuntimeContext;
 
-/// Crate-local error type. Until the clean-room rebuild lands every
-/// public API path returns [`Error::NotImplemented`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Error {
-    /// The crate has been reset to a scaffold pending clean-room
-    /// rebuild; no decoder or encoder functionality is wired up yet.
-    NotImplemented,
-}
+pub mod adts;
+pub mod raw_data_block;
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "oxideav-aac: orphan-rebuild scaffold — no codec wired up"
-        )
-    }
-}
+mod error;
 
-impl std::error::Error for Error {}
+pub use error::Error;
 
-/// No-op codec registration — the orphan-rebuild scaffold registers
-/// nothing into the runtime context.
+/// Result alias used throughout the crate.
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// Codec-registry entry point. The Phase 1 skeleton does **not** wire
+/// a [`Decoder`](oxideav_core::Decoder) or
+/// [`Encoder`](oxideav_core::Encoder) into the runtime context — those
+/// arrive in subsequent rounds once decode / encode bodies land.
 pub fn register(_ctx: &mut RuntimeContext) {}
 
 oxideav_core::register!("aac", register);
