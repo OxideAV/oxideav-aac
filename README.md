@@ -47,7 +47,7 @@ sit on top of in later rounds:
 
 ## Provenance
 
-No external implementation (FFmpeg / `libavcodec`, FDK-AAC, FAAD,
+No external implementation (FFmpeg's `libav*` family, FDK-AAC, FAAD,
 Nero AAC, libfaac, …) was consulted at any stage. Every numeric
 constant, bit-layout decision, and clause reference in this crate
 is sourced from the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 PDFs

@@ -22,8 +22,9 @@
 //!
 //! ## Provenance
 //!
-//! No external implementation (FFmpeg / `libavcodec`, FDK-AAC, FAAD,
-//! Nero AAC, libfaac, …) was consulted at any stage. Every numeric
+//! No external implementation (FFmpeg's `libav*` family, FDK-AAC,
+//! FAAD, Nero AAC, libfaac, …) was consulted at any stage. Every
+//! numeric
 //! constant, bit layout, and clause reference in this crate is sourced
 //! from the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 PDFs under
 //! `docs/audio/aac/`. The fixture descriptions in
