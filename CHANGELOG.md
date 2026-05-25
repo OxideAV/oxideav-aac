@@ -6,6 +6,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 129 — Phase 2 begin: ics_info)
+
+- `ics_info` module: ISO/IEC 14496-3 §4.4.6 Table 4.6
+  `ics_info()` parser. Surfaces `ics_reserved_bit`,
+  `window_sequence` (Table 4.128), `window_shape`, `max_sfb`
+  (4-bit / 6-bit branching on `EIGHT_SHORT_SEQUENCE`),
+  `scale_factor_grouping` mask, the Main AOT's `predictor_data()`
+  body (`predictor_reset` + `predictor_reset_group_number` +
+  `prediction_used[]`), and every non-Main AOT's `ltp_data_present`
+  chain. `ltp_data()` (Table 4.55) is fully parsed for both the
+  ER-AAC-LD (AOT 23) and non-LD forms, including the second
+  `ltp_data_present` for CPE common-window streams. The parser
+  also computes the §4.5.2.3.4 derivations (`num_windows`,
+  `num_window_groups`, `window_group_length[]`, `num_swb`) and
+  exposes them as struct fields plus a public
+  `derive_window_grouping()` helper.
+- Sample-rate count tables: `NUM_SWB_LONG_WINDOW[12]`,
+  `NUM_SWB_SHORT_WINDOW[12]`, and `PRED_SFB_MAX[12]` constants —
+  transcribed from ISO/IEC 14496-3 Tables 4.129–4.141 and ISO/IEC
+  13818-7 Table 62.
+- `Error::IcsInfoUnsupportedSampleRateIndex(u8)` for the case
+  where a caller invokes `IcsInfo::parse` with the 24-bit
+  explicit-rate escape (or a reserved index) without first
+  resolving it to a standard 0..=11 index.
+- 26 new integration tests covering long / EIGHT_SHORT / KBD,
+  grouping-mask edge cases, Main predictor, LTP, ER-AAC-LD LTP,
+  CPE common-window LTP, and unexpected-end — bringing the suite
+  to 69 tests.
+
 ### Added (round 126 — configuration layer)
 
 - `asc` module: ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` parser

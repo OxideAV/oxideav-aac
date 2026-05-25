@@ -47,6 +47,15 @@ pub enum Error {
     /// unwrapped before this check. Any other AOT — CELP, HVXC,
     /// SSC, USAC, ELD, ALS, SLS, …  — currently surfaces here.
     UnsupportedAot(u8),
+
+    /// [`crate::ics_info::IcsInfo::parse`] was called with a
+    /// `sampling_frequency_index` outside the standard 0..=11
+    /// range covered by the `NUM_SWB_{LONG,SHORT}_WINDOW` tables.
+    /// The 24-bit explicit-rate escape (`samplingFrequencyIndex
+    /// == 0xf`) does not select an SWB table directly — the caller
+    /// must resolve the explicit rate to the nearest standard
+    /// index before invoking the ics_info parser.
+    IcsInfoUnsupportedSampleRateIndex(u8),
 }
 
 impl core::fmt::Display for Error {
@@ -85,6 +94,13 @@ impl core::fmt::Display for Error {
                     f,
                     "AudioSpecificConfig audioObjectType {} is not handled in Phase 1",
                     aot
+                )
+            }
+            Error::IcsInfoUnsupportedSampleRateIndex(idx) => {
+                write!(
+                    f,
+                    "ics_info sampling_frequency_index {} is outside the 0..=11 SWB-table range",
+                    idx
                 )
             }
         }

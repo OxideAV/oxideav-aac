@@ -24,6 +24,14 @@
 //!   element-header event and the consumer is responsible for
 //!   advancing the bit-reader past the body (subsequent rounds will
 //!   internalise this). PCE is fully parsed.
+//! * The [`ics_info`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.6
+//!   *ics_info()* parser. The first piece of Phase 2
+//!   (channel-element body parsing) — surfaces the window-sequence /
+//!   shape, `max_sfb`, `scale_factor_grouping`, the Main predictor
+//!   side-info (AOT 1), and the LTP `ltp_data()` body
+//!   (Table 4.55) when the wire bit selects it, plus the
+//!   §4.5.2.3.4 derivations (`num_windows`, `num_window_groups`,
+//!   `window_group_length[]`, `num_swb`).
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -40,16 +48,18 @@
 //! `docs/audio/aac/aac-fixtures-and-traces.md` were consulted as a
 //! cross-reference against the spec wording.
 //!
-//! ## Status (Phase 1)
+//! ## Status (Phase 1 + Phase 2 begin)
 //!
 //! * ADTS fixed header parsing: **complete** (sync + 7-byte body).
 //! * ADTS CRC validation: deferred; the parser surfaces the
 //!   `protection_absent` flag but does not validate the trailing
 //!   16-bit CRC when present.
-//! * `raw_data_block()` walker: **iterates `id_syn_ele` and stops at
-//!   `END`**; element-body skipping is implemented for `FIL` /
-//!   `DSE` only. SCE / CPE / CCE / LFE / PCE bodies are deferred to
-//!   subsequent rounds.
+//! * `raw_data_block()` walker: iterates `id_syn_ele` and stops at
+//!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
+//!   CCE / LFE bodies start with [`ics_info`] (Phase 2 begin) but
+//!   the remaining channel-stream tools (`section_data`,
+//!   `scale_factor_data`, `pulse_data`, `tns_data`,
+//!   `gain_control_data`, `spectral_data`) are deferred.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -58,6 +68,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod adts;
 pub mod asc;
+pub mod ics_info;
 pub mod pce;
 pub mod raw_data_block;
 
