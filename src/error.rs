@@ -57,6 +57,28 @@ pub enum Error {
     /// index before invoking the ics_info parser.
     IcsInfoUnsupportedSampleRateIndex(u8),
 
+    /// [`crate::ics_info::IcsInfo::write`] was handed an in-memory
+    /// [`crate::ics_info::IcsInfo`] whose field combination cannot
+    /// be represented on the wire under ISO/IEC 14496-3 Table 4.6 /
+    /// Table 4.55. Examples: `max_sfb` exceeds its field width
+    /// (`> 15` for `EIGHT_SHORT_SEQUENCE`, `> 63` otherwise);
+    /// `scale_factor_grouping == None` for `EIGHT_SHORT_SEQUENCE` or
+    /// `Some(_)` for any other window sequence; a predictor / LTP
+    /// body slot is populated while the dispatching
+    /// `predictor_data_present` bit is zero, or vice versa; a
+    /// non-Main AOT has `predictor_data` set instead of `ltp_data`;
+    /// the paired-channel `ltp_data_present_pair` slot is populated
+    /// while `common_window == false`; a `prediction_used[]` /
+    /// `long_used[]` length differs from the spec-cap
+    /// (`min(max_sfb, PRED_SFB_MAX[fs_index])` or
+    /// `min(max_sfb, MAX_LTP_LONG_SFB)`); or a numeric field
+    /// (`ltp_coef`, `ltp_lag`, `reset_group_number`) exceeds the
+    /// width of its wire slot. A conforming AAC encoder never builds
+    /// such a structure; this surfaces caller bugs at the boundary
+    /// between psychoacoustic / windowing-decision code and bitstream
+    /// emission.
+    IcsInfoEncodeInvalid,
+
     /// [`crate::section_data::SectionData::parse`] read a section
     /// run-length (`sect_len`) that would extend a section past
     /// `max_sfb`. ISO/IEC 13818-7 §6.3 Table 17 terminates the
@@ -122,6 +144,12 @@ impl core::fmt::Display for Error {
                     f,
                     "ics_info sampling_frequency_index {} is outside the 0..=11 SWB-table range",
                     idx
+                )
+            }
+            Error::IcsInfoEncodeInvalid => {
+                write!(
+                    f,
+                    "ics_info encode: in-memory IcsInfo violates a Table 4.6 / 4.55 wire-field invariant"
                 )
             }
             Error::SectionDataOverrun => {

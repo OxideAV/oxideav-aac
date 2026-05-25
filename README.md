@@ -3,23 +3,30 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 137)
+## Status (round 140)
 
-**Phase 1 complete + Phase 2 in progress + first encoder primitive.**
-Round 137 lands `SectionData::write` — the inverse of the
-`section_data()` parser and the crate's first encode-side
-syntax-element writer (4-bit `sect_cb` + 3- or 5-bit
-`sect_len_incr` with the §6.3 escape, in §13818-7 Table 17 layout).
-A self-roundtrip test set (18 new tests) drives the writer through
-the long and EIGHT_SHORT branches, single + double escape, the
-escape-multiple terminator (`sect_len == sect_esc_val` requires a
-trailing `0`), multi-group, multi-section, the
-`max_sfb == 0` empty-list case, and a hand-pinned wire-layout
-assertion — every round-trip recovers the original `SectionData`
-bit-exactly and the parser consumes exactly the bit count the writer
-emitted. Round 133 had landed the `section_data()` parser itself;
-round 129 started the channel-element body work with `ics_info()`;
-earlier rounds (121 / 126) landed the ADTS framing, out-of-band
+**Phase 1 complete + Phase 2 in progress + two encoder primitives.**
+Round 140 lands `IcsInfo::write` (and a public `write_ltp_data`
+helper) — the inverse of the round-129 `ics_info()` parser and the
+crate's second encode-side syntax-element writer. The new primitive
+covers the full Table 4.6 surface (`ics_reserved_bit` 1 +
+`window_sequence` 2 + `window_shape` 1; `max_sfb` 4 + 7-bit grouping
+mask on `EIGHT_SHORT_SEQUENCE`; `max_sfb` 6 + `predictor_data_present`
+1 plus the per-AOT predictor / LTP body on every other window
+sequence) and the Table 4.55 `ltp_data()` body for both the non-LD
+11-bit-lag form and the ER-AAC-LD delta-coded form, with the second
+`ltp_data_present` (+ optional paired body) for CPE common-window
+streams. 35 new self-roundtrip integration tests exercise the long
+branch, EIGHT_SHORT grouping, Main predictor (with and without reset,
+including the `PRED_SFB_MAX[fs_index]` cap), non-LD LTP, ER-AAC-LD LTP
+with and without `lag_update`, CPE common-window paired LTP, every
+encoder-rejection branch (`Error::IcsInfoEncodeInvalid` for field
+overflow, wrong AOT vs body slot, missing flag matching, stale data
+on the predictor-absent branch, …), plus a hand-pinned wire-layout
+assertion (`buf[0] == 0x06`, `buf[1] == 0x40` for a 25-band LC long
+sequence). Round 137 had landed the `section_data()` writer; round
+133 the `section_data()` parser; round 129 the `ics_info()` parser;
+earlier rounds (121 / 126) the ADTS framing, out-of-band
 `AudioSpecificConfig`, the `raw_data_block()` walker, and the
 `program_config_element()` parser. The current capability set:
 
@@ -104,6 +111,29 @@ earlier rounds (121 / 126) landed the ADTS framing, out-of-band
   `Codebook` classifier (QUAD / PAIR signedness per Table 59,
   intensity / PNS / zero predicates) are exposed for the downstream
   tools. Every field is fixed-width — no Huffman decode yet.
+- **`ics_info()` encoder primitive** (ISO/IEC 14496-3 §4.4.6
+  Table 4.6 / Table 4.55, **new in round 140**):
+  `IcsInfo::write(writer, audio_object_type, sampling_frequency_index,
+  common_window)` — the inverse of the round-129 parser. Emits the
+  bit-exact Table 4.6 stream: 1-bit `ics_reserved_bit`, 2-bit
+  `window_sequence`, 1-bit `window_shape`, then either the 4-bit
+  `max_sfb` + 7-bit `scale_factor_grouping` short-window pair, or the
+  6-bit `max_sfb` + 1-bit `predictor_data_present` long-window pair
+  with the per-AOT predictor body (Main: 1-bit `reset` + optional
+  5-bit `reset_group_number` + `min(max_sfb, PRED_SFB_MAX[fs_index])`
+  `prediction_used` bits; LTP / other GA: `write_ltp_data` for the
+  primary channel + an optional second `ltp_data_present` + paired
+  body when `common_window == true`). The companion
+  `write_ltp_data(writer, ltp, aot, window_sequence, max_sfb)` covers
+  the Table 4.55 body for both the non-LD 11-bit-lag form and the
+  ER-AAC-LD (AOT 23) delta-coded form, including the `EIGHT_SHORT`
+  omission of `ltp_long_used[]` in the non-LD branch. Caller-side
+  structural bugs surface as `Error::IcsInfoEncodeInvalid`
+  (`max_sfb` field-width overflow, wrong AOT vs predictor / LTP slot,
+  missing or extra pair flag, `prediction_used[]` / `long_used[]`
+  length mismatch, `coef`/`lag`/`reset_group_number` field overflow,
+  populated predictor or LTP slot on the `EIGHT_SHORT` or
+  predictor-absent branch).
 - **`section_data()` encoder primitive** (ISO/IEC 14496-3 §4.4.6 /
   ISO/IEC 13818-7 §6.3 Table 17, **new in round 137**):
   `SectionData::write(writer, window_sequence, max_sfb)` — the

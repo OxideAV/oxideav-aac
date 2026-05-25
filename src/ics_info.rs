@@ -77,7 +77,7 @@
 //! enforces nothing here — it surfaces whatever the wire said and
 //! lets a higher-layer validator decide.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::{Error, Result};
 
@@ -434,6 +434,183 @@ impl IcsInfo {
             num_swb,
         })
     }
+
+    /// Encode `ics_info()` onto `writer`, the inverse of
+    /// [`IcsInfo::parse`].
+    ///
+    /// The writer mirrors Table 4.6 verbatim — `ics_reserved_bit`
+    /// (1 bit), `window_sequence` (2 bits), `window_shape` (1 bit),
+    /// then either `max_sfb` (4 bits) + `scale_factor_grouping`
+    /// (7 bits) for `EIGHT_SHORT_SEQUENCE`, or `max_sfb` (6 bits) +
+    /// `predictor_data_present` (1 bit) plus the per-AOT
+    /// predictor / LTP body for every other window sequence.
+    ///
+    /// The `audio_object_type` / `sampling_frequency_index` /
+    /// `common_window` parameters must match the values the parser
+    /// was (or would be) invoked with. They drive the branch the
+    /// encoder takes for the Main vs LTP predictor body and the
+    /// `prediction_used[]` cap (`PRED_SFB_MAX[fs_index]` for AOT 1).
+    ///
+    /// Returns [`Error::IcsInfoEncodeInvalid`] if the in-memory
+    /// [`IcsInfo`] violates a wire-field invariant:
+    ///
+    /// * `max_sfb` exceeds its field width
+    ///   (`> 15` for `EIGHT_SHORT_SEQUENCE`, `> 63` otherwise).
+    /// * `scale_factor_grouping` is `None` for `EIGHT_SHORT_SEQUENCE`,
+    ///   `Some(_)` otherwise, or its value exceeds 7 bits.
+    /// * `predictor_data_present == true` for `EIGHT_SHORT_SEQUENCE`
+    ///   (Table 4.6 omits the bit on the short branch).
+    /// * `predictor_data` is `Some` while `audio_object_type != 1`,
+    ///   or `None` while the predictor bit is set with AOT 1.
+    /// * Predictor `reset_group_number` doesn't match
+    ///   `reset.is_some()` parity, or exceeds 5 bits.
+    /// * Predictor `prediction_used.len()` differs from `min(max_sfb,
+    ///   PRED_SFB_MAX[fs_index])`.
+    /// * LTP body fields (lag width, `coef`, `long_used[]` length) do
+    ///   not satisfy Table 4.55 (delegated to [`write_ltp_data`]).
+    /// * The paired-channel LTP slot is populated while
+    ///   `common_window == false`, or while `predictor_data_present
+    ///   == false`, or while `audio_object_type == 1`.
+    /// * `sampling_frequency_index` is outside `0..=11`.
+    pub fn write(
+        &self,
+        writer: &mut BitWriter,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        common_window: bool,
+    ) -> Result<()> {
+        let fs_index = sampling_frequency_index as usize;
+        if fs_index >= NUM_SWB_LONG_WINDOW.len() {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+
+        writer.write_bit(self.ics_reserved_bit);
+        writer.write_u32(self.window_sequence as u32 & 0b11, 2);
+        writer.write_u32(self.window_shape as u32 & 0b1, 1);
+
+        if self.window_sequence.is_eight_short() {
+            if self.max_sfb > 0x0f {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            let mask = self
+                .scale_factor_grouping
+                .ok_or(Error::IcsInfoEncodeInvalid)?;
+            if mask > 0x7f {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            // EIGHT_SHORT branch has neither predictor_data_present
+            // nor any LTP body — reject populated slots before they
+            // silently round-trip into a non-conforming stream.
+            if self.predictor_data_present
+                || self.predictor_data.is_some()
+                || self.ltp_data_present
+                || self.ltp_data.is_some()
+                || self.ltp_data_present_pair.is_some()
+                || self.ltp_data_pair.is_some()
+            {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            writer.write_u32(self.max_sfb as u32, 4);
+            writer.write_u32(mask as u32, 7);
+        } else {
+            if self.max_sfb > 0x3f {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            if self.scale_factor_grouping.is_some() {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            writer.write_u32(self.max_sfb as u32, 6);
+            writer.write_bit(self.predictor_data_present);
+
+            if self.predictor_data_present {
+                if audio_object_type == 1 {
+                    // Main predictor side info.
+                    if self.ltp_data_present
+                        || self.ltp_data.is_some()
+                        || self.ltp_data_present_pair.is_some()
+                        || self.ltp_data_pair.is_some()
+                    {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    let pd = self
+                        .predictor_data
+                        .as_ref()
+                        .ok_or(Error::IcsInfoEncodeInvalid)?;
+                    // reset_group_number parity matches reset bit.
+                    if pd.reset != pd.reset_group_number.is_some() {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    let pred_sfb_max = PRED_SFB_MAX[fs_index] as u16;
+                    let expected = core::cmp::min(self.max_sfb as u16, pred_sfb_max) as usize;
+                    if pd.prediction_used.len() != expected {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    writer.write_bit(pd.reset);
+                    if let Some(g) = pd.reset_group_number {
+                        if g > 0x1f {
+                            return Err(Error::IcsInfoEncodeInvalid);
+                        }
+                        writer.write_u32(g as u32, 5);
+                    }
+                    for &b in &pd.prediction_used {
+                        writer.write_bit(b);
+                    }
+                } else {
+                    // LTP / non-Main branch.
+                    if self.predictor_data.is_some() || !self.ltp_data_present {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    let ltp = self.ltp_data.as_ref().ok_or(Error::IcsInfoEncodeInvalid)?;
+                    write_ltp_data(
+                        writer,
+                        ltp,
+                        audio_object_type,
+                        self.window_sequence,
+                        self.max_sfb,
+                    )?;
+                    if common_window {
+                        let pair_flag = self
+                            .ltp_data_present_pair
+                            .ok_or(Error::IcsInfoEncodeInvalid)?;
+                        writer.write_bit(pair_flag);
+                        if pair_flag {
+                            let ltp2 = self
+                                .ltp_data_pair
+                                .as_ref()
+                                .ok_or(Error::IcsInfoEncodeInvalid)?;
+                            write_ltp_data(
+                                writer,
+                                ltp2,
+                                audio_object_type,
+                                self.window_sequence,
+                                self.max_sfb,
+                            )?;
+                        } else if self.ltp_data_pair.is_some() {
+                            return Err(Error::IcsInfoEncodeInvalid);
+                        }
+                    } else if self.ltp_data_present_pair.is_some() || self.ltp_data_pair.is_some() {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                }
+            } else {
+                // predictor_data_present == 0: no predictor / LTP body
+                // is emitted at all (Table 4.6 only enters either
+                // branch under the predictor bit). Reject populated
+                // slots so a stale in-memory structure cannot
+                // silently desync from the wire.
+                if self.predictor_data.is_some()
+                    || self.ltp_data_present
+                    || self.ltp_data.is_some()
+                    || self.ltp_data_present_pair.is_some()
+                    || self.ltp_data_pair.is_some()
+                {
+                    return Err(Error::IcsInfoEncodeInvalid);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// `ltp_data()` per Table 4.55. Public to allow standalone unit
@@ -485,6 +662,83 @@ pub fn parse_ltp_data(
             long_used,
         })
     }
+}
+
+/// Encode an `ltp_data()` (Table 4.55) body onto `writer`, the
+/// inverse of [`parse_ltp_data`].
+///
+/// Mirrors the parser's two branches:
+///
+/// * `audio_object_type == 23` (ER AAC LD) — write `ltp_lag_update`
+///   (1 bit); if set, write `ltp_lag` (10 bits); then `ltp_coef`
+///   (3 bits); then `ltp_long_used[sfb]` for `sfb in 0..min(max_sfb,
+///   MAX_LTP_LONG_SFB)`.
+/// * Every other AOT — write `ltp_lag` (11 bits, always), `ltp_coef`
+///   (3 bits), then `ltp_long_used[]` *unless* the surrounding
+///   `ics_info()` says `EIGHT_SHORT_SEQUENCE` (the spec omits the
+///   loop in that case).
+///
+/// Returns [`Error::IcsInfoEncodeInvalid`] when the in-memory
+/// [`LtpData`] is inconsistent with the AOT or `window_sequence`
+/// context (e.g. `lag_update == Some(_)` for a non-LD AOT, missing
+/// `lag` for an LD `lag_update == true` slot, `coef > 7`, `lag`
+/// exceeding its field width, or `long_used.len()` not matching
+/// `min(max_sfb, MAX_LTP_LONG_SFB)` in the loop branch).
+pub fn write_ltp_data(
+    writer: &mut BitWriter,
+    ltp: &LtpData,
+    audio_object_type: u8,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+) -> Result<()> {
+    if ltp.coef > 0x07 {
+        return Err(Error::IcsInfoEncodeInvalid);
+    }
+    if audio_object_type == 23 {
+        let lag_update = ltp.lag_update.ok_or(Error::IcsInfoEncodeInvalid)?;
+        writer.write_bit(lag_update);
+        if lag_update {
+            let lag = ltp.lag.ok_or(Error::IcsInfoEncodeInvalid)?;
+            if lag > 0x3ff {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            writer.write_u32(lag as u32, 10);
+        } else if ltp.lag.is_some() {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        writer.write_u32(ltp.coef as u32, 3);
+        let expected = core::cmp::min(max_sfb as usize, MAX_LTP_LONG_SFB);
+        if ltp.long_used.len() != expected {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        for &b in &ltp.long_used {
+            writer.write_bit(b);
+        }
+    } else {
+        if ltp.lag_update.is_some() {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        let lag = ltp.lag.ok_or(Error::IcsInfoEncodeInvalid)?;
+        if lag > 0x7ff {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        writer.write_u32(lag as u32, 11);
+        writer.write_u32(ltp.coef as u32, 3);
+        if window_sequence.is_eight_short() {
+            if !ltp.long_used.is_empty() {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+        } else {
+            let expected = core::cmp::min(max_sfb as usize, MAX_LTP_LONG_SFB);
+            if ltp.long_used.len() != expected {
+                return Err(Error::IcsInfoEncodeInvalid);
+            }
+            for &b in &ltp.long_used {
+                writer.write_bit(b);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compute (`num_windows`, `num_window_groups`,

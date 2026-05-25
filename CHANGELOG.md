@@ -6,6 +6,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 140 — second encoder primitive: ics_info writer)
+
+- `ics_info::IcsInfo::write(writer, audio_object_type,
+  sampling_frequency_index, common_window)` — the inverse of the
+  round-129 `IcsInfo::parse` and the crate's second encode-side
+  syntax-element writer. Emits the bit-exact ISO/IEC 14496-3 §4.4.6
+  Table 4.6 stream: `ics_reserved_bit` (1 bit), `window_sequence`
+  (2 bits), `window_shape` (1 bit), then either `max_sfb` (4 bits) +
+  `scale_factor_grouping` (7 bits) for `EIGHT_SHORT_SEQUENCE`, or
+  `max_sfb` (6 bits) + `predictor_data_present` (1 bit) plus the
+  per-AOT predictor / LTP body for every other window sequence.
+  Main-AOT (1) predictor side info covers `predictor_reset` +
+  optional `predictor_reset_group_number` (5 bits) +
+  `prediction_used[]` capped at `min(max_sfb, PRED_SFB_MAX[fs_index])`.
+  Non-Main AOTs use the LTP branch, including the second
+  `ltp_data_present` (+ optional paired `ltp_data()`) when
+  `common_window == true`.
+- `ics_info::write_ltp_data(writer, ltp, audio_object_type,
+  window_sequence, max_sfb)` — Table 4.55 `ltp_data()` body writer.
+  Covers both the non-LD 11-bit-lag form (with the `EIGHT_SHORT`
+  omission of `ltp_long_used[]`) and the ER-AAC-LD (AOT 23)
+  delta-coded form (`lag_update` flag + optional 10-bit `lag` + 3-bit
+  `coef` + `long_used[]` capped at `MAX_LTP_LONG_SFB`).
+- `Error::IcsInfoEncodeInvalid` for caller-side structural bugs the
+  writer cannot represent on the wire: `max_sfb` exceeds its 4-/6-bit
+  field width, `scale_factor_grouping` missing on EIGHT_SHORT or
+  present on long, `predictor_data_present == true` on EIGHT_SHORT,
+  a predictor / LTP body slot populated on the wrong AOT branch or
+  on the predictor-absent branch, paired-channel LTP populated
+  without `common_window`, predictor `reset_group_number` parity
+  not matching the `reset` bit, `prediction_used[]` length not
+  equal to `min(max_sfb, PRED_SFB_MAX[fs_index])`, `long_used[]`
+  length not equal to `min(max_sfb, MAX_LTP_LONG_SFB)`, or a
+  numeric field (`coef`, `lag`, `reset_group_number`,
+  `scale_factor_grouping`) exceeding its wire-slot width.
+- 35 new self-roundtrip integration tests in
+  `tests/ics_info_encode.rs` — long branch (LC, KBD, `LongStart`,
+  `LongStop` with reserved-bit set, `max_sfb == 0`), EIGHT_SHORT
+  branch (no grouping, all grouped, mixed grouping mask), Main
+  predictor (no reset, with reset, `PRED_SFB_MAX` cap), non-LD LTP
+  (long, `MAX_LTP_LONG_SFB` cap, short via direct `write_ltp_data`
+  call), ER-AAC-LD LTP (with and without `lag_update`),
+  common-window paired LTP (present and absent), every
+  `IcsInfoEncodeInvalid` rejection branch, and a hand-pinned
+  wire-layout assertion (`buf[0] == 0x06`, `buf[1] == 0x40` for a
+  25-band LC long sequence). Suite size grows 104 → 139 tests.
+
 ### Added (round 137 — first encoder primitive: section_data writer)
 
 - `section_data::SectionData::write(writer, window_sequence, max_sfb)`

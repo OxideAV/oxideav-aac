@@ -31,7 +31,13 @@
 //!   side-info (AOT 1), and the LTP `ltp_data()` body
 //!   (Table 4.55) when the wire bit selects it, plus the
 //!   §4.5.2.3.4 derivations (`num_windows`, `num_window_groups`,
-//!   `window_group_length[]`, `num_swb`).
+//!   `window_group_length[]`, `num_swb`). **Round 140** added the
+//!   matching `IcsInfo::write` encoder primitive (and a public
+//!   `write_ltp_data` helper) — the second encode-side syntax-element
+//!   writer in the crate. Self-roundtrip (`write` → `parse`) is
+//!   bit-perfect across every branch the parser handles, including
+//!   the Main predictor + Table 4.55 LTP body for both the non-LD
+//!   and the ER-AAC-LD forms.
 //! * The [`section_data`] module — ISO/IEC 14496-3 §4.4.6 / ISO/IEC
 //!   13818-7 §6.3 Table 17 *section_data()* parser, **plus** (round
 //!   137) the matching `SectionData::write` encoder primitive. The
