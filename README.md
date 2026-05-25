@@ -3,13 +3,23 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 133)
+## Status (round 137)
 
-**Phase 1 complete + Phase 2 in progress.** Round 133 lands
-`section_data()` — the second channel-stream tool, immediately after
-`ics_info()` inside SCE / CPE / LFE. Round 129 had started the
-channel-element body work with `ics_info()`. Earlier rounds
-(121 / 126) landed the ADTS framing, out-of-band
+**Phase 1 complete + Phase 2 in progress + first encoder primitive.**
+Round 137 lands `SectionData::write` — the inverse of the
+`section_data()` parser and the crate's first encode-side
+syntax-element writer (4-bit `sect_cb` + 3- or 5-bit
+`sect_len_incr` with the §6.3 escape, in §13818-7 Table 17 layout).
+A self-roundtrip test set (18 new tests) drives the writer through
+the long and EIGHT_SHORT branches, single + double escape, the
+escape-multiple terminator (`sect_len == sect_esc_val` requires a
+trailing `0`), multi-group, multi-section, the
+`max_sfb == 0` empty-list case, and a hand-pinned wire-layout
+assertion — every round-trip recovers the original `SectionData`
+bit-exactly and the parser consumes exactly the bit count the writer
+emitted. Round 133 had landed the `section_data()` parser itself;
+round 129 started the channel-element body work with `ics_info()`;
+earlier rounds (121 / 126) landed the ADTS framing, out-of-band
 `AudioSpecificConfig`, the `raw_data_block()` walker, and the
 `program_config_element()` parser. The current capability set:
 
@@ -94,6 +104,22 @@ channel-element body work with `ics_info()`. Earlier rounds
   `Codebook` classifier (QUAD / PAIR signedness per Table 59,
   intensity / PNS / zero predicates) are exposed for the downstream
   tools. Every field is fixed-width — no Huffman decode yet.
+- **`section_data()` encoder primitive** (ISO/IEC 14496-3 §4.4.6 /
+  ISO/IEC 13818-7 §6.3 Table 17, **new in round 137**):
+  `SectionData::write(writer, window_sequence, max_sfb)` — the
+  inverse of the parser. Walks each window group's section list and
+  emits `sect_cb` (4 bits) + the inverse-§6.3 `sect_len_incr`
+  sequence: while remaining `sect_len >= sect_esc_val`, emit the
+  escape value and subtract; emit the residual (in
+  `[0, sect_esc_val)`) once at the end. The "greater than or equal
+  to" boundary forces a trailing non-escape `sect_len_incr == 0`
+  when the run length is an exact multiple of `sect_esc_val`,
+  preserving the parser's loop-termination invariant. Validates
+  caller-provided structure: per-group sections must be contiguous
+  `[0, max_sfb)`, `sect_cb` must fit the 4-bit field, and
+  zero-length sections are rejected (`Error::SectionDataEncodeInvalid`).
+  No Huffman tables of its own — purely the fixed-width side of
+  Table 17.
 
 ## What Phase 2 still omits
 

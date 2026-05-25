@@ -33,12 +33,17 @@
 //!   §4.5.2.3.4 derivations (`num_windows`, `num_window_groups`,
 //!   `window_group_length[]`, `num_swb`).
 //! * The [`section_data`] module — ISO/IEC 14496-3 §4.4.6 / ISO/IEC
-//!   13818-7 §6.3 Table 17 *section_data()* parser. The second
-//!   Phase 2 tool — assigns a Huffman codebook (`sect_cb`) to each
-//!   run of scalefactor bands per window group via run-length escape
+//!   13818-7 §6.3 Table 17 *section_data()* parser, **plus** (round
+//!   137) the matching `SectionData::write` encoder primitive. The
+//!   parser assigns a Huffman codebook (`sect_cb`) to each run of
+//!   scalefactor bands per window group via run-length escape
 //!   coding, building the per-group `sfb_cb[g][sfb]` map that
-//!   `scale_factor_data()` (next round) consumes. No Huffman decode
-//!   yet — every field is fixed-width.
+//!   `scale_factor_data()` (next round) consumes. The encoder is its
+//!   inverse: given the same `(window_sequence, max_sfb)` context it
+//!   emits a bit-exact Table 17 stream. Self-roundtrip
+//!   (`write` → `parse`) is bit-perfect across the long, EIGHT_SHORT,
+//!   single-escape, double-escape, and exact-multiple-of-`sect_esc_val`
+//!   branches. No Huffman decode yet — every field is fixed-width.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives

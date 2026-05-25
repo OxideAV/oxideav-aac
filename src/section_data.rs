@@ -55,8 +55,40 @@
 //!   [`Error::SectionDataOverrun`] when a section would extend past
 //!   `max_sfb` (which a conforming encoder never emits) and
 //!   otherwise trusts the run lengths.
+//!
+//! ## Encode side (Phase 2: first writer primitive)
+//!
+//! [`SectionData::write`] is the inverse of [`SectionData::parse`]:
+//! given the same `window_sequence` / `num_window_groups` / `max_sfb`
+//! context the parser was invoked with, it emits the bit-exact
+//! Table 17 syntax that the parser reads back. This is the AAC
+//! crate's first encoder primitive — a bounded syntax-element
+//! writer with no Huffman tables of its own, so the surface lives
+//! entirely in the fixed-width `sect_cb` / `sect_len_incr` field
+//! pair.
+//!
+//! The encode-side rule for the §6.3 escape is the inverse of the
+//! decode-side accumulation:
+//!
+//! 1. While the remaining `sect_len` is **greater than or equal to**
+//!    `sect_esc_val`, emit a `sect_len_incr` of `sect_esc_val` and
+//!    subtract `sect_esc_val` from the remaining length. The
+//!    "greater than or equal to" boundary is what forces a trailing
+//!    non-escape `sect_len_incr == 0` after a length that lands
+//!    exactly on a multiple of `sect_esc_val` — the parser loop
+//!    keeps reading while `incr == sect_esc_val`, so the writer
+//!    must terminate the run with a non-escape value (which can be
+//!    zero) so the parser sees a `break` condition.
+//! 2. Emit the residual `sect_len` (which is now strictly less than
+//!    `sect_esc_val`) as a single non-escape `sect_len_incr`.
+//!
+//! [`SectionData::write`] validates that the supplied sections form
+//! a contiguous run `0 → max_sfb` per group and that every
+//! `sect_cb` and `sect_len` fits the wire field; encoder bugs upstream
+//! that violate either invariant surface as
+//! [`Error::SectionDataEncodeInvalid`].
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::ics_info::WindowSequence;
 use crate::{Error, Result};
@@ -315,6 +347,105 @@ impl SectionData {
     /// Returns `0` for an out-of-range group index.
     pub fn num_sec(&self, group: usize) -> usize {
         self.sections.get(group).map_or(0, Vec::len)
+    }
+
+    /// Encode `section_data()` onto `writer`, inverse of
+    /// [`SectionData::parse`].
+    ///
+    /// * `writer` — receives the bit-exact Table 17 stream. The
+    ///   writer position advances by `4 + (3|5) × (n_increments)` bits
+    ///   per section (per the chosen `sect_esc_val` branch).
+    /// * `window_sequence` — must match the value the surrounding
+    ///   `ics_info()` carries; selects 3-bit / 5-bit `sect_len_incr`.
+    /// * `max_sfb` — the band count the parser will be told. Every
+    ///   per-group section list must cover bands `[0, max_sfb)`
+    ///   exactly without gaps or overlaps.
+    ///
+    /// Returns [`Error::SectionDataEncodeInvalid`] if:
+    ///
+    /// * `self.sections.len()` doesn't equal the implicit
+    ///   `num_window_groups` (taken from `self.sections.len()`).
+    ///   `num_window_groups` itself isn't a parameter — it's read
+    ///   off `self.sections` so a caller who constructed
+    ///   [`SectionData`] in-memory cannot accidentally desync.
+    /// * Any group's section list isn't contiguous from band `0`
+    ///   to band `max_sfb` (start of first section != 0; end of
+    ///   last section != `max_sfb`; or section `[i].end !=
+    ///   sections[i+1].start`).
+    /// * A `sect_cb` exceeds the 4-bit field width.
+    /// * A `sect_len` of `0` appears (a conforming encoder never
+    ///   emits empty sections, and the §6.3 escape can't terminate
+    ///   a zero-length run with the parser's `break` semantics).
+    pub fn write(
+        &self,
+        writer: &mut BitWriter,
+        window_sequence: WindowSequence,
+        max_sfb: u8,
+    ) -> Result<()> {
+        let (sect_esc_val, len_bits) = if window_sequence.is_eight_short() {
+            (7u32, 3u32) // (1 << 3) - 1, 3-bit field
+        } else {
+            (31u32, 5u32) // (1 << 5) - 1, 5-bit field
+        };
+
+        for group_sections in &self.sections {
+            // Empty section list is only valid when max_sfb == 0:
+            // the parser's `while k < max_sfb` loop never enters.
+            if group_sections.is_empty() {
+                if max_sfb != 0 {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+                continue;
+            }
+
+            // Contiguity: first section starts at 0, sections chain
+            // end[i] == start[i+1], last ends at max_sfb.
+            if group_sections[0].start != 0 {
+                return Err(Error::SectionDataEncodeInvalid);
+            }
+            for w in group_sections.windows(2) {
+                if w[0].end != w[1].start {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+            }
+            if group_sections.last().unwrap().end != max_sfb {
+                return Err(Error::SectionDataEncodeInvalid);
+            }
+
+            for section in group_sections {
+                // sect_cb is 4 bits; reject any out-of-range value.
+                if section.codebook > 0x0f {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+                let sect_len = section.len() as u32;
+                // A conforming encoder never emits a zero-length
+                // section; the §6.3 termination relies on a non-
+                // escape final increment, and the parser's outer
+                // `while k < max_sfb` would then re-enter the loop
+                // expecting another sect_cb. Reject up front.
+                if sect_len == 0 {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+
+                writer.write_u32(section.codebook as u32, 4);
+
+                // §6.3 escape: while remaining >= sect_esc_val,
+                // emit sect_esc_val and subtract. The trailing
+                // non-escape increment (which is in [0, sect_esc_val)
+                // by construction) terminates the run. This is what
+                // forces a literal `0` after a length that's an
+                // exact multiple of sect_esc_val (e.g. sect_len=31
+                // long branch → emit 31, then 0).
+                let mut remaining = sect_len;
+                while remaining >= sect_esc_val {
+                    writer.write_u32(sect_esc_val, len_bits);
+                    remaining -= sect_esc_val;
+                }
+                writer.write_u32(remaining, len_bits);
+            }
+        }
+
+        Ok(())
     }
 }
 

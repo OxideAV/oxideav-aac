@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 137 — first encoder primitive: section_data writer)
+
+- `section_data::SectionData::write(writer, window_sequence, max_sfb)`
+  — the inverse of `SectionData::parse` and the AAC crate's first
+  encode-side syntax-element writer. Emits the bit-exact ISO/IEC
+  14496-3 §4.4.6 / ISO/IEC 13818-7 §6.3 Table 17 stream that the
+  existing parser reads back: per window group, for each section,
+  4-bit `sect_cb` followed by an inverse-§6.3 `sect_len_incr`
+  sequence — while remaining `sect_len >= sect_esc_val`, emit
+  `sect_esc_val` and subtract; emit the residual (which is in
+  `[0, sect_esc_val)`) once at the end. The "greater than or equal
+  to" boundary forces a trailing non-escape `sect_len_incr == 0`
+  whenever the section length is an exact multiple of
+  `sect_esc_val`, preserving the parser's `break-on-non-escape`
+  invariant.
+- `Error::SectionDataEncodeInvalid` for caller-side structural bugs
+  the writer cannot represent on the wire: non-contiguous per-group
+  sections, gaps or overlaps in band coverage, `sect_cb` exceeding
+  the 4-bit field, or zero-length sections.
+- 18 new self-roundtrip integration tests in
+  `tests/section_data_encode.rs` — long branch (no escape, single
+  escape, double escape, exact-multiple terminator, double exact
+  multiple), EIGHT_SHORT branch (no escape, single escape,
+  exact-multiple terminator), multi-window-group with intensity and
+  PNS codebooks, `max_sfb == 0` empty list, every
+  `SectionDataEncodeInvalid` rejection branch, and a hand-pinned
+  wire-layout assertion (`buf[0] == 0xB1`, `buf[1] == 0x91`,
+  `buf[2] == 0x00` for `[(11, 3), (2, 4)]` with `max_sfb=7`). Each
+  test feeds the encoded buffer back through the existing parser
+  and asserts both structural equality and matching bit position.
+  Suite size grows 86 → 104 tests.
+
 ### Added (round 133 — Phase 2: section_data)
 
 - `section_data` module: ISO/IEC 14496-3 §4.4.6 / ISO/IEC 13818-7

@@ -64,6 +64,19 @@ pub enum Error {
     /// emits a `sect_len` that overshoots, so this signals a
     /// malformed `section_data()`.
     SectionDataOverrun,
+
+    /// [`crate::section_data::SectionData::write`] was handed an
+    /// in-memory [`crate::section_data::SectionData`] whose
+    /// per-group section list violates an invariant the encoder
+    /// cannot represent on the wire — non-contiguous bands
+    /// (`start != 0`, `end[i] != start[i+1]`, or last `end !=
+    /// max_sfb`), a `sect_cb` greater than the 4-bit field, or a
+    /// zero-length section that the §6.3 escape cannot terminate
+    /// while preserving parser round-trip. A conforming AAC encoder
+    /// never builds such a structure; this surfaces caller bugs at
+    /// the boundary between scalefactor-grouping and section
+    /// emission.
+    SectionDataEncodeInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -115,6 +128,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "section_data sect_len overruns max_sfb (malformed bitstream)"
+                )
+            }
+            Error::SectionDataEncodeInvalid => {
+                write!(
+                    f,
+                    "section_data encode: per-group sections must be contiguous [0, max_sfb), sect_cb < 16, sect_len > 0"
                 )
             }
         }
