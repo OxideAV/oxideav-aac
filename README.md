@@ -3,14 +3,15 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 129)
+## Status (round 133)
 
-**Phase 1 complete + Phase 2 begin.** Round 129 starts the
-channel-element body work with `ics_info()` — the first table the
-decoder reaches inside SCE / CPE / LFE. Earlier rounds (121 / 126)
-landed the ADTS framing, out-of-band `AudioSpecificConfig`, the
-`raw_data_block()` walker, and the `program_config_element()`
-parser. The current capability set:
+**Phase 1 complete + Phase 2 in progress.** Round 133 lands
+`section_data()` — the second channel-stream tool, immediately after
+`ics_info()` inside SCE / CPE / LFE. Round 129 had started the
+channel-element body work with `ics_info()`. Earlier rounds
+(121 / 126) landed the ADTS framing, out-of-band
+`AudioSpecificConfig`, the `raw_data_block()` walker, and the
+`program_config_element()` parser. The current capability set:
 
 - **ADTS fixed + variable header parser** (ISO/IEC 13818-7
   §1.A.2.2.1–.2): syncword, ID, layer, `protection_absent`, profile,
@@ -79,14 +80,27 @@ parser. The current capability set:
   4.140) and short windows (Tables 4.130 / 4.133 / 4.135 / 4.137 /
   4.139 / 4.141) are encoded as `NUM_SWB_LONG_WINDOW[12]` /
   `NUM_SWB_SHORT_WINDOW[12]` constants.
+- **`section_data()` parser** (ISO/IEC 14496-3 §4.4.6 / ISO/IEC
+  13818-7 §6.3 Table 17, **new in round 133**): run-length section
+  assignment with the §6.3 escape mechanism — per window group it
+  reads `sect_cb` (4 bits) and accumulates `sect_len` from
+  `sect_len_incr` fields (3-bit / `sect_esc_val == 7` for
+  EIGHT_SHORT, 5-bit / `sect_esc_val == 31` otherwise), repeating
+  the increment read while it equals the escape value. Produces the
+  ordered per-group `Section { codebook, start, end }` lists plus
+  the flattened `sfb_cb[g][sfb]` map that `scale_factor_data()`
+  consumes. The codebook constants (`ZERO_HCB`, `FIRST_PAIR_HCB`,
+  `ESC_HCB`, `NOISE_HCB`, `INTENSITY_HCB2`, `INTENSITY_HCB`) and a
+  `Codebook` classifier (QUAD / PAIR signedness per Table 59,
+  intensity / PNS / zero predicates) are exposed for the downstream
+  tools. Every field is fixed-width — no Huffman decode yet.
 
 ## What Phase 2 still omits
 
-- The remaining channel-stream tools after `ics_info()`:
-  `section_data()`, `scale_factor_data()`, `pulse_data()`,
-  `tns_data()`, `gain_control_data()`, and `spectral_data()`. The
-  walker therefore still cannot iterate past a single
-  channel-element body.
+- The remaining channel-stream tools after `section_data()`:
+  `scale_factor_data()`, `pulse_data()`, `tns_data()`,
+  `gain_control_data()`, and `spectral_data()`. The walker
+  therefore still cannot iterate past a single channel-element body.
 - The full per-AOT IMDCT + windowing back-end (filterbank, TNS
   reconstruction, PNS / IS pair routing).
 - All decode / encode runtime wiring. The `register()` entry point
@@ -104,8 +118,9 @@ parser. The current capability set:
 - ADTS CRC-16 validation.
 - The `swb_offset_long_window` / `swb_offset_short_window` /
   `sect_sfb_offset` tables — only the **count** of scalefactor
-  bands is needed to step through `ics_info()`; the offset tables
-  arrive with `section_data()` / `spectral_data()`.
+  bands is needed to step through `ics_info()` and `section_data()`
+  (which works in band units); the offset tables arrive with
+  `spectral_data()`.
 
 ## Provenance
 

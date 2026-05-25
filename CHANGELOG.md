@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 133 — Phase 2: section_data)
+
+- `section_data` module: ISO/IEC 14496-3 §4.4.6 / ISO/IEC 13818-7
+  §6.3 Table 17 `section_data()` parser. Walks each window group's
+  run-length-coded section list — reading `sect_cb` (4 bits) and
+  accumulating `sect_len` from `sect_len_incr` fields with the §6.3
+  escape mechanism (3-bit field / `sect_esc_val == 7` for
+  `EIGHT_SHORT_SEQUENCE`, 5-bit field / `sect_esc_val == 31`
+  otherwise). Produces the ordered per-group `Section { codebook,
+  start, end }` lists, the flattened `sfb_cb[g][sfb]` codebook map,
+  and a `num_sec(group)` accessor. Every field is fixed-width — no
+  Huffman decode.
+- Codebook constants `ZERO_HCB` (0), `FIRST_PAIR_HCB` (5),
+  `ESC_HCB` (11), `NOISE_HCB` (13), `INTENSITY_HCB2` (14),
+  `INTENSITY_HCB` (15) per ISO/IEC 13818-7 §9.2.2, plus a
+  `Codebook` classifier (QUAD / PAIR dimension + `unsigned_cb[]`
+  signedness per Table 59, with `is_intensity()` / `is_noise()` /
+  `is_zero()` predicates) for downstream `scale_factor_data()` /
+  `spectral_data()` dispatch.
+- `Error::SectionDataOverrun` for a non-conforming `sect_len` that
+  would extend a section past `max_sfb`.
+- 17 new integration tests covering single / multi-section long and
+  EIGHT_SHORT branches, single and double escape coding, multi
+  window-group parsing, `max_sfb == 0`, overrun rejection,
+  unexpected-end, the codebook constants and `Codebook`
+  classification, and the fixtures-doc reference section trace —
+  bringing the suite to 86 tests.
+
 ### Added (round 129 — Phase 2 begin: ics_info)
 
 - `ics_info` module: ISO/IEC 14496-3 §4.4.6 Table 4.6

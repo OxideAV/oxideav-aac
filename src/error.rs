@@ -56,6 +56,14 @@ pub enum Error {
     /// must resolve the explicit rate to the nearest standard
     /// index before invoking the ics_info parser.
     IcsInfoUnsupportedSampleRateIndex(u8),
+
+    /// [`crate::section_data::SectionData::parse`] read a section
+    /// run-length (`sect_len`) that would extend a section past
+    /// `max_sfb`. ISO/IEC 13818-7 §6.3 Table 17 terminates the
+    /// per-group loop at `k < max_sfb`; a conforming encoder never
+    /// emits a `sect_len` that overshoots, so this signals a
+    /// malformed `section_data()`.
+    SectionDataOverrun,
 }
 
 impl core::fmt::Display for Error {
@@ -101,6 +109,12 @@ impl core::fmt::Display for Error {
                     f,
                     "ics_info sampling_frequency_index {} is outside the 0..=11 SWB-table range",
                     idx
+                )
+            }
+            Error::SectionDataOverrun => {
+                write!(
+                    f,
+                    "section_data sect_len overruns max_sfb (malformed bitstream)"
                 )
             }
         }

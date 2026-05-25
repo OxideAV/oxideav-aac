@@ -32,6 +32,13 @@
 //!   (Table 4.55) when the wire bit selects it, plus the
 //!   §4.5.2.3.4 derivations (`num_windows`, `num_window_groups`,
 //!   `window_group_length[]`, `num_swb`).
+//! * The [`section_data`] module — ISO/IEC 14496-3 §4.4.6 / ISO/IEC
+//!   13818-7 §6.3 Table 17 *section_data()* parser. The second
+//!   Phase 2 tool — assigns a Huffman codebook (`sect_cb`) to each
+//!   run of scalefactor bands per window group via run-length escape
+//!   coding, building the per-group `sfb_cb[g][sfb]` map that
+//!   `scale_factor_data()` (next round) consumes. No Huffman decode
+//!   yet — every field is fixed-width.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -56,9 +63,9 @@
 //!   16-bit CRC when present.
 //! * `raw_data_block()` walker: iterates `id_syn_ele` and stops at
 //!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
-//!   CCE / LFE bodies start with [`ics_info`] (Phase 2 begin) but
-//!   the remaining channel-stream tools (`section_data`,
-//!   `scale_factor_data`, `pulse_data`, `tns_data`,
+//!   CCE / LFE bodies start with [`ics_info`] then [`section_data`]
+//!   (Phase 2 in progress); the remaining channel-stream tools
+//!   (`scale_factor_data`, `pulse_data`, `tns_data`,
 //!   `gain_control_data`, `spectral_data`) are deferred.
 
 #![warn(missing_debug_implementations)]
@@ -71,6 +78,7 @@ pub mod asc;
 pub mod ics_info;
 pub mod pce;
 pub mod raw_data_block;
+pub mod section_data;
 
 mod error;
 
