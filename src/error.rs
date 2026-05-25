@@ -33,10 +33,20 @@ pub enum Error {
     /// Encountered an `id_syn_ele` value the walker cannot advance
     /// past in Phase 1. Carries the raw 3-bit value (0..=7) — the
     /// caller can map it back to ISO/IEC 14496-3 Table 4.71 names.
-    /// Phase 1 can step past FIL (`0b110`) and DSE (`0b100`); the
-    /// channel elements (SCE/CPE/CCE/LFE) and PCE require body
-    /// parsing that is deferred.
+    /// Phase 1 can step past FIL (`0b110`), DSE (`0b100`), and PCE
+    /// (`0b101`); the channel elements (SCE/CPE/CCE/LFE) still
+    /// require body parsing that is deferred.
     UnsupportedElementSkip(u8),
+
+    /// `AudioSpecificConfig` carried an `audioObjectType` whose
+    /// body Phase 1 does not parse. The General Audio AOTs handled
+    /// by Phase 1 are 1 (Main), 2 (LC), 3 (SSR), 4 (LTP), 6
+    /// (scalable), 7 (TwinVQ), 17 (ER AAC LC), 19 (ER AAC LTP), 20
+    /// (ER AAC scalable), 21 (ER TwinVQ), 22 (ER BSAC), 23 (ER AAC
+    /// LD); SBR (5) and PS (29) hierarchical wrappers are
+    /// unwrapped before this check. Any other AOT — CELP, HVXC,
+    /// SSC, USAC, ELD, ALS, SLS, …  — currently surfaces here.
+    UnsupportedAot(u8),
 }
 
 impl core::fmt::Display for Error {
@@ -68,6 +78,13 @@ impl core::fmt::Display for Error {
                     f,
                     "raw_data_block walker cannot advance past id_syn_ele {} in Phase 1",
                     id
+                )
+            }
+            Error::UnsupportedAot(aot) => {
+                write!(
+                    f,
+                    "AudioSpecificConfig audioObjectType {} is not handled in Phase 1",
+                    aot
                 )
             }
         }

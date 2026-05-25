@@ -138,13 +138,13 @@ fn walks_through_adts_header_and_raw_data_block() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(kinds.len(), 3);
-    match kinds[0] {
+    match &kinds[0] {
         Element::ChannelElement {
             kind,
             element_instance_tag,
         } => {
-            assert_eq!(kind, IdSynEle::Sce);
-            assert_eq!(element_instance_tag, 5);
+            assert_eq!(*kind, IdSynEle::Sce);
+            assert_eq!(*element_instance_tag, 5);
         }
         other => panic!("expected SCE channel element, got {:?}", other),
     }
@@ -269,18 +269,50 @@ fn lfe_and_cce_recognised() {
 }
 
 #[test]
-fn pce_returns_unsupported_element_skip() {
+fn pce_is_parsed_in_raw_data_block() {
+    // Construct a minimal PCE-bearing raw_data_block: PCE element
+    // (id=0b101) followed by an END terminator. PCE body uses the
+    // simplest legal contents — element_instance_tag=3, object_type=1
+    // (LC), sampling_frequency_index=4 (44.1 kHz), every per-channel
+    // list empty, no mixdown, no comment field.
     let mut bw = BitWriter::new();
     bw.write_u32(IdSynEle::Pce as u32, 3);
-    bw.align_to_byte_zero();
+    // PCE body
+    bw.write_u32(3, 4); // element_instance_tag
+    bw.write_u32(1, 2); // object_type = LC
+    bw.write_u32(4, 4); // sampling_frequency_index = 44100
+    bw.write_u32(0, 4); // num_front_channel_elements
+    bw.write_u32(0, 4); // num_side_channel_elements
+    bw.write_u32(0, 4); // num_back_channel_elements
+    bw.write_u32(0, 2); // num_lfe_channel_elements
+    bw.write_u32(0, 3); // num_assoc_data_elements
+    bw.write_u32(0, 4); // num_valid_cc_elements
+    bw.write_bit(false); // mono_mixdown_present
+    bw.write_bit(false); // stereo_mixdown_present
+    bw.write_bit(false); // matrix_mixdown_idx_present
+                         // (all per-element loops are empty)
+    bw.align_to_byte_zero(); // PCE Note 1 byte_alignment()
+    bw.write_u32(0, 8); // comment_field_bytes = 0
+    write_end(&mut bw);
     let payload = bw.finish();
 
     let mut br = BitReader::new(&payload);
     let mut walker = Walker::new(&mut br);
-    assert_eq!(
-        walker.next_element(),
-        Err(Error::UnsupportedElementSkip(IdSynEle::Pce as u8))
-    );
+    match walker.next_element().unwrap().unwrap() {
+        Element::ProgramConfig(pce) => {
+            assert_eq!(pce.element_instance_tag, 3);
+            assert_eq!(pce.object_type, 1);
+            assert_eq!(pce.sampling_frequency_index, 4);
+            assert!(pce.front_elements.is_empty());
+            assert!(pce.side_elements.is_empty());
+            assert!(pce.back_elements.is_empty());
+            assert!(pce.lfe_element_tag_selects.is_empty());
+            assert!(pce.comment_field.is_empty());
+            assert_eq!(pce.channel_count(), 0);
+        }
+        other => panic!("expected PCE element, got {:?}", other),
+    }
+    assert_eq!(walker.next_element().unwrap(), Some(Element::End));
 }
 
 #[test]

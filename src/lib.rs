@@ -8,13 +8,22 @@
 //!   Stream* fixed-header parser (sync, profile, sampling-frequency
 //!   index, channel configuration, frame length, raw-data-block count,
 //!   CRC presence flag).
+//! * The [`asc`] module — ISO/IEC 14496-3 §1.6.2.1 *AudioSpecificConfig*
+//!   parser, including the §4.4.1 *GASpecificConfig* body for all
+//!   General Audio audio-object types (AOTs 1, 2, 3, 4, 6, 7, 17, 19,
+//!   20, 21, 22, 23) and the hierarchical SBR (AOT 5) / PS (AOT 29)
+//!   outer-wrapper unwrap. Embeds an inline
+//!   [`pce::Pce`](pce::Pce) when `channelConfiguration == 0`.
+//! * The [`pce`] module — ISO/IEC 14496-3 §4.4.1.1 *program_config_element*
+//!   parser. Used both standalone (inside [`raw_data_block`]) and inline
+//!   inside [`asc`].
 //! * The [`raw_data_block`] module — ISO/IEC 14496-3 §4.4.2.1 syntactic
 //!   *raw_data_block()* walker that visits each `id_syn_ele` in order
 //!   and stops cleanly at `END (0b111)`. Per-element bodies for
 //!   SCE / CPE / CCE / LFE are **not** parsed yet — the walker emits an
 //!   element-header event and the consumer is responsible for
 //!   advancing the bit-reader past the body (subsequent rounds will
-//!   internalise this).
+//!   internalise this). PCE is fully parsed.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -48,6 +57,8 @@
 use oxideav_core::RuntimeContext;
 
 pub mod adts;
+pub mod asc;
+pub mod pce;
 pub mod raw_data_block;
 
 mod error;

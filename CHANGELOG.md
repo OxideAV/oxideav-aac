@@ -6,6 +6,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 126 — configuration layer)
+
+- `asc` module: ISO/IEC 14496-3 §1.6.2.1 `AudioSpecificConfig` parser
+  + §4.4.1 `GASpecificConfig` body for every General Audio
+  `audioObjectType` (1, 2, 3, 4, 6, 7, 17, 19, 20, 21, 22, 23).
+  Hierarchical SBR (AOT 5) and PS (AOT 29) outer-wrappers are
+  unwrapped and surfaced as `sbr_present` / `ps_present` plus the
+  extension sampling-frequency index. `samplingFrequencyIndex` 24-bit
+  escape (`0xf`) is honoured; `GetAudioObjectType` 5/6-bit escape is
+  honoured. Non-GA AOTs return `Error::UnsupportedAot`.
+- `pce` module: ISO/IEC 14496-3 §4.4.1.1 / ISO/IEC 13818-7 §8.5
+  `program_config_element()` parser — every wire field is preserved
+  (`front` / `side` / `back` / `lfe` / `assoc` / `cc` element
+  lists, mono / stereo / matrix mix-down hints, comment field).
+  `byte_alignment()` is configurable via the `origin_bit_offset`
+  parameter to honour Table 4.2 Note 1 (ASC-relative alignment when
+  the PCE is embedded inside an `AudioSpecificConfig`).
+- `raw_data_block::Element::ProgramConfig(Pce)`: the walker now
+  fully parses a PCE element inside a raw_data_block (previously
+  `Error::UnsupportedElementSkip(5)`).
+- 20 new integration tests (13 ASC, 7 PCE), bringing the suite to
+  43 tests.
+
 ### Added (round 121 — Phase 1 syntactic skeleton)
 
 - `adts` module: ISO/IEC 13818-7 §1.A.2.2.1–.2 ADTS fixed + variable

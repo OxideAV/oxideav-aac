@@ -42,14 +42,18 @@
 //!   `element_instance_tag`, 1-bit `data_byte_align_flag`, 8-bit
 //!   `count`, optional 8-bit `esc_count`, byte-align (if flag set),
 //!   then *count* bytes of `data_stream_byte[]`.
-//! * **PCE**: parsing deferred. Calling [`Walker::next_element`] on a
-//!   `PCE` returns [`Error::UnsupportedElementSkip`] with id `5`.
-//!   Phase 2 will provide the full §4.4.1.1 parse.
+//! * **PCE**: parsed via [`crate::pce::Pce::parse`] with an
+//!   `origin_bit_offset` of `0` (the standalone-in-`raw_data_block`
+//!   form has no enclosing ASC, so the Table 4.2 `byte_alignment()`
+//!   resolves to the absolute byte boundary). The walker emits
+//!   [`Element::ProgramConfig`] carrying the resolved
+//!   [`crate::pce::Pce`].
 //! * **END**: emits [`Element::End`] and byte-aligns the reader.
 //!   Subsequent calls return `None`.
 
 use oxideav_core::bits::BitReader;
 
+use crate::pce::Pce;
 use crate::{Error, Result};
 
 /// Syntactic element identifier — the 3-bit `id_syn_ele` field
@@ -114,7 +118,7 @@ impl IdSynEle {
 /// after the call reflects the bytes the walker itself consumed
 /// (header + any per-element bookkeeping it parses); see the
 /// per-variant docs for which bytes have been skipped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Element {
     /// SCE / CPE / CCE / LFE — channel element. The walker has
     /// consumed the 3-bit `id_syn_ele` and the 4-bit
@@ -152,6 +156,12 @@ pub enum Element {
         /// optional escape expansion).
         payload_bytes: u32,
     },
+    /// PCE — program config element. The walker has consumed the
+    /// 3-bit `id_syn_ele` and the entire PCE body per
+    /// [`Pce::parse`] (`origin_bit_offset = 0` — see
+    /// [`crate::pce`] for the standalone vs ASC-embedded handling
+    /// of the trailing `byte_alignment()`).
+    ProgramConfig(Pce),
     /// END (`0b111`) — the raw-data-block terminator. The walker
     /// has consumed the 3-bit `id_syn_ele` and byte-aligned the
     /// bit-reader (ISO/IEC 14496-3 §4.4.2.1).
@@ -195,12 +205,14 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// further calls after `End`.
     ///
     /// Errors out with [`Error::UnsupportedElementSkip`] when the
-    /// next `id_syn_ele` is one Phase 1 does not parse a body for
-    /// (currently: PCE / SCE / CPE / CCE / LFE bodies, though the
-    /// channel-element *headers* are recognised and emitted —
-    /// `UnsupportedElementSkip` is returned only when a body skip
-    /// would be required to continue, which Phase 1 only fires for
-    /// PCE).
+    /// next `id_syn_ele` would require body parsing Phase 1 has
+    /// not landed yet. As of this round, PCE is fully parsed
+    /// (round 126) and FIL / DSE are skipped (round 121); only the
+    /// channel-element bodies (SCE/CPE/CCE/LFE) remain deferred,
+    /// and even those return [`Element::ChannelElement`] for the
+    /// header — the caller must advance the bit-reader past the
+    /// body itself if more than one element is needed in a single
+    /// `raw_data_block()`.
     pub fn next_element(&mut self) -> Result<Option<Element>> {
         if self.finished {
             return Ok(None);
@@ -238,7 +250,14 @@ impl<'a, 'b> Walker<'a, 'b> {
                     payload_bytes,
                 }))
             }
-            IdSynEle::Pce => Err(Error::UnsupportedElementSkip(IdSynEle::Pce as u8)),
+            IdSynEle::Pce => {
+                // Standalone PCE inside a raw_data_block: align the
+                // PCE's byte_alignment() to the absolute byte
+                // boundary (origin_bit_offset == 0). The ASC-inline
+                // variant uses the surrounding ASC origin instead.
+                let pce = Pce::parse(self.reader, 0)?;
+                Ok(Some(Element::ProgramConfig(pce)))
+            }
             IdSynEle::End => {
                 self.reader.align_to_byte();
                 self.finished = true;
