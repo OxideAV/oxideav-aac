@@ -134,6 +134,28 @@ pub enum Error {
     /// surfaces caller bugs at the boundary between the TNS
     /// psychoacoustic-decision stage and bitstream emission.
     TnsDataEncodeInvalid,
+
+    /// [`crate::scale_factor_data::ScaleFactorData::write`] was
+    /// handed an in-memory record set whose shape cannot be
+    /// represented on the wire under ISO/IEC 14496-3 §4.4.6 /
+    /// Table 4.53 (non-resilient branch). Examples: the outer
+    /// `entries.len()` does not match the supplied `sfb_cb.len()`;
+    /// a group's entry count differs from the non-`ZERO_HCB` band
+    /// count of the matching `sfb_cb` group; an entry variant
+    /// does not match its band's codebook classification
+    /// (e.g. [`crate::scale_factor_data::ScaleFactorEntry::Intensity`]
+    /// paired with a spectrum band, or
+    /// [`crate::scale_factor_data::ScaleFactorEntry::NoisePcm`] re-used
+    /// after the §4.4.6 frame-scope `noise_pcm_flag` has already
+    /// cleared, or
+    /// [`crate::scale_factor_data::ScaleFactorEntry::NoiseDpcm`] used
+    /// on the first PNS band of the frame); a DPCM delta falls
+    /// outside `-60..=+60` (Table 4.150); or a `NoisePcm` magnitude
+    /// exceeds the 9-bit field cap (`> 0x1ff`). A conforming AAC
+    /// encoder never builds such a structure; this surfaces caller
+    /// bugs at the boundary between the rate-allocation /
+    /// scalefactor-quantisation stage and bitstream emission.
+    ScaleFactorDataEncodeInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -209,6 +231,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "tns_data encode: in-memory TnsData violates a Table 4.54 / 4.155 wire-field invariant"
+                )
+            }
+            Error::ScaleFactorDataEncodeInvalid => {
+                write!(
+                    f,
+                    "scale_factor_data encode: in-memory record set violates a Table 4.53 / 4.150 wire-field invariant"
                 )
             }
         }

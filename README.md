@@ -3,22 +3,52 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 146)
+## Status (round 149)
 
-**Phase 1 complete + Phase 2 in progress + four encoder primitives.**
-Round 146 lands the `tns_data()` parser **and** `TnsData::write`
-encoder primitive (ISO/IEC 14496-3 §4.4.6 / Table 4.54, with the
-§4.6.9.2 Table 4.155 size switch) — the fourth encode-side
-syntax-element writer in the crate, covering every transform window
-of the surrounding `window_sequence` (`num_windows` = 8 for
-`EIGHT_SHORT_SEQUENCE`, 1 otherwise), with `n_filt` (1 or 2 bits),
-the optional `coef_res` (when `n_filt > 0`), per-filter `length`
-(4 or 6 bits), `order` (3 or 5 bits), and — when `order > 0` —
-`direction`, `coef_compress`, and `order` × `coef[i]` magnitudes
-whose width is `coef_bits = (3 + coef_res) − coef_compress ∈
-{2, 3, 4}` per §4.6.9.3. Public helpers `field_widths`,
-`num_windows`, and `coef_bits` expose the Table 4.155 / §4.5.2.3.4 /
-§4.6.9.3 dispatch. Round 142 had landed `PulseData::parse` /
+**Phase 1 complete + Phase 2 in progress + five encoder primitives.**
+Round 149 lands the `scale_factor_data()` parser **and**
+`ScaleFactorData::write` encoder primitive (ISO/IEC 14496-3 §4.4.6 /
+Table 4.53, non-resilient branch, plus the §4.6.3 / Table 4.A.1
+"scalefactor Huffman codebook" — codebook 12) — the fifth encode-side
+syntax-element writer in the crate. Table 4.A.1 is transcribed
+verbatim from the spec (121 entries indexed `0..=120`, max length
+19 bits, codeword for index 60 / delta 0 is the single bit `0`)
+and is a *complete* prefix code (Kraft equality, exhaustively
+verified by walking all `2^19` 19-bit prefixes). Public helpers
+`hcod_sf_encode(dpcm: i8) -> (length, codeword)` and
+`hcod_sf_decode(reader) -> i8` expose the Table 4.A.1 codebook
+directly; `SF_INDEX_OFFSET = -60` and `NOISE_PCM_BITS = 9`
+constants pin the §4.6.3 / Table 4.150 dispatch. The parser /
+writer walk the per-`(g, sfb)` non-`ZERO_HCB` subsequence driven
+by `SectionData::sfb_cb`, dispatching between `hcod_sf[]` (ordinary
+spectrum / PNS-after-first / both intensity codebooks 14 + 15)
+and the 9-bit `dpcm_noise_nrg` PCM seed (first PNS band of the
+frame; `noise_pcm_flag` is *frame*-scoped, not group-scoped). The
+writer's structural sieve rejects every illegal in-memory shape
+(`Error::ScaleFactorDataEncodeInvalid`): outer length mismatch
+vs `sfb_cb`, missing or surplus entries, variant ↔ codebook
+mismatch, `NoisePcm` re-used after `noise_pcm_flag` clears,
+`NoiseDpcm` on the first PNS band, DPCM delta outside `-60..=+60`,
+`NoisePcm` magnitude > 0x1FF. The §4.6.2.3.2 `last_sf =
+global_gain` accumulator (DPCM → absolute `sf[g][sfb] ∈ 0..=255`)
+is **not** performed; that's a per-AOT decoder step. The §4.4.6
+error-resilient branch (`aacScalefactorDataResilienceFlag == 1`,
+RVLC + `rev_global_gain` + `sf_concealment`) is **not** implemented;
+ER AAC-LD / scalable profiles will need a sibling
+`scale_factor_data_rvlc()` module. Round 146 had landed the
+`tns_data()` parser **and** `TnsData::write` encoder primitive
+(ISO/IEC 14496-3 §4.4.6 / Table 4.54, with the §4.6.9.2 Table 4.155
+size switch) — the fourth encode-side syntax-element writer in the
+crate, covering every transform window of the surrounding
+`window_sequence` (`num_windows` = 8 for `EIGHT_SHORT_SEQUENCE`, 1
+otherwise), with `n_filt` (1 or 2 bits), the optional `coef_res`
+(when `n_filt > 0`), per-filter `length` (4 or 6 bits), `order`
+(3 or 5 bits), and — when `order > 0` — `direction`,
+`coef_compress`, and `order` × `coef[i]` magnitudes whose width is
+`coef_bits = (3 + coef_res) − coef_compress ∈ {2, 3, 4}` per
+§4.6.9.3. Public helpers `field_widths`, `num_windows`, and
+`coef_bits` expose the Table 4.155 / §4.5.2.3.4 / §4.6.9.3
+dispatch. Round 142 had landed `PulseData::parse` /
 `PulseData::write` (§4.4.6.3 / Table 4.7) — the third encode-side
 primitive, covering the 2-bit `number_pulse` + 6-bit
 `pulse_start_sfb` + 1..=4 `(5-bit offset, 4-bit amp)` records.
@@ -219,10 +249,19 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
 
 ## What Phase 2 still omits
 
-- The remaining channel-stream tools after `tns_data()`:
-  `scale_factor_data()`, `gain_control_data()`, and
-  `spectral_data()`. The walker therefore still cannot iterate past
-  a single channel-element body.
+- The remaining channel-stream tools after `scale_factor_data()`:
+  `gain_control_data()` and `spectral_data()`. The walker therefore
+  still cannot iterate past a single channel-element body.
+- The `scale_factor_data()` error-resilient branch
+  (`aacScalefactorDataResilienceFlag == 1` → RVLC with
+  `rev_global_gain`, `length_of_rvlc_sf`, `sf_concealment`,
+  `length_of_rvlc_escapes`); ER AAC-LD / scalable profiles need
+  a sibling `scale_factor_data_rvlc()` module.
+- The §4.6.2.3.2 `last_sf = global_gain` accumulator that converts
+  the transmitted DPCM deltas to absolute `sf[g][sfb] ∈ 0..=255`;
+  same shape on the encode side (the rate-allocation stage applies
+  `dpcm = sf[g][sfb] - last_sf` before invoking the writer). Both
+  are per-AOT decoder / encoder back-end concerns.
 - The §4.6.13 pulse-escape *reconstruction* loop. The pulse-data
   record is parseable / writable bit-for-bit, but applying the
   fix-up to the decoded `x_quant` coefficients requires the

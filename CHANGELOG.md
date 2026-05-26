@@ -6,6 +6,77 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 149 — fifth encoder primitive: scale_factor_data parser + writer)
+
+- `scale_factor_data` module: ISO/IEC 14496-3 §4.4.6 / Table 4.53
+  (non-resilient branch) plus §4.6.3 / Table 4.A.1 *scalefactor
+  Huffman codebook* (codebook 12) — the AAC crate's fifth encode-
+  side syntax-element writer. The 121-entry Table 4.A.1 is
+  transcribed verbatim from the spec (max length 19 bits, codeword
+  for index 60 / delta 0 is the single bit `0`) and is a *complete*
+  prefix code (Kraft equality, exhaustively verified by walking all
+  `2^19` 19-bit prefixes).
+- Public helpers `hcod_sf_encode(dpcm: i8) -> Result<(u8, u32)>`
+  and `hcod_sf_decode(reader: &mut BitReader) -> Result<i8>` expose
+  the Table 4.A.1 codebook directly for Auditor harnesses and
+  fixture cross-checks.
+- Public constants `SF_INDEX_OFFSET = -60` (Table 4.150 DPCM range
+  centre), `NOISE_PCM_BITS = 9` (Table 4.53 first-PNS seed width),
+  `HCOD_SF_NUM_ENTRIES = 121`, `HCOD_SF_MAX_LEN = 19` pin the
+  §4.6.3 / Table 4.150 dispatch.
+- `ScaleFactorData::parse(reader, sfb_cb)` walks the per-`(g, sfb)`
+  non-`ZERO_HCB` subsequence driven by
+  `SectionData::sfb_cb`, dispatching between `hcod_sf[]` (ordinary
+  spectrum / PNS-after-first / both intensity codebooks 14 and 15)
+  and the 9-bit `dpcm_noise_nrg` PCM seed (first PNS band of the
+  frame). `noise_pcm_flag` is *frame*-scoped, not group-scoped:
+  the first PNS band consumes the seed regardless of which window
+  group it lives in.
+- `ScaleFactorData::write(writer, sfb_cb)` is the bit-exact inverse.
+  Validates per-band variant ↔ codebook classification, DPCM range
+  `-60..=+60`, `NoisePcm` 9-bit cap, and the `noise_pcm_flag`
+  consumption rule.
+- `Error::ScaleFactorDataEncodeInvalid` for caller-side structural
+  bugs the writer cannot represent on the wire: `entries.len()`
+  differs from `sfb_cb.len()`; a group's entry count does not match
+  the non-`ZERO_HCB` band count of its `sfb_cb` group; a variant
+  paired with the wrong codebook (Intensity on a spectrum band,
+  NoisePcm on a non-PNS band, NoiseDpcm on the first PNS band,
+  Dpcm on an intensity / PNS band); a second NoisePcm in the same
+  frame (`noise_pcm_flag` already cleared); a DPCM delta outside
+  `-60..=+60`; a NoisePcm magnitude exceeding the 9-bit field cap
+  (`> 0x1FF`).
+- The §4.6.2.3.2 `last_sf = global_gain` accumulator that converts
+  the transmitted DPCM deltas to absolute `sf[g][sfb] ∈ 0..=255`
+  is **not** performed — it needs `global_gain` and is a per-AOT
+  decoder step the back-end will own (with the symmetric `dpcm
+  = sf[g][sfb] - last_sf` step on the encoder rate-allocation
+  side).
+- The §4.4.6 error-resilient branch (`aacScalefactorDataResilienceFlag
+  == 1` → RVLC with `rev_global_gain`, `sf_concealment`,
+  `length_of_rvlc_sf`, `length_of_rvlc_escapes`, etc.) is **not**
+  implemented; ER AAC-LD / scalable profiles will need a sibling
+  `scale_factor_data_rvlc()` module.
+- 23 new integration tests in `tests/scale_factor_data.rs`
+  covering: empty / all-`ZERO_HCB` no-op paths; single-band
+  spectrum / intensity / PNS-seed / PNS-Huffman cases; frame-scope
+  `noise_pcm_flag` invariant across window groups; exhaustive
+  per-DPCM-value bit-length agreement against Table 4.A.1; a
+  mixed-content frame with all four variants and ZERO_HCB skips;
+  EIGHT_SHORT-style 8-group iteration; hand-pinned wire-byte
+  assertions (single-bit `0x00`, `dpcm_noise_nrg = 0x1AB` →
+  `[0xD5, 0x80]` MSB-first); every writer-rejection branch
+  (outer length / extra / missing entries, variant ↔ band
+  mismatch, second NoisePcm, NoiseDpcm-first-PNS, DPCM out-of-
+  range, NoisePcm overflow); parse underflow on the PCM seed; and
+  the exhaustive `hcod_sf_decode` completeness test (every 19-bit
+  prefix decodes successfully — Kraft equality verification).
+- 5 new module-level unit tests covering: known Table 4.A.1 rows
+  (`HCOD_SF[60] = (1, 0)`, etc.); prefix-free transcription
+  regression guard; `dpcm = 0` collapsing to a single bit;
+  encode-boundary rejection at `-61` / `+61`; and the full
+  encode→decode round-trip for every legal DPCM value `-60..=+60`.
+
 ### Added (round 146 — fourth encoder primitive: tns_data parser + writer)
 
 - `tns_data` module: ISO/IEC 14496-3 §4.4.6 / Table 4.54 `tns_data()`

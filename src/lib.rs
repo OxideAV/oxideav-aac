@@ -62,6 +62,31 @@
 //!   pulse_offset[j]; x_quant[…] ±= pulse_amp[j]`) is **not**
 //!   performed; it needs `swb_offset_long_window[]` and the
 //!   post-Huffman `x_quant` array that arrive with `spectral_data()`.
+//! * The [`scale_factor_data`] module — ISO/IEC 14496-3 §4.4.6 /
+//!   Table 4.53 (non-resilient branch) plus §4.6.3 / Table 4.A.1
+//!   *scale_factor_data()* parser **and** encoder primitive
+//!   (**new in round 149**, the fifth encode-side syntax-element
+//!   writer in the crate). Carries the AAC scalefactor Huffman
+//!   codebook (codebook 12) — 121 entries indexed `0..=120` with
+//!   `index_offset = -60`, producing DPCM deltas in `-60..=+60`. The
+//!   parser walks the per-`(g, sfb)` non-`ZERO_HCB` subsequence
+//!   driven by [`section_data::SectionData::sfb_cb`] and dispatches
+//!   between `hcod_sf[]` (ordinary spectrum / PNS-after-first / both
+//!   intensity codebooks) and the 9-bit `dpcm_noise_nrg` PCM seed
+//!   (first PNS band of the frame). The writer serialises the same
+//!   structure back bit-for-bit and validates the in-memory record
+//!   variants against the codebook map (catches a NoisePcm re-used
+//!   after `noise_pcm_flag` clears, a NoiseDpcm on the first PNS
+//!   band, a delta outside `-60..=+60`, etc.). The §4.6.2.3.2
+//!   `last_sf = global_gain` accumulator that converts DPCM deltas
+//!   to absolute `sf[g][sfb] ∈ 0..=255` values is **not** performed;
+//!   that needs `global_gain` and is a decoder-side step the
+//!   per-AOT back-end will own. The §4.4.6 error-resilient branch
+//!   (`aacScalefactorDataResilienceFlag == 1`, RVLC with
+//!   `rev_global_gain`, `sf_concealment`, `length_of_rvlc_sf`) is
+//!   **not** implemented; ER AAC-LD / scalable profiles that flip
+//!   the resilience flag will need a sibling
+//!   `scale_factor_data_rvlc()` module.
 //! * The [`tns_data`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.54
 //!   *tns_data()* parser **and** encoder primitive (**new in round
 //!   146**). The parser walks every transform window of the
@@ -102,9 +127,9 @@
 //! * `raw_data_block()` walker: iterates `id_syn_ele` and stops at
 //!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
 //!   CCE / LFE bodies start with [`ics_info`] then [`section_data`]
-//!   (Phase 2 in progress); the optional [`pulse_data`] and
-//!   [`tns_data`] tools now parse and write; the remaining channel-
-//!   stream tools (`scale_factor_data`, `gain_control_data`,
+//!   then [`scale_factor_data`] (Phase 2 in progress); the optional
+//!   [`pulse_data`] and [`tns_data`] tools now parse and write; the
+//!   remaining channel-stream tools (`gain_control_data`,
 //!   `spectral_data`) are deferred.
 
 #![warn(missing_debug_implementations)]
@@ -118,6 +143,7 @@ pub mod ics_info;
 pub mod pce;
 pub mod pulse_data;
 pub mod raw_data_block;
+pub mod scale_factor_data;
 pub mod section_data;
 pub mod tns_data;
 
