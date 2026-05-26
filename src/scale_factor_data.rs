@@ -62,38 +62,64 @@
 //! * [`ScaleFactorData::parse`] — read a non-resilient Table 4.53
 //!   block given the surrounding `sfb_cb[g][sfb]` map. Surfaces the
 //!   raw transmitted `dpcm_sf` / `dpcm_is_position` deltas and the
-//!   `dpcm_noise_nrg` magnitudes verbatim, without applying the
-//!   §4.6.2.3.2 running-`last_sf` accumulator (which is a decoder-only
-//!   step that needs `global_gain` as the start value).
+//!   `dpcm_noise_nrg` magnitudes verbatim.
 //! * [`ScaleFactorData::write`] — the inverse: serialise a
 //!   [`ScaleFactorData`] bit-for-bit. Surfaces caller-side structural
 //!   bugs (delta out of range, PCM energy out of range, missing /
 //!   surplus per-band entry versus the `sfb_cb` map) as
 //!   [`Error::ScaleFactorDataEncodeInvalid`].
+//! * [`accumulate`] — the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM
+//!   accumulator (decoder side). Runs the three independent tracks
+//!   forward: spectrum scalefactors (`last_sf = global_gain`),
+//!   intensity stereo positions (`last_is = 0`), and PNS noise
+//!   energies (`last_nrg = global_gain - NOISE_OFFSET - 256`).
+//!   Returns absolute `(sf, is_pos, noise_nrg)` per band.
+//! * [`differentiate`] — the symmetric inverse (encoder side). Takes
+//!   absolute per-band quantities from rate-allocation and produces
+//!   the [`ScaleFactorData`] the bit-exact writer expects. Validates
+//!   that every spectrum / intensity / PNS-subsequent delta fits
+//!   Table 4.150's `-60..=+60`, and that the first PNS band's
+//!   seed fits the 9-bit `uimsbf` Table 4.53 field.
 //! * [`hcod_sf_encode`] / [`hcod_sf_decode`] — public Table 4.A.1
 //!   accessors for callers (Auditor harnesses, fixture cross-checks)
 //!   that need the codebook directly without going through the full
 //!   `scale_factor_data()` driver.
 //!
+//! ## Three-track DPCM (spec ambiguity, resolved per §4.6.8 / §4.6.13)
+//!
+//! The §4.6.2.3.2 illustrative pseudocode declares **one** accumulator
+//! `last_sf = global_gain` and lumps PNS (`NOISE_HCB`) bands into it
+//! alongside spectrum bands. This pseudocode predates MPEG-4's PNS
+//! feature (it is identical in 13818-7 §11.3.2 where no PNS exists)
+//! and conflicts with the surrounding §4.6.8.1.4 + §4.6.13 wording,
+//! which states explicitly that "differential decoding is done
+//! separately between scalefactors, intensity stereo positions and
+//! noise energies" with each track having its own running register
+//! and its own initial-condition seed.
+//!
+//! This module implements the three-track interpretation:
+//! intensity bands seed at `last_is = 0`, PNS bands seed at
+//! `last_nrg = global_gain - NOISE_OFFSET - 256` (with the first
+//! PNS band's 9-bit literal added directly to `last_nrg`), spectrum
+//! bands seed at `last_sf = global_gain`. The §4.6.2.3.2 pseudocode's
+//! single-track form is not used because the §4.6.8 / §4.6.13
+//! prose-level requirement of independence cannot be honoured under
+//! a single track that mixes spectrum and PNS deltas.
+//!
 //! ## What this module does *not* cover
 //!
-//! * The §4.6.2.3.2 `last_sf = global_gain` accumulator — that is a
-//!   decoder-side step that converts the transmitted DPCM deltas into
-//!   absolute `sf[g][sfb]` values in the `0..=255` range. The
-//!   accumulator needs `global_gain` and is symmetrically applied at
-//!   encode-time before this module is invoked.
 //! * The §4.4.6 error-resilient branch (`aacScalefactorDataResilienceFlag
 //!   == 1` → RVLC with `rev_global_gain`, `length_of_rvlc_sf`,
 //!   `sf_concealment`, `length_of_rvlc_escapes`, etc.) — the in-memory
 //!   structure here is the non-resilient flavour. ER AAC-LD / scalable
 //!   profiles that flip the resilience flag will need a sibling
 //!   `scale_factor_data_rvlc()` module.
-//! * The §4.6.13 `dpcm_noise_nrg` reconstruction (running-energy
-//!   accumulator that mirrors the scalefactor `last_sf` accumulator
-//!   but uses the first 9-bit literal as the seed) — same reasoning:
-//!   the wire record is what this module exchanges with the parser;
-//!   the seeded-running-difference unwind belongs in the per-AOT
-//!   decoder.
+//! * The §4.6.2.3.3 / §4.6.8 / §4.6.13 reconstruction steps that
+//!   actually *consume* the absolute values: `get_scale_factor_gain
+//!   = 2^(0.25 * (sf - SF_OFFSET))`, the IS rescaling sign-flip per
+//!   `ms_used`, and the PNS random-vector energy rescaling. Those
+//!   are per-AOT IMDCT back-end concerns that need spectral-context
+//!   state this module does not own.
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
@@ -492,6 +518,273 @@ impl ScaleFactorData {
         }
         Ok(())
     }
+}
+
+// =============================================================================
+// §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulators
+// =============================================================================
+//
+// `scale_factor_data()` transmits *differential* values. Recovering the
+// absolute per-band quantities the per-AOT IMDCT / intensity-stereo /
+// PNS back-ends consume requires accumulating the DPCM deltas against
+// initial-condition seeds. There are **three** independent tracks:
+//
+// 1. **Spectrum scalefactors** (codebooks 1..=11): per ISO/IEC 14496-3
+//    §4.6.2.3.2 / ISO/IEC 13818-7 §11.3.2, accumulator initial value
+//    `last_sf = global_gain`; per-band `sf[g][sfb] = dpcm_sf +
+//    last_sf; last_sf = sf[g][sfb]`. Range `0..=255` (clause note;
+//    the 13818-7 wording matches).
+//
+// 2. **Intensity stereo positions** (codebooks 14, 15): per
+//    §4.6.8.1.4, initial `last_is = 0`; per-band `is_pos[g][sfb] =
+//    dpcm_is_position + last_is; last_is = is_pos[g][sfb]`. The
+//    §4.6.8.1.4 text is explicit that intensity-position differential
+//    decoding is "done separately" from the scalefactor track, with
+//    the seed starting at zero rather than `global_gain`.
+//
+// 3. **PNS noise energies** (codebook 13): per §4.6.13, initial
+//    `last_nrg = global_gain - NOISE_OFFSET - 256` (`NOISE_OFFSET ==
+//    90`); the first PNS band carries a 9-bit `uimsbf` literal
+//    `dpcm_noise_nrg` (added to `last_nrg` directly), each
+//    subsequent PNS band carries a Huffman delta in `-60..=+60`.
+//    Per-band `noise_nrg[g][sfb] = dpcm_noise_nrg + last_nrg;
+//    last_nrg = noise_nrg[g][sfb]`. The §4.6.13 text is explicit
+//    that PNS energies are "done separately" from both other tracks.
+//
+// The three-track presentation in §4.6.8 / §4.6.13 takes precedence
+// over the §4.6.2.3.2 illustrative pseudocode (which predates PNS
+// in 13818-7 and conflates the spectrum + PNS tracks under a single
+// `last_sf` register). The "done separately" wording in §4.6.8.1.4
+// and §4.6.13 is unambiguous; this crate honours it.
+//
+// `accumulate(sfd, sfb_cb, global_gain)` runs all three tracks
+// forward (decoder side) to recover absolute `(sf, is_pos,
+// noise_nrg)`. `differentiate(abs, sfb_cb, global_gain)` is its
+// inverse (encoder side, fed by the rate-allocation stage's
+// absolute-value output).
+
+/// `NOISE_OFFSET` per §4.6.13 — added to the PNS energy seed to
+/// position the running `last_nrg` register relative to
+/// `global_gain`.
+pub const NOISE_OFFSET: i32 = 90;
+
+/// One absolute per-band record, the result of running the §4.6.2.3.2
+/// / §4.6.8.1.4 / §4.6.13 DPCM accumulators forward over a
+/// [`ScaleFactorData`] together with `global_gain`.
+///
+/// The variant matches the [`ScaleFactorEntry`] variant of the
+/// corresponding transmitted record but carries the absolute value
+/// the per-AOT back-end consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsoluteScaleFactorEntry {
+    /// Absolute spectrum-band scalefactor `sf[g][sfb] ∈ 0..=255` —
+    /// the gain applied to the spectral coefficients of this
+    /// scalefactor band per §4.6.2.3.3.
+    Sf(u8),
+    /// Absolute intensity stereo position `is_pos[g][sfb] ∈
+    /// -60..=+60` accumulated — the value the §4.6.8.2 IS decoder
+    /// consumes. The track seeds at 0 and accumulates `-60..=+60`
+    /// deltas, so the absolute value's reachable range is in
+    /// principle unbounded; conforming streams keep it within the
+    /// signed 8-bit window.
+    IsPos(i16),
+    /// Absolute noise energy `noise_nrg[g][sfb]` — the value the
+    /// §4.6.13 noise-substitution back-end consumes. Tracked as
+    /// `i32` because the seed is `global_gain - NOISE_OFFSET - 256`
+    /// (which can be negative for small `global_gain`) and the
+    /// running accumulator may dip negative before the first PNS
+    /// band lands a positive 9-bit delta.
+    NoiseNrg(i32),
+}
+
+/// Absolute per-band quantities recovered by running the §4.6.2.3.2
+/// / §4.6.8.1.4 / §4.6.13 DPCM accumulators forward over a
+/// [`ScaleFactorData`].
+///
+/// Outer length equals `sfb_cb.len()` (`num_window_groups`); inner
+/// `entries[g]` length matches the `entries[g]` of the source
+/// [`ScaleFactorData`] (the non-`ZERO_HCB` band count of the
+/// matching `sfb_cb[g]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsoluteScaleFactors {
+    /// `entries[g]` — the per-band absolute records of window group
+    /// `g` in wire (low-frequency-first) order. Variant order
+    /// follows the per-band codebook classification in the matching
+    /// `sfb_cb[g]`, skipping `ZERO_HCB` bands.
+    pub entries: Vec<Vec<AbsoluteScaleFactorEntry>>,
+}
+
+/// Run the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulators
+/// forward over `sfd` to recover absolute scalefactors, intensity
+/// stereo positions, and PNS noise energies (decoder side).
+///
+/// * `sfd` — the transmitted DPCM record set returned by
+///   [`ScaleFactorData::parse`].
+/// * `sfb_cb` — the per-`(g, sfb)` codebook map produced by
+///   [`crate::section_data::SectionData::parse`].
+/// * `global_gain` — the 8-bit `global_gain` element transmitted
+///   immediately before `section_data()` in
+///   `individual_channel_stream()`.
+///
+/// Returns [`Error::ScaleFactorAccumulatorInvalid`] if the
+/// per-group entry layout in `sfd` does not match the non-`ZERO_HCB`
+/// codebook classification of the matching `sfb_cb` group, or if a
+/// Sf-track running value escapes the `0..=255` spec range (Note
+/// after §4.6.2.3.2 pseudocode).
+pub fn accumulate(
+    sfd: &ScaleFactorData,
+    sfb_cb: &[Vec<u8>],
+    global_gain: u8,
+) -> Result<AbsoluteScaleFactors> {
+    if sfd.entries.len() != sfb_cb.len() {
+        return Err(Error::ScaleFactorAccumulatorInvalid);
+    }
+    let mut last_sf: i32 = i32::from(global_gain);
+    let mut last_is: i32 = 0;
+    let mut last_nrg: i32 = i32::from(global_gain) - NOISE_OFFSET - 256;
+    let mut noise_pcm_flag = true;
+    let mut out: Vec<Vec<AbsoluteScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
+    for (group_entries, group_cb) in sfd.entries.iter().zip(sfb_cb.iter()) {
+        let mut entry_iter = group_entries.iter();
+        let mut group_out: Vec<AbsoluteScaleFactorEntry> = Vec::new();
+        for &cb in group_cb {
+            if cb == ZERO_HCB {
+                continue;
+            }
+            let entry = entry_iter
+                .next()
+                .ok_or(Error::ScaleFactorAccumulatorInvalid)?;
+            let abs_entry = match (entry, cb) {
+                (ScaleFactorEntry::Intensity(dpcm), cb) if is_intensity(cb) => {
+                    last_is += i32::from(*dpcm);
+                    AbsoluteScaleFactorEntry::IsPos(last_is as i16)
+                }
+                (ScaleFactorEntry::NoisePcm(pcm), cb) if is_noise(cb) => {
+                    if !noise_pcm_flag {
+                        return Err(Error::ScaleFactorAccumulatorInvalid);
+                    }
+                    noise_pcm_flag = false;
+                    last_nrg += i32::from(*pcm);
+                    AbsoluteScaleFactorEntry::NoiseNrg(last_nrg)
+                }
+                (ScaleFactorEntry::NoiseDpcm(dpcm), cb) if is_noise(cb) => {
+                    if noise_pcm_flag {
+                        return Err(Error::ScaleFactorAccumulatorInvalid);
+                    }
+                    last_nrg += i32::from(*dpcm);
+                    AbsoluteScaleFactorEntry::NoiseNrg(last_nrg)
+                }
+                (ScaleFactorEntry::Dpcm(dpcm), cb) if !is_intensity(cb) && !is_noise(cb) => {
+                    last_sf += i32::from(*dpcm);
+                    if !(0..=255).contains(&last_sf) {
+                        return Err(Error::ScaleFactorAccumulatorInvalid);
+                    }
+                    AbsoluteScaleFactorEntry::Sf(last_sf as u8)
+                }
+                _ => return Err(Error::ScaleFactorAccumulatorInvalid),
+            };
+            group_out.push(abs_entry);
+        }
+        if entry_iter.next().is_some() {
+            return Err(Error::ScaleFactorAccumulatorInvalid);
+        }
+        out.push(group_out);
+    }
+    Ok(AbsoluteScaleFactors { entries: out })
+}
+
+/// Run the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulators
+/// backward (encoder side): convert absolute per-band quantities
+/// produced by rate-allocation into the transmitted DPCM record set
+/// the bit-exact `scale_factor_data()` writer expects.
+///
+/// This is the symmetric inverse of [`accumulate`]:
+/// `accumulate(differentiate(abs, sfb_cb, gg)?, sfb_cb, gg) == abs`
+/// on every well-formed input.
+///
+/// * `abs` — the absolute per-band records from rate-allocation
+///   (`Sf` for spectrum bands, `IsPos` for intensity bands,
+///   `NoiseNrg` for PNS bands).
+/// * `sfb_cb` — per-band codebook map from `section_data()`.
+/// * `global_gain` — the 8-bit element the wire stream carries
+///   immediately before `section_data()` (a free parameter the
+///   encoder picks; conforming choice is the first spectrum band's
+///   absolute `sf` to make the first delta `0`).
+///
+/// Returns [`Error::ScaleFactorAccumulatorInvalid`] if outer / inner
+/// shape disagrees with `sfb_cb`, if an entry variant does not match
+/// its band's codebook, if a spectrum / intensity / PNS-subsequent
+/// delta `cur - prev` falls outside Table 4.150's `-60..=+60`, or
+/// if the first PNS band's initial `dpcm_noise_nrg` magnitude does
+/// not fit the 9-bit `uimsbf` Table 4.53 field (`0..=511`).
+pub fn differentiate(
+    abs: &AbsoluteScaleFactors,
+    sfb_cb: &[Vec<u8>],
+    global_gain: u8,
+) -> Result<ScaleFactorData> {
+    if abs.entries.len() != sfb_cb.len() {
+        return Err(Error::ScaleFactorAccumulatorInvalid);
+    }
+    let mut last_sf: i32 = i32::from(global_gain);
+    let mut last_is: i32 = 0;
+    let mut last_nrg: i32 = i32::from(global_gain) - NOISE_OFFSET - 256;
+    let mut noise_pcm_flag = true;
+    let mut out: Vec<Vec<ScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
+    for (group_abs, group_cb) in abs.entries.iter().zip(sfb_cb.iter()) {
+        let mut abs_iter = group_abs.iter();
+        let mut group_out: Vec<ScaleFactorEntry> = Vec::new();
+        for &cb in group_cb {
+            if cb == ZERO_HCB {
+                continue;
+            }
+            let abs_entry = abs_iter
+                .next()
+                .ok_or(Error::ScaleFactorAccumulatorInvalid)?;
+            let entry = match (abs_entry, cb) {
+                (AbsoluteScaleFactorEntry::IsPos(cur), cb) if is_intensity(cb) => {
+                    let delta = i32::from(*cur) - last_is;
+                    if !(-60..=60).contains(&delta) {
+                        return Err(Error::ScaleFactorAccumulatorInvalid);
+                    }
+                    last_is = i32::from(*cur);
+                    ScaleFactorEntry::Intensity(delta as i8)
+                }
+                (AbsoluteScaleFactorEntry::NoiseNrg(cur), cb) if is_noise(cb) => {
+                    if noise_pcm_flag {
+                        let delta = *cur - last_nrg;
+                        if !(0..=511).contains(&delta) {
+                            return Err(Error::ScaleFactorAccumulatorInvalid);
+                        }
+                        noise_pcm_flag = false;
+                        last_nrg = *cur;
+                        ScaleFactorEntry::NoisePcm(delta as u16)
+                    } else {
+                        let delta = *cur - last_nrg;
+                        if !(-60..=60).contains(&delta) {
+                            return Err(Error::ScaleFactorAccumulatorInvalid);
+                        }
+                        last_nrg = *cur;
+                        ScaleFactorEntry::NoiseDpcm(delta as i8)
+                    }
+                }
+                (AbsoluteScaleFactorEntry::Sf(cur), cb) if !is_intensity(cb) && !is_noise(cb) => {
+                    let delta = i32::from(*cur) - last_sf;
+                    if !(-60..=60).contains(&delta) {
+                        return Err(Error::ScaleFactorAccumulatorInvalid);
+                    }
+                    last_sf = i32::from(*cur);
+                    ScaleFactorEntry::Dpcm(delta as i8)
+                }
+                _ => return Err(Error::ScaleFactorAccumulatorInvalid),
+            };
+            group_out.push(entry);
+        }
+        if abs_iter.next().is_some() {
+            return Err(Error::ScaleFactorAccumulatorInvalid);
+        }
+        out.push(group_out);
+    }
+    Ok(ScaleFactorData { entries: out })
 }
 
 /// Internal: `cb` is an intensity codebook (14 or 15).

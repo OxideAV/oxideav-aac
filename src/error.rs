@@ -156,6 +156,25 @@ pub enum Error {
     /// bugs at the boundary between the rate-allocation /
     /// scalefactor-quantisation stage and bitstream emission.
     ScaleFactorDataEncodeInvalid,
+
+    /// [`crate::scale_factor_data::differentiate`] was handed an
+    /// [`crate::scale_factor_data::AbsoluteScaleFactors`] whose
+    /// shape or numeric values cannot be encoded back to a
+    /// well-formed `scale_factor_data()` block. Examples: outer
+    /// length differs from `sfb_cb.len()`; a group's
+    /// per-band-classification list differs from the matching
+    /// `sfb_cb` group; the spectrum-track delta `sf - last_sf`
+    /// falls outside Table 4.150's `-60..=+60`; the intensity-track
+    /// delta `is_pos - last_is` falls outside `-60..=+60`; the
+    /// PNS-track delta `nrg - last_nrg` (for PNS bands after the
+    /// first) falls outside `-60..=+60`; or the first PNS band's
+    /// initial seed magnitude (`first_nrg - (global_gain -
+    /// NOISE_OFFSET - 256)`) does not fit the 9-bit Table 4.53
+    /// `dpcm_noise_nrg` uimsbf field (`0..=511`). A conforming AAC
+    /// rate-allocation stage never produces such a structure; this
+    /// surfaces caller bugs at the boundary between absolute
+    /// scalefactor quantisation and DPCM differential coding.
+    ScaleFactorAccumulatorInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -237,6 +256,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "scale_factor_data encode: in-memory record set violates a Table 4.53 / 4.150 wire-field invariant"
+                )
+            }
+            Error::ScaleFactorAccumulatorInvalid => {
+                write!(
+                    f,
+                    "scale_factor accumulator: absolute-to-DPCM differentiation produced a delta outside Table 4.150 / Table 4.53 ranges"
                 )
             }
         }

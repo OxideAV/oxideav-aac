@@ -3,13 +3,34 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 149)
+## Status (round 152)
 
-**Phase 1 complete + Phase 2 in progress + five encoder primitives.**
-Round 149 lands the `scale_factor_data()` parser **and**
-`ScaleFactorData::write` encoder primitive (ISO/IEC 14496-3 §4.4.6 /
-Table 4.53, non-resilient branch, plus the §4.6.3 / Table 4.A.1
-"scalefactor Huffman codebook" — codebook 12) — the fifth encode-side
+**Phase 1 complete + Phase 2 in progress + five encoder primitives +
+the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator pair.**
+Round 152 lands `accumulate()` / `differentiate()` — the symmetric
+decoder / encoder pair that converts between transmitted DPCM deltas
+and absolute per-band quantities. Three independent tracks run in
+lockstep: spectrum scalefactors (seed `last_sf = global_gain`, range
+`0..=255`), intensity stereo positions (seed `last_is = 0`), and PNS
+noise energies (seed `last_nrg = global_gain - NOISE_OFFSET - 256`
+with `NOISE_OFFSET = 90`; the first PNS band of the frame carries
+the 9-bit `uimsbf` literal directly into `last_nrg`, every
+subsequent PNS band a `-60..=+60` Huffman delta). The §4.6.2.3.2
+illustrative pseudocode that would single-track everything is
+deliberately not implemented — the surrounding §4.6.8.1.4 / §4.6.13
+prose "differential decoding is done separately between
+scalefactors, intensity stereo positions and noise energies" takes
+precedence (the §4.6.2.3.2 listing predates MPEG-4 PNS and is
+identical in 13818-7 §11.3.2 where PNS does not exist). The
+encoder-side `differentiate()` checks every spectrum / intensity /
+PNS-subsequent delta against Table 4.150's `-60..=+60`, the first
+PNS band's literal against the 9-bit `uimsbf` field (0..=511), and
+the §4.6.2.3.2 Note's `sf ∈ 0..=255` range — rejections surface as
+`Error::ScaleFactorAccumulatorInvalid`. Round 149 had landed the
+`scale_factor_data()` parser **and** `ScaleFactorData::write`
+encoder primitive (ISO/IEC 14496-3 §4.4.6 / Table 4.53,
+non-resilient branch, plus the §4.6.3 / Table 4.A.1 "scalefactor
+Huffman codebook" — codebook 12) — the fifth encode-side
 syntax-element writer in the crate. Table 4.A.1 is transcribed
 verbatim from the spec (121 entries indexed `0..=120`, max length
 19 bits, codeword for index 60 / delta 0 is the single bit `0`)
@@ -257,11 +278,6 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   `rev_global_gain`, `length_of_rvlc_sf`, `sf_concealment`,
   `length_of_rvlc_escapes`); ER AAC-LD / scalable profiles need
   a sibling `scale_factor_data_rvlc()` module.
-- The §4.6.2.3.2 `last_sf = global_gain` accumulator that converts
-  the transmitted DPCM deltas to absolute `sf[g][sfb] ∈ 0..=255`;
-  same shape on the encode side (the rate-allocation stage applies
-  `dpcm = sf[g][sfb] - last_sf` before invoking the writer). Both
-  are per-AOT decoder / encoder back-end concerns.
 - The §4.6.13 pulse-escape *reconstruction* loop. The pulse-data
   record is parseable / writable bit-for-bit, but applying the
   fix-up to the decoded `x_quant` coefficients requires the

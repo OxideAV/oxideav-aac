@@ -65,9 +65,9 @@
 //! * The [`scale_factor_data`] module — ISO/IEC 14496-3 §4.4.6 /
 //!   Table 4.53 (non-resilient branch) plus §4.6.3 / Table 4.A.1
 //!   *scale_factor_data()* parser **and** encoder primitive
-//!   (**new in round 149**, the fifth encode-side syntax-element
-//!   writer in the crate). Carries the AAC scalefactor Huffman
-//!   codebook (codebook 12) — 121 entries indexed `0..=120` with
+//!   (round 149, the fifth encode-side syntax-element writer in
+//!   the crate). Carries the AAC scalefactor Huffman codebook
+//!   (codebook 12) — 121 entries indexed `0..=120` with
 //!   `index_offset = -60`, producing DPCM deltas in `-60..=+60`. The
 //!   parser walks the per-`(g, sfb)` non-`ZERO_HCB` subsequence
 //!   driven by [`section_data::SectionData::sfb_cb`] and dispatches
@@ -75,18 +75,22 @@
 //!   intensity codebooks) and the 9-bit `dpcm_noise_nrg` PCM seed
 //!   (first PNS band of the frame). The writer serialises the same
 //!   structure back bit-for-bit and validates the in-memory record
-//!   variants against the codebook map (catches a NoisePcm re-used
-//!   after `noise_pcm_flag` clears, a NoiseDpcm on the first PNS
-//!   band, a delta outside `-60..=+60`, etc.). The §4.6.2.3.2
-//!   `last_sf = global_gain` accumulator that converts DPCM deltas
-//!   to absolute `sf[g][sfb] ∈ 0..=255` values is **not** performed;
-//!   that needs `global_gain` and is a decoder-side step the
-//!   per-AOT back-end will own. The §4.4.6 error-resilient branch
-//!   (`aacScalefactorDataResilienceFlag == 1`, RVLC with
-//!   `rev_global_gain`, `sf_concealment`, `length_of_rvlc_sf`) is
-//!   **not** implemented; ER AAC-LD / scalable profiles that flip
-//!   the resilience flag will need a sibling
-//!   `scale_factor_data_rvlc()` module.
+//!   variants against the codebook map.
+//!
+//!   **Round 152** adds the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM
+//!   accumulator pair [`scale_factor_data::accumulate`] (decoder
+//!   side) / [`scale_factor_data::differentiate`] (encoder side)
+//!   that converts between transmitted DPCM deltas and absolute
+//!   per-band quantities. Three independent tracks: spectrum
+//!   scalefactors (seed `last_sf = global_gain`, range `0..=255`),
+//!   intensity stereo positions (seed `last_is = 0`), and PNS noise
+//!   energies (seed `last_nrg = global_gain - NOISE_OFFSET - 256`,
+//!   first PNS band carries a 9-bit `uimsbf` literal). The §4.4.6
+//!   error-resilient branch (`aacScalefactorDataResilienceFlag ==
+//!   1`, RVLC with `rev_global_gain`, `sf_concealment`,
+//!   `length_of_rvlc_sf`) is still **not** implemented; ER AAC-LD /
+//!   scalable profiles that flip the resilience flag will need a
+//!   sibling `scale_factor_data_rvlc()` module.
 //! * The [`tns_data`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.54
 //!   *tns_data()* parser **and** encoder primitive (**new in round
 //!   146**). The parser walks every transform window of the

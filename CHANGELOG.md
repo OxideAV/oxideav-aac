@@ -6,6 +6,84 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 152 — §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator pair)
+
+- `scale_factor_data::accumulate(sfd, sfb_cb, global_gain) ->
+  Result<AbsoluteScaleFactors>` — the symmetric decoder-side
+  accumulator that converts the transmitted DPCM record set
+  produced by `ScaleFactorData::parse` into absolute per-band
+  quantities. Runs three independent DPCM tracks: spectrum
+  scalefactors (seed `last_sf = global_gain`, range `0..=255` per
+  the §4.6.2.3.2 Note), intensity stereo positions (seed
+  `last_is = 0` per §4.6.8.1.4), and PNS noise energies (seed
+  `last_nrg = global_gain - NOISE_OFFSET - 256` per §4.6.13, with
+  the first PNS band of the frame's 9-bit `uimsbf` literal added
+  directly and every subsequent PNS band's Huffman delta in
+  `-60..=+60`). Returns `Error::ScaleFactorAccumulatorInvalid` on
+  shape mismatch with `sfb_cb`, variant ↔ codebook mismatch, second
+  `NoisePcm` after the frame-scope flag cleared, or `Sf`-track
+  running value escaping `0..=255`.
+- `scale_factor_data::differentiate(abs, sfb_cb, global_gain) ->
+  Result<ScaleFactorData>` — the symmetric encoder-side inverse.
+  Takes absolute per-band records (the output of rate-allocation
+  / scalefactor quantisation / PNS noise-energy estimation) and
+  produces the DPCM record set the bit-exact `ScaleFactorData::write`
+  consumes. Validates every spectrum / intensity / PNS-subsequent
+  delta against Table 4.150's `-60..=+60`, the first PNS band's
+  initial seed magnitude against the 9-bit `uimsbf` Table 4.53
+  field (`0..=511`), variant ↔ codebook agreement, and outer / inner
+  shape against `sfb_cb`. Roundtrip: `accumulate(differentiate(abs,
+  sfb_cb, gg)?, sfb_cb, gg)? == abs` on every well-formed input.
+- `scale_factor_data::AbsoluteScaleFactorEntry { Sf(u8) /
+  IsPos(i16) / NoiseNrg(i32) }` — the per-band absolute record
+  variant. `Sf` for spectrum-band scalefactors (`0..=255`); `IsPos`
+  for intensity stereo positions (signed, the accumulator allows
+  in-principle unbounded range, conforming streams stay within an
+  8-bit window); `NoiseNrg` for PNS noise energies (signed `i32`
+  because the seed `global_gain - 346` can be negative).
+- `scale_factor_data::AbsoluteScaleFactors` — the per-window-group
+  container, matching the outer / inner shape of `ScaleFactorData`.
+- `scale_factor_data::NOISE_OFFSET = 90` — §4.6.13 constant that
+  positions the PNS-track running register relative to
+  `global_gain`. Made `pub` so downstream rate-allocation callers
+  can derive the seed without hard-coding the constant.
+- `Error::ScaleFactorAccumulatorInvalid` for caller-side bugs the
+  accumulator / differentiator cannot represent: outer length
+  mismatch with `sfb_cb`; per-group entry count mismatch with the
+  non-`ZERO_HCB` band count of the matching `sfb_cb` group;
+  variant ↔ codebook mismatch; spectrum-track running value
+  escaping `0..=255`; spectrum / intensity / PNS-subsequent delta
+  outside `-60..=+60`; first PNS band's initial seed magnitude
+  outside the 9-bit `uimsbf` field (`0..=511`); second `NoisePcm`
+  in the same frame (`noise_pcm_flag` already cleared);
+  `NoiseDpcm` on the first PNS band of the frame.
+- Module-level documentation calls out the spec ambiguity between
+  the §4.6.2.3.2 illustrative pseudocode (single-track, lumps PNS
+  into `last_sf`) and the §4.6.8.1.4 + §4.6.13 prose-level "done
+  separately" wording. This crate honours the three-track prose
+  interpretation; the rationale is that the §4.6.2.3.2 pseudocode
+  is identical in 13818-7 §11.3.2 where PNS does not exist, so the
+  MPEG-4 prose §4.6.13 supersedes for PNS bands.
+- 37 new integration tests in `tests/scale_factor_accumulator.rs`
+  covering: empty / all-`ZERO_HCB` no-op paths; spectrum-only
+  ascending sequences; spectrum-track boundary deltas (±60) at
+  both ends of the 0..=255 range; intensity-track zero-seed
+  independence of `global_gain`; intensity-track boundary deltas;
+  PNS first-band PCM seed including 9-bit boundaries (delta 0 and
+  511); PNS subsequent-band Huffman delta; frame-scope
+  `noise_pcm_flag` invariant across window groups; three-track
+  independence under interleaved bands; `ZERO_HCB` skip behaviour;
+  cross-window-group accumulator persistence; two hand-pinned
+  §4.6.2.3.2 / §4.6.13 spec-pseudocode lockstep tests; every
+  `ScaleFactorAccumulatorInvalid` rejection branch (spectrum /
+  intensity / PNS-first-seed / PNS-subsequent overflows,
+  underflows, variant ↔ codebook mismatch, outer / inner length
+  mismatch, decoder-side sf-track 0..=255 overflow / underflow,
+  decoder-side PCM-after-flag-clear and Huffman-before-flag-clear);
+  a composite EIGHT_SHORT-shape frame with all three tracks
+  interleaved across 8 window groups; and a `NOISE_OFFSET` constant
+  pin. Suite size grows 227 → 264 tests.
+
 ### Added (round 149 — fifth encoder primitive: scale_factor_data parser + writer)
 
 - `scale_factor_data` module: ISO/IEC 14496-3 §4.4.6 / Table 4.53
