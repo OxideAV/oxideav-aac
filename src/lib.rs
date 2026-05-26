@@ -50,6 +50,18 @@
 //!   (`write` → `parse`) is bit-perfect across the long, EIGHT_SHORT,
 //!   single-escape, double-escape, and exact-multiple-of-`sect_esc_val`
 //!   branches. No Huffman decode yet — every field is fixed-width.
+//! * The [`pulse_data`] module — ISO/IEC 14496-3 §4.4.6.3 / Table 4.7
+//!   *pulse_data()* parser **and** encoder primitive (**new in round
+//!   142**). The parser reads the 2-bit `number_pulse`, 6-bit
+//!   `pulse_start_sfb`, and `number_pulse + 1` `(5-bit pulse_offset,
+//!   4-bit pulse_amp)` records into [`pulse_data::PulseData`]; the
+//!   writer serialises the same structure back bit-for-bit. Every
+//!   field is fixed-width — no Huffman tables, no `swb_offset`
+//!   dependence, and no surrounding-element state. The §4.6.13
+//!   reconstruction loop (`k += swb_offset[pulse_start_sfb] +
+//!   pulse_offset[j]; x_quant[…] ±= pulse_amp[j]`) is **not**
+//!   performed; it needs `swb_offset_long_window[]` and the
+//!   post-Huffman `x_quant` array that arrive with `spectral_data()`.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -75,9 +87,10 @@
 //! * `raw_data_block()` walker: iterates `id_syn_ele` and stops at
 //!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
 //!   CCE / LFE bodies start with [`ics_info`] then [`section_data`]
-//!   (Phase 2 in progress); the remaining channel-stream tools
-//!   (`scale_factor_data`, `pulse_data`, `tns_data`,
-//!   `gain_control_data`, `spectral_data`) are deferred.
+//!   (Phase 2 in progress); the optional [`pulse_data`] tool now
+//!   parses and writes; the remaining channel-stream tools
+//!   (`scale_factor_data`, `tns_data`, `gain_control_data`,
+//!   `spectral_data`) are deferred.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -88,6 +101,7 @@ pub mod adts;
 pub mod asc;
 pub mod ics_info;
 pub mod pce;
+pub mod pulse_data;
 pub mod raw_data_block;
 pub mod section_data;
 

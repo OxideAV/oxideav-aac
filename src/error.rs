@@ -99,6 +99,20 @@ pub enum Error {
     /// the boundary between scalefactor-grouping and section
     /// emission.
     SectionDataEncodeInvalid,
+
+    /// [`crate::pulse_data::PulseData::write`] was handed an
+    /// in-memory [`crate::pulse_data::PulseData`] whose field set
+    /// cannot be represented on the wire under ISO/IEC 14496-3
+    /// §4.4.6.3 Table 4.7. Examples: `pulses` is empty (the loop
+    /// bound is `number_pulse + 1 >= 1`) or exceeds the 2-bit
+    /// `number_pulse` field cap (`pulses.len() > 4`);
+    /// `pulse_start_sfb > 0x3f` (6-bit overflow); a `Pulse::offset >
+    /// 0x1f` (5-bit overflow) or `Pulse::amp > 0x0f` (4-bit
+    /// overflow). A conforming AAC encoder never builds such a
+    /// structure; this surfaces caller bugs at the boundary between
+    /// the pulse-selection psychoacoustic stage and bitstream
+    /// emission.
+    PulseDataEncodeInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -162,6 +176,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "section_data encode: per-group sections must be contiguous [0, max_sfb), sect_cb < 16, sect_len > 0"
+                )
+            }
+            Error::PulseDataEncodeInvalid => {
+                write!(
+                    f,
+                    "pulse_data encode: pulses.len() in 1..=4, pulse_start_sfb < 64, pulse_offset < 32, pulse_amp < 16"
                 )
             }
         }

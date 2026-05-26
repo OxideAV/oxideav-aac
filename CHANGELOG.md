@@ -6,6 +6,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 142 — third encoder primitive: pulse_data parser + writer)
+
+- `pulse_data` module: ISO/IEC 14496-3 §4.4.6.3 / Table 4.7
+  `pulse_data()` parser **and** encoder primitive. `PulseData::parse`
+  reads the 2-bit `number_pulse`, 6-bit `pulse_start_sfb`, and
+  `number_pulse + 1` `(5-bit pulse_offset, 4-bit pulse_amp)` records
+  into a [`PulseData`] struct; `PulseData::write` is the bit-exact
+  inverse. Every field is fixed-width; no Huffman tables, no
+  `swb_offset` dependence, no surrounding-element state. Public
+  constants `PULSE_OFFSET_BITS` (5), `PULSE_AMP_BITS` (4), and
+  `MAX_PULSES` (4) pin the Table 4.7 widths for downstream callers.
+  A `PulseData::number_pulse()` accessor returns the wire value
+  (`pulses.len() - 1`). The §4.6.13 reconstruction loop (`k +=
+  swb_offset[pulse_start_sfb] + pulse_offset[j]; x_quant[…] ±=
+  pulse_amp[j]`) is **not** performed — it needs the
+  `swb_offset_long_window[]` table and the post-Huffman `x_quant`
+  array that arrive with `spectral_data()`.
+- `Error::PulseDataEncodeInvalid` for caller-side structural bugs the
+  writer cannot represent on the wire: empty `pulses` vector (the
+  loop bound is `number_pulse + 1 >= 1`), `pulses.len() > MAX_PULSES`
+  (2-bit `number_pulse` field cap of 4), `pulse_start_sfb > 0x3f`
+  (6-bit overflow), `Pulse::offset > 0x1f` (5-bit overflow), or
+  `Pulse::amp > 0x0f` (4-bit overflow).
+- 22 new integration tests in `tests/pulse_data.rs` covering single-
+  pulse smallest legal block, every legal pulse count (1..=4),
+  wire-field-at-max (per individual field and all fields
+  simultaneously), two hand-pinned wire-layout assertions (one
+  synthetic 17-bit layout for a `(start=42, offset=21, amp=5)`
+  single-pulse block; one realistic 26-bit layout for a
+  `(start=32, [(3,2), (17,4)])` two-pulse block), every
+  `PulseDataEncodeInvalid` rejection branch, parser unexpected-end at
+  both the header and the pulse-loop positions, accessor / constant
+  sanity, and a back-to-back two-block sequence that asserts the
+  parser / writer carry no inter-block state. Suite size grows 139
+  → 161 tests.
+
 ### Added (round 140 — second encoder primitive: ics_info writer)
 
 - `ics_info::IcsInfo::write(writer, audio_object_type,

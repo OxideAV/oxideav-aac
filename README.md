@@ -3,12 +3,19 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 140)
+## Status (round 142)
 
-**Phase 1 complete + Phase 2 in progress + two encoder primitives.**
-Round 140 lands `IcsInfo::write` (and a public `write_ltp_data`
-helper) — the inverse of the round-129 `ics_info()` parser and the
-crate's second encode-side syntax-element writer. The new primitive
+**Phase 1 complete + Phase 2 in progress + three encoder primitives.**
+Round 142 lands the `pulse_data()` parser **and** `PulseData::write`
+encoder primitive (ISO/IEC 14496-3 §4.4.6.3 / Table 4.7) — the third
+encode-side syntax-element writer in the crate, covering the
+single-block 2-bit `number_pulse` + 6-bit `pulse_start_sfb` + 1..=4
+`(5-bit pulse_offset, 4-bit pulse_amp)` records. Every field is
+fixed-width; no Huffman tables, no `swb_offset` dependence, no
+surrounding-element state. Round 140 had landed `IcsInfo::write`
+(and a public `write_ltp_data` helper) — the inverse of the round-129
+`ics_info()` parser and the crate's second encode-side syntax-element
+writer. The new primitive
 covers the full Table 4.6 surface (`ics_reserved_bit` 1 +
 `window_sequence` 2 + `window_shape` 1; `max_sfb` 4 + 7-bit grouping
 mask on `EIGHT_SHORT_SEQUENCE`; `max_sfb` 6 + `predictor_data_present`
@@ -150,13 +157,35 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   zero-length sections are rejected (`Error::SectionDataEncodeInvalid`).
   No Huffman tables of its own — purely the fixed-width side of
   Table 17.
+- **`pulse_data()` parser + encoder primitive** (ISO/IEC 14496-3
+  §4.4.6.3 / Table 4.7, **new in round 142**):
+  `PulseData::parse(reader)` and `PulseData::write(writer)` cover the
+  full pulse-escape tool — 2-bit `number_pulse` (wire value
+  `pulses.len() - 1`, so 1..=4 pulses), 6-bit `pulse_start_sfb`, then
+  `number_pulse + 1` `(5-bit pulse_offset, 4-bit pulse_amp)` records.
+  Every field is fixed-width; no Huffman tables, no `swb_offset`
+  dependence, no surrounding-element state. Public constants
+  (`PULSE_OFFSET_BITS`, `PULSE_AMP_BITS`, `MAX_PULSES`) pin the
+  Table 4.7 widths for downstream call sites. The §4.6.13
+  reconstruction loop (`k += swb_offset[pulse_start_sfb] +
+  pulse_offset[j]; x_quant[…] ±= pulse_amp[j]`) is **not** performed
+  here — it needs `swb_offset_long_window[]` and the post-Huffman
+  `x_quant` array that arrive with `spectral_data()`. Caller-side
+  structural bugs surface as `Error::PulseDataEncodeInvalid` (empty
+  pulse list, `> 4` pulses, `pulse_start_sfb > 63`, `pulse_offset > 31`,
+  or `pulse_amp > 15`).
 
 ## What Phase 2 still omits
 
-- The remaining channel-stream tools after `section_data()`:
-  `scale_factor_data()`, `pulse_data()`, `tns_data()`,
-  `gain_control_data()`, and `spectral_data()`. The walker
-  therefore still cannot iterate past a single channel-element body.
+- The remaining channel-stream tools after `pulse_data()`:
+  `scale_factor_data()`, `tns_data()`, `gain_control_data()`, and
+  `spectral_data()`. The walker therefore still cannot iterate past
+  a single channel-element body.
+- The §4.6.13 pulse-escape *reconstruction* loop. The pulse-data
+  record is parseable / writable bit-for-bit, but applying the
+  fix-up to the decoded `x_quant` coefficients requires the
+  `swb_offset_long_window[]` table (still owed) and an already-
+  Huffman-decoded spectrum (still owed).
 - The full per-AOT IMDCT + windowing back-end (filterbank, TNS
   reconstruction, PNS / IS pair routing).
 - All decode / encode runtime wiring. The `register()` entry point
