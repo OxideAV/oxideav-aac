@@ -62,6 +62,21 @@
 //!   pulse_offset[j]; x_quant[…] ±= pulse_amp[j]`) is **not**
 //!   performed; it needs `swb_offset_long_window[]` and the
 //!   post-Huffman `x_quant` array that arrive with `spectral_data()`.
+//! * The [`tns_data`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.54
+//!   *tns_data()* parser **and** encoder primitive (**new in round
+//!   146**). The parser walks every transform window of the
+//!   surrounding `window_sequence` and reads `n_filt[w]`
+//!   (1 or 2 bits per Table 4.155), an optional `coef_res[w]`
+//!   (when `n_filt[w] > 0`), then per-filter `length` (4 or 6 bits),
+//!   `order` (3 or 5 bits), and — when `order > 0` — `direction`,
+//!   `coef_compress`, and `order` × `coef[i]` magnitudes whose width
+//!   is `(3 + coef_res) − coef_compress` per §4.6.9.3. The writer
+//!   serialises the same structure back bit-for-bit. The §4.6.9.3
+//!   `tns_decode_coef` LPC reconstruction (signed conversion,
+//!   `iqfac` arcsine inverse-quantisation, Levinson-style conversion
+//!   to LPC) and the §4.6.9.3 `tns_ar_filter` all-pole pass over the
+//!   spectrum are **not** performed; they need the spectral context
+//!   that arrives with the per-AOT IMDCT back-end.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -87,9 +102,9 @@
 //! * `raw_data_block()` walker: iterates `id_syn_ele` and stops at
 //!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
 //!   CCE / LFE bodies start with [`ics_info`] then [`section_data`]
-//!   (Phase 2 in progress); the optional [`pulse_data`] tool now
-//!   parses and writes; the remaining channel-stream tools
-//!   (`scale_factor_data`, `tns_data`, `gain_control_data`,
+//!   (Phase 2 in progress); the optional [`pulse_data`] and
+//!   [`tns_data`] tools now parse and write; the remaining channel-
+//!   stream tools (`scale_factor_data`, `gain_control_data`,
 //!   `spectral_data`) are deferred.
 
 #![warn(missing_debug_implementations)]
@@ -104,6 +119,7 @@ pub mod pce;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod section_data;
+pub mod tns_data;
 
 mod error;
 

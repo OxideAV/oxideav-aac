@@ -3,19 +3,28 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 142)
+## Status (round 146)
 
-**Phase 1 complete + Phase 2 in progress + three encoder primitives.**
-Round 142 lands the `pulse_data()` parser **and** `PulseData::write`
-encoder primitive (ISO/IEC 14496-3 §4.4.6.3 / Table 4.7) — the third
-encode-side syntax-element writer in the crate, covering the
-single-block 2-bit `number_pulse` + 6-bit `pulse_start_sfb` + 1..=4
-`(5-bit pulse_offset, 4-bit pulse_amp)` records. Every field is
-fixed-width; no Huffman tables, no `swb_offset` dependence, no
-surrounding-element state. Round 140 had landed `IcsInfo::write`
-(and a public `write_ltp_data` helper) — the inverse of the round-129
-`ics_info()` parser and the crate's second encode-side syntax-element
-writer. The new primitive
+**Phase 1 complete + Phase 2 in progress + four encoder primitives.**
+Round 146 lands the `tns_data()` parser **and** `TnsData::write`
+encoder primitive (ISO/IEC 14496-3 §4.4.6 / Table 4.54, with the
+§4.6.9.2 Table 4.155 size switch) — the fourth encode-side
+syntax-element writer in the crate, covering every transform window
+of the surrounding `window_sequence` (`num_windows` = 8 for
+`EIGHT_SHORT_SEQUENCE`, 1 otherwise), with `n_filt` (1 or 2 bits),
+the optional `coef_res` (when `n_filt > 0`), per-filter `length`
+(4 or 6 bits), `order` (3 or 5 bits), and — when `order > 0` —
+`direction`, `coef_compress`, and `order` × `coef[i]` magnitudes
+whose width is `coef_bits = (3 + coef_res) − coef_compress ∈
+{2, 3, 4}` per §4.6.9.3. Public helpers `field_widths`,
+`num_windows`, and `coef_bits` expose the Table 4.155 / §4.5.2.3.4 /
+§4.6.9.3 dispatch. Round 142 had landed `PulseData::parse` /
+`PulseData::write` (§4.4.6.3 / Table 4.7) — the third encode-side
+primitive, covering the 2-bit `number_pulse` + 6-bit
+`pulse_start_sfb` + 1..=4 `(5-bit offset, 4-bit amp)` records.
+Round 140 had landed `IcsInfo::write` (and a public `write_ltp_data`
+helper) — the inverse of the round-129 `ics_info()` parser and the
+crate's second encode-side syntax-element writer. The new primitive
 covers the full Table 4.6 surface (`ics_reserved_bit` 1 +
 `window_sequence` 2 + `window_shape` 1; `max_sfb` 4 + 7-bit grouping
 mask on `EIGHT_SHORT_SEQUENCE`; `max_sfb` 6 + `predictor_data_present`
@@ -174,11 +183,44 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   structural bugs surface as `Error::PulseDataEncodeInvalid` (empty
   pulse list, `> 4` pulses, `pulse_start_sfb > 63`, `pulse_offset > 31`,
   or `pulse_amp > 15`).
+- **`tns_data()` parser + encoder primitive** (ISO/IEC 14496-3
+  §4.4.6 / Table 4.54 with the §4.6.9.2 Table 4.155 size switch,
+  **new in round 146**): `TnsData::parse(reader, window_sequence)`
+  walks every transform window (`num_windows` = 8 for
+  `EIGHT_SHORT_SEQUENCE`, 1 otherwise) and reads `n_filt[w]` with
+  the field-width switch (1 bit short / 2 bits long), an optional
+  `coef_res[w]` (when `n_filt[w] > 0`), then per-filter
+  `length[w][filt]` (4 / 6 bits), `order[w][filt]` (3 / 5 bits),
+  and — when `order > 0` — `direction`, `coef_compress`, and
+  `order` × `coef[i]` unsigned magnitudes whose width is
+  `coef_bits = (3 + coef_res) − coef_compress ∈ {2, 3, 4}` per
+  §4.6.9.3 `tns_decode_coef`. `TnsData::write(writer,
+  window_sequence)` is the bit-exact inverse. Public helpers
+  `field_widths(window_sequence)`, `num_windows(window_sequence)`,
+  and `coef_bits(coef_res, coef_compress)` plus the
+  `N_FILT_BITS_*` / `LENGTH_BITS_*` / `ORDER_BITS_*` /
+  `COEF_RES_BITS` / `DIRECTION_BITS` / `COEF_COMPRESS_BITS`
+  constants pin the Table 4.155 / §4.5.2.3.4 / §4.6.9.3 dispatch.
+  The §4.6.9.3 `tns_decode_coef` LPC reconstruction (signed
+  conversion, `iqfac` arcsine inverse-quantisation, Levinson-style
+  conversion to LPC coefficients) and the §4.6.9.3 `tns_ar_filter`
+  all-pole pass over the spectrum are **not** performed here — they
+  need the spectral context that arrives with the per-AOT IMDCT
+  back-end. The §4.6.9.4 `TNS_MAX_ORDER` / `TNS_MAX_BANDS` clamp
+  tables (Tables 4.156 / 4.157) are similarly the decoder
+  reconstruction layer's responsibility. Caller-side structural
+  bugs surface as `Error::TnsDataEncodeInvalid` (wrong
+  `windows.len()` for the surrounding `window_sequence`,
+  `n_filt` / `length` / `order` field overflow, `coef[]` length
+  mismatch with `order`, coef-value overflow at any
+  `coef_bits` tier, or zero-`order` filter carrying a non-default
+  `direction` / `coef_compress` that would be silently dropped on
+  the wire).
 
 ## What Phase 2 still omits
 
-- The remaining channel-stream tools after `pulse_data()`:
-  `scale_factor_data()`, `tns_data()`, `gain_control_data()`, and
+- The remaining channel-stream tools after `tns_data()`:
+  `scale_factor_data()`, `gain_control_data()`, and
   `spectral_data()`. The walker therefore still cannot iterate past
   a single channel-element body.
 - The §4.6.13 pulse-escape *reconstruction* loop. The pulse-data
@@ -186,6 +228,13 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   fix-up to the decoded `x_quant` coefficients requires the
   `swb_offset_long_window[]` table (still owed) and an already-
   Huffman-decoded spectrum (still owed).
+- The §4.6.9.3 `tns_decode_coef` LPC reconstruction and the
+  §4.6.9.3 `tns_ar_filter` all-pole pass. The `tns_data()` block
+  is parseable / writable bit-for-bit, but applying the all-pole
+  filter to the dequantised MDCT spectrum requires both the LPC
+  reconstruction (signed conversion + `iqfac` arcsine inverse-
+  quantisation + Levinson-style conversion to LPC coefficients)
+  and a real spectral context.
 - The full per-AOT IMDCT + windowing back-end (filterbank, TNS
   reconstruction, PNS / IS pair routing).
 - All decode / encode runtime wiring. The `register()` entry point

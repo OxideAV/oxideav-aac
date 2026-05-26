@@ -6,6 +6,68 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 146 — fourth encoder primitive: tns_data parser + writer)
+
+- `tns_data` module: ISO/IEC 14496-3 §4.4.6 / Table 4.54 `tns_data()`
+  parser **and** encoder primitive — the AAC crate's fourth encode-
+  side syntax-element writer. `TnsData::parse(reader, window_sequence)`
+  walks every transform window (`num_windows` = 8 for
+  `EIGHT_SHORT_SEQUENCE`, 1 otherwise) and reads `n_filt[w]` with the
+  §4.6.9.2 Table 4.155 size switch (1 bit short / 2 bits long), an
+  optional `coef_res[w]` (when `n_filt[w] > 0`), then per-filter
+  `length[w][filt]` (4 / 6 bits), `order[w][filt]` (3 / 5 bits), and —
+  when `order > 0` — `direction`, `coef_compress`, and `order` ×
+  `coef[i]` unsigned magnitudes whose width is
+  `coef_bits = (3 + coef_res) − coef_compress` per §4.6.9.3.
+  `TnsData::write(writer, window_sequence)` is the bit-exact inverse.
+  Public helpers `field_widths(window_sequence)`,
+  `num_windows(window_sequence)`, and `coef_bits(coef_res,
+  coef_compress)` expose the Table 4.155 / §4.5.2.3.4 / §4.6.9.3
+  selection rules; public constants `N_FILT_BITS_{SHORT,LONG}`,
+  `LENGTH_BITS_{SHORT,LONG}`, `ORDER_BITS_{SHORT,LONG}`,
+  `COEF_RES_BITS`, `DIRECTION_BITS`, `COEF_COMPRESS_BITS` pin the
+  per-table widths. The §4.6.9.3 `tns_decode_coef` LPC reconstruction
+  (signed conversion, `iqfac` arcsine inverse-quantisation, Levinson-
+  style conversion to LPC) and the §4.6.9.3 `tns_ar_filter` all-pole
+  pass over the spectrum are **not** performed here — they need the
+  spectral context that arrives with the per-AOT IMDCT back-end. The
+  §4.6.9.4 `TNS_MAX_ORDER` / `TNS_MAX_BANDS` clamp tables (Tables
+  4.156 / 4.157) are similarly the decoder reconstruction layer's
+  responsibility; the parser surfaces the literal wire `order` /
+  `length` values regardless.
+- `Error::TnsDataEncodeInvalid` for caller-side structural bugs the
+  writer cannot represent on the wire: `windows.len()` differs from
+  `num_windows(window_sequence)` (1 for long sequences, 8 for
+  `EIGHT_SHORT_SEQUENCE`); per-window `filters.len()` exceeds the
+  `n_filt` field cap (1 on `EIGHT_SHORT_SEQUENCE`, 3 otherwise); a
+  filter's `length` exceeds the `length` field cap (15 / 63); a
+  filter's `order` exceeds the `order` field cap (7 / 31); the
+  `coef[]` length differs from `order`; a coefficient magnitude
+  exceeds the `(1 << coef_bits) - 1` cap; or a zero-`order` filter
+  carries a non-default `direction` / `coef_compress` that would
+  silently be dropped on the wire (those fields are not transmitted
+  when `order == 0`).
+- 38 new integration tests in `tests/tns_data.rs` covering empty
+  windows for every `WindowSequence` variant, every
+  `(coef_res, coef_compress)` combination on the long-window branch
+  (verifying `coef_bits ∈ {2, 3, 4}`), zero-order filters that skip
+  the entire `direction`/`compress`/`coef[]` tail, mixed zero- and
+  non-zero-order filters in the same window, max-`n_filt` long
+  (3 filters) and short (1 filter) cases, max-field-width short
+  windows (length=15 / order=7 / 4-bit coef on all 8 windows),
+  heterogeneous `EIGHT_SHORT` packing, three hand-pinned wire-layout
+  assertions (one for a 19-bit single-filter long-window block, two
+  zero-filter pins for long and short), field-width / helper sanity
+  matching Table 4.155 + §4.5.2.3.4 + §4.6.9.3 dispatch, every
+  `TnsDataEncodeInvalid` rejection branch (wrong window count,
+  `n_filt` / `length` / `order` overflow on both long and short,
+  `coef[]` length mismatch, coef-value overflow at every
+  `coef_bits` tier, zero-order with `direction`/`compress` set),
+  parser unexpected-end at both the `n_filt` and inside-filter
+  positions, and a back-to-back two-block sequence that asserts the
+  parser / writer carry no inter-block state. Suite size grows
+  161 → 199 tests.
+
 ### Added (round 142 — third encoder primitive: pulse_data parser + writer)
 
 - `pulse_data` module: ISO/IEC 14496-3 §4.4.6.3 / Table 4.7

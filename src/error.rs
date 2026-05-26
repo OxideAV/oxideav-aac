@@ -113,6 +113,27 @@ pub enum Error {
     /// the pulse-selection psychoacoustic stage and bitstream
     /// emission.
     PulseDataEncodeInvalid,
+
+    /// [`crate::tns_data::TnsData::write`] was handed an in-memory
+    /// [`crate::tns_data::TnsData`] whose field combination cannot
+    /// be represented on the wire under ISO/IEC 14496-3 §4.4.6 /
+    /// Table 4.54 (with the §4.6.9.2 Table 4.155 size switch).
+    /// Examples: `windows.len()` differs from `num_windows` for the
+    /// surrounding `window_sequence` (1 for long sequences, 8 for
+    /// `EIGHT_SHORT_SEQUENCE`); per-window `filters.len()` exceeds
+    /// the `n_filt` field cap (1 on `EIGHT_SHORT_SEQUENCE`, 3
+    /// otherwise); a filter's `length` exceeds the `length` field
+    /// cap (15 / 63); a filter's `order` exceeds the `order` field
+    /// cap (7 / 31); the `coef[]` length differs from `order`; a
+    /// coefficient magnitude exceeds the `(1 << coef_bits) - 1`
+    /// cap (where `coef_bits = (3 + coef_res) - coef_compress`); a
+    /// zero-`order` filter carries a non-default `direction` /
+    /// `coef_compress` that would silently be dropped on the wire
+    /// (those fields are not transmitted when `order == 0`). A
+    /// conforming AAC encoder never builds such a structure; this
+    /// surfaces caller bugs at the boundary between the TNS
+    /// psychoacoustic-decision stage and bitstream emission.
+    TnsDataEncodeInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -182,6 +203,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "pulse_data encode: pulses.len() in 1..=4, pulse_start_sfb < 64, pulse_offset < 32, pulse_amp < 16"
+                )
+            }
+            Error::TnsDataEncodeInvalid => {
+                write!(
+                    f,
+                    "tns_data encode: in-memory TnsData violates a Table 4.54 / 4.155 wire-field invariant"
                 )
             }
         }
