@@ -157,6 +157,33 @@ pub enum Error {
     /// scalefactor-quantisation stage and bitstream emission.
     ScaleFactorDataEncodeInvalid,
 
+    /// [`crate::raw_data_block::FrameAssembler`] was handed an
+    /// element whose field combination cannot be represented on the
+    /// wire under ISO/IEC 14496-3 §4.4.2.1. Examples:
+    /// [`crate::raw_data_block::FrameAssembler::push_channel_header`]
+    /// was called with an `IdSynEle` other than `SCE` / `CPE` / `CCE`
+    /// / `LFE` (those have their own dedicated `push_*` entry points
+    /// because each carries a bespoke wire layout — FIL goes through
+    /// [`crate::raw_data_block::FrameAssembler::push_fill`], DSE
+    /// through
+    /// [`crate::raw_data_block::FrameAssembler::push_data`], END
+    /// through
+    /// [`crate::raw_data_block::FrameAssembler::push_end`], and PCE
+    /// has no writer yet); a channel-element `element_instance_tag`
+    /// or DSE `element_instance_tag` exceeds the 4-bit field cap
+    /// (`> 0x0f`); a FIL payload exceeds the 269-byte ceiling
+    /// (`15 + 255 − 1`) imposed by the §4.4.2.7 8-bit `esc_count`
+    /// field; a DSE payload exceeds the 510-byte ceiling
+    /// (`255 + 255`) imposed by the §4.4.2.5 8-bit `esc_count`
+    /// field; or
+    /// [`crate::raw_data_block::FrameAssembler::push_channel_body_bits`]
+    /// was called with `bit_count > bits.len() * 8`. Long fill /
+    /// data payloads (above the per-element ceilings) split
+    /// naturally across multiple back-to-back FIL / DSE elements
+    /// with the same `tag`; that splitting is the caller's
+    /// responsibility, not the assembler's.
+    RawDataBlockEncodeInvalid,
+
     /// [`crate::scale_factor_data::differentiate`] was handed an
     /// [`crate::scale_factor_data::AbsoluteScaleFactors`] whose
     /// shape or numeric values cannot be encoded back to a
@@ -256,6 +283,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "scale_factor_data encode: in-memory record set violates a Table 4.53 / 4.150 wire-field invariant"
+                )
+            }
+            Error::RawDataBlockEncodeInvalid => {
+                write!(
+                    f,
+                    "raw_data_block encode: element field violates a §4.4.2.1 / §4.4.2.5 / §4.4.2.7 wire-field invariant"
                 )
             }
             Error::ScaleFactorAccumulatorInvalid => {

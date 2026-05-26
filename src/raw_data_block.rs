@@ -51,7 +51,7 @@
 //! * **END**: emits [`Element::End`] and byte-aligns the reader.
 //!   Subsequent calls return `None`.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::pce::Pce;
 use crate::{Error, Result};
@@ -306,5 +306,312 @@ impl<'a, 'b> Walker<'a, 'b> {
         // 15 + 255 − 1 = 269, well below `u32::MAX / 8`.
         let bits = n.saturating_mul(8);
         self.reader.skip(bits).map_err(|_| Error::UnexpectedEnd)
+    }
+}
+
+// ===================================================================
+// raw_data_block() frame assembler — encoder primitive
+// ===================================================================
+//
+// Round 160 lands the symmetric encoder side: a [`FrameAssembler`]
+// that composes the existing typed writers into a complete
+// `raw_data_block()` byte stream per ISO/IEC 14496-3 §4.4.2.1, the
+// inverse of [`Walker`]. The assembler accepts:
+//
+// * [`FrameAssembler::push_channel_header`] — emits the 3-bit
+//   `id_syn_ele` (`SCE` / `CPE` / `CCE` / `LFE`) + 4-bit
+//   `element_instance_tag`. The channel-element *body*
+//   (`ics_info` → `section_data` → `scale_factor_data` → optional
+//   `pulse_data` / `tns_data` / `gain_control_data` → `spectral_data`)
+//   is not internalised yet; the caller is responsible for serialising
+//   it via the existing per-tool writers (`IcsInfo::write`,
+//   `SectionData::write`, `ScaleFactorData::write`, `PulseData::write`,
+//   `TnsData::write`, …). [`FrameAssembler::push_channel_body_bits`]
+//   appends a pre-serialised body as a bit-slice immediately after a
+//   channel header.
+//
+// * [`FrameAssembler::push_fill`] — emits a FIL element per §4.4.2.7,
+//   including the 8-bit `esc_count` escape when `payload_bytes >= 15`
+//   (resulting wire `count = 15` + `esc_count = payload_bytes - 15 + 1`
+//   — the inverse of `read_fill_count`'s `cnt = esc_count + 15 - 1`).
+//
+// * [`FrameAssembler::push_data`] — emits a DSE element per §4.4.2.5,
+//   honouring `data_byte_align_flag` (which, when set, byte-aligns
+//   *before* the payload bytes per §4.4.2.5) and the 8-bit `esc_count`
+//   escape when `payload_bytes >= 255` (resulting wire `count = 255` +
+//   `esc_count = payload_bytes - 255` — the inverse of
+//   `read_data_count`'s `cnt = count + esc_count`).
+//
+// * [`FrameAssembler::push_end`] — emits the 3-bit `END` terminator
+//   and byte-aligns to the next byte boundary per §4.4.2.1.
+//
+// PCE encoding is deferred — [`Pce`] has no `write` primitive yet, and
+// adding one is a separate round's worth of work (Tables 4.4 / 4.5
+// front/side/back/lfe element selects, mono / stereo / matrix
+// mix-down hints, comment field, plus the relative-origin
+// `byte_alignment()` per Table 4.2 Note 1).
+//
+// The §4.4.2.1 normative constraint that exactly one `END` element
+// terminates the block (and that no further elements may follow) is
+// enforced by the type-state: [`FrameAssembler::push_end`] consumes
+// `self` and returns the finished [`Vec<u8>`] (calling any other
+// `push_*` after END is a compile-time error).
+
+/// Encoder-side frame assembler for `raw_data_block()` per ISO/IEC
+/// 14496-3 §4.4.2.1 — the bit-exact inverse of [`Walker`].
+///
+/// Construct via [`FrameAssembler::new`] or
+/// [`FrameAssembler::with_capacity`], push elements with the
+/// `push_*` family in wire order, then finish with
+/// [`FrameAssembler::push_end`] which consumes the assembler and
+/// returns the byte-aligned frame. END is mandatory — dropping a
+/// non-finished assembler discards the in-progress frame.
+///
+/// ## Composition with the existing typed writers
+///
+/// Channel-element *headers* are emitted by
+/// [`FrameAssembler::push_channel_header`]. The channel-element
+/// *body* — `ics_info` → `section_data` → `scale_factor_data` →
+/// optional `pulse_data` / `tns_data` / `gain_control_data` →
+/// `spectral_data` — has no single round-160 writer. Callers
+/// serialise the body separately via the existing tool writers
+/// ([`crate::ics_info::IcsInfo::write`],
+/// [`crate::section_data::SectionData::write`],
+/// [`crate::scale_factor_data::ScaleFactorData::write`],
+/// [`crate::pulse_data::PulseData::write`],
+/// [`crate::tns_data::TnsData::write`]) into an auxiliary
+/// [`BitWriter`] and append the resulting bits to the frame via
+/// [`FrameAssembler::push_channel_body_bits`]. This keeps the
+/// frame-level concern (element ordering + sync + alignment +
+/// fill/data escapes + END) separate from the channel-element-level
+/// concern (per-tool bit layouts), which round 160 already covers
+/// for everything except `gain_control_data` / `spectral_data`.
+///
+/// ## Why this is `Phase 2`, not `Phase 1`
+///
+/// The Phase 1 [`Walker`] *consumes* a `raw_data_block()` byte slice
+/// produced by an external encoder (typically extracted from an ADTS
+/// frame or an MP4 audio sample). Phase 2 adds the inverse — the
+/// assembler that *produces* the byte slice that the Phase 1 walker
+/// can read back. Together they form a complete §4.4.2.1
+/// parse / write cycle for every element type with a bit-exact
+/// inverse already in the crate (channel headers, FIL, DSE, END).
+pub struct FrameAssembler {
+    writer: BitWriter,
+}
+
+impl core::fmt::Debug for FrameAssembler {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FrameAssembler")
+            .field("bit_position", &self.writer.bit_position())
+            .finish()
+    }
+}
+
+impl Default for FrameAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameAssembler {
+    /// Start a new, empty `raw_data_block()` assembler.
+    pub fn new() -> Self {
+        Self {
+            writer: BitWriter::new(),
+        }
+    }
+
+    /// Start a new assembler whose underlying byte buffer is
+    /// pre-reserved for at least `cap` bytes.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            writer: BitWriter::with_capacity(cap),
+        }
+    }
+
+    /// Current bit position (relative to the start of the frame).
+    /// Useful for sizing channel-element bodies.
+    pub fn bit_position(&self) -> u64 {
+        self.writer.bit_position()
+    }
+
+    /// Emit a channel-element header — the 3-bit `id_syn_ele` (one of
+    /// `SCE` / `CPE` / `CCE` / `LFE`) followed by the 4-bit
+    /// `element_instance_tag` per ISO/IEC 14496-3 §4.4.2.1.
+    ///
+    /// The channel-element body itself is the caller's responsibility
+    /// — see [`FrameAssembler::push_channel_body_bits`] for the
+    /// post-header append.
+    ///
+    /// Returns [`Error::RawDataBlockEncodeInvalid`] when:
+    ///
+    /// * `kind` is not one of `SCE` / `CPE` / `CCE` / `LFE` (this
+    ///   helper is for channel elements only — use
+    ///   [`FrameAssembler::push_fill`] / [`FrameAssembler::push_data`]
+    ///   / [`FrameAssembler::push_end`] for the other element types,
+    ///   each of which has its own bespoke wire layout).
+    /// * `element_instance_tag > 0x0f` (4-bit field overflow).
+    pub fn push_channel_header(&mut self, kind: IdSynEle, element_instance_tag: u8) -> Result<()> {
+        match kind {
+            IdSynEle::Sce | IdSynEle::Cpe | IdSynEle::Cce | IdSynEle::Lfe => {}
+            _ => return Err(Error::RawDataBlockEncodeInvalid),
+        }
+        if element_instance_tag > 0x0f {
+            return Err(Error::RawDataBlockEncodeInvalid);
+        }
+        self.writer.write_u32(kind as u32, 3);
+        self.writer.write_u32(element_instance_tag as u32, 4);
+        Ok(())
+    }
+
+    /// Append `bit_count` raw bits from `bits` (read MSB-first) to
+    /// the frame — the channel-element body that follows a
+    /// [`FrameAssembler::push_channel_header`].
+    ///
+    /// `bits` is interpreted as an MSB-first packed bit-buffer (the
+    /// same byte layout [`BitWriter::finish`] / [`BitReader::new`]
+    /// already use throughout the crate). The low `(8 - bit_count %
+    /// 8) % 8` bits of the last byte are not consumed and may carry
+    /// arbitrary content.
+    ///
+    /// Returns [`Error::RawDataBlockEncodeInvalid`] when `bit_count`
+    /// exceeds `bits.len() * 8`.
+    pub fn push_channel_body_bits(&mut self, bits: &[u8], bit_count: u64) -> Result<()> {
+        if bit_count > (bits.len() as u64).saturating_mul(8) {
+            return Err(Error::RawDataBlockEncodeInvalid);
+        }
+        let mut remaining = bit_count;
+        let mut byte_idx = 0usize;
+        // Whole bytes first.
+        while remaining >= 8 {
+            self.writer.write_byte(bits[byte_idx]);
+            byte_idx += 1;
+            remaining -= 8;
+        }
+        // Trailing partial byte: take the high `remaining` bits of
+        // the next source byte.
+        if remaining > 0 {
+            let last = bits[byte_idx];
+            let high = (last as u32) >> (8 - remaining);
+            self.writer.write_u32(high, remaining as u32);
+        }
+        Ok(())
+    }
+
+    /// Emit a FIL element per ISO/IEC 14496-3 §4.4.2.7 — the 3-bit
+    /// `id_syn_ele` (`0b110`), the 4-bit `count`, the optional 8-bit
+    /// `esc_count` escape (when `payload_bytes >= 15`), then the
+    /// `payload_bytes` of `extension_payload`.
+    ///
+    /// Escape arithmetic: the parser's `cnt = esc_count + 15 - 1`
+    /// (see [`Walker::read_fill_count`]) inverts to `esc_count =
+    /// payload_bytes - 15 + 1 = payload_bytes - 14`, so the largest
+    /// representable payload is `15 + 255 - 1 = 269` bytes. Larger
+    /// fill payloads must be split across multiple FIL elements (as
+    /// AAC's bit-reservoir code path does in practice for long fill
+    /// runs).
+    ///
+    /// Returns [`Error::RawDataBlockEncodeInvalid`] when:
+    ///
+    /// * `payload.len() > 269` (Table 4.57 + escape arithmetic
+    ///   ceiling), or
+    /// * `payload.len()` exceeds the `bit_count` capacity of the
+    ///   surrounding writer (in practice `u32::MAX`).
+    pub fn push_fill(&mut self, payload: &[u8]) -> Result<()> {
+        let n = payload.len();
+        if n > 269 {
+            return Err(Error::RawDataBlockEncodeInvalid);
+        }
+        self.writer.write_u32(IdSynEle::Fil as u32, 3);
+        if n < 15 {
+            self.writer.write_u32(n as u32, 4);
+        } else {
+            self.writer.write_u32(15, 4);
+            // §4.4.2.7: parser reconstructs `cnt = esc_count + 15 -
+            // 1`. The inverse, given `cnt == n`, is
+            // `esc_count = n - 15 + 1 = n - 14`. The 8-bit
+            // `esc_count` field caps `n` at `15 + 255 - 1 = 269`,
+            // which we already rejected above when violated.
+            let esc = (n as u32) - 14;
+            self.writer.write_u32(esc, 8);
+        }
+        // Per §4.4.2.7 the payload is *not* required to be
+        // byte-aligned — `extension_payload()` is itself a
+        // bit-level item — but the walker treats it as `count`
+        // whole bytes, mirroring how every conforming encoder we
+        // care about ever emits it. The assembler therefore writes
+        // the payload as bytes too.
+        for &b in payload {
+            self.writer.write_byte(b);
+        }
+        Ok(())
+    }
+
+    /// Emit a DSE element per ISO/IEC 14496-3 §4.4.2.5 — the 3-bit
+    /// `id_syn_ele` (`0b100`), the 4-bit `element_instance_tag`, the
+    /// 1-bit `data_byte_align_flag`, the 8-bit `count`, the optional
+    /// 8-bit `esc_count` escape (when `payload_bytes >= 255`),
+    /// optionally byte-align (if the flag was set), then the
+    /// `payload_bytes` of `data_stream_byte[]`.
+    ///
+    /// Escape arithmetic: the parser's `cnt = count + esc_count` (see
+    /// [`Walker::read_data_count`]) inverts to `esc_count =
+    /// payload_bytes - 255`, so the largest representable payload is
+    /// `255 + 255 = 510` bytes. Larger data payloads must be split
+    /// across multiple DSE elements with the same `tag`.
+    ///
+    /// Returns [`Error::RawDataBlockEncodeInvalid`] when:
+    ///
+    /// * `element_instance_tag > 0x0f` (4-bit field overflow), or
+    /// * `payload.len() > 510` (the escape arithmetic ceiling above).
+    pub fn push_data(
+        &mut self,
+        element_instance_tag: u8,
+        byte_align_flag: bool,
+        payload: &[u8],
+    ) -> Result<()> {
+        if element_instance_tag > 0x0f {
+            return Err(Error::RawDataBlockEncodeInvalid);
+        }
+        let n = payload.len();
+        if n > 510 {
+            return Err(Error::RawDataBlockEncodeInvalid);
+        }
+        self.writer.write_u32(IdSynEle::Dse as u32, 3);
+        self.writer.write_u32(element_instance_tag as u32, 4);
+        self.writer.write_bit(byte_align_flag);
+        if n < 255 {
+            self.writer.write_u32(n as u32, 8);
+        } else {
+            // §4.4.2.5: parser reconstructs `cnt = count +
+            // esc_count`. The inverse, given `cnt == n` and the
+            // escape trigger `count == 255`, is `esc_count = n -
+            // 255`. The 8-bit `esc_count` field caps `n` at
+            // `255 + 255 = 510`, which we already rejected above
+            // when violated.
+            self.writer.write_u32(255, 8);
+            let esc = (n as u32) - 255;
+            self.writer.write_u32(esc, 8);
+        }
+        if byte_align_flag {
+            self.writer.align_to_byte();
+        }
+        for &b in payload {
+            self.writer.write_byte(b);
+        }
+        Ok(())
+    }
+
+    /// Emit the terminating `END` element per ISO/IEC 14496-3
+    /// §4.4.2.1 — the 3-bit `id_syn_ele` (`0b111`), then a pad-to-
+    /// byte-boundary that the [`Walker`] mirrors via
+    /// [`BitReader::align_to_byte`]. Consumes the assembler and
+    /// returns the finished byte buffer; the final byte is always
+    /// fully populated.
+    pub fn push_end(mut self) -> Vec<u8> {
+        self.writer.write_u32(IdSynEle::End as u32, 3);
+        self.writer.align_to_byte();
+        self.writer.finish()
     }
 }

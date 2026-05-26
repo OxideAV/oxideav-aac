@@ -6,6 +6,78 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 160 — §4.4.2.1 raw_data_block frame assembler)
+
+- `raw_data_block::FrameAssembler` — encoder-side composition primitive
+  for `raw_data_block()` per ISO/IEC 14496-3 §4.4.2.1, the bit-exact
+  inverse of the round-121 `raw_data_block::Walker`. Wraps an internal
+  [`oxideav_core::bits::BitWriter`] and exposes a small typed push-API:
+  - `push_channel_header(kind, element_instance_tag)` emits the 3-bit
+    `id_syn_ele` (`SCE` / `CPE` / `CCE` / `LFE`) + 4-bit
+    `element_instance_tag`. The channel-element *body* (`ics_info` →
+    `section_data` → `scale_factor_data` → optional `pulse_data` /
+    `tns_data` → `spectral_data`) is the caller's responsibility — it
+    is appended via the next entry point.
+  - `push_channel_body_bits(bits, bit_count)` appends a pre-serialised
+    channel-element body as an MSB-first packed bit-slice. This lets
+    callers run the existing typed writers (`IcsInfo::write`,
+    `SectionData::write`, `ScaleFactorData::write`, `PulseData::write`,
+    `TnsData::write`) into an auxiliary [`BitWriter`] and splice the
+    resulting bits into the frame without forcing the assembler to own
+    every per-tool body layout.
+  - `push_fill(payload)` emits a FIL element per §4.4.2.7 — 3-bit id +
+    4-bit `count` + optional 8-bit `esc_count` (when `payload.len() >=
+    15`) + payload bytes. The escape arithmetic inverts the parser's
+    `cnt = esc_count + 15 - 1` to `esc_count = payload_bytes - 14`,
+    capping single-element fill at 269 bytes.
+  - `push_data(tag, byte_align_flag, payload)` emits a DSE element per
+    §4.4.2.5 — 3-bit id + 4-bit `element_instance_tag` + 1-bit
+    `data_byte_align_flag` + 8-bit `count` + optional 8-bit `esc_count`
+    (when `payload.len() >= 255`) + optional byte-align (before payload
+    bytes) + payload bytes. The escape arithmetic inverts the parser's
+    `cnt = count + esc_count` to `esc_count = payload_bytes - 255`,
+    capping single-element data at 510 bytes.
+  - `push_end()` consumes the assembler, emits the 3-bit `END` (`0b111`)
+    terminator, byte-aligns the writer per §4.4.2.1, and returns the
+    finished `Vec<u8>`. END is mandatory (the type-state forces every
+    completed frame to call it) and post-END pushes are a compile-time
+    error.
+- `Error::RawDataBlockEncodeInvalid` for caller-side structural bugs
+  the assembler cannot represent on the wire: non-channel `IdSynEle`
+  passed to `push_channel_header` (FIL / DSE / END have their own
+  bespoke entry points; PCE has no writer yet); `element_instance_tag
+  > 0x0f` on a channel or DSE element; FIL `payload.len() > 269`; DSE
+  `payload.len() > 510`; or `push_channel_body_bits` called with
+  `bit_count > bits.len() * 8`. Long fill / data payloads above the
+  per-element ceilings split naturally across multiple back-to-back
+  FIL / DSE elements with the same `tag`; the assembler intentionally
+  enforces the single-element ceiling rather than splitting silently.
+- PCE encoding is **not** in this round — the [`crate::pce::Pce`]
+  struct is fully parsed (round 126) but has no `write` primitive yet,
+  and adding one is a separate round's worth of work (Tables 4.4 / 4.5
+  front/side/back/lfe element selects, mono / stereo / matrix mix-down
+  hints, comment field, plus the relative-origin `byte_alignment()`
+  per Table 4.2 Note 1). The assembler rejects PCE in
+  `push_channel_header` rather than admitting an `Element::ProgramConfig`
+  variant the writer cannot honour.
+- 30 new integration tests in `tests/raw_data_block_encode.rs`:
+  END-only frame (one-byte `0xE0` wire-layout pin); channel-header
+  push for every `(SCE, CPE, CCE, LFE)` × `(tag = 0, 7, 0x0a, 0x0f)`
+  combination with a hand-pinned wire-byte assertion for the
+  SCE(tag=0x0a)+END case (`[0x15, 0xC0]`); rejection of non-channel
+  kinds (`Dse`, `Pce`, `Fil`, `End`) and over-4-bit tags; channel-body
+  bit-append for partial-byte (12-bit), whole-byte (32-bit), and
+  zero-count cases with a hand-pinned three-byte wire-layout assertion
+  (`[0x01, 0x57, 0x9C]` for SCE(tag=0)+0xABC(12-bit)+END); FIL empty
+  pin (`[0xC1, 0xC0]`), every `payload_bytes ∈ 0..15`, escape-boundary
+  pair (15 / 16), max-payload-269 roundtrip, and rejection above 269;
+  DSE short / byte-align-set / byte-align-with-mid-byte-offset /
+  escape-boundary-255 / max-510 roundtrips and rejection above 510 /
+  over-4-bit tag; composite frames (SCE+FIL+END mirroring the parser
+  test, CPE+13-bit-body+DSE+FIL+END, two back-to-back FIL elements);
+  `bit_position` tracking; and END byte-alignment after an unaligned
+  body. Suite size grows 264 → 294 tests.
+
 ### Added (round 152 — §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator pair)
 
 - `scale_factor_data::accumulate(sfd, sfb_cb, global_gain) ->

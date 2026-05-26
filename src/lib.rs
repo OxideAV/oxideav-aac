@@ -23,7 +23,14 @@
 //!   SCE / CPE / CCE / LFE are **not** parsed yet — the walker emits an
 //!   element-header event and the consumer is responsible for
 //!   advancing the bit-reader past the body (subsequent rounds will
-//!   internalise this). PCE is fully parsed.
+//!   internalise this). PCE is fully parsed. **Round 160** added the
+//!   matching encoder-side [`raw_data_block::FrameAssembler`] — the
+//!   bit-exact inverse, with a typed push-API
+//!   (`push_channel_header` / `push_channel_body_bits` / `push_fill` /
+//!   `push_data` / `push_end`) that composes the existing per-tool
+//!   writers (`IcsInfo::write`, `SectionData::write`, …) into a
+//!   complete byte stream. PCE encoding is deferred until the
+//!   [`pce::Pce`] writer lands.
 //! * The [`ics_info`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.6
 //!   *ics_info()* parser. The first piece of Phase 2
 //!   (channel-element body parsing) — surfaces the window-sequence /
