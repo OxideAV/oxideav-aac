@@ -40,7 +40,7 @@
 //!   [`AudioSpecificConfig`](crate::asc::AudioSpecificConfig) for
 //!   the ASC-origin handling.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::{Error, Result};
 
@@ -222,6 +222,187 @@ impl Pce {
             + count_list(&self.side_elements)
             + count_list(&self.back_elements)
             + self.lfe_element_tag_selects.len()
+    }
+
+    /// Encode this PCE into `writer` per ISO/IEC 14496-3 §4.4.1.1
+    /// Table 4.2 — the bit-exact inverse of [`Pce::parse`]. The
+    /// emitted layout matches the parser exactly:
+    ///
+    /// `element_instance_tag(4) + object_type(2) +
+    /// sampling_frequency_index(4) + num_front(4) + num_side(4) +
+    /// num_back(4) + num_lfe(2) + num_assoc(3) + num_valid_cc(4) +
+    /// mono_mixdown_present(1) [+ mono_mixdown_element_number(4)] +
+    /// stereo_mixdown_present(1) [+ stereo_mixdown_element_number(4)] +
+    /// matrix_mixdown_idx_present(1) [+ matrix_mixdown_idx(2) +
+    /// pseudo_surround_enable(1)] + front[i].is_cpe(1) +
+    /// front[i].tag_select(4) ... + side[...] + back[...] +
+    /// lfe[i].tag_select(4) + assoc[i].tag_select(4) +
+    /// cc[i].is_ind_sw(1) + cc[i].tag_select(4) + byte_alignment() +
+    /// comment_field_bytes(8) + comment_field bytes`
+    ///
+    /// `origin_bit_offset` controls the Table 4.2 Note 1
+    /// `byte_alignment()` semantics — pass `0` for a standalone PCE
+    /// inside a `raw_data_block()` (align to the absolute byte
+    /// boundary of the writer), and the ASC origin bit-position for
+    /// a PCE inline in [`AudioSpecificConfig`](crate::asc::AudioSpecificConfig)
+    /// (align relative to the ASC origin). Note that when the writer
+    /// itself starts at bit 0 (the standalone case) the absolute and
+    /// the origin-relative alignments coincide.
+    ///
+    /// Returns [`Error::PceEncodeInvalid`] when any wire field
+    /// overflows its bit-width — see [`Error::PceEncodeInvalid`] for
+    /// the exhaustive list.
+    pub fn write(&self, writer: &mut BitWriter, origin_bit_offset: u64) -> Result<()> {
+        // ----- Header fields -----
+        // 4-bit element_instance_tag, 2-bit object_type, 4-bit
+        // sampling_frequency_index.
+        if self.element_instance_tag > 0x0f
+            || self.object_type > 0x03
+            || self.sampling_frequency_index > 0x0f
+        {
+            return Err(Error::PceEncodeInvalid);
+        }
+
+        // ----- Element counts: validate against field widths first
+        // so a single overflow surfaces before any bits leak onto
+        // the wire.
+        if self.front_elements.len() > 0x0f
+            || self.side_elements.len() > 0x0f
+            || self.back_elements.len() > 0x0f
+            || self.lfe_element_tag_selects.len() > 0x03
+            || self.assoc_data_tag_selects.len() > 0x07
+            || self.valid_cc_elements.len() > 0x0f
+        {
+            return Err(Error::PceEncodeInvalid);
+        }
+
+        // ----- Per-element tag_select field-width checks (4 bits
+        // each) and mix-down field-width checks. Doing the checks
+        // up-front avoids emitting a partial PCE on a downstream
+        // overflow.
+        for e in self
+            .front_elements
+            .iter()
+            .chain(self.side_elements.iter())
+            .chain(self.back_elements.iter())
+        {
+            if e.tag_select > 0x0f {
+                return Err(Error::PceEncodeInvalid);
+            }
+        }
+        for &t in self
+            .lfe_element_tag_selects
+            .iter()
+            .chain(self.assoc_data_tag_selects.iter())
+        {
+            if t > 0x0f {
+                return Err(Error::PceEncodeInvalid);
+            }
+        }
+        for cc in &self.valid_cc_elements {
+            if cc.tag_select > 0x0f {
+                return Err(Error::PceEncodeInvalid);
+            }
+        }
+        if let Some(n) = self.mono_mixdown_element_number {
+            if n > 0x0f {
+                return Err(Error::PceEncodeInvalid);
+            }
+        }
+        if let Some(n) = self.stereo_mixdown_element_number {
+            if n > 0x0f {
+                return Err(Error::PceEncodeInvalid);
+            }
+        }
+        if let Some((idx, _)) = self.matrix_mixdown {
+            if idx > 0x03 {
+                return Err(Error::PceEncodeInvalid);
+            }
+        }
+        if self.comment_field.len() > 0xff {
+            return Err(Error::PceEncodeInvalid);
+        }
+
+        // ----- Emit header -----
+        writer.write_u32(self.element_instance_tag as u32, 4);
+        writer.write_u32(self.object_type as u32, 2);
+        writer.write_u32(self.sampling_frequency_index as u32, 4);
+        writer.write_u32(self.front_elements.len() as u32, 4);
+        writer.write_u32(self.side_elements.len() as u32, 4);
+        writer.write_u32(self.back_elements.len() as u32, 4);
+        writer.write_u32(self.lfe_element_tag_selects.len() as u32, 2);
+        writer.write_u32(self.assoc_data_tag_selects.len() as u32, 3);
+        writer.write_u32(self.valid_cc_elements.len() as u32, 4);
+
+        // ----- Mix-down presence + bodies -----
+        match self.mono_mixdown_element_number {
+            Some(n) => {
+                writer.write_bit(true);
+                writer.write_u32(n as u32, 4);
+            }
+            None => writer.write_bit(false),
+        }
+        match self.stereo_mixdown_element_number {
+            Some(n) => {
+                writer.write_bit(true);
+                writer.write_u32(n as u32, 4);
+            }
+            None => writer.write_bit(false),
+        }
+        match self.matrix_mixdown {
+            Some((idx, pseudo)) => {
+                writer.write_bit(true);
+                writer.write_u32(idx as u32, 2);
+                writer.write_bit(pseudo);
+            }
+            None => writer.write_bit(false),
+        }
+
+        // ----- Element lists -----
+        for e in &self.front_elements {
+            writer.write_bit(e.is_cpe);
+            writer.write_u32(e.tag_select as u32, 4);
+        }
+        for e in &self.side_elements {
+            writer.write_bit(e.is_cpe);
+            writer.write_u32(e.tag_select as u32, 4);
+        }
+        for e in &self.back_elements {
+            writer.write_bit(e.is_cpe);
+            writer.write_u32(e.tag_select as u32, 4);
+        }
+        for &t in &self.lfe_element_tag_selects {
+            writer.write_u32(t as u32, 4);
+        }
+        for &t in &self.assoc_data_tag_selects {
+            writer.write_u32(t as u32, 4);
+        }
+        for cc in &self.valid_cc_elements {
+            writer.write_bit(cc.is_ind_sw);
+            writer.write_u32(cc.tag_select as u32, 4);
+        }
+
+        // ----- Table 4.2 Note 1 byte_alignment() — relative to the
+        // PCE's origin reference. The pad is `(8 - from_origin % 8) %
+        // 8` where `from_origin = writer.bit_position() -
+        // origin_bit_offset`. For a standalone PCE inside
+        // `raw_data_block()` the caller passes `origin_bit_offset =
+        // 0` and this collapses to absolute alignment; for an
+        // ASC-inline PCE the caller passes the ASC origin so the
+        // alignment is computed relative to the start of the ASC.
+        let cur = writer.bit_position();
+        let from_origin = cur.saturating_sub(origin_bit_offset);
+        let pad = (8 - (from_origin % 8)) % 8;
+        if pad > 0 {
+            writer.write_u32(0, pad as u32);
+        }
+
+        // ----- comment_field -----
+        writer.write_u32(self.comment_field.len() as u32, 8);
+        for &b in &self.comment_field {
+            writer.write_byte(b);
+        }
+        Ok(())
     }
 }
 

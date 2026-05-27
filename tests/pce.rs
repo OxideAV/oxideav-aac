@@ -250,3 +250,313 @@ fn truncated_pce_returns_unexpected_end() {
     let mut br = BitReader::new(&buf);
     assert_eq!(Pce::parse(&mut br, 0), Err(Error::UnexpectedEnd));
 }
+
+// =====================================================================
+// Pce::write (round 165) — self-roundtrip + structural rejection tests
+// =====================================================================
+
+/// Helper: build a small PCE struct that exercises the §4.4.1.1 / Table
+/// 4.2 wire layout end-to-end (header + counts + mix-downs + per-list
+/// elements + alignment + comment).
+fn pce_fixture() -> Pce {
+    Pce {
+        element_instance_tag: 0x05,
+        object_type: 1,              // LC
+        sampling_frequency_index: 3, // 48000
+        front_elements: vec![
+            ElementSelect {
+                is_cpe: false,
+                tag_select: 0,
+            }, // centre SCE
+            ElementSelect {
+                is_cpe: true,
+                tag_select: 0,
+            }, // L/R CPE
+        ],
+        side_elements: vec![],
+        back_elements: vec![ElementSelect {
+            is_cpe: true,
+            tag_select: 1,
+        }],
+        lfe_element_tag_selects: vec![0],
+        assoc_data_tag_selects: vec![],
+        valid_cc_elements: vec![CcElementSelect {
+            is_ind_sw: true,
+            tag_select: 2,
+        }],
+        mono_mixdown_element_number: None,
+        stereo_mixdown_element_number: Some(0),
+        matrix_mixdown: Some((1, false)),
+        comment_field: b"hi-clean-room".to_vec(),
+    }
+}
+
+#[test]
+fn write_then_parse_roundtrip_empty_pce() {
+    let pce = Pce {
+        element_instance_tag: 0,
+        object_type: 1,
+        sampling_frequency_index: 4,
+        front_elements: vec![],
+        side_elements: vec![],
+        back_elements: vec![],
+        lfe_element_tag_selects: vec![],
+        assoc_data_tag_selects: vec![],
+        valid_cc_elements: vec![],
+        mono_mixdown_element_number: None,
+        stereo_mixdown_element_number: None,
+        matrix_mixdown: None,
+        comment_field: vec![],
+    };
+    let mut bw = BitWriter::new();
+    pce.write(&mut bw, 0).unwrap();
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let round = Pce::parse(&mut br, 0).unwrap();
+    assert_eq!(round, pce);
+}
+
+#[test]
+fn write_then_parse_roundtrip_5_1_with_mixdowns_and_comment() {
+    let pce = pce_fixture();
+    let mut bw = BitWriter::new();
+    pce.write(&mut bw, 0).unwrap();
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let round = Pce::parse(&mut br, 0).unwrap();
+    assert_eq!(round, pce);
+    assert_eq!(round.channel_count(), 6);
+}
+
+#[test]
+fn write_roundtrip_at_non_zero_origin_matches_parser() {
+    // Place 3 bits of leading padding before the PCE body, write at
+    // origin = 3, parse at origin = 3 — the byte_alignment() inside
+    // `write` and `parse` should agree on the ASC-relative pad and the
+    // round-trip should be exact.
+    let pce = Pce {
+        element_instance_tag: 0,
+        object_type: 1,
+        sampling_frequency_index: 4,
+        front_elements: vec![],
+        side_elements: vec![],
+        back_elements: vec![],
+        lfe_element_tag_selects: vec![],
+        assoc_data_tag_selects: vec![],
+        valid_cc_elements: vec![],
+        mono_mixdown_element_number: None,
+        stereo_mixdown_element_number: None,
+        matrix_mixdown: None,
+        comment_field: b"ASC-inline".to_vec(),
+    };
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(0b101, 3); // pre-origin padding
+    pce.write(&mut bw, 3).unwrap();
+    let buf = bw.finish();
+
+    let mut br = BitReader::new(&buf);
+    br.skip(3).unwrap();
+    let round = Pce::parse(&mut br, 3).unwrap();
+    assert_eq!(round, pce);
+}
+
+#[test]
+fn write_rejects_element_instance_tag_overflow() {
+    let mut pce = pce_fixture();
+    pce.element_instance_tag = 0x10; // 4-bit cap is 0x0f
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_object_type_overflow() {
+    let mut pce = pce_fixture();
+    pce.object_type = 4; // 2-bit cap is 3
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_sampling_frequency_index_overflow() {
+    let mut pce = pce_fixture();
+    pce.sampling_frequency_index = 0x10; // 4-bit cap is 0x0f
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_front_elements_overflow() {
+    let mut pce = pce_fixture();
+    // 4-bit num_front cap is 15; produce 16 entries.
+    pce.front_elements = (0..16)
+        .map(|_| ElementSelect {
+            is_cpe: false,
+            tag_select: 0,
+        })
+        .collect();
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_lfe_elements_overflow() {
+    let mut pce = pce_fixture();
+    pce.lfe_element_tag_selects = vec![0, 0, 0, 0, 0]; // 2-bit cap is 3
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_assoc_elements_overflow() {
+    let mut pce = pce_fixture();
+    pce.assoc_data_tag_selects = vec![0; 8]; // 3-bit cap is 7
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_cc_elements_overflow() {
+    let mut pce = pce_fixture();
+    pce.valid_cc_elements = (0..16)
+        .map(|_| CcElementSelect {
+            is_ind_sw: false,
+            tag_select: 0,
+        })
+        .collect();
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_per_element_tag_select_overflow() {
+    let mut pce = pce_fixture();
+    pce.front_elements[1].tag_select = 0x10; // 4-bit cap is 0x0f
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_lfe_tag_select_overflow() {
+    let mut pce = pce_fixture();
+    pce.lfe_element_tag_selects[0] = 0x10;
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_cc_tag_select_overflow() {
+    let mut pce = pce_fixture();
+    pce.valid_cc_elements[0].tag_select = 0x10;
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_mono_mixdown_overflow() {
+    let mut pce = pce_fixture();
+    pce.mono_mixdown_element_number = Some(0x10);
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_stereo_mixdown_overflow() {
+    let mut pce = pce_fixture();
+    pce.stereo_mixdown_element_number = Some(0x10);
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_matrix_mixdown_idx_overflow() {
+    let mut pce = pce_fixture();
+    pce.matrix_mixdown = Some((4, false));
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_rejects_comment_field_overflow() {
+    let mut pce = pce_fixture();
+    pce.comment_field = vec![0u8; 256]; // 8-bit length cap is 255
+    let mut bw = BitWriter::new();
+    assert_eq!(pce.write(&mut bw, 0), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn write_roundtrip_with_all_mixdowns_set() {
+    let pce = Pce {
+        element_instance_tag: 0x0f,
+        object_type: 3,                 // LTP
+        sampling_frequency_index: 0x0f, // explicit-rate escape sentinel
+        front_elements: vec![ElementSelect {
+            is_cpe: false,
+            tag_select: 0x0f,
+        }],
+        side_elements: vec![ElementSelect {
+            is_cpe: true,
+            tag_select: 7,
+        }],
+        back_elements: vec![ElementSelect {
+            is_cpe: true,
+            tag_select: 1,
+        }],
+        lfe_element_tag_selects: vec![0x0f, 0x0e],
+        assoc_data_tag_selects: vec![0, 1, 2, 3, 4, 5, 6], // 7 entries (3-bit cap)
+        valid_cc_elements: vec![
+            CcElementSelect {
+                is_ind_sw: true,
+                tag_select: 0x0f,
+            },
+            CcElementSelect {
+                is_ind_sw: false,
+                tag_select: 0,
+            },
+        ],
+        mono_mixdown_element_number: Some(0x0f),
+        stereo_mixdown_element_number: Some(0x0e),
+        matrix_mixdown: Some((3, true)),
+        comment_field: vec![0xff; 255],
+    };
+    let mut bw = BitWriter::new();
+    pce.write(&mut bw, 0).unwrap();
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let round = Pce::parse(&mut br, 0).unwrap();
+    assert_eq!(round, pce);
+}
+
+#[test]
+fn write_emits_zero_pad_for_byte_alignment() {
+    // After header(10) + counts(4+4+4+2+3+4=21) + mixdown flags(3) = 34
+    // bits on an empty PCE with no mix-down bodies and no elements, the
+    // §4.4.1.1 byte_alignment() must inject 6 zero bits to reach the
+    // 5th byte boundary. The very next byte (`comment_field_bytes`)
+    // therefore lands at byte index 5. The padding being literally
+    // zeros lets us spot-check the exact output bytes.
+    let pce = Pce {
+        element_instance_tag: 0,
+        object_type: 0,
+        sampling_frequency_index: 0,
+        front_elements: vec![],
+        side_elements: vec![],
+        back_elements: vec![],
+        lfe_element_tag_selects: vec![],
+        assoc_data_tag_selects: vec![],
+        valid_cc_elements: vec![],
+        mono_mixdown_element_number: None,
+        stereo_mixdown_element_number: None,
+        matrix_mixdown: None,
+        comment_field: vec![],
+    };
+    let mut bw = BitWriter::new();
+    pce.write(&mut bw, 0).unwrap();
+    let buf = bw.finish();
+    // 34 bits of header content + 6 pad zero bits = 40 bits = 5 bytes,
+    // then 8 bits of `comment_field_bytes = 0` = byte 5. Total 6 bytes.
+    assert_eq!(buf.len(), 6);
+    // All-zero header field combination + zero pad + zero comment-len
+    // ⇒ every byte is zero.
+    assert!(buf.iter().all(|&b| b == 0));
+}

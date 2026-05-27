@@ -157,6 +157,27 @@ pub enum Error {
     /// scalefactor-quantisation stage and bitstream emission.
     ScaleFactorDataEncodeInvalid,
 
+    /// [`crate::pce::Pce::write`] was handed an in-memory
+    /// [`crate::pce::Pce`] whose field combination cannot be
+    /// represented on the wire under ISO/IEC 14496-3 §4.4.1.1 /
+    /// Table 4.2. Examples: `element_instance_tag > 0x0f` (4-bit
+    /// field cap); `object_type > 0x03` (2-bit field cap);
+    /// `sampling_frequency_index > 0x0f` (4-bit field cap);
+    /// `front_elements.len() > 0x0f`, `side_elements.len() > 0x0f`,
+    /// or `back_elements.len() > 0x0f` (4-bit `num_*` field caps);
+    /// `lfe_element_tag_selects.len() > 0x03` (2-bit `num_lfe`
+    /// field cap); `assoc_data_tag_selects.len() > 0x07` (3-bit
+    /// `num_assoc` field cap); `valid_cc_elements.len() > 0x0f`
+    /// (4-bit `num_valid_cc` field cap); a `tag_select` inside any
+    /// per-element list exceeds the 4-bit cap; a `matrix_mixdown`
+    /// `idx > 0x03` (2-bit field cap); `mono_mixdown_element_number`
+    /// or `stereo_mixdown_element_number` `> 0x0f` (4-bit caps); or
+    /// `comment_field.len() > 0xff` (8-bit `comment_field_bytes`
+    /// length prefix). A conforming AAC encoder never builds such a
+    /// structure; this surfaces caller bugs at the boundary between
+    /// channel-layout selection and bitstream emission.
+    PceEncodeInvalid,
+
     /// [`crate::raw_data_block::FrameAssembler`] was handed an
     /// element whose field combination cannot be represented on the
     /// wire under ISO/IEC 14496-3 §4.4.2.1. Examples:
@@ -283,6 +304,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "scale_factor_data encode: in-memory record set violates a Table 4.53 / 4.150 wire-field invariant"
+                )
+            }
+            Error::PceEncodeInvalid => {
+                write!(
+                    f,
+                    "pce encode: in-memory Pce violates a Table 4.2 wire-field invariant"
                 )
             }
             Error::RawDataBlockEncodeInvalid => {

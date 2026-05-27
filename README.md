@@ -3,12 +3,49 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 160)
+## Status (round 165)
 
 **Phase 1 complete + Phase 2 in progress + five tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
-pair + the §4.4.2.1 `raw_data_block()` frame assembler.** Round 160
-lands [`raw_data_block::FrameAssembler`] — the encoder-side
+pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.1.1
+`program_config_element()` writer.** Round 165 lands
+[`pce::Pce::write`] — the encoder-side counterpart of the round-126
+`Pce::parse`, emitting the full Table 4.2 wire layout (4-bit
+`element_instance_tag` + 2-bit `object_type` + 4-bit
+`sampling_frequency_index`; the six element-count fields with widths
+4 / 4 / 4 / 2 / 3 / 4; three mix-down presence bits and their
+optional 4 / 4 / (2+1)-bit bodies; per-element select lists for
+front / side / back as `(is_cpe, tag_select)` pairs plus bare
+4-bit `tag_select` lists for LFE / assoc and `(is_ind_sw,
+tag_select)` pairs for `valid_cc`; a §4.4.1.1 Note 1 origin-relative
+`byte_alignment()`; then the 8-bit `comment_field_bytes` length
+prefix and payload bytes) — and the matching
+[`raw_data_block::FrameAssembler::push_pce`] that emits the 3-bit PCE
+`id_syn_ele` (`0b101`) before the body and passes
+`origin_bit_offset = 0` so the byte-alignment collapses to the
+absolute byte boundary inside the assembler. The origin handling
+mirrors the parser exactly: pass `0` for a standalone PCE inside a
+`raw_data_block()`, or the ASC origin bit-position for a PCE inline
+in [`AudioSpecificConfig`](crate::asc::AudioSpecificConfig). A new
+`Error::PceEncodeInvalid` variant surfaces every caller-side
+wire-field violation: `element_instance_tag > 0x0f`, `object_type >
+0x03`, `sampling_frequency_index > 0x0f`, `front`/`side`/`back`
+element-list lengths > 15, LFE list length > 3, assoc list length >
+7, CC list length > 15, any per-element `tag_select > 0x0f`,
+`matrix_mixdown.idx > 0x03`, mono / stereo mix-down element numbers >
+0x0f, or `comment_field.len() > 0xff`. 26 new integration tests cover
+self-roundtrip (`write` → `parse`) across the empty PCE, a 5.1 layout
+with mixed SCE / CPE / LFE / CC and a comment field, the
+all-mix-downs-set permutation, the maximum-fields ladder
+(`tag = 0x0f`, `object_type = 3`, `sfi = 0x0f`, 255-byte comment),
+and a non-zero-origin parser / writer agreement test; six
+`FrameAssembler::push_pce` Walker round-trip tests (PCE+END, PCE
+after SCE header, PCE+FIL+END, full-mix-downs PCE) plus two error-
+propagation tests; and a hand-pinned wire-layout assertion that the
+all-zero PCE produces 6 all-zero bytes (header + counts + flags +
+6-bit pad + comment length). Suite size grows 294 → 320 tests.
+
+Round 160 had landed [`raw_data_block::FrameAssembler`] — the encoder-side
 composition primitive that splices the existing typed writers
 (`IcsInfo::write`, `SectionData::write`, `ScaleFactorData::write`,
 `PulseData::write`, `TnsData::write`) into a complete bit-exact
@@ -28,14 +65,9 @@ and `push_end` which emits the 3-bit `END (0b111)`, byte-aligns per
 §4.4.2.1, and consumes the assembler to return the finished
 `Vec<u8>`. END is mandatory — `push_end` is a destructor-style
 terminator, so post-END pushes are a compile-time error rather than a
-runtime check. PCE encoding is deliberately deferred: the
-[`pce::Pce`] struct is fully parsed (round 126) but has no `write`
-primitive yet, and adding one is a separate round's worth of work
-(Tables 4.4 / 4.5 front/side/back/lfe element selects, mono / stereo
-/ matrix mix-down hints, comment field, plus the relative-origin
-`byte_alignment()` per Table 4.2 Note 1) — the assembler rejects PCE
-in `push_channel_header` rather than admitting an
-`Element::ProgramConfig` variant the writer cannot honour. The new
+runtime check. **Round 165** now closes the PCE-writer gap with
+[`raw_data_block::FrameAssembler::push_pce`] (3-bit `id_syn_ele`
+prefix + the round-165 `Pce::write` body). The new
 `Error::RawDataBlockEncodeInvalid` surfaces every caller-side wire-
 field violation: non-channel `IdSynEle` on `push_channel_header`,
 over-4-bit `element_instance_tag` on channel or DSE elements, FIL
@@ -337,17 +369,12 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   and a real spectral context.
 - The full per-AOT IMDCT + windowing back-end (filterbank, TNS
   reconstruction, PNS / IS pair routing).
-- The encoder-side `program_config_element()` writer. The
-  [`pce::Pce`] struct is fully parsed (round 126) but has no
-  `write` primitive yet; round 160's `FrameAssembler` deliberately
-  rejects PCE in `push_channel_header` rather than admitting an
-  `Element::ProgramConfig` variant the writer cannot honour. A
-  future round will add `Pce::write` covering Tables 4.4 / 4.5
-  front/side/back/lfe element selects, mono / stereo / matrix
-  mix-down hints, the comment field, and the relative-origin
-  `byte_alignment()` per Table 4.2 Note 1, after which
-  `FrameAssembler::push_pce(&Pce)` can be added with the same
-  origin-bit-offset handling the parser already does.
+- The decoder-side channel-element body walker that drives
+  `ics_info` → `section_data` → `scale_factor_data` → optional
+  `pulse_data` / `tns_data` / `gain_control_data` → `spectral_data`
+  inside the per-channel `Element::ChannelElement` branch — the
+  Phase 1 walker still stops after the 4-bit `element_instance_tag`
+  and the caller must advance the bit-reader past the body manually.
 - All decode / encode runtime wiring. The `register()` entry point
   installs no `Decoder` or `Encoder` into the runtime context yet,
   and the factory functions return `Error::NotImplemented`.

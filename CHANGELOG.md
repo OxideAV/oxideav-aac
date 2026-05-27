@@ -6,6 +6,55 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 165 — `Pce::write` + `FrameAssembler::push_pce`)
+
+- `pce::Pce::write(writer, origin_bit_offset)` — encoder primitive for
+  the `program_config_element()` per ISO/IEC 14496-3 §4.4.1.1 /
+  Table 4.2, the bit-exact inverse of the round-126 `Pce::parse`. Emits
+  the full PCE wire layout: 4-bit `element_instance_tag` + 2-bit
+  `object_type` + 4-bit `sampling_frequency_index`; element counts
+  (4-bit `num_front`, 4-bit `num_side`, 4-bit `num_back`, 2-bit
+  `num_lfe`, 3-bit `num_assoc`, 4-bit `num_valid_cc`); mix-down
+  presence flags + bodies (`mono_mixdown_present` + 4-bit
+  `mono_mixdown_element_number`; `stereo_mixdown_present` + 4-bit
+  `stereo_mixdown_element_number`; `matrix_mixdown_idx_present` +
+  2-bit `matrix_mixdown_idx` + 1-bit `pseudo_surround_enable`); the
+  per-element select lists (`front` / `side` / `back` are
+  `(1-bit is_cpe, 4-bit tag_select)` pairs; `lfe` and `assoc` are
+  bare 4-bit `tag_select` values; `valid_cc` is
+  `(1-bit is_ind_sw, 4-bit tag_select)` pairs); a §4.4.1.1 Note 1
+  origin-relative `byte_alignment()`; then the 8-bit
+  `comment_field_bytes` length prefix + `comment_field` bytes. The
+  origin handling mirrors the parser exactly — pass `0` for a
+  standalone PCE inside a `raw_data_block()` (collapses to absolute
+  alignment), or the ASC origin bit-position for a PCE inline in
+  `AudioSpecificConfig` (the ASC-relative form). Self-roundtrip
+  (`write` → `parse`) is bit-perfect across the empty layout, a 5.1
+  layout with mixed SCE / CPE / LFE / CC and a comment field, every
+  mix-down body permutation, the maximum-fields ladder (`tag=0x0f`,
+  `object_type=3`, `sfi=0x0f`, 255-byte comment), and a non-zero-
+  origin ASC-relative roundtrip.
+- `raw_data_block::FrameAssembler::push_pce(&Pce)` — emits the 3-bit
+  PCE `id_syn_ele` (`0b101`) followed by the full PCE body via
+  `Pce::write` with `origin_bit_offset = 0`. Pairs with the round-121
+  walker's `Element::ProgramConfig` branch; round-trips through the
+  walker bit-exactly when placed before END, after a channel header,
+  next to a FIL element, or with every mix-down + CC slot populated.
+  Propagates `Error::PceEncodeInvalid` from `Pce::write` when any
+  wire field overflows its bit-width. The round-160 `push_channel_header`
+  still rejects `IdSynEle::Pce` — PCE has its own bespoke wire shape
+  (with the §4.4.1.1 Note 1 origin alignment) and routes through this
+  dedicated entry point instead.
+- New `Error::PceEncodeInvalid` variant — surfaces caller-side
+  structural bugs that cannot be represented on the Table 4.2 wire
+  (any of the field-width caps listed in the variant's doc-comment).
+- 26 new integration tests (`tests/pce.rs` +17,
+  `tests/raw_data_block_encode.rs` +9) — self-roundtrip + every
+  encoder-rejection branch + a non-zero-origin parser / writer
+  agreement test + a hand-pinned wire-layout assertion that the
+  all-zero PCE produces 6 all-zero bytes (header + counts + flags +
+  6-bit pad + comment length). Crate suite size grows 294 → 320.
+
 ### Added (round 160 — §4.4.2.1 raw_data_block frame assembler)
 
 - `raw_data_block::FrameAssembler` — encoder-side composition primitive

@@ -27,10 +27,14 @@
 //!   matching encoder-side [`raw_data_block::FrameAssembler`] — the
 //!   bit-exact inverse, with a typed push-API
 //!   (`push_channel_header` / `push_channel_body_bits` / `push_fill` /
-//!   `push_data` / `push_end`) that composes the existing per-tool
-//!   writers (`IcsInfo::write`, `SectionData::write`, …) into a
-//!   complete byte stream. PCE encoding is deferred until the
-//!   [`pce::Pce`] writer lands.
+//!   `push_data` / `push_pce` / `push_end`) that composes the existing
+//!   per-tool writers (`IcsInfo::write`, `SectionData::write`, …) into
+//!   a complete byte stream. **Round 165** adds
+//!   [`pce::Pce::write`] (the bit-exact inverse of the round-126
+//!   `Pce::parse`) and the matching
+//!   [`raw_data_block::FrameAssembler::push_pce`] entry point, closing
+//!   the last per-element writer gap in the `raw_data_block()` frame
+//!   assembler.
 //! * The [`ics_info`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.6
 //!   *ics_info()* parser. The first piece of Phase 2
 //!   (channel-element body parsing) — surfaces the window-sequence /

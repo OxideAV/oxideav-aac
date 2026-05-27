@@ -603,6 +603,37 @@ impl FrameAssembler {
         Ok(())
     }
 
+    /// Emit a PCE element per ISO/IEC 14496-3 §4.4.1.1 / Table 4.2
+    /// — the 3-bit `id_syn_ele` (`0b101`) followed by the full
+    /// `program_config_element()` body produced by [`Pce::write`].
+    ///
+    /// The Table 4.2 Note 1 `byte_alignment()` call inside the PCE
+    /// body is *relative to the start of the PCE body* (i.e. the bit
+    /// position immediately after the 3-bit `id_syn_ele`). For the
+    /// standalone-in-`raw_data_block()` form the PCE-relative origin
+    /// is the parser's `origin_bit_offset = 0` (see [`Pce::parse`])
+    /// — since [`Pce::write`] reproduces that exact arithmetic, this
+    /// helper simply passes `0` and the writer's own
+    /// `bit_position` becomes the alignment reference. Bit-exact
+    /// inverse of [`Walker::next_element`]'s
+    /// [`Element::ProgramConfig`] branch.
+    ///
+    /// Returns [`Error::PceEncodeInvalid`] propagated from
+    /// [`Pce::write`] when any wire field overflows its bit-width.
+    pub fn push_pce(&mut self, pce: &Pce) -> Result<()> {
+        self.writer.write_u32(IdSynEle::Pce as u32, 3);
+        // §4.4.1.1 Note 1: the Table 4.2 byte_alignment() is
+        // measured from the start of the PCE body, which is the
+        // current writer position *after* the id_syn_ele prefix.
+        // The Phase 1 standalone-in-raw_data_block parser hands
+        // origin_bit_offset = 0 to `Pce::parse`, which collapses to
+        // absolute byte alignment of the reader. The writer mirrors
+        // that exact collapse by passing 0 here — the alignment
+        // pad inside `Pce::write` will then align to the next
+        // absolute byte boundary of the underlying BitWriter.
+        pce.write(&mut self.writer, 0)
+    }
+
     /// Emit the terminating `END` element per ISO/IEC 14496-3
     /// §4.4.2.1 — the 3-bit `id_syn_ele` (`0b111`), then a pad-to-
     /// byte-boundary that the [`Walker`] mirrors via

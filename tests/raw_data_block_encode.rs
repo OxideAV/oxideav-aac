@@ -7,6 +7,7 @@
 //! both element shape and byte position. A handful of hand-pinned
 //! wire-layout assertions cover the per-element bit layouts directly.
 
+use oxideav_aac::pce::{CcElementSelect, ElementSelect, Pce};
 use oxideav_aac::raw_data_block::{Element, FrameAssembler, IdSynEle, Walker};
 use oxideav_aac::Error;
 use oxideav_core::bits::BitReader;
@@ -575,4 +576,185 @@ fn end_byte_aligns_after_unaligned_body() {
     // bits zero-filled. Top 2 bits of byte1 are the bottom 2 of END,
     // the next 6 are pad.
     assert_eq!(last_byte & 0b0011_1111, 0);
+}
+
+// -------------------------------------------------------------------
+// PCE element (round 165) — push_pce + Walker round-trip
+// -------------------------------------------------------------------
+
+/// Helper: build a small but non-trivial PCE for use in the
+/// `push_pce` round-trip tests.
+fn pce_5_1_fixture() -> Pce {
+    Pce {
+        element_instance_tag: 0x05,
+        object_type: 1,              // LC
+        sampling_frequency_index: 3, // 48000
+        front_elements: vec![
+            ElementSelect {
+                is_cpe: false,
+                tag_select: 0,
+            },
+            ElementSelect {
+                is_cpe: true,
+                tag_select: 0,
+            },
+        ],
+        side_elements: vec![],
+        back_elements: vec![ElementSelect {
+            is_cpe: true,
+            tag_select: 1,
+        }],
+        lfe_element_tag_selects: vec![0],
+        assoc_data_tag_selects: vec![],
+        valid_cc_elements: vec![],
+        mono_mixdown_element_number: None,
+        stereo_mixdown_element_number: None,
+        matrix_mixdown: None,
+        comment_field: b"clean-room".to_vec(),
+    }
+}
+
+#[test]
+fn push_pce_then_end_roundtrips_through_walker() {
+    let pce = pce_5_1_fixture();
+    let mut asm = FrameAssembler::new();
+    asm.push_pce(&pce).unwrap();
+    let frame = asm.push_end();
+
+    let mut br = BitReader::new(&frame);
+    let mut walker = Walker::new(&mut br);
+    match walker.next_element().unwrap() {
+        Some(Element::ProgramConfig(round)) => assert_eq!(round, pce),
+        other => panic!("expected ProgramConfig, got {:?}", other),
+    }
+    assert_eq!(walker.next_element().unwrap(), Some(Element::End));
+    assert_eq!(walker.next_element().unwrap(), None);
+}
+
+#[test]
+fn push_pce_first_byte_starts_with_pce_id_syn_ele() {
+    let pce = pce_5_1_fixture();
+    let mut asm = FrameAssembler::new();
+    asm.push_pce(&pce).unwrap();
+    let frame = asm.push_end();
+    // PCE id_syn_ele = 0b101 — the top three bits of byte 0 must
+    // therefore be `101`.
+    assert_eq!(frame[0] >> 5, 0b101, "leading bits = {:03b}", frame[0] >> 5);
+}
+
+#[test]
+fn push_pce_after_channel_header_roundtrips() {
+    // Place an SCE channel header before the PCE so the PCE's byte
+    // alignment lands at a non-trivial offset relative to frame
+    // start; the walker must still see both elements in order.
+    let pce = pce_5_1_fixture();
+    let mut asm = FrameAssembler::new();
+    asm.push_channel_header(IdSynEle::Sce, 0x0a).unwrap();
+    // Empty channel body (the walker doesn't parse the body, so 0
+    // bits of body is acceptable for this PCE-position test).
+    asm.push_pce(&pce).unwrap();
+    let frame = asm.push_end();
+
+    let mut br = BitReader::new(&frame);
+    let mut walker = Walker::new(&mut br);
+    assert_eq!(
+        walker.next_element().unwrap(),
+        Some(Element::ChannelElement {
+            kind: IdSynEle::Sce,
+            element_instance_tag: 0x0a,
+        })
+    );
+    match walker.next_element().unwrap() {
+        Some(Element::ProgramConfig(round)) => assert_eq!(round, pce),
+        other => panic!("expected ProgramConfig, got {:?}", other),
+    }
+    assert_eq!(walker.next_element().unwrap(), Some(Element::End));
+}
+
+#[test]
+fn push_pce_then_fill_then_end_roundtrips() {
+    let pce = pce_5_1_fixture();
+    let payload = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let mut asm = FrameAssembler::new();
+    asm.push_pce(&pce).unwrap();
+    asm.push_fill(&payload).unwrap();
+    let frame = asm.push_end();
+
+    let mut br = BitReader::new(&frame);
+    let mut walker = Walker::new(&mut br);
+    match walker.next_element().unwrap() {
+        Some(Element::ProgramConfig(round)) => assert_eq!(round, pce),
+        other => panic!("expected ProgramConfig, got {:?}", other),
+    }
+    assert_eq!(
+        walker.next_element().unwrap(),
+        Some(Element::Fill {
+            payload_bytes: payload.len() as u32,
+        })
+    );
+    assert_eq!(walker.next_element().unwrap(), Some(Element::End));
+}
+
+#[test]
+fn push_pce_with_all_mixdowns_and_cc_roundtrips() {
+    let pce = Pce {
+        element_instance_tag: 0,
+        object_type: 1,
+        sampling_frequency_index: 4,
+        front_elements: vec![ElementSelect {
+            is_cpe: true,
+            tag_select: 0,
+        }],
+        side_elements: vec![ElementSelect {
+            is_cpe: false,
+            tag_select: 1,
+        }],
+        back_elements: vec![ElementSelect {
+            is_cpe: true,
+            tag_select: 2,
+        }],
+        lfe_element_tag_selects: vec![3],
+        assoc_data_tag_selects: vec![4, 5],
+        valid_cc_elements: vec![
+            CcElementSelect {
+                is_ind_sw: false,
+                tag_select: 6,
+            },
+            CcElementSelect {
+                is_ind_sw: true,
+                tag_select: 7,
+            },
+        ],
+        mono_mixdown_element_number: Some(0xa),
+        stereo_mixdown_element_number: Some(0xb),
+        matrix_mixdown: Some((2, true)),
+        comment_field: vec![],
+    };
+    let mut asm = FrameAssembler::new();
+    asm.push_pce(&pce).unwrap();
+    let frame = asm.push_end();
+
+    let mut br = BitReader::new(&frame);
+    let mut walker = Walker::new(&mut br);
+    match walker.next_element().unwrap() {
+        Some(Element::ProgramConfig(round)) => assert_eq!(round, pce),
+        other => panic!("expected ProgramConfig, got {:?}", other),
+    }
+    assert_eq!(walker.next_element().unwrap(), Some(Element::End));
+}
+
+#[test]
+fn push_pce_propagates_encode_invalid_for_overflowing_tag() {
+    let mut pce = pce_5_1_fixture();
+    pce.element_instance_tag = 0x10; // 4-bit cap is 0x0f
+    let mut asm = FrameAssembler::new();
+    assert_eq!(asm.push_pce(&pce), Err(Error::PceEncodeInvalid));
+}
+
+#[test]
+fn push_pce_propagates_encode_invalid_for_oversized_comment() {
+    let mut pce = pce_5_1_fixture();
+    pce.comment_field = vec![0; 256]; // 8-bit length cap is 255
+    let mut asm = FrameAssembler::new();
+    assert_eq!(asm.push_pce(&pce), Err(Error::PceEncodeInvalid));
 }
