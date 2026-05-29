@@ -127,6 +127,17 @@
 //!   to LPC) and the §4.6.9.3 `tns_ar_filter` all-pole pass over the
 //!   spectrum are **not** performed; they need the spectral context
 //!   that arrives with the per-AOT IMDCT back-end.
+//! * The [`gain_control_data`] module — ISO/IEC 14496-3 §4.4.6.5 /
+//!   Table 4.12 *gain_control_data()* parser **and** encoder
+//!   primitive (**new in round 183**). Carries the SSR (AOT 3)
+//!   PQF-band gain-control ladder: 2-bit `max_band`, then for each
+//!   `bd ∈ 1..=max_band` a per-window `(3-bit adjust_num) +
+//!   adjust_num × (4-bit alevcode + W(seq, wd)-bit aloccode)` ladder
+//!   with the per-`window_sequence` window count `N ∈ {1, 2, 8, 2}`
+//!   and the per-`(seq, wd)` `aloccode` width table from Table 4.12
+//!   (5 / 4-2 / 2 / 4-5). The §4.6.12 ladder-application loop that
+//!   reconstructs sample-domain attenuation factors is **not**
+//!   performed; it needs the SSR PQF / IMDCT back-end.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -153,9 +164,9 @@
 //!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
 //!   CCE / LFE bodies start with [`ics_info`] then [`section_data`]
 //!   then [`scale_factor_data`] (Phase 2 in progress); the optional
-//!   [`pulse_data`] and [`tns_data`] tools now parse and write; the
-//!   remaining channel-stream tools (`gain_control_data`,
-//!   `spectral_data`) are deferred.
+//!   [`pulse_data`], [`tns_data`], and [`gain_control_data`] tools
+//!   now parse and write; the remaining channel-stream tool
+//!   (`spectral_data`) is deferred.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -164,6 +175,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod adts;
 pub mod asc;
+pub mod gain_control_data;
 pub mod ics_info;
 pub mod pce;
 pub mod pulse_data;

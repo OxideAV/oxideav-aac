@@ -223,6 +223,27 @@ pub enum Error {
     /// advance the bit-reader and rejects the ASC.
     UnsupportedAscExtensionFlag3,
 
+    /// [`crate::gain_control_data::GainControlData::write`] was
+    /// handed an in-memory
+    /// [`crate::gain_control_data::GainControlData`] whose field
+    /// combination cannot be represented on the wire under ISO/IEC
+    /// 14496-3 §4.4.6.5 / Table 4.12. Examples: `max_band > 0x03`
+    /// (2-bit field cap); `bands.len() != max_band` (the outer
+    /// band-loop count must match the dispatched wire value);
+    /// `band.windows.len()` differs from the per-`window_sequence`
+    /// count (1 for `OnlyLong`, 2 for `LongStart` / `LongStop`, 8 for
+    /// `EightShort`); a per-`(bd, wd)` `adjustments.len() > 7`
+    /// (3-bit `adjust_num` field cap); a `GainAdjust::alevcode >
+    /// 0x0f` (4-bit field cap); or a `GainAdjust::aloccode` exceeds
+    /// the per-slot width-derived cap (5 bits for `OnlyLong wd=0`,
+    /// 4 bits for `LongStart / LongStop wd=0`, 2 bits for
+    /// `EightShort` and the `wd=1` slot of `LongStart`, 5 bits for
+    /// the `wd=1` slot of `LongStop`). A conforming AAC SSR encoder
+    /// never builds such a structure; this surfaces caller bugs at
+    /// the boundary between the SSR PQF gain-control psychoacoustic
+    /// stage and bitstream emission.
+    GainControlDataEncodeInvalid,
+
     /// [`crate::scale_factor_data::differentiate`] was handed an
     /// [`crate::scale_factor_data::AbsoluteScaleFactors`] whose
     /// shape or numeric values cannot be encoded back to a
@@ -334,6 +355,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "raw_data_block encode: element field violates a §4.4.2.1 / §4.4.2.5 / §4.4.2.7 wire-field invariant"
+                )
+            }
+            Error::GainControlDataEncodeInvalid => {
+                write!(
+                    f,
+                    "gain_control_data encode: in-memory GainControlData violates a Table 4.12 wire-field invariant"
                 )
             }
             Error::ScaleFactorAccumulatorInvalid => {

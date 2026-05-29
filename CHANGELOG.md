@@ -6,6 +6,56 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 183 — gain_control_data() parser + encoder primitive)
+
+- New `gain_control_data` module implementing the ISO/IEC 14496-3
+  §4.4.6.5 / Table 4.12 `gain_control_data()` syntax element used by
+  the SSR (Scalable Sample Rate, AOT 3) gain-control tool:
+  - `GainControlData { max_band: u8, bands: Vec<GainBand> }` —
+    parsed Table 4.12 block, with `bands.len() == max_band` mapping
+    the per-spec `bd ∈ 1..=max_band` band index onto `bands[bd - 1]`.
+  - `GainBand { windows: Vec<GainWindow> }` — per-`bd` collection
+    whose length matches the per-`window_sequence` window count
+    (1 for `OnlyLong`, 2 for `LongStart` / `LongStop`, 8 for
+    `EightShort`).
+  - `GainWindow { adjustments: Vec<GainAdjust> }` — per-`(bd, wd)`
+    ladder; `adjustments.len()` is the wire `adjust_num` value
+    (`0..=7`).
+  - `GainAdjust { alevcode: u8, aloccode: u8 }` — single ladder
+    entry with the 4-bit `alevcode` and the per-slot-width
+    `aloccode`.
+- `GainControlData::parse(reader, window_sequence)` walks the
+  Table 4.12 syntax: 2-bit `max_band`, then for each `bd` in
+  `1..=max_band` and each `wd` in `0..N(window_sequence)` a 3-bit
+  `adjust_num` followed by `adjust_num` `(4-bit alevcode,
+  W(seq, wd)-bit aloccode)` records.
+- `GainControlData::write(writer, window_sequence)` is the bit-exact
+  inverse; caller-side field violations surface as
+  `Error::GainControlDataEncodeInvalid`.
+- Public helpers `num_windows(window_sequence)` and
+  `aloccode_bits(window_sequence, wd)` pin Table 4.12's per-`seq`
+  loop count and the per-`(seq, wd)` `aloccode` width (5 / 4-2 /
+  2-2 / 4-5 across `OnlyLong` / `LongStart` / `EightShort` /
+  `LongStop`).
+- Public field-width constants `MAX_BAND_BITS = 2`,
+  `ADJUST_NUM_BITS = 3`, `ALEVCODE_BITS = 4` and the cap constants
+  `MAX_BAND_CAP = 0x03`, `MAX_ADJUST_NUM = 0x07`,
+  `MAX_ALEVCODE = 0x0f`.
+- New `Error::GainControlDataEncodeInvalid` variant for caller-side
+  field-overflow / shape-mismatch on the encoder.
+- 20 integration tests in `tests/gain_control_data.rs` covering the
+  per-`window_sequence` `num_windows` and `aloccode_bits` lookup
+  tables, the `max_band == 0` collapsed body byte layout, a hand-
+  pinned `OnlyLong` wire-bit assertion, self-roundtrip across the
+  four window sequences (including a max-everything `EightShort`
+  with `max_band = 3` and every per-slot adjustment maxed out), six
+  encoder-side overflow rejections (max-band, band-count mismatch,
+  window-count mismatch, adjust-num overflow, alevcode overflow,
+  aloccode overflow at the 5-bit / 2-bit slots), an
+  `UnexpectedEnd` mid-record truncation test, and a trailing-bit
+  non-consumption check confirming the parser does not over-read
+  past the Table 4.12 body. Suite size grows 333 → 353.
+
 ### Added (round 177 — GASpecificConfig extensionFlag body + ER-AOT epConfig)
 
 - `asc::GaSpecificConfig::extension_body: Option<GaExtensionBody>` —

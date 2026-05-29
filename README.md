@@ -3,14 +3,49 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 177)
+## Status (round 183)
 
-**Phase 1 complete + Phase 2 in progress + five tool-level encoder
+**Phase 1 complete + Phase 2 in progress + six tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
 pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.1.1
 `program_config_element()` writer + the §4.4.1 / Table 4.1
 `extensionFlag` body and the Table 1.15 `epConfig` field for every
-General Audio ER object type.** Round 177 closes the two
+General Audio ER object type + the §4.4.6.5 / Table 4.12
+`gain_control_data()` SSR tool.** Round 183 closes the SSR-side
+gap by landing the §4.4.6.5 / Table 4.12 `gain_control_data()`
+parser + encoder primitive (`GainControlData::parse` /
+`GainControlData::write`) — the sixth tool-level encode-side syntax
+writer in the crate. The wire layout is a 2-bit `max_band` followed
+by, for each `bd ∈ 1..=max_band` and each `wd ∈ 0..N(window_sequence)`,
+a 3-bit `adjust_num` then `adjust_num` `(4-bit alevcode, W(seq,
+wd)-bit aloccode)` records. The per-`window_sequence` window count
+`N` (1 / 2 / 8 / 2 for `OnlyLong` / `LongStart` / `EightShort` /
+`LongStop`) and the per-`(seq, wd)` `aloccode` width table
+(5 / 4-2 / 2 / 4-5) are exposed as the public helpers
+`gain_control_data::num_windows` and `aloccode_bits` so downstream
+callers can compute the body size without re-deriving Table 4.12.
+A new `Error::GainControlDataEncodeInvalid` variant surfaces
+caller-side wire-field violations: `max_band > 3`, `bands.len() !=
+max_band`, a per-`bd` `windows.len()` that disagrees with the
+surrounding `window_sequence`, a per-`(bd, wd)` `adjustments.len()
+> 7`, an `alevcode > 0x0f`, or an `aloccode` exceeding the per-slot
+width cap. 20 new integration tests cover the `num_windows` /
+`aloccode_bits` lookup tables, the `max_band == 0` body byte
+layout, a hand-pinned `OnlyLong` wire-bit assertion, self-roundtrip
+across the four window sequences (including a max-everything
+`EightShort` with `max_band = 3` and every per-slot adjustment
+maxed out), six encoder-side overflow rejections (max-band,
+band-count mismatch, window-count mismatch, adjust-num overflow,
+alevcode overflow, aloccode overflow at the 5-bit / 2-bit slots),
+an `UnexpectedEnd` mid-record truncation test, and a trailing-bit
+non-consumption check confirming the parser does not over-read
+past the Table 4.12 body. Suite size grows 333 → 353. The §4.6.12
+ladder-application loop that reconstructs sample-domain
+attenuation factors from the `(alevcode, aloccode)` pairs is
+**not** performed here — it needs the SSR PQF / IMDCT back-end,
+which is not part of Phase 2.
+
+Round 177 closes the two
 configuration-layer Phase 1 gaps that the previous rounds had left as
 explicit deferrals: the `GASpecificConfig` `extensionFlag == 1`
 subtree (Table 4.1: AOT 22's 5-bit `numOfSubFrame` + 11-bit
@@ -377,9 +412,14 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
 
 ## What Phase 2 still omits
 
-- The remaining channel-stream tools after `scale_factor_data()`:
-  `gain_control_data()` and `spectral_data()`. The walker therefore
-  still cannot iterate past a single channel-element body.
+- The remaining channel-stream tool after `scale_factor_data()`:
+  `spectral_data()`. The walker therefore still cannot iterate past
+  a single channel-element body.
+- The §4.6.12 `gain_control_data()` ladder-application loop. The
+  Table 4.12 record is parseable / writable bit-for-bit, but
+  reconstructing sample-domain attenuation factors from the
+  `(alevcode, aloccode)` pairs requires the SSR PQF / IMDCT back-end
+  (still owed).
 - The `scale_factor_data()` error-resilient branch
   (`aacScalefactorDataResilienceFlag == 1` → RVLC with
   `rev_global_gain`, `length_of_rvlc_sf`, `sf_concealment`,
