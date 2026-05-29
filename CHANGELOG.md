@@ -6,6 +6,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 177 — GASpecificConfig extensionFlag body + ER-AOT epConfig)
+
+- `asc::GaSpecificConfig::extension_body: Option<GaExtensionBody>` —
+  parsed body of the `if (extensionFlag)` branch of `GASpecificConfig`
+  per ISO/IEC 14496-3 §4.4.1 / Table 4.1. Populated when the
+  `extensionFlag` bit (which precedes the layerNr in Table 4.1) was
+  `1` on the wire.
+- `asc::GaExtensionBody { bsac_layer, resilience, extension_flag3 }`
+  carrier struct:
+  - `bsac_layer: Option<BsacLayerSpec { num_of_sub_frame: u8 (5 bit),
+    layer_length: u16 (11 bit) }>` — emitted only when the
+    surrounding `audioObjectType == 22` (ER BSAC).
+  - `resilience: Option<AacResilienceFlags { section_data,
+    scalefactor_data, spectral_data }>` — emitted only when the
+    surrounding `audioObjectType ∈ {17, 19, 20, 23}` (ER AAC LC /
+    ER AAC LTP / ER AAC scalable / ER AAC LD). Stores the three
+    `aac*ResilienceFlag` bits used by the §4.4.6 RVLC scalefactor
+    branch + the §4.4.6 HCR spectral branch in downstream rounds.
+  - `extension_flag3: bool` — always present at the tail of the
+    extension body. ISO/IEC 14496-3:2009 reserves the body behind
+    this flag with the comment "tbd in version 3"; Phase 1
+    surfaces the bit but rejects the body itself with the new
+    `Error::UnsupportedAscExtensionFlag3` when the flag is `1`.
+- `asc::AudioSpecificConfig::ep_config: Option<u8>` — Table 1.15
+  trailing 2-bit `epConfig` field emitted for AOTs ∈
+  {17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 39}. Phase 1 supports
+  `epConfig ∈ {0, 1}` (no inline `ErrorProtectionSpecificConfig()`
+  body); `epConfig == 2 || 3` (which mandate `EPSpecificConfig()`
+  parsing) surface as the new `Error::UnsupportedEpConfig(u8)`.
+- New `Error::UnsupportedEpConfig(u8)` variant carrying the literal
+  2-bit `epConfig` value as read from the wire.
+- New `Error::UnsupportedAscExtensionFlag3` variant.
+- 13 new integration tests in `tests/asc.rs` covering: AAC-LC
+  regression (extension body / ep_config both `None`); ER AAC LC
+  with the full resilience triplet + epConfig 0; ER AAC LC with
+  epConfig 1 accepted; ER AAC LC rejection at epConfig 2 and 3;
+  ER BSAC (AOT 22) `numOfSubFrame` + `layer_length` pair with an
+  inline PCE; ER AAC LD (AOT 23) resilience triplet only; ER AAC
+  scalable (AOT 20) covering BOTH the layerNr branch AND the
+  resilience triplet in the correct Table 4.1 order; ER TwinVQ
+  (AOT 21) where the extension body collapses to `extensionFlag3`
+  + `epConfig` only; `extensionFlag3 == 1` rejection; truncation
+  inside the resilience body and at the `epConfig` field; and a
+  hand-pinned bit-position assertion (a 22-bit ER AAC LC ASC).
+  Suite size grows 320 → 333 tests.
+- Module-level documentation in `src/asc.rs` rewritten to reflect
+  the new coverage and to remove the round-126 "What is not parsed
+  yet" entries that this round closes (`epConfig` and the
+  `extensionFlag` body); the `syncExtensionType == 0x2b7` implicit-
+  SBR probe and the FIL-extension-payload implicit path remain
+  listed as deferred.
+
 ### Added (round 165 — `Pce::write` + `FrameAssembler::push_pce`)
 
 - `pce::Pce::write(writer, origin_bit_offset)` — encoder primitive for

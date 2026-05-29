@@ -14,6 +14,16 @@
 //!   20, 21, 22, 23) and the hierarchical SBR (AOT 5) / PS (AOT 29)
 //!   outer-wrapper unwrap. Embeds an inline
 //!   [`pce::Pce`](pce::Pce) when `channelConfiguration == 0`.
+//!   **Round 177** extends the GA body with the `extensionFlag == 1`
+//!   subtree (Table 4.1: AOT 22's `numOfSubFrame` + `layer_length`;
+//!   the AOT-17 / 19 / 20 / 23 resilience triplet; the
+//!   always-present `extensionFlag3` tail bit) and the Table 1.15
+//!   trailing `epConfig` 2-bit field for every ER AOT in
+//!   {17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 39}. `epConfig == 2`
+//!   or `3` (which mandate `ErrorProtectionSpecificConfig()` parsing)
+//!   surface as [`Error::UnsupportedEpConfig`]; an `extensionFlag3
+//!   == 1` body — whose layout is reserved by the spec — surfaces as
+//!   [`Error::UnsupportedAscExtensionFlag3`].
 //! * The [`pce`] module — ISO/IEC 14496-3 §4.4.1.1 *program_config_element*
 //!   parser. Used both standalone (inside [`raw_data_block`]) and inline
 //!   inside [`asc`].

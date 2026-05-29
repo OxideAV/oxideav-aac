@@ -3,12 +3,42 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 165)
+## Status (round 177)
 
 **Phase 1 complete + Phase 2 in progress + five tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
 pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.1.1
-`program_config_element()` writer.** Round 165 lands
+`program_config_element()` writer + the §4.4.1 / Table 4.1
+`extensionFlag` body and the Table 1.15 `epConfig` field for every
+General Audio ER object type.** Round 177 closes the two
+configuration-layer Phase 1 gaps that the previous rounds had left as
+explicit deferrals: the `GASpecificConfig` `extensionFlag == 1`
+subtree (Table 4.1: AOT 22's 5-bit `numOfSubFrame` + 11-bit
+`layer_length`; the AOT-17 / 19 / 20 / 23 `aacSection /
+Scalefactor / Spectral DataResilienceFlag` triplet; the
+always-present `extensionFlag3` tail bit, whose body is reserved by
+the spec as "tbd in version 3" and is rejected via the new
+`Error::UnsupportedAscExtensionFlag3`) and the Table 1.15 trailing
+2-bit `epConfig` field for ER object types in {17, 19, 20, 21, 22,
+23, 24, 25, 26, 27, 39}. `epConfig ∈ {0, 1}` are accepted and
+surfaced as `AudioSpecificConfig::ep_config = Some(_)`; `epConfig ==
+2` or `epConfig == 3` (which mandate the inline
+`ErrorProtectionSpecificConfig()` body that Phase 1 does not parse)
+surface as `Error::UnsupportedEpConfig(u8)`. New carrier types in
+the public API: `GaExtensionBody`, `BsacLayerSpec`,
+`AacResilienceFlags`. 13 new integration tests in `tests/asc.rs`
+cover the resilience triplet for ER AAC LC (AOT 17), epConfig 0
+through 3 round-trip / rejection, ER BSAC (AOT 22) with the
+`numOfSubFrame` pair and an inline PCE, ER AAC LD (AOT 23) with
+the resilience triplet only, ER AAC scalable (AOT 20) hitting both
+the `layerNr` branch AND the resilience triplet in the correct
+Table 4.1 order, ER TwinVQ (AOT 21) where the extension body
+collapses to `extensionFlag3` + `epConfig` only, the
+`extensionFlag3 == 1` rejection, truncation inside the resilience
+body and at the `epConfig` field, and a hand-pinned bit-position
+assertion (a 22-bit ER AAC LC ASC). Suite size grows 320 → 333.
+
+Round 165 had landed
 [`pce::Pce::write`] — the encoder-side counterpart of the round-126
 `Pce::parse`, emitting the full Table 4.2 wire layout (4-bit
 `element_instance_tag` + 2-bit `object_type` + 4-bit
@@ -378,12 +408,13 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
 - All decode / encode runtime wiring. The `register()` entry point
   installs no `Decoder` or `Encoder` into the runtime context yet,
   and the factory functions return `Error::NotImplemented`.
-- The `GASpecificConfig` `extensionFlag == 1` body for ER AOTs
-  (numOfSubFrame / layer_length / `aacSectionDataResilienceFlag` /
-  `aacScalefactorDataResilienceFlag` /
-  `aacSpectralDataResilienceFlag` / `extensionFlag3`).
-- `epConfig` for ER object types — the ASC parser stops at the end
-  of the GA body.
+- The `extensionFlag3 == 1` body inside `GASpecificConfig` (Table 4.1
+  reserves it as "tbd in version 3"; round 177 surfaces the bit but
+  rejects the body via `Error::UnsupportedAscExtensionFlag3`).
+- The `ErrorProtectionSpecificConfig()` body that follows when
+  `epConfig == 2` or `epConfig == 3` (round 177 rejects via
+  `Error::UnsupportedEpConfig(u8)` rather than silently returning a
+  partial ASC).
 - The `syncExtensionType == 0x2b7` trailing-bits probe at the end
   of Table 1.15 (implicit-SBR signalling detection).
 - LATM/LOAS transport (ISO/IEC 14496-3 §1.7.3).

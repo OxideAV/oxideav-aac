@@ -23,10 +23,6 @@
 //!
 //! ## What is *not* parsed yet
 //!
-//! * `epConfig` for ER object types — the parser stops at the end
-//!   of the GA body and returns the ASC without reading the
-//!   `epConfig` 2-bit field that follows for AOTs 17/19/20/21/22/23
-//!   /24/25/26/27/39. A subsequent round will extend the body.
 //! * The trailing `syncExtensionType == 0x2b7` sync probe used for
 //!   implicit SBR signalling (last part of Table 1.15). Implicit
 //!   SBR signalling is the dominant form for ADTS HE-AAC v1 and
@@ -37,6 +33,27 @@
 //!   information — the decoder must look at the FIL stream. Phase 1
 //!   correctly records `sbr_present = false` / `ps_present = false`
 //!   for that case because no ASC bit said otherwise.
+//!
+//! ## What round 177 adds
+//!
+//! * `GASpecificConfig` `extensionFlag == 1` body (Table 4.1):
+//!   AOT 22 (ER BSAC) emits a 5-bit `numOfSubFrame` + 11-bit
+//!   `layer_length`; AOTs 17 / 19 / 20 / 23 emit the 1-bit
+//!   `aacSectionDataResilienceFlag` + 1-bit
+//!   `aacScalefactorDataResilienceFlag` + 1-bit
+//!   `aacSpectralDataResilienceFlag` triplet; every AOT closes the
+//!   body with a 1-bit `extensionFlag3` (the Version 3 body behind it
+//!   is reserved per the spec's own "tbd in version 3" comment, so the
+//!   bit is surfaced but the body is rejected with
+//!   [`Error::UnsupportedAscExtensionFlag3`] when set).
+//! * `epConfig` for ER object types (Table 1.15) — the 2-bit
+//!   `epConfig` field that follows the AOT body for AOTs 17, 19, 20,
+//!   21, 22, 23, 24, 25, 26, 27, 39. `epConfig == 2` or
+//!   `epConfig == 3` further triggers the
+//!   `ErrorProtectionSpecificConfig()` body, which Phase 1 does not
+//!   parse — the ASC parser surfaces
+//!   [`Error::UnsupportedEpConfig`] in that case rather than
+//!   silently returning a partial ASC.
 
 use oxideav_core::bits::BitReader;
 
@@ -54,6 +71,19 @@ const GA_AOTS: &[u8] = &[1, 2, 3, 4, 6, 7, 17, 19, 20, 21, 22, 23];
 /// before dispatching to the inner body.
 const SBR_AOT: u8 = 5;
 const PS_AOT: u8 = 29;
+
+/// AOTs whose `GASpecificConfig` extension-flag body emits the 5-bit
+/// `numOfSubFrame` + 11-bit `layer_length` pair (Table 4.1).
+const GA_EXTENSION_NUM_OF_SUBFRAME_AOTS: &[u8] = &[22];
+
+/// AOTs whose `GASpecificConfig` extension-flag body emits the three
+/// error-resilience flags (Table 4.1).
+const GA_EXTENSION_RESILIENCE_AOTS: &[u8] = &[17, 19, 20, 23];
+
+/// AOTs whose ASC trailing body carries the 2-bit `epConfig` field
+/// (Table 1.15 outer `switch (audioObjectType)` for the ER object
+/// types).
+const EP_CONFIG_AOTS: &[u8] = &[17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 39];
 
 /// Length of the IMDCT frame in samples for a GA AOT, controlled by
 /// `frameLengthFlag`. ISO/IEC 14496-3 §4.4.1 semantics.
@@ -95,6 +125,55 @@ pub struct GaSpecificConfig {
     pub pce: Option<Pce>,
     /// `layerNr` (3 bits, only present when AOT ∈ {6, 20}).
     pub layer_nr: Option<u8>,
+    /// Parsed extension-flag body (only populated when
+    /// `extension_flag == true`).
+    pub extension_body: Option<GaExtensionBody>,
+}
+
+/// Parsed body of the `if (extensionFlag)` branch of `GASpecificConfig`
+/// (Table 4.1). Carries AOT-dependent subfields plus the always-present
+/// `extensionFlag3` bit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GaExtensionBody {
+    /// `numOfSubFrame` (5 bits) + `layer_length` (11 bits). Only
+    /// present when `audioObjectType == 22` (ER BSAC).
+    pub bsac_layer: Option<BsacLayerSpec>,
+    /// Error-resilience triplet. Only present when
+    /// `audioObjectType ∈ {17, 19, 20, 23}` (ER AAC LC / ER AAC LTP /
+    /// ER AAC scalable / ER AAC LD).
+    pub resilience: Option<AacResilienceFlags>,
+    /// `extensionFlag3` (1 bit). Always present at the tail of the
+    /// extension-flag body. ISO/IEC 14496-3:2009 reserves the body
+    /// behind this flag with the comment "tbd in version 3"; Phase 1
+    /// surfaces the bit but rejects the body itself with
+    /// [`Error::UnsupportedAscExtensionFlag3`] when the flag is set.
+    pub extension_flag3: bool,
+}
+
+/// `numOfSubFrame` + `layer_length` pair from Table 4.1, only emitted
+/// when the surrounding `audioObjectType == 22` (ER BSAC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BsacLayerSpec {
+    /// 5-bit `numOfSubFrame` field.
+    pub num_of_sub_frame: u8,
+    /// 11-bit `layer_length` field.
+    pub layer_length: u16,
+}
+
+/// `aacSection / Scalefactor / Spectral DataResilienceFlag` triplet from
+/// Table 4.1, only emitted when the surrounding `audioObjectType ∈
+/// {17, 19, 20, 23}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AacResilienceFlags {
+    /// `aacSectionDataResilienceFlag`. Routes `section_data()` through
+    /// the §4.4.6 RVLC branch in a downstream round.
+    pub section_data: bool,
+    /// `aacScalefactorDataResilienceFlag`. Routes `scale_factor_data()`
+    /// through the §4.4.6 RVLC branch in a downstream round.
+    pub scalefactor_data: bool,
+    /// `aacSpectralDataResilienceFlag`. Routes `spectral_data()` through
+    /// the §4.4.6 HCR / reordered branch in a downstream round.
+    pub spectral_data: bool,
 }
 
 /// Parsed `AudioSpecificConfig`.
@@ -140,6 +219,14 @@ pub struct AudioSpecificConfig {
     /// populated; for other AOTs (which Phase 1 rejects with
     /// [`Error::UnsupportedAot`]) this is never returned.
     pub ga_body: GaSpecificConfig,
+    /// `epConfig` (2 bits) for the ER object types listed in the
+    /// Table 1.15 outer `switch (audioObjectType)` (AOTs 17, 19, 20,
+    /// 21, 22, 23, 24, 25, 26, 27, 39). `None` for every other AOT.
+    /// When the field is `2` or `3`, the spec mandates parsing the
+    /// trailing `ErrorProtectionSpecificConfig()` body — Phase 1
+    /// does **not** parse that body and surfaces
+    /// [`Error::UnsupportedEpConfig`] at the call site.
+    pub ep_config: Option<u8>,
 }
 
 impl AudioSpecificConfig {
@@ -210,6 +297,20 @@ impl AudioSpecificConfig {
             origin_bit_offset,
         )?;
 
+        // Table 1.15 outer `switch (audioObjectType)` — `epConfig`
+        // for ER object types. `epConfig == 2 || epConfig == 3`
+        // triggers the `ErrorProtectionSpecificConfig()` body which
+        // Phase 1 does not parse.
+        let ep_config = if EP_CONFIG_AOTS.contains(&effective_aot) {
+            let v = read_u8(reader, 2)?;
+            if v == 2 || v == 3 {
+                return Err(Error::UnsupportedEpConfig(v));
+            }
+            Some(v)
+        } else {
+            None
+        };
+
         Ok(AudioSpecificConfig {
             outer_aot,
             aot: effective_aot,
@@ -222,6 +323,7 @@ impl AudioSpecificConfig {
             extension_sample_rate: ext_rate,
             extension_channel_configuration: ext_chan_cfg,
             ga_body,
+            ep_config,
         })
     }
 
@@ -281,10 +383,12 @@ fn parse_ga_specific_config(
         None
     };
 
-    // Phase 1 stops after layerNr. The remainder of Table 4.1
-    // (numOfSubFrame/layer_length for AOT 22; the ER resilience
-    // flags + extensionFlag3 chain for AOTs 17/19/20/21/22/23) is
-    // deferred to a follow-up round once consumers need it.
+    let extension_body = if extension_flag {
+        Some(parse_ga_extension_body(reader, aot)?)
+    } else {
+        None
+    };
+
     Ok(GaSpecificConfig {
         frame_length,
         depends_on_core_coder,
@@ -292,6 +396,49 @@ fn parse_ga_specific_config(
         extension_flag,
         pce,
         layer_nr,
+        extension_body,
+    })
+}
+
+/// Parse the `if (extensionFlag)` body of `GASpecificConfig()` per
+/// Table 4.1. Subfield gating mirrors the AOT lists in the spec
+/// listing exactly: `numOfSubFrame` / `layer_length` only for
+/// `audioObjectType == 22`; the resilience triplet only for
+/// `audioObjectType ∈ {17, 19, 20, 23}`; `extensionFlag3` always.
+fn parse_ga_extension_body(reader: &mut BitReader<'_>, aot: u8) -> Result<GaExtensionBody> {
+    let bsac_layer = if GA_EXTENSION_NUM_OF_SUBFRAME_AOTS.contains(&aot) {
+        let num_of_sub_frame = read_u8(reader, 5)?;
+        let layer_length = read_u32(reader, 11)? as u16;
+        Some(BsacLayerSpec {
+            num_of_sub_frame,
+            layer_length,
+        })
+    } else {
+        None
+    };
+
+    let resilience = if GA_EXTENSION_RESILIENCE_AOTS.contains(&aot) {
+        let section_data = read_bit(reader)?;
+        let scalefactor_data = read_bit(reader)?;
+        let spectral_data = read_bit(reader)?;
+        Some(AacResilienceFlags {
+            section_data,
+            scalefactor_data,
+            spectral_data,
+        })
+    } else {
+        None
+    };
+
+    let extension_flag3 = read_bit(reader)?;
+    if extension_flag3 {
+        return Err(Error::UnsupportedAscExtensionFlag3);
+    }
+
+    Ok(GaExtensionBody {
+        bsac_layer,
+        resilience,
+        extension_flag3,
     })
 }
 

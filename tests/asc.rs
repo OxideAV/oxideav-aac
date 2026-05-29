@@ -2,7 +2,7 @@
 //! ASC buffers constructed via `oxideav_core::bits::BitWriter` so
 //! the tests do not depend on any external AAC encoder.
 
-use oxideav_aac::asc::{AudioSpecificConfig, FrameLength};
+use oxideav_aac::asc::{AacResilienceFlags, AudioSpecificConfig, BsacLayerSpec, FrameLength};
 use oxideav_aac::Error;
 use oxideav_core::bits::BitWriter;
 
@@ -261,4 +261,324 @@ fn scalable_aot_6_has_layer_nr() {
     let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
     assert_eq!(asc.aot, 6);
     assert_eq!(asc.ga_body.layer_nr, Some(5));
+}
+
+// ---------------------------------------------------------------------
+// Round 177 — GASpecificConfig extensionFlag body + epConfig coverage.
+// ---------------------------------------------------------------------
+
+#[test]
+fn lc_aac_default_has_no_extension_body_and_no_ep_config() {
+    // Regression: AOT 2 (LC) has extension_flag = 0 (shall be 0 per
+    // Table 4.1 for AOTs 1, 2, 3, 4, 6, 7) and is not in the
+    // EP_CONFIG_AOTS list, so both new fields stay `None`.
+    let buf = build_lc_asc(4, 2);
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert!(asc.ga_body.extension_body.is_none());
+    assert_eq!(asc.ep_config, None);
+}
+
+/// Build an ER AOT 17 (ER AAC LC) ASC with the resilience triplet
+/// + extensionFlag3 = 0 + epConfig.
+fn build_er_aac_lc_asc(
+    sfi: u8,
+    chan_cfg: u8,
+    section: bool,
+    scalefactor: bool,
+    spectral: bool,
+    ep_config: u32,
+) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+    bw.write_u32(17, 5); // outer AOT = ER AAC LC
+    bw.write_u32(sfi as u32, 4);
+    bw.write_u32(chan_cfg as u32, 4);
+    // GASpecificConfig
+    bw.write_bit(false); // frameLengthFlag
+    bw.write_bit(false); // dependsOnCoreCoder
+    bw.write_bit(true); // extensionFlag = 1 (shall be 1 for ER AOTs)
+                        // Extension body: no numOfSubFrame (AOT != 22),
+                        // resilience triplet for AOTs ∈ {17,19,20,23}.
+    bw.write_bit(section);
+    bw.write_bit(scalefactor);
+    bw.write_bit(spectral);
+    bw.write_bit(false); // extensionFlag3
+                         // Tail epConfig — 2 bits.
+    bw.write_u32(ep_config, 2);
+    bw.finish()
+}
+
+#[test]
+fn er_aac_lc_parses_resilience_triplet_and_ep_config() {
+    let buf = build_er_aac_lc_asc(4, 2, true, false, true, 0);
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(asc.outer_aot, 17);
+    assert_eq!(asc.aot, 17);
+    assert!(asc.ga_body.extension_flag);
+    let body = asc.ga_body.extension_body.as_ref().unwrap();
+    assert_eq!(
+        body.resilience,
+        Some(AacResilienceFlags {
+            section_data: true,
+            scalefactor_data: false,
+            spectral_data: true,
+        })
+    );
+    assert!(body.bsac_layer.is_none());
+    assert!(!body.extension_flag3);
+    assert_eq!(asc.ep_config, Some(0));
+}
+
+#[test]
+fn er_aac_lc_ep_config_one_is_accepted() {
+    // epConfig == 1 routes via the EP class mapping table without an
+    // inline ErrorProtectionSpecificConfig body.
+    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 1);
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(asc.ep_config, Some(1));
+}
+
+#[test]
+fn er_aac_lc_ep_config_two_is_rejected() {
+    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 2);
+    assert_eq!(
+        AudioSpecificConfig::parse(&buf),
+        Err(Error::UnsupportedEpConfig(2))
+    );
+}
+
+#[test]
+fn er_aac_lc_ep_config_three_is_rejected() {
+    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 3);
+    assert_eq!(
+        AudioSpecificConfig::parse(&buf),
+        Err(Error::UnsupportedEpConfig(3))
+    );
+}
+
+#[test]
+fn er_bsac_aot_22_has_num_of_sub_frame_and_layer_length() {
+    // AOT 22 (ER BSAC) — extension body adds 5-bit numOfSubFrame +
+    // 11-bit layer_length BEFORE the resilience triplet is *not*
+    // emitted (Table 4.1 gates the resilience triplet on AOTs
+    // {17, 19, 20, 23} which does not include 22).
+    let mut bw = BitWriter::new();
+    bw.write_u32(22, 5); // outer AOT = ER BSAC
+    bw.write_u32(4, 4); // sfi = 44100
+    bw.write_u32(0, 4); // chan_cfg = 0 (BSAC carries an inline PCE)
+                        // GASpecificConfig
+    bw.write_bit(false); // frameLengthFlag
+    bw.write_bit(false); // dependsOnCoreCoder
+    bw.write_bit(true); // extensionFlag = 1
+                        // Inline PCE because chan_cfg == 0.
+    bw.write_u32(0, 4); // element_instance_tag
+    bw.write_u32(1, 2); // object_type
+    bw.write_u32(4, 4); // sampling_frequency_index
+    bw.write_u32(0, 4); // n_front
+    bw.write_u32(0, 4); // n_side
+    bw.write_u32(0, 4); // n_back
+    bw.write_u32(0, 2); // n_lfe
+    bw.write_u32(0, 3); // n_assoc
+    bw.write_u32(0, 4); // n_cc
+    bw.write_bit(false); // mono_mixdown_present
+    bw.write_bit(false); // stereo_mixdown_present
+    bw.write_bit(false); // matrix_mixdown_present
+    bw.align_to_byte_zero(); // PCE byte_alignment()
+    bw.write_u32(0, 8); // comment_field_bytes
+                        // Extension body:
+    bw.write_u32(7, 5); // numOfSubFrame
+    bw.write_u32(0x123, 11); // layer_length
+    bw.write_bit(false); // extensionFlag3
+                         // epConfig = 0.
+    bw.write_u32(0, 2);
+    let buf = bw.finish();
+
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    let body = asc.ga_body.extension_body.as_ref().unwrap();
+    assert_eq!(
+        body.bsac_layer,
+        Some(BsacLayerSpec {
+            num_of_sub_frame: 7,
+            layer_length: 0x123,
+        })
+    );
+    // AOT 22 is NOT in the resilience triplet list.
+    assert!(body.resilience.is_none());
+    assert!(!body.extension_flag3);
+    assert_eq!(asc.ep_config, Some(0));
+}
+
+#[test]
+fn er_aac_ld_aot_23_emits_resilience_triplet_only() {
+    // AOT 23 (ER AAC LD) — extension body emits the resilience
+    // triplet but NOT the numOfSubFrame pair (which is AOT 22 only).
+    let mut bw = BitWriter::new();
+    bw.write_u32(23, 5);
+    bw.write_u32(4, 4);
+    bw.write_u32(1, 4);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(true); // extensionFlag = 1
+    bw.write_bit(true); // section
+    bw.write_bit(true); // scalefactor
+    bw.write_bit(false); // spectral
+    bw.write_bit(false); // extensionFlag3
+    bw.write_u32(0, 2); // epConfig
+    let buf = bw.finish();
+
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    let body = asc.ga_body.extension_body.as_ref().unwrap();
+    assert!(body.bsac_layer.is_none());
+    assert_eq!(
+        body.resilience,
+        Some(AacResilienceFlags {
+            section_data: true,
+            scalefactor_data: true,
+            spectral_data: false,
+        })
+    );
+    assert_eq!(asc.ep_config, Some(0));
+}
+
+#[test]
+fn er_aac_scalable_aot_20_emits_both_layer_nr_and_resilience() {
+    // AOT 20 sits in BOTH the layerNr list (AOTs {6, 20}) and the
+    // resilience-triplet list ({17, 19, 20, 23}). Verifies the
+    // ordering: layerNr is BEFORE the extension body in Table 4.1.
+    let mut bw = BitWriter::new();
+    bw.write_u32(20, 5);
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(true); // extensionFlag = 1
+    bw.write_u32(3, 3); // layerNr
+                        // Extension body resilience triplet.
+    bw.write_bit(false); // section
+    bw.write_bit(true); // scalefactor
+    bw.write_bit(false); // spectral
+    bw.write_bit(false); // extensionFlag3
+    bw.write_u32(1, 2); // epConfig
+    let buf = bw.finish();
+
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(asc.ga_body.layer_nr, Some(3));
+    let body = asc.ga_body.extension_body.as_ref().unwrap();
+    assert!(body.bsac_layer.is_none());
+    assert_eq!(
+        body.resilience,
+        Some(AacResilienceFlags {
+            section_data: false,
+            scalefactor_data: true,
+            spectral_data: false,
+        })
+    );
+    assert_eq!(asc.ep_config, Some(1));
+}
+
+#[test]
+fn er_aac_extension_flag3_set_is_rejected() {
+    // extensionFlag3 == 1 means "tbd in version 3" — the body
+    // layout is undefined, so the parser cannot continue.
+    let mut bw = BitWriter::new();
+    bw.write_u32(17, 5);
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(true);
+    bw.write_bit(false); // section
+    bw.write_bit(false); // scalefactor
+    bw.write_bit(false); // spectral
+    bw.write_bit(true); // extensionFlag3 = 1 → reject
+    let buf = bw.finish();
+
+    assert_eq!(
+        AudioSpecificConfig::parse(&buf),
+        Err(Error::UnsupportedAscExtensionFlag3)
+    );
+}
+
+#[test]
+fn er_aac_lc_truncated_in_resilience_body_is_unexpected_end() {
+    // Build a complete frame, then truncate the buffer mid-resilience.
+    // Layout reaches bit 16 (AOT/sfi/chan/3 GA flags) — we cut to a
+    // single byte so only the 5-bit AOT + 3 bits of sfi survive.
+    let mut bw = BitWriter::new();
+    bw.write_u32(17, 5);
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(true); // extensionFlag
+    bw.write_bit(true); // section
+    bw.write_bit(true); // scalefactor
+    bw.write_bit(true); // spectral
+    bw.write_bit(false); // extensionFlag3
+    bw.write_u32(0, 2); // epConfig
+    let mut buf = bw.finish();
+    buf.truncate(2); // chops out everything past bit 16 — mid extension body.
+
+    assert_eq!(AudioSpecificConfig::parse(&buf), Err(Error::UnexpectedEnd));
+}
+
+#[test]
+fn er_aac_lc_truncated_at_ep_config_is_unexpected_end() {
+    // Build a complete frame, truncate at the byte boundary that
+    // sits *before* the epConfig field. The frame normally takes 22
+    // bits → 3 bytes; truncating to 2 bytes leaves the parser with
+    // only the first 16 bits (AOT/sfi/chan + 3 GA flags). All
+    // subsequent reads fail at the body bit-reader.
+    let mut bw = BitWriter::new();
+    bw.write_u32(17, 5);
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(true);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_u32(0, 2);
+    let mut buf = bw.finish();
+    buf.truncate(2);
+
+    assert_eq!(AudioSpecificConfig::parse(&buf), Err(Error::UnexpectedEnd));
+}
+
+#[test]
+fn er_twinvq_aot_21_has_ep_config_but_no_extension_subfields() {
+    // AOT 21 (ER TwinVQ) is in EP_CONFIG_AOTS but NOT in either
+    // {17, 19, 20, 23} (resilience) or {22} (BSAC), so the
+    // extension body collapses to extensionFlag3 + epConfig only.
+    let mut bw = BitWriter::new();
+    bw.write_u32(21, 5);
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(true); // extensionFlag = 1
+    bw.write_bit(false); // extensionFlag3
+    bw.write_u32(0, 2); // epConfig
+    let buf = bw.finish();
+
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    let body = asc.ga_body.extension_body.as_ref().unwrap();
+    assert!(body.bsac_layer.is_none());
+    assert!(body.resilience.is_none());
+    assert!(!body.extension_flag3);
+    assert_eq!(asc.ep_config, Some(0));
+}
+
+#[test]
+fn er_aac_lc_bit_position_advances_through_extension_and_ep_config() {
+    // Sanity that the parser consumes the right number of bits.
+    // Layout: 5 + 4 + 4 (= 13) AOT/sfi/chan_cfg
+    //       + 1 + 1 + 1 (= 16) frameLengthFlag/dependsOn/extensionFlag
+    //       + 1 + 1 + 1 (= 19) resilience triplet
+    //       + 1       (= 20) extensionFlag3
+    //       + 2       (= 22) epConfig
+    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 0);
+    let (_asc, bits) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(bits, 22);
 }

@@ -205,6 +205,24 @@ pub enum Error {
     /// responsibility, not the assembler's.
     RawDataBlockEncodeInvalid,
 
+    /// `epConfig` (from the Table 1.15 outer `switch (audioObjectType)`
+    /// for the ER object types) selected value `2` or `3`, which
+    /// mandates parsing the trailing `ErrorProtectionSpecificConfig()`
+    /// body. Phase 1 does not parse the error-protection
+    /// configuration; the carried `u8` is the literal 2-bit
+    /// `epConfig` field value as read from the wire. `epConfig == 0`
+    /// (no EP) and `epConfig == 1` (EP defined by EP class mapping
+    /// table only — no trailing body) are accepted and surfaced via
+    /// [`crate::asc::AudioSpecificConfig::ep_config`].
+    UnsupportedEpConfig(u8),
+
+    /// `extensionFlag3` was set to `1` inside the `GASpecificConfig`
+    /// `extensionFlag` body (Table 4.1). ISO/IEC 14496-3:2009 reserves
+    /// the body behind this flag with the comment "tbd in version 3";
+    /// since the body bit-layout is not defined, Phase 1 cannot
+    /// advance the bit-reader and rejects the ASC.
+    UnsupportedAscExtensionFlag3,
+
     /// [`crate::scale_factor_data::differentiate`] was handed an
     /// [`crate::scale_factor_data::AbsoluteScaleFactors`] whose
     /// shape or numeric values cannot be encoded back to a
@@ -322,6 +340,19 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "scale_factor accumulator: absolute-to-DPCM differentiation produced a delta outside Table 4.150 / Table 4.53 ranges"
+                )
+            }
+            Error::UnsupportedEpConfig(value) => {
+                write!(
+                    f,
+                    "AudioSpecificConfig epConfig {} requires ErrorProtectionSpecificConfig parsing (Phase 1 supports only epConfig 0 and 1)",
+                    value
+                )
+            }
+            Error::UnsupportedAscExtensionFlag3 => {
+                write!(
+                    f,
+                    "GASpecificConfig extensionFlag3 body is reserved (\"tbd in version 3\") and cannot be parsed"
                 )
             }
         }
