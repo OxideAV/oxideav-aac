@@ -223,6 +223,47 @@ pub enum Error {
     /// advance the bit-reader and rejects the ASC.
     UnsupportedAscExtensionFlag3,
 
+    /// `extension_payload()` dispatched on an `extension_type` value
+    /// whose body needs the SBR back-end this crate does not yet
+    /// provide. The carried `u8` is the literal 4-bit
+    /// `extension_type` value as read from the wire — one of
+    /// `0b1101` (`EXT_SBR_DATA`) or `0b1110` (`EXT_SBR_DATA_CRC`)
+    /// per ISO/IEC 13818-7 Table 40.
+    UnsupportedExtensionSbr(u8),
+
+    /// `extension_payload()` dispatched on a reserved
+    /// `extension_type` value (any 4-bit value not in
+    /// `{0b0000, 0b0001, 0b1011, 0b1101, 0b1110}`). ISO/IEC
+    /// 14496-3 Table 4.59 and ISO/IEC 13818-7 Table 40 list these
+    /// values as "reserved"; this crate has no body layout to
+    /// advance the bit-reader by.
+    UnsupportedExtensionType(u8),
+
+    /// [`crate::extension_payload::ExtensionPayload`] parse / write
+    /// hit a structural invariant violation:
+    ///
+    /// * The dispatching FIL `cnt` is 0 (no room for the 4-bit
+    ///   `extension_type` field).
+    /// * For `EXT_FILL` (parser / writer): an `other_bits` byte
+    ///   buffer whose length does not match the
+    ///   `8 * (cnt - 1) + 4` body-bits ceiling.
+    /// * For `EXT_FILL_DATA` (parser): a `fill_nibble` that is not
+    ///   normatively `0b0000`, or a `fill_byte` that is not
+    ///   normatively `0b10100101`.
+    /// * For `EXT_DYNAMIC_RANGE` (parser): the Table 4.52 derived
+    ///   byte count `n` disagrees with the dispatching FIL `cnt`.
+    /// * For `EXT_DYNAMIC_RANGE` (writer): a numeric field
+    ///   overflows its Table 4.52 cap (`pce_instance_tag > 0x0f`,
+    ///   `drc_tag_reserved_bits > 0x0f`, `drc_band_incr > 0x0f`,
+    ///   `drc_bands_reserved_bits > 0x0f`, `prog_ref_level >
+    ///   0x7f`, `dyn_rng_ctl > 0x7f`), an internal
+    ///   shape-mismatch (`band_top.len() != 1 + band_incr`,
+    ///   `bands.len() != drc_num_bands`), or an
+    ///   `excluded_channels.exclude_mask.len()` that is not a
+    ///   positive multiple of 7 (Table 4.53 emits exclusion bits
+    ///   in fixed groups of 7).
+    ExtensionPayloadInvalid,
+
     /// [`crate::gain_control_data::GainControlData::write`] was
     /// handed an in-memory
     /// [`crate::gain_control_data::GainControlData`] whose field
@@ -380,6 +421,26 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "GASpecificConfig extensionFlag3 body is reserved (\"tbd in version 3\") and cannot be parsed"
+                )
+            }
+            Error::UnsupportedExtensionSbr(value) => {
+                write!(
+                    f,
+                    "extension_payload extension_type 0x{:x} selects EXT_SBR_DATA / EXT_SBR_DATA_CRC; SBR back-end is not implemented",
+                    value
+                )
+            }
+            Error::UnsupportedExtensionType(value) => {
+                write!(
+                    f,
+                    "extension_payload extension_type 0x{:x} is reserved (no body layout defined)",
+                    value
+                )
+            }
+            Error::ExtensionPayloadInvalid => {
+                write!(
+                    f,
+                    "extension_payload: Table 4.51 / 4.52 / 4.53 / 4.59 wire-field invariant violated"
                 )
             }
         }

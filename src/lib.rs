@@ -138,6 +138,28 @@
 //!   (5 / 4-2 / 2 / 4-5). The §4.6.12 ladder-application loop that
 //!   reconstructs sample-domain attenuation factors is **not**
 //!   performed; it needs the SSR PQF / IMDCT back-end.
+//! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
+//!   Table 4.51 *extension_payload()* parser **and** encoder
+//!   primitive (**new in round 187**). Implements the three
+//!   non-SBR `extension_type` branches whose body layouts are
+//!   fully specified by fixed-width fields: `EXT_FILL` (`0b0000`)
+//!   — the Table 4.51 default branch surfacing the
+//!   `8 * (cnt - 1) + 4` `other_bits` as a packed byte buffer;
+//!   `EXT_FILL_DATA` (`0b0001`) — the normative-pattern filler
+//!   with `fill_nibble == 0b0000` and `fill_byte ==
+//!   0b1010_0101`; and `EXT_DYNAMIC_RANGE` (`0b1011`) — the
+//!   Table 4.52 `dynamic_range_info()` block (optional
+//!   `pce_instance_tag`, optional Table 4.53 `excluded_channels()`
+//!   exclude-mask list, optional per-band partitioning, optional
+//!   `prog_ref_level`, and per-band `(dyn_rng_sgn, dyn_rng_ctl)`
+//!   records). The two SBR-data values from ISO/IEC 13818-7
+//!   Table 40 (`EXT_SBR_DATA` `0b1101` and `EXT_SBR_DATA_CRC`
+//!   `0b1110`) surface as [`Error::UnsupportedExtensionSbr`] —
+//!   their bodies are `sbr_extension_data()` which needs the QMF /
+//!   patching back-end this crate does not yet provide. The
+//!   §4.5.2.13 DRC companding-curve application is **not**
+//!   performed; the raw `(dyn_rng_sgn, dyn_rng_ctl)` records are
+//!   surfaced verbatim for a later round.
 //!
 //! Public API surface that requires a decoder or encoder body still
 //! returns [`Error::NotImplemented`]; the syntactic skeleton lives
@@ -175,6 +197,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod adts;
 pub mod asc;
+pub mod extension_payload;
 pub mod gain_control_data;
 pub mod ics_info;
 pub mod pce;

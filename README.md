@@ -3,15 +3,76 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 183)
+## Status (round 187)
 
-**Phase 1 complete + Phase 2 in progress + six tool-level encoder
+**Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
-pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.1.1
+pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.2.7
+`extension_payload()` body parser/writer for EXT_FILL / EXT_FILL_DATA
+/ EXT_DYNAMIC_RANGE (Table 4.52 `dynamic_range_info()` + Table 4.53
+`excluded_channels()`) + the §4.4.1.1
 `program_config_element()` writer + the §4.4.1 / Table 4.1
 `extensionFlag` body and the Table 1.15 `epConfig` field for every
 General Audio ER object type + the §4.4.6.5 / Table 4.12
-`gain_control_data()` SSR tool.** Round 183 closes the SSR-side
+`gain_control_data()` SSR tool.** Round 187 lands the §4.4.2.7 /
+Table 4.51 `extension_payload()` parser **and** encoder primitive,
+the seventh tool-level encode-side syntax writer in the crate. The
+new `extension_payload` module covers the three Table 4.51
+`extension_type` branches whose body layouts are fully specified
+by fixed-width fields: `EXT_FILL` (`0b0000`) — the default branch
+surfacing `8 * (cnt - 1) + 4` `other_bits` as a packed byte buffer;
+`EXT_FILL_DATA` (`0b0001`) — the normative-pattern filler with
+`fill_nibble == 0b0000` and `fill_byte == 0b1010_0101`; and
+`EXT_DYNAMIC_RANGE` (`0b1011`) — the Table 4.52
+`dynamic_range_info()` block with optional `pce_instance_tag`
+(4 + 4 bits), optional Table 4.53 `excluded_channels()` exclude-mask
+list (7 mask bits + 1 continuation bit per 8-bit group), optional
+per-band partitioning (4-bit `drc_band_incr`, 4-bit
+`drc_bands_reserved_bits`, then `1 + drc_band_incr` × 8-bit
+`drc_band_top[]`), optional `prog_ref_level` (7 + 1 bits), and
+per-band `(1-bit dyn_rng_sgn, 7-bit dyn_rng_ctl)` records. The two
+SBR-data extension types from ISO/IEC 13818-7 Table 40
+(`EXT_SBR_DATA` `0b1101` and `EXT_SBR_DATA_CRC` `0b1110`) surface
+as `Error::UnsupportedExtensionSbr` — their bodies are the
+`sbr_extension_data()` syntax which needs the QMF / patching
+back-end this crate does not yet provide. All other 4-bit values
+surface as `Error::UnsupportedExtensionType` (Table 4.59 / Table 40
+list them as "reserved"). A new `Error::ExtensionPayloadInvalid`
+variant surfaces caller-side wire-field violations: `cnt == 0` (no
+room for the extension_type nibble); EXT_FILL `other_bits.len()` not
+matching the `8 * (cnt - 1) + 4` body-bits ceiling; EXT_FILL_DATA
+non-`0b0000` `fill_nibble` or non-`0b1010_0101` `fill_byte`; DRC
+Table 4.52 derived `n` disagreeing with the dispatching FIL `cnt`;
+DRC field overflows (`pce_instance_tag > 0x0f`,
+`drc_tag_reserved_bits > 0x0f`, `drc_band_incr > 0x0f`,
+`drc_bands_reserved_bits > 0x0f`, `prog_ref_level > 0x7f`,
+`dyn_rng_ctl > 0x7f`); internal shape mismatches
+(`band_top.len() != 1 + band_incr`, `bands.len() != drc_num_bands`);
+and an `excluded_channels.exclude_mask.len()` that is not a positive
+multiple of 7 (Table 4.53 emits exclusion bits in fixed groups of
+7). 36 new integration tests cover Table 4.59 / Table 40 dispatch
+(known values, round-trip, SBR rejection, reserved rejection), the
+EXT_FILL `cnt == 1` collapsed body (4 unused trailing bits), an
+EXT_FILL `cnt == 3` round-trip with a partial trailing byte, the
+EXT_FILL_DATA `cnt == 1` and `cnt == 3` cases with hand-pinned byte
+sequences (`[0x10]` and `[0x10, 0xA5, 0xA5]`) and the two normative
+rejections (non-zero nibble, non-`0xA5` byte), the DRC minimal body
+with all four optionals absent (hand-pinned bytes
+`[0xB0, 0x42]`), single-optional round-trips for pce_tag /
+excluded_channels / drc_bands / prog_ref_level, an
+every-optional-present round-trip (`n == 9`), the
+continuation-bit positioning across a two-group exclude_mask
+(hand-pinned bytes `[0xB6, 0x04, 0x08, 0x00]`), six encoder-side
+overflow rejections, a parser-side `cnt`-vs-`n` mismatch detection,
+three truncation tests, an `excluded_group_count` lookup-table
+check, the `byte_length` / `num_bands` accessor checks, and a
+trailing-bit non-consumption assertion confirming the parser stops
+exactly at bit-position `8 * n`. Suite size grows 353 → 389. The
+§4.5.2.13 DRC companding-curve application is **not** performed
+here — the raw `(dyn_rng_sgn, dyn_rng_ctl)` records are surfaced
+verbatim for a later round.
+
+Round 183 closed the SSR-side
 gap by landing the §4.4.6.5 / Table 4.12 `gain_control_data()`
 parser + encoder primitive (`GainControlData::parse` /
 `GainControlData::write`) — the sixth tool-level encode-side syntax

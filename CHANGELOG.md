@@ -6,6 +6,69 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 187 — extension_payload() parser + encoder primitive)
+
+- New `extension_payload` module implementing the ISO/IEC 14496-3
+  §4.4.2.7 / Table 4.51 `extension_payload()` body that rides inside
+  every FIL element, plus the Table 4.52 `dynamic_range_info()` and
+  Table 4.53 `excluded_channels()` sub-bodies:
+  - `ExtensionType` enum with the five well-known values (`Fill`,
+    `FillData`, `DynamicRange` per Table 4.59;`SbrData`,
+    `SbrDataCrc` per ISO/IEC 13818-7 Table 40) and the
+    `from_bits` / `as_u8` round-trip pair.
+  - `ExtensionPayload::Fill { cnt, other_bits }` — Table 4.51
+    default branch carrying `8 * (cnt - 1) + 4` `other_bits`
+    packed MSB-first.
+  - `ExtensionPayload::FillData { cnt }` — Table 4.51 normative
+    pattern: 4-bit `fill_nibble == 0b0000` + (cnt - 1) × 8-bit
+    `fill_byte == 0b1010_0101`.
+  - `ExtensionPayload::DynamicRange(DynamicRangeInfo)` — Table 4.52
+    DRC body carrier with optional `PceTagFields`, optional
+    `ExcludedChannels` (Table 4.53), optional `DrcBands`
+    partitioning, optional `ProgRefLevelFields`, and the per-band
+    `(dyn_rng_sgn, dyn_rng_ctl)` `DrcBandRecord` list whose length
+    matches the resolved `drc_num_bands`.
+- `ExtensionPayload::parse(reader, cnt)` walks the Table 4.51
+  dispatch (4-bit `extension_type`, then per-type body) and
+  surfaces the SBR extension types as
+  `Error::UnsupportedExtensionSbr` (since this crate does not
+  carry the QMF / patching back-end), reserved values as
+  `Error::UnsupportedExtensionType`, and structural / normative-
+  value violations as `Error::ExtensionPayloadInvalid`.
+- `ExtensionPayload::write(writer)` is the bit-exact inverse;
+  returns Table 4.51's `n` byte count and surfaces caller-side
+  field overflows / shape mismatches as
+  `Error::ExtensionPayloadInvalid`.
+- `ExtensionPayload::byte_length` / `DynamicRangeInfo::byte_length` /
+  `DynamicRangeInfo::num_bands` accessors for callers that need the
+  Table 4.51 returned `n` without round-tripping through `write`.
+- Public helper `excluded_group_count(exclude_mask_len)` exposing
+  Table 4.53's 7-bit-group → 8-bit-byte mapping.
+- Public field-width constants: `EXTENSION_TYPE_BITS = 4`,
+  `FILL_DATA_NIBBLE = 0b0000`, `FILL_DATA_BYTE = 0b1010_0101`.
+- Three new `Error` variants: `UnsupportedExtensionSbr(u8)` for
+  the SBR extension types, `UnsupportedExtensionType(u8)` for
+  reserved 4-bit values, and `ExtensionPayloadInvalid` for
+  caller-side wire-field violations and parser-side normative-
+  value / structural mismatches.
+- 36 integration tests in `tests/extension_payload.rs` covering
+  Table 4.59 / Table 40 dispatch (known values, round-trip, SBR
+  rejection, reserved rejection), the EXT_FILL `cnt == 1`
+  collapsed body, an EXT_FILL `cnt == 3` round-trip with a
+  partial trailing byte, the EXT_FILL_DATA cases with hand-
+  pinned byte sequences and the two normative rejections (non-
+  zero nibble, non-`0xA5` byte), the DRC minimal body (hand-
+  pinned bytes `[0xB0, 0x42]`), single-optional round-trips for
+  pce_tag / excluded_channels / drc_bands / prog_ref_level, an
+  every-optional-present round-trip (`n == 9`), the
+  continuation-bit positioning across a two-group exclude_mask
+  (hand-pinned bytes `[0xB6, 0x04, 0x08, 0x00]`), six encoder-
+  side overflow rejections, a parser-side `cnt`-vs-`n` mismatch
+  detection, three truncation tests, an `excluded_group_count`
+  lookup-table check, the `byte_length` / `num_bands` accessor
+  checks, and a trailing-bit non-consumption assertion. Suite
+  size grows 353 → 389.
+
 ### Added (round 183 — gain_control_data() parser + encoder primitive)
 
 - New `gain_control_data` module implementing the ISO/IEC 14496-3
