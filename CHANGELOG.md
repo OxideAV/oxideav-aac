@@ -6,6 +6,94 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added (round 192 — Table 1.15 trailing syncExtensionType == 0x2b7 implicit-SBR probe)
+
+- New `AudioSpecificConfig` field `trailing_sbr_probe:
+  Option<SbrExtensionProbe>` carrying the result of the §1.6.5 /
+  Table 1.15 trailing-bits backward-compatible implicit-SBR /
+  PS / ER BSAC-extension probe.
+- New entry point `AudioSpecificConfig::parse_bits_bounded(reader,
+  origin_bit_offset, asc_bit_length)` for carriers that know the
+  ASC bit length (LATM `StreamMuxConfig`, esds AudioObj
+  descriptor). The existing `AudioSpecificConfig::parse(&[u8])`
+  now computes the byte-slice bound and calls into the new entry
+  point automatically; `AudioSpecificConfig::parse_bits` keeps
+  its no-probe semantics so callers holding a `BitReader`
+  carrying trailing carrier bytes are not surprised by a stray
+  11-bit `0x2b7` match.
+- Probe field-width / marker constants exposed as public
+  module-level constants: `SYNC_EXTENSION_TYPE_BITS = 11`,
+  `SYNC_EXTENSION_TYPE_SBR = 0x2b7`, `SYNC_EXTENSION_TYPE_PS =
+  0x548`, `TRAILING_EXTENSION_AOT_SBR = 5`,
+  `TRAILING_EXTENSION_AOT_BSAC = 22`.
+- Probe semantics — driven by the spec's two guards:
+  - Outer guard: `extensionAudioObjectType != 5` (skip when the
+    outer `audioObjectType` is the explicit hierarchical SBR
+    (5) or PS (29) wrapper, which already established
+    `extensionAudioObjectType == 5`) **and** `bits_to_decode()
+    >= 16` (the ASC carrier must have at least 11 + 5 bits
+    remaining to attempt the 11-bit `syncExtensionType` plus a
+    minimum-width nested `GetAudioObjectType()`).
+  - On a `0x2b7` match the parser dispatches on the resolved
+    extension AOT:
+    - `5` → `sbrPresentFlag` + (when set) the 4-bit
+      `extensionSamplingFrequencyIndex` (with the 24-bit
+      `extensionSamplingFrequency` escape on the `0xf`
+      sentinel) + (when at least 12 further bits remain) a
+      second 11-bit `syncExtensionType == 0x548` gating a
+      1-bit `psPresentFlag`.
+    - `22` → `sbrPresentFlag` + (when set) the 4-bit
+      `extensionSamplingFrequencyIndex` (with the same 24-bit
+      escape) + mandatory 4-bit
+      `extensionChannelConfiguration`.
+    - any other value → `Error::UnsupportedTrailingExtensionAot`
+      (Table 1.15 spells out no body layout for those).
+- Propagation: when the probe records `sbr_present_flag == true`
+  the resolved extension sample rate is also promoted to
+  `AudioSpecificConfig::extension_sampling_frequency_index` /
+  `AudioSpecificConfig::extension_sample_rate` and
+  `AudioSpecificConfig::sbr_present` is set; when the probe
+  records `ps_present_flag == Some(true)`
+  `AudioSpecificConfig::ps_present` is set; when the probe
+  resolves the BSAC branch the
+  `AudioSpecificConfig::extension_channel_configuration` field
+  is set. This mirrors the explicit-SBR / PS wrapper path so
+  call sites can read SBR / PS state from a single top-level
+  field set whether the signalling was hierarchical-explicit or
+  trailing-implicit.
+- New `Error::UnsupportedTrailingExtensionAot(u8)` variant for
+  resolved extension AOTs whose Table 1.15 body is not defined
+  (anything outside `{5, 22}`).
+- 20 new integration tests in `tests/asc.rs` (`suite size 389 →
+  409`) covering:
+  - Field-width / marker constant pin.
+  - Four "probe-skipped" branches: no trailing bits at all,
+    fewer than 16 bits remaining (one byte of pad), 11-bit
+    non-`0x2b7` value, outer SBR wrapper (AOT 5) and outer PS
+    wrapper (AOT 29) guard skipping the probe even with
+    trailing bits that *would* match.
+  - SBR-branch round-trips: `sbrPresentFlag = 0`,
+    `sbrPresentFlag = 1` with a Table 1.18 index, `sfi = 0xf`
+    with the 24-bit escape, the PS sub-probe with
+    `psPresentFlag = 1`, the PS marker mismatch (non-0x548
+    inner sync — `ps_present_flag` stays `None`), and the
+    inner 12-bit guard skipping the PS sub-probe with only 8
+    bits of slack.
+  - ER BSAC-branch round-trips: `sbrPresentFlag = 1` with a
+    rate + `extensionChannelConfiguration = 2`,
+    `sbrPresentFlag = 0` with `extensionChannelConfiguration = 3`.
+  - `Error::UnsupportedTrailingExtensionAot(3)` reject for an
+    `extensionAudioObjectType` outside `{5, 22}`.
+  - `parse_bits` no-probe contract — the bit-level entry point
+    stops at end-of-body and leaves trailing bits alone.
+  - `parse_bits_bounded` explicit-`asc_bit_length` call shape —
+    one round-trip plus a truncated-bound assertion that the
+    probe does not over-read when the bound stops at the body.
+  - Mid-escape truncation surfaces `Error::UnexpectedEnd` (24-bit
+    explicit-rate escape cut to 16 bits).
+  - Hand-pinned 7-byte HE-AAC v2 implicit chain (AOT 2 / 16 kHz
+    / mono + 0x2b7 + ext_aot=5 + sbr=1 + sfi=5 + 0x548 + ps=1).
+
 ### Added (round 187 — extension_payload() parser + encoder primitive)
 
 - New `extension_payload` module implementing the ISO/IEC 14496-3

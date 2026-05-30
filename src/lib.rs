@@ -24,6 +24,30 @@
 //!   surface as [`Error::UnsupportedEpConfig`]; an `extensionFlag3
 //!   == 1` body — whose layout is reserved by the spec — surfaces as
 //!   [`Error::UnsupportedAscExtensionFlag3`].
+//!   **Round 192** adds the Table 1.15 trailing
+//!   `syncExtensionType == 0x2b7` implicit-SBR probe (§1.6.5):
+//!   when the outer AOT is **not** the explicit SBR (5) or PS (29)
+//!   wrapper and the carrier has at least 16 bits remaining,
+//!   [`AudioSpecificConfig::parse`] now reads an 11-bit
+//!   `syncExtensionType` field. On a `0x2b7` match it consumes the
+//!   nested `GetAudioObjectType()` plus either the SBR branch
+//!   (`sbrPresentFlag`, optional `extensionSamplingFrequencyIndex`,
+//!   then a second 11-bit `syncExtensionType == 0x548` gating a
+//!   1-bit `psPresentFlag`) or the BSAC branch (`sbrPresentFlag`,
+//!   optional `extensionSamplingFrequencyIndex`, mandatory 4-bit
+//!   `extensionChannelConfiguration`). The probe result is exposed
+//!   as [`asc::AudioSpecificConfig::trailing_sbr_probe`] and the
+//!   implicitly-signalled SBR / PS / extension-sample-rate values
+//!   are also propagated to the top-level `sbr_present` /
+//!   `ps_present` / `extension_sampling_frequency_index` /
+//!   `extension_sample_rate` / `extension_channel_configuration`
+//!   fields. A carrier-bounded entry point
+//!   [`asc::AudioSpecificConfig::parse_bits_bounded`] is exposed so
+//!   LATM `StreamMuxConfig` (and any future esds AudioObj
+//!   descriptor) callers can pass the exact ASC bit length;
+//!   [`asc::AudioSpecificConfig::parse_bits`] preserves its
+//!   no-probe semantics for callers that hold a `BitReader`
+//!   carrying trailing carrier bytes.
 //! * The [`pce`] module — ISO/IEC 14496-3 §4.4.1.1 *program_config_element*
 //!   parser. Used both standalone (inside [`raw_data_block`]) and inline
 //!   inside [`asc`].

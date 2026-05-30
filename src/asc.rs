@@ -21,18 +21,49 @@
 //! All other AOTs return [`Error::UnsupportedAot`] so the spec
 //! gap is explicit at the call site.
 //!
+//! ## What round 192 adds
+//!
+//! * The Table 1.15 trailing `syncExtensionType == 0x2b7` probe used
+//!   for *backward-compatible* implicit SBR / PS signalling in the
+//!   AudioSpecificConfig (§1.6.5, §1.6.6). After the per-AOT body
+//!   and `epConfig`, when `extensionAudioObjectType != 5` and the
+//!   carrier has `>= 16` bits remaining, the parser reads an 11-bit
+//!   `syncExtensionType` value: if it equals `0x2b7` it consumes a
+//!   nested `GetAudioObjectType()` and (when the resolved extension
+//!   AOT is `5`) the `sbrPresentFlag`, optional
+//!   `extensionSamplingFrequencyIndex` (with the same 24-bit escape
+//!   as the outer ASC), and a second 11-bit `syncExtensionType`
+//!   gated on `>= 12` further bits — if it equals `0x548` the
+//!   `psPresentFlag` follows. The AOT-22 (ER BSAC) extension branch
+//!   is also parsed: `sbrPresentFlag` (+ optional
+//!   `extensionSamplingFrequencyIndex`) then a mandatory 4-bit
+//!   `extensionChannelConfiguration`. The probe result lands in
+//!   [`AudioSpecificConfig::trailing_sbr_probe`] as
+//!   [`SbrExtensionProbe`]; when the probe resolves SBR or PS,
+//!   `asc.sbr_present` / `asc.ps_present` are updated to reflect
+//!   the implicit signalling. This entry point is exposed as
+//!   [`AudioSpecificConfig::parse_bits_bounded`] for carriers that
+//!   know the ASC bit length (LATM `StreamMuxConfig`, esds AudioObj
+//!   descriptor); the byte-slice [`AudioSpecificConfig::parse`]
+//!   computes the bound automatically. The original bit-level
+//!   [`AudioSpecificConfig::parse_bits`] keeps its no-probe
+//!   semantics so existing callers that pass a BitReader carrying
+//!   trailing carrier bytes are not surprised by a stray 11-bit
+//!   match.
+//!
 //! ## What is *not* parsed yet
 //!
-//! * The trailing `syncExtensionType == 0x2b7` sync probe used for
-//!   implicit SBR signalling (last part of Table 1.15). Implicit
-//!   SBR signalling is the dominant form for ADTS HE-AAC v1 and
-//!   needs trailing-bit probing once the body is fully resolved.
-//! * `AOT 5` / `AOT 29` *implicit-extension* path: when the outer
-//!   AOT is 2 (LC) and the SBR/PS extension is announced via the
-//!   FIL `extension_payload`, the ASC alone does not carry the
-//!   information — the decoder must look at the FIL stream. Phase 1
-//!   correctly records `sbr_present = false` / `ps_present = false`
-//!   for that case because no ASC bit said otherwise.
+//! * `AOT 5` / `AOT 29` *implicit-extension* path **via the FIL
+//!   extension_payload**: when the outer AOT is 2 (LC) and the
+//!   SBR/PS extension is announced via the FIL `extension_payload`
+//!   inside the raw_data_block stream (not the ASC trailing probe),
+//!   the ASC alone does not carry the information — the decoder
+//!   must look at the FIL stream. Round 192 only resolves the
+//!   *ASC-side* implicit signalling (the Table 1.15
+//!   `syncExtensionType == 0x2b7` probe). When neither signalling
+//!   form is present, the ASC parser correctly records
+//!   `sbr_present = false` / `ps_present = false` because no ASC
+//!   bit said otherwise.
 //!
 //! ## What round 177 adds
 //!
@@ -84,6 +115,26 @@ const GA_EXTENSION_RESILIENCE_AOTS: &[u8] = &[17, 19, 20, 23];
 /// (Table 1.15 outer `switch (audioObjectType)` for the ER object
 /// types).
 const EP_CONFIG_AOTS: &[u8] = &[17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 39];
+
+/// Outer 11-bit `syncExtensionType` marker that introduces the Table
+/// 1.15 trailing implicit-SBR signalling block.
+pub const SYNC_EXTENSION_TYPE_SBR: u16 = 0x2b7;
+
+/// Inner 11-bit `syncExtensionType` marker that introduces the
+/// `psPresentFlag` inside the SBR (`extensionAudioObjectType == 5`)
+/// branch of the Table 1.15 trailing probe.
+pub const SYNC_EXTENSION_TYPE_PS: u16 = 0x548;
+
+/// Width of the `syncExtensionType` field (Table 1.15).
+pub const SYNC_EXTENSION_TYPE_BITS: u32 = 11;
+
+/// `extensionAudioObjectType` value that signals HE-AAC SBR inside
+/// the trailing probe (Table 1.15).
+pub const TRAILING_EXTENSION_AOT_SBR: u8 = 5;
+
+/// `extensionAudioObjectType` value that signals ER BSAC inside the
+/// trailing probe (Table 1.15).
+pub const TRAILING_EXTENSION_AOT_BSAC: u8 = 22;
 
 /// Length of the IMDCT frame in samples for a GA AOT, controlled by
 /// `frameLengthFlag`. ISO/IEC 14496-3 §4.4.1 semantics.
@@ -176,6 +227,53 @@ pub struct AacResilienceFlags {
     pub spectral_data: bool,
 }
 
+/// Result of the Table 1.15 trailing `syncExtensionType == 0x2b7`
+/// implicit-SBR / PS / BSAC-extension probe (§1.6.5).
+///
+/// Only ever populated when the ASC parser reaches the trailing-bits
+/// branch — i.e. the outer `audioObjectType` is **not** the
+/// hierarchical SBR wrapper (5) or PS wrapper (29) (those already
+/// emit `sbr_present` / `ps_present` from their explicit-signalling
+/// path), at least 16 bits remain in the ASC carrier, and the next
+/// 11 bits equal [`SYNC_EXTENSION_TYPE_SBR`] (`0x2b7`).
+///
+/// `extension_audio_object_type` is the resolved nested AOT
+/// (`GetAudioObjectType()` after the `0x2b7` sync). Round 192
+/// implements the bodies for `extension_audio_object_type == 5`
+/// (HE-AAC SBR with the optional `0x548` PS sub-probe) and
+/// `extension_audio_object_type == 22` (ER BSAC); any other resolved
+/// extension AOT surfaces as
+/// [`crate::Error::UnsupportedTrailingExtensionAot`] at parse time
+/// (the body bit-layout is not defined by Table 1.15 for those).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SbrExtensionProbe {
+    /// Resolved `extensionAudioObjectType` immediately after the
+    /// 11-bit `syncExtensionType == 0x2b7` marker. Currently
+    /// constrained to `5` (HE-AAC) or `22` (ER BSAC).
+    pub extension_audio_object_type: u8,
+    /// `sbrPresentFlag` (1 bit). Present for both the `ext_aot == 5`
+    /// and `ext_aot == 22` branches.
+    pub sbr_present_flag: bool,
+    /// `extensionSamplingFrequencyIndex` (4 bits). Only present when
+    /// `sbr_present_flag == true`; when the wire value is `0xf` the
+    /// 24-bit `extensionSamplingFrequency` escape follows and the
+    /// resolved rate lands in
+    /// [`SbrExtensionProbe::extension_sample_rate`].
+    pub extension_sampling_frequency_index: Option<u8>,
+    /// Resolved extension sample rate in Hz (Table 1.18 lookup, or
+    /// the 24-bit escape value when `extension_sampling_frequency_index
+    /// == Some(0xf)`).
+    pub extension_sample_rate: Option<u32>,
+    /// `psPresentFlag` (1 bit). Only present when the SBR (`ext_aot
+    /// == 5`) branch ran, at least 12 further bits were available, and
+    /// the second 11-bit `syncExtensionType` equalled
+    /// [`SYNC_EXTENSION_TYPE_PS`] (`0x548`).
+    pub ps_present_flag: Option<bool>,
+    /// `extensionChannelConfiguration` (4 bits). Only present when
+    /// the resolved extension AOT is `22` (ER BSAC).
+    pub extension_channel_configuration: Option<u8>,
+}
+
 /// Parsed `AudioSpecificConfig`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSpecificConfig {
@@ -227,6 +325,21 @@ pub struct AudioSpecificConfig {
     /// does **not** parse that body and surfaces
     /// [`Error::UnsupportedEpConfig`] at the call site.
     pub ep_config: Option<u8>,
+    /// Result of the Table 1.15 trailing `syncExtensionType == 0x2b7`
+    /// implicit-SBR probe (§1.6.5). Only ever populated when the
+    /// outer `audioObjectType` is not the explicit SBR (5) or PS
+    /// (29) wrapper, the carrier had at least 16 bits remaining
+    /// after the per-AOT body + `epConfig`, and the next 11 bits
+    /// equalled [`SYNC_EXTENSION_TYPE_SBR`]. When the probe resolves
+    /// SBR or PS, [`AudioSpecificConfig::sbr_present`] /
+    /// [`AudioSpecificConfig::ps_present`] are also updated to
+    /// reflect the implicit signalling. Only populated by
+    /// [`AudioSpecificConfig::parse`] (which knows the byte-slice
+    /// bound) and the new [`AudioSpecificConfig::parse_bits_bounded`]
+    /// entry point; the older
+    /// [`AudioSpecificConfig::parse_bits`] keeps its no-probe
+    /// semantics.
+    pub trailing_sbr_probe: Option<SbrExtensionProbe>,
 }
 
 impl AudioSpecificConfig {
@@ -234,10 +347,67 @@ impl AudioSpecificConfig {
     /// resolved ASC and the bit-length consumed (so the caller can
     /// skip the rest of the carrier — `esds` payload, LATM
     /// StreamMuxConfig, etc.).
+    ///
+    /// The byte-slice bound is also forwarded into the Table 1.15
+    /// trailing `syncExtensionType == 0x2b7` implicit-SBR probe
+    /// (§1.6.5), so the bit-length returned here already reflects
+    /// any consumed trailing-probe fields.
     pub fn parse(data: &[u8]) -> Result<(Self, u64)> {
         let mut reader = BitReader::new(data);
-        let asc = Self::parse_bits(&mut reader, 0)?;
+        let asc_bit_length = (data.len() as u64).saturating_mul(8);
+        let asc = Self::parse_bits_bounded(&mut reader, 0, asc_bit_length)?;
         Ok((asc, reader.bit_position()))
+    }
+
+    /// Parse from a pre-existing [`BitReader`] given the
+    /// `origin_bit_offset` (the absolute bit position of the start
+    /// of the ASC) and an explicit `asc_bit_length` (the total
+    /// bit-length of the ASC inside the carrier, as conveyed by
+    /// e.g. LATM `StreamMuxConfig`'s `audioSpecificConfig` length
+    /// field). The trailing Table 1.15 `syncExtensionType == 0x2b7`
+    /// probe consumes bits up to that bound.
+    pub fn parse_bits_bounded(
+        reader: &mut BitReader<'_>,
+        origin_bit_offset: u64,
+        asc_bit_length: u64,
+    ) -> Result<Self> {
+        let start_bit = reader.bit_position();
+        let mut asc = Self::parse_bits_core(reader, origin_bit_offset)?;
+        let consumed = reader.bit_position().saturating_sub(start_bit);
+        // The Table 1.15 trailing-probe guard `extensionAudioObjectType
+        // != 5` translates into "skip the probe when the explicit
+        // hierarchical SBR (outer AOT 5) or PS (outer AOT 29) wrapper
+        // already established `extensionAudioObjectType == 5`". For
+        // every other outer AOT the spec defaults
+        // `extensionAudioObjectType = 0` (per §1.6.5), so the
+        // `!= 5` predicate is satisfied and the probe runs.
+        let already_hierarchical_sbr = asc.outer_aot == SBR_AOT || asc.outer_aot == PS_AOT;
+        if !already_hierarchical_sbr && consumed < asc_bit_length {
+            let remaining = asc_bit_length - consumed;
+            if let Some(probe) = parse_trailing_sbr_probe(reader, remaining)? {
+                if probe.extension_audio_object_type == TRAILING_EXTENSION_AOT_SBR {
+                    if probe.sbr_present_flag {
+                        asc.sbr_present = true;
+                        asc.extension_sampling_frequency_index =
+                            probe.extension_sampling_frequency_index;
+                        asc.extension_sample_rate = probe.extension_sample_rate;
+                    }
+                    if probe.ps_present_flag == Some(true) {
+                        asc.ps_present = true;
+                    }
+                } else if probe.extension_audio_object_type == TRAILING_EXTENSION_AOT_BSAC {
+                    if probe.sbr_present_flag {
+                        asc.sbr_present = true;
+                        asc.extension_sampling_frequency_index =
+                            probe.extension_sampling_frequency_index;
+                        asc.extension_sample_rate = probe.extension_sample_rate;
+                    }
+                    asc.extension_channel_configuration = probe.extension_channel_configuration;
+                }
+                asc.trailing_sbr_probe = Some(probe);
+            }
+        }
+        Ok(asc)
     }
 
     /// Parse from a pre-existing [`BitReader`] given the
@@ -248,7 +418,19 @@ impl AudioSpecificConfig {
     /// relative to the LATM packet's first bit. The
     /// `origin_bit_offset` is forwarded into PCE parsing so the
     /// Table 4.2 `byte_alignment()` note is honoured.
+    ///
+    /// This entry point does **not** invoke the Table 1.15 trailing
+    /// `syncExtensionType == 0x2b7` implicit-SBR probe: the
+    /// `BitReader` may carry trailing carrier bytes that are not
+    /// part of the ASC, and probing into them would mis-interpret
+    /// garbage as a `0x2b7` marker. Carriers that know the exact
+    /// ASC bit-length should call
+    /// [`AudioSpecificConfig::parse_bits_bounded`] instead.
     pub fn parse_bits(reader: &mut BitReader<'_>, origin_bit_offset: u64) -> Result<Self> {
+        Self::parse_bits_core(reader, origin_bit_offset)
+    }
+
+    fn parse_bits_core(reader: &mut BitReader<'_>, origin_bit_offset: u64) -> Result<Self> {
         // Outer audioObjectType + samplingFrequencyIndex (+ escape)
         let outer_aot = read_aot(reader)?;
         let sampling_frequency_index = read_u8(reader, 4)?;
@@ -324,6 +506,7 @@ impl AudioSpecificConfig {
             extension_channel_configuration: ext_chan_cfg,
             ga_body,
             ep_config,
+            trailing_sbr_probe: None,
         })
     }
 
@@ -440,6 +623,128 @@ fn parse_ga_extension_body(reader: &mut BitReader<'_>, aot: u8) -> Result<GaExte
         resilience,
         extension_flag3,
     })
+}
+
+/// Probe the Table 1.15 trailing `syncExtensionType == 0x2b7` /
+/// `0x548` chain for implicit SBR / PS / BSAC-extension signalling
+/// (§1.6.5, §1.6.6).
+///
+/// Returns `Ok(None)` if any of the following holds (each is a
+/// normative "no implicit signalling present" outcome — never an
+/// error):
+///
+/// * Fewer than `SYNC_EXTENSION_TYPE_BITS + 5 = 16` bits remain
+///   (the spec's outer `bits_to_decode() >= 16` guard).
+/// * The next 11 bits are not [`SYNC_EXTENSION_TYPE_SBR`] (0x2b7).
+///
+/// When the outer 0x2b7 marker fires but the resolved
+/// `extensionAudioObjectType` is neither `5` nor `22`, the parser
+/// returns [`Error::UnsupportedTrailingExtensionAot`] — Table 1.15
+/// does not specify a body layout for any other extension AOT and
+/// the bit-reader cannot advance.
+///
+/// The `remaining_bits` parameter is the upper bound of bits the
+/// probe is allowed to consume from the carrier (typically the
+/// ASC's `bits_to_decode()`). The function never reads more than
+/// `remaining_bits` bits; an UnexpectedEnd surfaces if a sub-field
+/// extends past it.
+fn parse_trailing_sbr_probe(
+    reader: &mut BitReader<'_>,
+    remaining_bits: u64,
+) -> Result<Option<SbrExtensionProbe>> {
+    // Outer §1.6.2.1 guard: at least 16 bits required to even
+    // attempt the probe (`syncExtensionType` + the minimum 5-bit
+    // `GetAudioObjectType()` base it gates).
+    if remaining_bits < (SYNC_EXTENSION_TYPE_BITS as u64 + 5) {
+        return Ok(None);
+    }
+    let sync = read_u32(reader, SYNC_EXTENSION_TYPE_BITS)? as u16;
+    if sync != SYNC_EXTENSION_TYPE_SBR {
+        return Ok(None);
+    }
+
+    let extension_audio_object_type = read_aot(reader)?;
+    match extension_audio_object_type {
+        TRAILING_EXTENSION_AOT_SBR => parse_trailing_sbr_branch(reader, remaining_bits),
+        TRAILING_EXTENSION_AOT_BSAC => parse_trailing_bsac_branch(reader),
+        other => Err(Error::UnsupportedTrailingExtensionAot(other)),
+    }
+}
+
+/// `extensionAudioObjectType == 5` body of the trailing probe:
+/// `sbrPresentFlag` + optional `extensionSamplingFrequencyIndex` /
+/// `extensionSamplingFrequency` + optional second `syncExtensionType
+/// == 0x548` + `psPresentFlag` (Table 1.15).
+fn parse_trailing_sbr_branch(
+    reader: &mut BitReader<'_>,
+    initial_remaining_bits: u64,
+) -> Result<Option<SbrExtensionProbe>> {
+    let sbr_present_flag = read_bit(reader)?;
+    let mut extension_sampling_frequency_index = None;
+    let mut extension_sample_rate = None;
+    let mut ps_present_flag = None;
+    if sbr_present_flag {
+        let sfi = read_u8(reader, 4)?;
+        let rate = if sfi == 0xf {
+            read_u32(reader, 24)?
+        } else {
+            resolve_sample_rate_index(sfi)?
+        };
+        extension_sampling_frequency_index = Some(sfi);
+        extension_sample_rate = Some(rate);
+        // §1.6.2.1 inner guard: at least 12 further bits required
+        // to attempt the PS sub-probe (11-bit syncExtensionType +
+        // 1-bit psPresentFlag).
+        let consumed_so_far = SYNC_EXTENSION_TYPE_BITS as u64
+            + 5 // GetAudioObjectType base
+            + 1 // sbrPresentFlag
+            + 4 // extensionSamplingFrequencyIndex
+            + if sfi == 0xf { 24 } else { 0 };
+        let still_available = initial_remaining_bits.saturating_sub(consumed_so_far);
+        if still_available >= 12 {
+            let inner_sync = read_u32(reader, SYNC_EXTENSION_TYPE_BITS)? as u16;
+            if inner_sync == SYNC_EXTENSION_TYPE_PS {
+                ps_present_flag = Some(read_bit(reader)?);
+            }
+        }
+    }
+    Ok(Some(SbrExtensionProbe {
+        extension_audio_object_type: TRAILING_EXTENSION_AOT_SBR,
+        sbr_present_flag,
+        extension_sampling_frequency_index,
+        extension_sample_rate,
+        ps_present_flag,
+        extension_channel_configuration: None,
+    }))
+}
+
+/// `extensionAudioObjectType == 22` body of the trailing probe:
+/// `sbrPresentFlag` + optional `extensionSamplingFrequencyIndex` /
+/// `extensionSamplingFrequency` + mandatory
+/// `extensionChannelConfiguration` (Table 1.15).
+fn parse_trailing_bsac_branch(reader: &mut BitReader<'_>) -> Result<Option<SbrExtensionProbe>> {
+    let sbr_present_flag = read_bit(reader)?;
+    let mut extension_sampling_frequency_index = None;
+    let mut extension_sample_rate = None;
+    if sbr_present_flag {
+        let sfi = read_u8(reader, 4)?;
+        let rate = if sfi == 0xf {
+            read_u32(reader, 24)?
+        } else {
+            resolve_sample_rate_index(sfi)?
+        };
+        extension_sampling_frequency_index = Some(sfi);
+        extension_sample_rate = Some(rate);
+    }
+    let extension_channel_configuration = Some(read_u8(reader, 4)?);
+    Ok(Some(SbrExtensionProbe {
+        extension_audio_object_type: TRAILING_EXTENSION_AOT_BSAC,
+        sbr_present_flag,
+        extension_sampling_frequency_index,
+        extension_sample_rate,
+        ps_present_flag: None,
+        extension_channel_configuration,
+    }))
 }
 
 /// Table 1.16 — `GetAudioObjectType()`. 5-bit base, with the `31`

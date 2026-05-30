@@ -223,6 +223,16 @@ pub enum Error {
     /// advance the bit-reader and rejects the ASC.
     UnsupportedAscExtensionFlag3,
 
+    /// The Table 1.15 trailing `syncExtensionType == 0x2b7` probe
+    /// resolved an `extensionAudioObjectType` whose body bit-layout
+    /// is not specified by ISO/IEC 14496-3:2009 §1.6.2.1. The carrier
+    /// only spells out two values: `5` (HE-AAC SBR with the optional
+    /// `0x548` PS sub-probe) and `22` (ER BSAC with mandatory
+    /// `extensionChannelConfiguration`); any other extension AOT
+    /// resolved by `GetAudioObjectType()` inside the probe surfaces
+    /// here. The carried `u8` is the resolved extension AOT.
+    UnsupportedTrailingExtensionAot(u8),
+
     /// `extension_payload()` dispatched on an `extension_type` value
     /// whose body needs the SBR back-end this crate does not yet
     /// provide. The carried `u8` is the literal 4-bit
@@ -421,6 +431,13 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "GASpecificConfig extensionFlag3 body is reserved (\"tbd in version 3\") and cannot be parsed"
+                )
+            }
+            Error::UnsupportedTrailingExtensionAot(aot) => {
+                write!(
+                    f,
+                    "AudioSpecificConfig trailing syncExtensionType=0x2b7 probe resolved extensionAudioObjectType {} (only 5 and 22 have a Table 1.15 body)",
+                    aot
                 )
             }
             Error::UnsupportedExtensionSbr(value) => {

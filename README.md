@@ -3,7 +3,7 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 187)
+## Status (round 192)
 
 **Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
@@ -14,7 +14,61 @@ pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.2.7
 `program_config_element()` writer + the §4.4.1 / Table 4.1
 `extensionFlag` body and the Table 1.15 `epConfig` field for every
 General Audio ER object type + the §4.4.6.5 / Table 4.12
-`gain_control_data()` SSR tool.** Round 187 lands the §4.4.2.7 /
+`gain_control_data()` SSR tool + the §1.6.5 / Table 1.15 trailing
+`syncExtensionType == 0x2b7` implicit-SBR / PS probe.** Round 192
+lands the Table 1.15 trailing-bits backward-compatible probe used
+to carry HE-AAC v1 / v2 / ER BSAC extension data **inside the
+AudioSpecificConfig** when the outer `audioObjectType` is not the
+explicit SBR (5) or PS (29) wrapper. Driven from
+`AudioSpecificConfig::parse(&[u8])` (which knows the byte-slice
+bound) and the new carrier-bounded entry point
+`AudioSpecificConfig::parse_bits_bounded(reader,
+origin_bit_offset, asc_bit_length)`. After the per-AOT body
+(plus optional `epConfig`), when at least 16 bits remain, the
+parser reads an 11-bit `syncExtensionType`; on a `0x2b7` match it
+consumes a nested `GetAudioObjectType()` and dispatches the
+extension AOT (`5` = HE-AAC SBR or `22` = ER BSAC; any other
+value surfaces `Error::UnsupportedTrailingExtensionAot`). The
+SBR branch reads `sbrPresentFlag`, an optional
+`extensionSamplingFrequencyIndex` (with the 24-bit explicit-rate
+escape mirroring the outer ASC), and, when at least 12 further
+bits remain, a second 11-bit `syncExtensionType` gating a 1-bit
+`psPresentFlag` on the `0x548` match. The ER BSAC branch reads
+`sbrPresentFlag`, the optional `extensionSamplingFrequencyIndex`,
+and a mandatory 4-bit `extensionChannelConfiguration`. Probe
+results land in the new `AudioSpecificConfig::trailing_sbr_probe:
+Option<SbrExtensionProbe>` carrier; when the probe resolves SBR
+or PS, `asc.sbr_present` / `asc.ps_present` /
+`asc.extension_sampling_frequency_index` /
+`asc.extension_sample_rate` / `asc.extension_channel_configuration`
+are also promoted so callers reading the top-level fields see the
+implicit signalling. The existing bit-level
+`AudioSpecificConfig::parse_bits(reader, origin_bit_offset)` keeps
+its no-probe semantics so callers holding a `BitReader` carrying
+trailing carrier bytes are not surprised by a stray 11-bit match.
+20 new integration tests cover the constant-pin, the four
+"probe-skipped" branches (no trailing bits, fewer than 16 bits
+remaining, 11-bit non-match, outer SBR / PS wrapper guard), the
+SBR-branch round-trips (sbrPresentFlag clear and set, 24-bit
+escape `extensionSamplingFrequencyIndex == 0xf`, PS sub-probe
+present, PS marker mismatch, inner-guard under 12 bits), the ER
+BSAC-branch round-trips (sbrPresentFlag clear and set), the
+`UnsupportedTrailingExtensionAot` reject for AOT 3, the
+`parse_bits` no-probe contract, the `parse_bits_bounded`
+explicit-length call shape (including a truncated-bound assertion
+that the probe does not over-read), a mid-escape truncation
+(`UnexpectedEnd`), and a hand-pinned 7-byte HE-AAC v2 implicit
+chain (AOT-2/16kHz/mono + 0x2b7 + ext_aot=5 + sbr=1 + sfi=5 +
+0x548 + ps=1). Suite size grows 389 → 409. A new
+`Error::UnsupportedTrailingExtensionAot(u8)` variant surfaces
+non-{5, 22} extension AOTs returned by `GetAudioObjectType()`
+inside the probe; new public constants `SYNC_EXTENSION_TYPE_SBR`
+(0x2b7), `SYNC_EXTENSION_TYPE_PS` (0x548),
+`SYNC_EXTENSION_TYPE_BITS` (11), `TRAILING_EXTENSION_AOT_SBR`
+(5), `TRAILING_EXTENSION_AOT_BSAC` (22) pin the field-width and
+marker constants.
+
+Round 187 lands the §4.4.2.7 /
 Table 4.51 `extension_payload()` parser **and** encoder primitive,
 the seventh tool-level encode-side syntax writer in the crate. The
 new `extension_payload` module covers the three Table 4.51
@@ -516,8 +570,12 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   `epConfig == 2` or `epConfig == 3` (round 177 rejects via
   `Error::UnsupportedEpConfig(u8)` rather than silently returning a
   partial ASC).
-- The `syncExtensionType == 0x2b7` trailing-bits probe at the end
-  of Table 1.15 (implicit-SBR signalling detection).
+- The implicit-SBR / PS signalling path **via the FIL
+  `extension_payload`** carried inside the raw_data_block stream.
+  Round 192 already covers the ASC-side Table 1.15 trailing
+  `syncExtensionType == 0x2b7` probe; the FIL-side detection
+  (ADTS HE-AAC's dominant form) still needs the SBR QMF / patching
+  back-end this crate does not yet provide.
 - LATM/LOAS transport (ISO/IEC 14496-3 §1.7.3).
 - ADTS CRC-16 validation.
 - The `swb_offset_long_window` / `swb_offset_short_window` /
