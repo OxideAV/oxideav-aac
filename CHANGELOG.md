@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-aac/releases/tag/v0.1.2) - 2026-05-30
+
+### Other
+
+- phase 2 (r192): asc Table 1.15 trailing syncExtensionType == 0x2b7 implicit-SBR / PS probe
+- phase 2 (r187): extension_payload() parser + encoder primitive — seventh tool-level encode-side syntax writer
+- phase 2 (r183): gain_control_data() parser + encoder primitive — sixth tool-level encode-side syntax writer
+- Table 4.1 extensionFlag body + Table 1.15 epConfig for ER AOTs
+- phase 2 (r165): pce::Pce::write + FrameAssembler::push_pce
+- phase 2 (r160): raw_data_block() frame assembler — encoder primitive for §4.4.2.1
+- phase 2 (r152): §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator pair
+- phase 2 (r149): scale_factor_data() parser + encoder primitive — fifth encode-side syntax-element writer
+- phase 2 (r146): tns_data() parser + encoder primitive — fourth encode-side syntax-element writer
+- phase 2 (r142): pulse_data() parser + encoder primitive — third encode-side syntax-element writer
+- phase 2 (r140): ics_info() encoder primitive — second encode-side syntax-element writer
+- phase 2 (r137): section_data() encoder primitive — first encode-side syntax-element writer
+- phase 2 (r133): section_data() parser (Table 17)
+- phase 2 begin (r129): ics_info() parser (Table 4.6)
+- phase 1 (r126): AudioSpecificConfig + program_config_element parsers
+- tighten provenance attestation wording
+- phase 1: ADTS header parser + raw_data_block syntactic walker
+- drop fuzz workflow (no fuzz targets in scaffold)
+- orphan rebuild — clean-room reset 2026-05-24
+
 ### Added (round 192 — Table 1.15 trailing syncExtensionType == 0x2b7 implicit-SBR probe)
 
 - New `AudioSpecificConfig` field `trailing_sbr_probe:
