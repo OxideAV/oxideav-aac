@@ -3,7 +3,7 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 192)
+## Status (round 194)
 
 **Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
@@ -15,7 +15,55 @@ pair + the §4.4.2.1 `raw_data_block()` frame assembler + the §4.4.2.7
 `extensionFlag` body and the Table 1.15 `epConfig` field for every
 General Audio ER object type + the §4.4.6.5 / Table 4.12
 `gain_control_data()` SSR tool + the §1.6.5 / Table 1.15 trailing
-`syncExtensionType == 0x2b7` implicit-SBR / PS probe.** Round 192
+`syncExtensionType == 0x2b7` implicit-SBR / PS probe + the §4.5.4.1
+`swb_offset_long_window[]` / `swb_offset_short_window[]` lookup
+tables and the §4.6.13 pulse-escape reconstruction loop.** Round 194
+lands the ISO/IEC 14496-3 Tables 4.129–4.141 scalefactor-band offset
+tables for all 12 standard `samplingFrequencyIndex` values, the
+first spectrum-reconstruction-layer entry point in the crate, and
+the §4.6.13 pulse-escape fix-up that consumes one. Public
+constants: `SWB_OFFSET_LONG_WINDOW[13]` and
+`SWB_OFFSET_SHORT_WINDOW[13]` (slot `12`, 7350 Hz, is an empty
+slice — no SWB table is defined for that rate); each non-empty
+slot is `num_swb + 1` entries long (the trailing entry is the
+spectrum-length sentinel `1024` or `128`). Public constants
+`LONG_WINDOW_LEN = 1024` / `SHORT_WINDOW_LEN = 128` pin the
+sentinel values. Safe accessors `long_window_offsets(fs_index)` /
+`short_window_offsets(fs_index)` reject out-of-range
+`fs_index` (`>= 13`) and the 7350 Hz slot via
+`Error::IcsInfoUnsupportedSampleRateIndex`. The new
+`swb_offset::apply_pulse_data(x_quant, fs_index, pulse_data)`
+walks the §4.6.13 pseudocode:
+`k = swb_offset_long[fs][pulse_start_sfb]; for each pulse: k +=
+pulse_offset[i]; if x_quant[k] > 0 then x_quant[k] += pulse_amp[i]
+else x_quant[k] -= pulse_amp[i]`. Rejects empty / oversized pulse
+lists, a `pulse_start_sfb` past the last real scalefactor band,
+and a `k` accumulation that runs off the 1024-coefficient
+spectrum via `Error::PulseDataEncodeInvalid`. The 960-line frame
+variant (Tables 4.142–4.147, `frameLengthFlag == 1`) and the
+24-bit explicit-rate escape (`samplingFrequencyIndex == 0xf`) are
+NOT covered — both demand caller resolution before the accessor
+is invoked. 45 new tests (33 unit in `src/swb_offset.rs` + 12
+integration in `tests/swb_offset.rs`): per-table band-count
+verification, Table-row-by-row spot checks against the spec PDF
+(Tables 4.129 / 4.130 / 4.131 / 4.132 / 4.133 / 4.134 / 4.135 /
+4.136 / 4.137 / 4.138 / 4.139 / 4.140 / 4.141), strict-monotonic
++ sum-to-spectrum-length invariants for every table, same-table
+aliasing (fs 0 / 1 share Table 4.140; 3 / 4 share 4.129; 3 / 4 /
+5 share 4.130; 6 / 7 share 4.136 + 4.137; 8 / 9 / 10 share 4.134
++ 4.135), 7350 Hz / out-of-range / explicit-rate rejection, the
+§4.6.13 sign-dependent reconstruction (`> 0` positive-add branch,
+`<= 0` negative-subtract branch, exact-zero falling into the
+else), the multi-pulse `k` chaining (one-pulse, two-pulse,
+four-pulse with `(offset=31, amp=15)` saturation), the
+zero-`pulse_offset` corner case (two pulses on the same
+coefficient), reconstruction at 8 kHz (Table 4.132) and 96 kHz
+(Table 4.140), unrelated-coefficient untouched assertion, and
+every error-rejection branch (empty pulses, > 4 pulses, oversized
+`pulse_start_sfb`, k-overrun, unsupported `fs_index`). Suite size
+grows 409 → 454 tests.
+
+Round 192
 lands the Table 1.15 trailing-bits backward-compatible probe used
 to carry HE-AAC v1 / v2 / ER BSAC extension data **inside the
 AudioSpecificConfig** when the outer `audioObjectType` is not the
@@ -524,6 +572,35 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   `coef_bits` tier, or zero-`order` filter carrying a non-default
   `direction` / `coef_compress` that would be silently dropped on
   the wire).
+- **`swb_offset` module** (ISO/IEC 14496-3 §4.5.4.1 / Tables
+  4.129–4.141, **new in round 194**): the per-sample-rate
+  `swb_offset_long_window[]` and `swb_offset_short_window[]`
+  lookup tables, plus the §4.6.13 pulse-escape reconstruction
+  loop. Constants `SWB_OFFSET_LONG_WINDOW[13]` /
+  `SWB_OFFSET_SHORT_WINDOW[13]` map every standard
+  `samplingFrequencyIndex` (Table 1.18 slots 0..=11) to a
+  per-band offset slice; slot `12` (7350 Hz) is an empty slice —
+  no SWB table is defined. Each non-empty slot is `num_swb + 1`
+  entries long (the trailing entry is the spectrum-length
+  sentinel `1024` for long, `128` for short). Safe accessors
+  `long_window_offsets(fs_index)` /
+  `short_window_offsets(fs_index)` reject out-of-range
+  `fs_index` and 7350 Hz via
+  `Error::IcsInfoUnsupportedSampleRateIndex`. Public constants
+  `LONG_WINDOW_LEN = 1024` / `SHORT_WINDOW_LEN = 128` pin the
+  sentinel values. `apply_pulse_data(x_quant, fs_index,
+  pulse_data)` is the first spectrum-reconstruction-layer entry
+  point in the crate — it walks the §4.6.13 pseudocode `k =
+  swb_offset_long[fs][pulse_start_sfb]; for i in 0..number_pulse
+  + 1: k += pulse_offset[i]; if x_quant[k] > 0 then x_quant[k] +=
+  pulse_amp[i] else x_quant[k] -= pulse_amp[i]`, with structural
+  rejections (empty / oversized pulse list, `pulse_start_sfb`
+  past the last real band, `k` overrun past `LONG_WINDOW_LEN`,
+  unsupported `fs_index`) surfaced via the existing
+  `Error::PulseDataEncodeInvalid` and
+  `Error::IcsInfoUnsupportedSampleRateIndex` variants. The
+  960-line frame variant (Tables 4.142–4.147, `frameLengthFlag
+  == 1`) is **not** covered.
 
 ## What Phase 2 still omits
 
@@ -540,11 +617,15 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   `rev_global_gain`, `length_of_rvlc_sf`, `sf_concealment`,
   `length_of_rvlc_escapes`); ER AAC-LD / scalable profiles need
   a sibling `scale_factor_data_rvlc()` module.
-- The §4.6.13 pulse-escape *reconstruction* loop. The pulse-data
-  record is parseable / writable bit-for-bit, but applying the
-  fix-up to the decoded `x_quant` coefficients requires the
-  `swb_offset_long_window[]` table (still owed) and an already-
-  Huffman-decoded spectrum (still owed).
+- The §4.6.13 pulse-escape reconstruction loop's *upstream
+  dependency*. Round 194 lands
+  `swb_offset::apply_pulse_data(x_quant, fs_index, pulse_data)`,
+  which folds the per-pulse `±pulse_amp` fix-up into a long-window
+  `x_quant` slice at the running coefficient index `k =
+  swb_offset_long[fs][pulse_start_sfb] + Σ pulse_offset[i]`. The
+  fix-up itself is complete; what's still owed is the
+  *already-Huffman-decoded* spectrum that it operates on, which
+  arrives with `spectral_data()`.
 - The §4.6.9.3 `tns_decode_coef` LPC reconstruction and the
   §4.6.9.3 `tns_ar_filter` all-pole pass. The `tns_data()` block
   is parseable / writable bit-for-bit, but applying the all-pole
@@ -578,11 +659,13 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   back-end this crate does not yet provide.
 - LATM/LOAS transport (ISO/IEC 14496-3 §1.7.3).
 - ADTS CRC-16 validation.
-- The `swb_offset_long_window` / `swb_offset_short_window` /
-  `sect_sfb_offset` tables — only the **count** of scalefactor
-  bands is needed to step through `ics_info()` and `section_data()`
-  (which works in band units); the offset tables arrive with
-  `spectral_data()`.
+- The `sect_sfb_offset` table — derived per-frame from
+  `swb_offset_long_window[]` / `swb_offset_short_window[]` (which
+  are now in place as of round 194) and the runtime grouping mask
+  from `ics_info()`. The derivation belongs in the per-frame
+  channel-element body walker that consumes `ics_info()` +
+  `section_data()` + `spectral_data()` together; the building-
+  block tables themselves are landed.
 
 ## Provenance
 

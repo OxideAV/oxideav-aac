@@ -6,6 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- phase 2 (r194): `swb_offset` module — ISO/IEC 14496-3 §4.5.4.1 /
+  Tables 4.129–4.141 `swb_offset_long_window[]` and
+  `swb_offset_short_window[]` lookup tables for all 12 standard
+  `samplingFrequencyIndex` values. Exposed as
+  `SWB_OFFSET_LONG_WINDOW[13]` and `SWB_OFFSET_SHORT_WINDOW[13]`
+  const slices (slot `12` empty — 7350 Hz has no defined SWB
+  table); safe accessors `long_window_offsets(fs_index)` and
+  `short_window_offsets(fs_index)`. Adds `LONG_WINDOW_LEN` /
+  `SHORT_WINDOW_LEN` spectrum-length constants (1024 / 128).
+- phase 2 (r194): `swb_offset::apply_pulse_data` — §4.6.13
+  pulse-escape reconstruction loop, the crate's first
+  spectrum-reconstruction-layer entry point. Consumes a parsed
+  `pulse_data::PulseData` block plus a `&mut [i32]` long-window
+  `x_quant` slice, folds the per-pulse `±pulse_amp` fix-up at the
+  running coefficient index
+  `k = swb_offset_long[fs][pulse_start_sfb] + Σ pulse_offset[i]`.
+  Rejects malformed bitstreams (`pulse_start_sfb` past the last
+  real band, `k` overrun past `LONG_WINDOW_LEN`, empty / >4 pulse
+  list) via `Error::PulseDataEncodeInvalid`, unsupported
+  `fs_index` via `Error::IcsInfoUnsupportedSampleRateIndex`. Suite
+  size grows 409 → 454 tests (+45: 33 unit + 12 integration).
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-aac/releases/tag/v0.1.2) - 2026-05-30
 
 ### Other

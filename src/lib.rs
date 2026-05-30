@@ -162,6 +162,25 @@
 //!   (5 / 4-2 / 2 / 4-5). The §4.6.12 ladder-application loop that
 //!   reconstructs sample-domain attenuation factors is **not**
 //!   performed; it needs the SSR PQF / IMDCT back-end.
+//! * The [`swb_offset`] module — ISO/IEC 14496-3 §4.5.4.1 / Tables
+//!   4.129–4.141 *swb_offset_long_window[]* and
+//!   *swb_offset_short_window[]* lookup tables, **new in round 194**.
+//!   The per-band lowest-coefficient index for each of the 12 valid
+//!   `samplingFrequencyIndex` values is exposed as
+//!   [`swb_offset::SWB_OFFSET_LONG_WINDOW`] (each slot
+//!   `num_swb + 1` entries with trailing 1024 sentinel) and
+//!   [`swb_offset::SWB_OFFSET_SHORT_WINDOW`] (each slot
+//!   `num_swb + 1` entries with trailing 128 sentinel). Public
+//!   accessors [`swb_offset::long_window_offsets`] and
+//!   [`swb_offset::short_window_offsets`] bounds-check
+//!   `fs_index`. [`swb_offset::apply_pulse_data`] applies the
+//!   §4.6.13 pulse-escape reconstruction to a long-window
+//!   `x_quant` slice — the first reconstruction-layer entry point in
+//!   the crate, consuming a parsed [`pulse_data::PulseData`] block
+//!   and folding the `±pulse_amp` fix-up into the quantised
+//!   spectrum at the running coefficient index `k = swb_offset[fs][
+//!   pulse_start_sfb] + Σ pulse_offset[i]`. The 960-line frame
+//!   variant (Tables 4.142–4.147) is **not** covered.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three
@@ -229,6 +248,7 @@ pub mod pulse_data;
 pub mod raw_data_block;
 pub mod scale_factor_data;
 pub mod section_data;
+pub mod swb_offset;
 pub mod tns_data;
 
 mod error;
