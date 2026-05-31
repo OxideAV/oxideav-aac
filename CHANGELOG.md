@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r200): `tns_max` module — ISO/IEC 14496-3 §4.6.9.4 /
+  Tables 4.102 (`TNS_MAX_ORDER`) and 4.103 (`TNS_MAX_BANDS`)
+  decoder-side clamp tables, plus the §4.6.17.2.5 Tables 4.119 /
+  4.120 LD-specific `TNS_MAX_BANDS` tables for the 480- and
+  512-sample AAC LD frame variants. Exposed as the accessors
+  `tns_max_order(aot, window_sequence, fs_index)`,
+  `tns_max_bands(aot, window_sequence, fs_index)`,
+  `tns_max_bands_ld_480(fs_index)`,
+  `tns_max_bands_ld_512(fs_index)`, plus the three-way
+  `min(band, TNS_MAX_BANDS, max_sfb)` and
+  `min(order, TNS_MAX_ORDER)` clamp helpers `clamp_tns_band` and
+  `clamp_tns_order` that fold the §4.6.9.3 pseudocode into one
+  call. Public AOT constants `AOT_AAC_MAIN`, `AOT_AAC_LC`,
+  `AOT_AAC_SSR`, `AOT_AAC_LTP`, `AOT_ER_AAC_LD` and the per-rate
+  LD tables `TNS_MAX_BANDS_LD_480: [Option<u8>; 12]` /
+  `TNS_MAX_BANDS_LD_512: [Option<u8>; 12]`. Table 4.102 dispatch
+  partitions the long-window column at the > 32 kHz / ≤ 32 kHz
+  threshold; Table 4.103 dispatch routes AOT 3 (AAC SSR) through
+  the PQF-filterbank columns and every other AOT through the
+  non-PQF columns. Out-of-range `fs_index` (`>= 13`) and the
+  uncovered LD rates surface as
+  `Error::IcsInfoUnsupportedSampleRateIndex`. 34 new tests
+  (24 unit + 10 integration). Suite grows 454 → 488 tests.
 - phase 2 (r194): `swb_offset` module — ISO/IEC 14496-3 §4.5.4.1 /
   Tables 4.129–4.141 `swb_offset_long_window[]` and
   `swb_offset_short_window[]` lookup tables for all 12 standard

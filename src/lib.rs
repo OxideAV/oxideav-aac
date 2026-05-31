@@ -181,6 +181,22 @@
 //!   spectrum at the running coefficient index `k = swb_offset[fs][
 //!   pulse_start_sfb] + Σ pulse_offset[i]`. The 960-line frame
 //!   variant (Tables 4.142–4.147) is **not** covered.
+//! * The [`tns_max`] module — ISO/IEC 14496-3 §4.6.9.4 Tables
+//!   4.102 / 4.103 decoder-side `TNS_MAX_ORDER` / `TNS_MAX_BANDS`
+//!   clamp tables and §4.6.17.2.5 Tables 4.119 / 4.120 LD-specific
+//!   `TNS_MAX_BANDS` tables, **new in round 200**. The accessors
+//!   [`tns_max::tns_max_order`] and [`tns_max::tns_max_bands`]
+//!   surface the per-AOT / per-window-sequence / per-`fs_index`
+//!   caps; [`tns_max::tns_max_bands_ld_480`] and
+//!   [`tns_max::tns_max_bands_ld_512`] handle the LD frame-size
+//!   split. The clamp helpers [`tns_max::clamp_tns_order`] and
+//!   [`tns_max::clamp_tns_band`] fold the §4.6.9.3 three-way
+//!   `min(band, TNS_MAX_BANDS, max_sfb)` and
+//!   `min(order, TNS_MAX_ORDER)` pseudocode into one call so the
+//!   eventual TNS reconstruction layer can consume them without
+//!   re-deriving the AOT dispatch. The Table 4.103 dispatch splits
+//!   AOT 3 (AAC SSR) into the PQF-filterbank columns; every other
+//!   AOT uses the non-PQF columns.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three
@@ -250,6 +266,7 @@ pub mod scale_factor_data;
 pub mod section_data;
 pub mod swb_offset;
 pub mod tns_data;
+pub mod tns_max;
 
 mod error;
 

@@ -3,7 +3,7 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 194)
+## Status (round 200)
 
 **Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
@@ -17,7 +17,64 @@ General Audio ER object type + the §4.4.6.5 / Table 4.12
 `gain_control_data()` SSR tool + the §1.6.5 / Table 1.15 trailing
 `syncExtensionType == 0x2b7` implicit-SBR / PS probe + the §4.5.4.1
 `swb_offset_long_window[]` / `swb_offset_short_window[]` lookup
-tables and the §4.6.13 pulse-escape reconstruction loop.** Round 194
+tables and the §4.6.13 pulse-escape reconstruction loop + the
+§4.6.9.4 `TNS_MAX_ORDER` / `TNS_MAX_BANDS` clamp tables and
+§4.6.17.2.5 LD-specific `TNS_MAX_BANDS` tables.** Round 200 lands
+the ISO/IEC 14496-3 Table 4.102 `TNS_MAX_ORDER` and Table 4.103
+`TNS_MAX_BANDS` decoder-side clamps that bound the `order` and
+band-index fields of every parsed `tns_data()` filter at
+reconstruction time, the §4.6.17.2.5 Tables 4.119 / 4.120
+LD-specific `TNS_MAX_BANDS` lookups (480- and 512-sample AAC LD
+frames), and the §4.6.9.3 three-way `min(band, TNS_MAX_BANDS,
+max_sfb)` and `min(order, TNS_MAX_ORDER)` clamp helpers. New
+module `tns_max` exposes the public AOT constants
+(`AOT_AAC_MAIN = 1`, `AOT_AAC_LC = 2`, `AOT_AAC_SSR = 3`,
+`AOT_AAC_LTP = 4`, `AOT_ER_AAC_LD = 23`); the per-rate caps
+`TNS_MAX_BANDS_LD_480: [Option<u8>; 12]` and
+`TNS_MAX_BANDS_LD_512: [Option<u8>; 12]` (slots 3/4/5/6/7 are
+`Some`, every other rate is `None` reflecting the LD-tables-only-cover-5-rates fact); and the accessors
+`tns_max_order(aot, window_sequence, fs_index)`,
+`tns_max_bands(aot, window_sequence, fs_index)`,
+`tns_max_bands_ld_480(fs_index)` /
+`tns_max_bands_ld_512(fs_index)`,
+`clamp_tns_order(order, aot, ws, fs_index)`, and
+`clamp_tns_band(band, max_sfb, aot, ws, fs_index)`. The Table
+4.102 dispatch splits AOT 1 / 2 / 3 from "other AOT using TNS"
+and partitions the long-window column at the > 32 kHz / ≤ 32 kHz
+threshold (fs ≤ 4 vs ≥ 5); the Table 4.103 dispatch routes
+AOT 3 (AAC SSR) through the PQF-filterbank columns and every
+other AOT through the non-PQF columns. `clamp_tns_band` folds
+the three-way `min(band, TNS_MAX_BANDS, max_sfb)` from the
+§4.6.9.3 pseudocode into one call so the eventual TNS
+reconstruction layer can consume it without re-deriving the AOT
+dispatch. Field-validity sanity: every non-LD cap is ≤ the
+corresponding `num_swb_long_window` / `num_swb_short_window`
+(verified by an integration test that walks every fs × AOT
+combination), and every `TNS_MAX_ORDER` cap is within the
+Table 4.155 `order` field width (5 bits for long, 3 bits for
+short). Rejection: `fs_index >= 13` (the Table 1.18 reserved
+slot) surfaces as `Error::IcsInfoUnsupportedSampleRateIndex` on
+every accessor; fs 12 (7350 Hz) rejects on the Table 4.103
+accessor (not listed in the table) but is accepted on the
+Table 4.102 `TNS_MAX_ORDER` accessor; the LD accessors reject
+the 7 uncovered rates (fs 0/1/2/8/9/10/11). 34 new tests
+(24 unit in `src/tns_max.rs` + 10 integration in
+`tests/tns_max.rs`): row-by-row exact-match of every
+12-entry table column (Table 4.103 long-non-PQF, short-non-PQF,
+long-PQF, short-PQF; Tables 4.119 / 4.120 row-by-row), the
+> 32 kHz / ≤ 32 kHz partition for the "other AOT" row of Table
+4.102, the short-windows-always-7 row collapse for every AOT,
+the AOT 3 PQF-column dispatch, the LongStart / LongStop = long
+column verification, the LD 480 vs 512 divergence at 24 / 22.05
+kHz (30 vs 31), every `Error::IcsInfoUnsupportedSampleRateIndex`
+branch on every accessor, three-way-`min` correctness for
+`clamp_tns_band` under each of the three operands dominating
+(band wins, max_sfb wins, TNS_MAX_BANDS wins), and the
+`tns_max_bands` ≤ `num_swb` integration invariant via the
+sibling [`ics_info`](src/ics_info.rs) constants. Suite size
+grows 454 → 488 tests.
+
+Round 194
 lands the ISO/IEC 14496-3 Tables 4.129–4.141 scalefactor-band offset
 tables for all 12 standard `samplingFrequencyIndex` values, the
 first spectrum-reconstruction-layer entry point in the crate, and
