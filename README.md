@@ -3,7 +3,7 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 200)
+## Status (round 207)
 
 **Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
@@ -19,7 +19,54 @@ General Audio ER object type + the §4.4.6.5 / Table 4.12
 `swb_offset_long_window[]` / `swb_offset_short_window[]` lookup
 tables and the §4.6.13 pulse-escape reconstruction loop + the
 §4.6.9.4 `TNS_MAX_ORDER` / `TNS_MAX_BANDS` clamp tables and
-§4.6.17.2.5 LD-specific `TNS_MAX_BANDS` tables.** Round 200 lands
+§4.6.17.2.5 LD-specific `TNS_MAX_BANDS` tables + the §4.4.6 /
+Table 4.50 `individual_channel_stream()` body walker.** Round 207
+lands the channel-element body walker that composes the existing
+per-tool parsers / writers (`global_gain`, `ics_info`,
+`section_data`, `scale_factor_data`, optional `pulse_data` /
+`tns_data` / `gain_control_data`) into a single
+`individual_channel_stream()` parse / write cycle, **up to but not
+including** `spectral_data()`. The new `ics_body` module exposes
+`IcsBody` with the four entry points
+`IcsBody::parse(reader, audio_object_type, sampling_frequency_index,
+scale_flag)` (SCE / LFE / non-shared CPE form — reads inline
+`ics_info()`),
+`IcsBody::parse_with_ics_info(reader, &ics_info,
+audio_object_type, scale_flag)` (CPE `common_window == 1`
+shared-info form), and the symmetric writers
+`IcsBody::write(...)` / `IcsBody::write_with_ics_info(...)`. The
+parsed struct surfaces every wire field plus the
+`spectral_data_bit_offset` (the bit position of the first
+`spectral_data()` bit relative to the start of the body) so the
+caller can hand off the trailing spectrum block to a future
+parser. The Table 4.50 Note 1 "pulse_data is illegal on
+`EIGHT_SHORT_SEQUENCE`" constraint and the §4.6.12
+"gain_control_data is AOT-3 (SSR) only" normative constraint are
+enforced on the writer side
+(`Error::PulseDataEncodeInvalid` / `Error::GainControlDataEncodeInvalid`);
+the parser surfaces the literal bits so hostile streams that violate
+the constraints do not panic. `scale_flag == true` (scalable AAC,
+AOT 6) is rejected on both sides with `Error::NotImplemented`
+because the scalable extension's `aac_scalable_main_header()`
+dispatch is not yet wired up. New public constants
+`GLOBAL_GAIN_BITS = 8` and `AOT_AAC_SSR = 3`. 15 new integration
+tests in `tests/ics_body.rs` cover: the minimal AAC-LC long body
+(no tools), the one-active-band variant, every dispatch branch
+(`pulse_data` / `tns_data` / `gain_control_data` independently
+and jointly), the AAC-LC eight-short tns_data round-trip, the
+`EIGHT_SHORT_SEQUENCE` pulse-data rejection, the populated-slot-
+without-dispatch-bit rejection, the AOT-3-only gain_control_data
+rejection, the CPE shared-`ics_info` round-trip, the missing-
+inline-`ics_info` writer rejection, the `scale_flag == true`
+rejection on both sides, and the
+`spectral_data_bit_offset == bits_written` invariant (the parser
+stops exactly at the writer's emitted position). Suite size grows
+488 → 503 tests. The `raw_data_block::Walker` still emits
+`Element::ChannelElement` for the header alone — wiring the
+walker to consume the body via `ics_body::IcsBody::parse` is a
+follow-up round.
+
+Round 200 lands
 the ISO/IEC 14496-3 Table 4.102 `TNS_MAX_ORDER` and Table 4.103
 `TNS_MAX_BANDS` decoder-side clamps that bound the `order` and
 band-index fields of every parsed `tns_data()` filter at

@@ -197,6 +197,26 @@
 //!   re-deriving the AOT dispatch. The Table 4.103 dispatch splits
 //!   AOT 3 (AAC SSR) into the PQF-filterbank columns; every other
 //!   AOT uses the non-PQF columns.
+//! * The [`ics_body`] module — ISO/IEC 14496-3 §4.4.6 / Table 4.50
+//!   `individual_channel_stream()` body walker, **new in round 207**.
+//!   Composes the existing per-tool parsers / writers (`global_gain`,
+//!   [`ics_info`], [`section_data`], [`scale_factor_data`], optional
+//!   [`pulse_data`] / [`tns_data`] / [`gain_control_data`]) into the
+//!   complete Table 4.50 channel-element body, **up to but not
+//!   including** `spectral_data()`. Surfaces the parsed structure plus
+//!   the `spectral_data_bit_offset` so the caller (e.g. a future
+//!   spectrum parser, or a frame-assembler that hands off the
+//!   spectrum-bit-slice via `push_channel_body_bits`) can resume the
+//!   walk at the right boundary. The shared-info `CPE` form
+//!   ([`ics_body::IcsBody::parse_with_ics_info`] /
+//!   [`ics_body::IcsBody::write_with_ics_info`]) accepts the
+//!   externally-held [`ics_info::IcsInfo`] for the per-channel body.
+//!   Table 4.50 Note 1's "pulse_data illegal on
+//!   `EIGHT_SHORT_SEQUENCE`" and the §4.6.12 "gain_control_data is
+//!   AOT-3 (SSR) only" normative constraints are enforced on the
+//!   writer side; the parser surfaces literal bits to keep hostile
+//!   streams from panicking. `scale_flag == true` (scalable AAC, AOT
+//!   6) rejects with [`Error::NotImplemented`].
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three
@@ -243,11 +263,13 @@
 //!   16-bit CRC when present.
 //! * `raw_data_block()` walker: iterates `id_syn_ele` and stops at
 //!   `END`; FIL / DSE / PCE bodies are fully consumed. SCE / CPE /
-//!   CCE / LFE bodies start with [`ics_info`] then [`section_data`]
-//!   then [`scale_factor_data`] (Phase 2 in progress); the optional
-//!   [`pulse_data`], [`tns_data`], and [`gain_control_data`] tools
-//!   now parse and write; the remaining channel-stream tool
-//!   (`spectral_data`) is deferred.
+//!   CCE / LFE bodies now compose through the new [`ics_body`]
+//!   walker (Table 4.50): `global_gain` → [`ics_info`] →
+//!   [`section_data`] → [`scale_factor_data`] → optional
+//!   [`pulse_data`] / [`tns_data`] / [`gain_control_data`]. The
+//!   remaining channel-stream tool (`spectral_data`) is deferred;
+//!   `ics_body` surfaces the start bit-offset of that tool so the
+//!   caller can hand off the spectrum slice to a future parser.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -258,6 +280,7 @@ pub mod adts;
 pub mod asc;
 pub mod extension_payload;
 pub mod gain_control_data;
+pub mod ics_body;
 pub mod ics_info;
 pub mod pce;
 pub mod pulse_data;

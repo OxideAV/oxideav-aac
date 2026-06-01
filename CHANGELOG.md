@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r207): `ics_body` module — ISO/IEC 14496-3 §4.4.6 /
+  Table 4.50 `individual_channel_stream()` body walker. Composes
+  the existing per-tool parsers / writers (`global_gain`, `ics_info`,
+  `section_data`, `scale_factor_data`, optional `pulse_data` /
+  `tns_data` / `gain_control_data`) into a single channel-element
+  body parse / write cycle, **up to but not including**
+  `spectral_data()`. Exposes `IcsBody::parse` /
+  `IcsBody::parse_with_ics_info` (SCE/LFE/CPE-shared-info dispatch)
+  and `IcsBody::write` / `IcsBody::write_with_ics_info`. Surfaces
+  the parser-derived `spectral_data_bit_offset` so the caller can
+  hand off the trailing spectrum block to a future
+  `spectral_data()` parser (or to a frame-assembler's
+  `push_channel_body_bits`). Public constants
+  `GLOBAL_GAIN_BITS = 8`, `AOT_AAC_SSR = 3`. Normative constraint
+  enforcement on the writer side: Table 4.50 Note 1
+  (pulse_data illegal on `EIGHT_SHORT_SEQUENCE`) and §4.6.12
+  (gain_control_data is AOT-3-only) reject with
+  `Error::PulseDataEncodeInvalid` /
+  `Error::GainControlDataEncodeInvalid`; the parser surfaces
+  literal bits to keep hostile streams from panicking.
+  `scale_flag == true` (scalable AAC, AOT 6) rejects with
+  `Error::NotImplemented` on both sides. 15 new integration tests
+  cover the minimal AAC-LC long body, the one-active-band variant,
+  the pulse_data / tns_data / gain_control_data dispatch branches,
+  the all-tools-dispatched SSR stress, the
+  `EIGHT_SHORT_SEQUENCE` pulse-data rejection, the populated-slot-
+  without-dispatch-bit rejection, the AOT-3-only gain_control
+  rejection, the CPE-shared-ics_info round-trip, the missing-
+  inline-ics_info writer rejection, the `scale_flag == true`
+  rejection on both sides, and the
+  `spectral_data_bit_offset == bits_written` invariant. Suite
+  grows 488 → 503 tests.
 - phase 2 (r200): `tns_max` module — ISO/IEC 14496-3 §4.6.9.4 /
   Tables 4.102 (`TNS_MAX_ORDER`) and 4.103 (`TNS_MAX_BANDS`)
   decoder-side clamp tables, plus the §4.6.17.2.5 Tables 4.119 /
