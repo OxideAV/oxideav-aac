@@ -3,34 +3,63 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 219)
+## Status (round 226)
 
-Round 219 lands the `spectrum_huffman` module — the **wire layer** for
-the §4.6.3 / Annex 4.A Huffman codebooks that the round-213
-[`spectral_codebook`](src/spectral_codebook.rs) §4.6.3.3 index↔tuple
-translation already consumes. This round transcribes **Table 4.A.2**
-(Spectrum Huffman Codebook 1, signed 4-tuple, `LAV = 1`, 81 entries
-indexed `0..=80`) verbatim from ISO/IEC 14496-3:2001(E) §4.A.1
-(page 193). Each entry stores `(length, codeword)` with the codeword
-right-aligned in a `u16` (MSB at bit `length − 1`); maximum codeword
-length is 11 bits; the zero-tuple `(0, 0, 0, 0)` at index 40 carries
-the single bit `0`. The codebook is a **complete** prefix code (Kraft
-equality `Σ 2^(11 − L) = 2048 = 2^11`), exhaustively verified by
-walking every 11-bit prefix and asserting each maps to exactly one
-entry. Public API: `HCOD1_NUM_ENTRIES = 81`, `HCOD1_MAX_LEN = 11`,
-`hcod1_encode(idx) -> (u8, u16)`, `hcod1_decode(reader) -> u32`, and
-the convenience `hcod1_write(writer, idx)`. Out-of-range indices
-surface as `Error::SpectralCodebookIndexOutOfRange(1)`; reader
+Round 226 lands **Table 4.A.3** (Spectrum Huffman Codebook 2) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module
+that round 219 bootstrapped against Table 4.A.2. Codebook 2 shares
+Codebook 1's signed 4-tuple universe (`unsigned_cb = 0`, `dim = 4`,
+`LAV = 1` → `3^4 = 81` entries indexed `0..=80`) but uses a different
+per-row Huffman length tuning to fit a different encoder
+target-statistics: maximum codeword length is **9 bits** (vs 11 for
+Codebook 1); the zero-tuple at index 40 carries the **3-bit
+codeword `0b000`** (vs the single bit `0` in Codebook 1); the
+shortest non-zero-tuple codeword is **4 bits** at index 67 (`0b0010`,
+the spec-PDF's most likely non-zero 4-tuple for this book's target
+statistics). The table is a **complete** 9-bit prefix code (Kraft
+equality `Σ 2^(9 − L) = 512 = 2^9`), exhaustively verified by
+walking every 9-bit prefix and asserting each maps to exactly one
+entry. Public API: `HCOD2_NUM_ENTRIES = 81`, `HCOD2_MAX_LEN = 9`,
+`hcod2_encode(idx) -> (u8, u16)`, `hcod2_decode(reader) -> u32`, and
+the convenience `hcod2_write(writer, idx)`. Out-of-range indices
+surface as `Error::SpectralCodebookIndexOutOfRange(2)`; reader
 underflow surfaces as `Error::UnexpectedEnd`. The round-213
-§4.6.3.3 translation is exercised as a cross-check: every Codebook 1
-index round-trips through `decode_index_to_tuple(1, idx)` →
-`encode_tuple_to_index(1, &tuple)` back to the same index, with every
-tuple element verified to lie in the `±LAV = ±1` range. 31 new tests
-(15 unit + 16 integration); suite grows 549 → 580 tests. Codebooks
-2..=11 (Tables 4.A.3 … 4.A.12) reuse the same module shape and will
-land one per future round; the `spectral_data()` driver that
-dispatches per-band onto the chosen codebook arrives once all
-eleven spectrum books are in place.
+§4.6.3.3 translation is exercised as a cross-check: every Codebook 2
+index round-trips through `decode_index_to_tuple(2, idx)` →
+`encode_tuple_to_index(2, &tuple)` back to the same index, and an
+explicit tuple-equivalence test confirms Codebook 1 and Codebook 2
+map every shared index to the same `(w, x, y, z)` spectral tuple —
+only the Huffman codewords differ, since the §4.6.3.3 translation
+depends on the Table 4.95 row shape (identical for both books) and
+not on the codeword assignment. 33 new tests (16 unit +
+17 integration); suite grows 580 → 613 tests. Codebooks 3..=11
+(Tables 4.A.4 … 4.A.12) reuse the same module shape and will land
+one per future round; the `spectral_data()` driver that dispatches
+per-band onto the chosen codebook arrives once all eleven spectrum
+books are in place.
+
+Round 219 had landed the bootstrap of `spectrum_huffman` — the
+**wire layer** for the §4.6.3 / Annex 4.A Huffman codebooks that the
+round-213 [`spectral_codebook`](src/spectral_codebook.rs) §4.6.3.3
+index↔tuple translation already consumes — by transcribing
+**Table 4.A.2** (Spectrum Huffman Codebook 1, signed 4-tuple,
+`LAV = 1`, 81 entries indexed `0..=80`) verbatim from ISO/IEC
+14496-3:2001(E) §4.A.1 (page 193). Each entry stores
+`(length, codeword)` with the codeword right-aligned in a `u16`
+(MSB at bit `length − 1`); maximum codeword length is 11 bits; the
+zero-tuple `(0, 0, 0, 0)` at index 40 carries the single bit `0`.
+The codebook is a **complete** prefix code (Kraft equality
+`Σ 2^(11 − L) = 2048 = 2^11`), exhaustively verified by walking
+every 11-bit prefix and asserting each maps to exactly one entry.
+Public API: `HCOD1_NUM_ENTRIES = 81`, `HCOD1_MAX_LEN = 11`,
+`hcod1_encode(idx) -> (u8, u16)`, `hcod1_decode(reader) -> u32`,
+and the convenience `hcod1_write(writer, idx)`. Out-of-range
+indices surface as `Error::SpectralCodebookIndexOutOfRange(1)`;
+reader underflow surfaces as `Error::UnexpectedEnd`. The §4.6.3.3
+translation is exercised as a cross-check: every Codebook 1 index
+round-trips through `decode_index_to_tuple(1, idx)` →
+`encode_tuple_to_index(1, &tuple)` back to the same index, with
+every tuple element verified to lie in the `±LAV = ±1` range.
 
 **Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
@@ -50,7 +79,9 @@ tables and the §4.6.13 pulse-escape reconstruction loop + the
 Table 4.50 `individual_channel_stream()` body walker + the
 §4.6.3 / Table 4.95 Spectrum Huffman codebook parameters and the
 §4.6.3.3 index → tuple translation (including the sign-bit fix-up
-and the codebook-11 ESC sequence).** Round 213 lands the
+and the codebook-11 ESC sequence) + the §4.A.1 Tables 4.A.2 / 4.A.3
+Spectrum Huffman Codebook 1 (11-bit max) and 2 (9-bit max) wire-layer
+encode / decode primitives.** Round 213 lands the
 `spectral_codebook` module — the foundational decoder layer for
 the upcoming `spectral_data()` parser. `TABLE_4_95: [Table495Row;
 32]` covers every codebook number `0..=31` row-by-row: the
@@ -773,9 +804,10 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
 
 - The remaining channel-stream tool after `scale_factor_data()`:
   `spectral_data()`. The walker therefore still cannot iterate past
-  a single channel-element body. Round 219 lands the first of the
-  eleven spectrum Huffman codebooks needed to drive that tool —
-  Codebook 1 (Table 4.A.2). Codebooks 2..=11 (Tables 4.A.3 …
+  a single channel-element body. Round 219 lands the first and
+  round 226 lands the second of the eleven spectrum Huffman
+  codebooks needed to drive that tool — Codebook 1 (Table 4.A.2)
+  and Codebook 2 (Table 4.A.3). Codebooks 3..=11 (Tables 4.A.4 …
   4.A.12) reuse the same module shape and are owed in subsequent
   rounds; the `spectral_data()` driver that dispatches per-band onto
   the chosen codebook arrives once all eleven are in place.

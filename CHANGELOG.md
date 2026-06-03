@@ -8,6 +8,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r226): `spectrum_huffman::HCOD2` — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.3 (Spectrum Huffman Codebook 2) wire layer.
+  Codebook 2 shares Codebook 1's tuple universe (signed 4-tuple,
+  `unsigned_cb = 0`, `dim = 4`, `LAV = 1` → `3^4 = 81` entries indexed
+  `0..=80`) but uses a different per-row Huffman length tuning:
+  maximum codeword length is 9 bits (vs 11 for Codebook 1); index 40
+  (the zero-tuple) carries the 3-bit codeword `0b000` (vs the
+  single-bit `0` in Codebook 1); index 67 carries the shortest
+  non-zero-tuple codeword at 4 bits (`0b0010`). Public constants
+  `HCOD2_NUM_ENTRIES = 81`, `HCOD2_MAX_LEN = 9`. Public functions
+  `hcod2_encode(idx) -> (length, codeword)` (right-aligned in `u16`),
+  `hcod2_decode(reader) -> idx` (MSB-first prefix match, linear scan
+  against the 81-row table), and the convenience writer
+  `hcod2_write(writer, idx)`. Out-of-range indices (`idx > 80`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(2)`; the decoder
+  surfaces `Error::UnexpectedEnd` on reader underflow. The table is a
+  **complete** prefix code (Kraft equality
+  `Σ 2^(9 − L) = 512 = 2^9`), exhaustively verified by walking every
+  9-bit prefix at unit-test time and asserting each maps to exactly
+  one entry — so the decoder's `unreachable!()` fall-through is
+  verifiably dead. Encode-then-decode round-trips every index for
+  both the direct API and the cross-check against the round-213
+  `spectral_codebook::decode_index_to_tuple` /
+  `encode_tuple_to_index` §4.6.3.3 translation. An explicit
+  cross-check confirms Codebook 1 and Codebook 2 map every shared
+  index to the same `(w, x, y, z)` spectral tuple — only the Huffman
+  codewords differ, since the §4.6.3.3 translation depends on the
+  Table 4.95 row shape (which is identical for both books) and not
+  on the codeword assignment. 16 new unit tests in
+  `src/spectrum_huffman.rs` (table-shape: 81 entries / max 9 bits /
+  min 3 bits at index 40 / codewords fit declared length; Kraft
+  equality sum = 512; complete-prefix walk over all 2^9 prefixes;
+  per-row PDF spot checks at indices 0 / 40 / 80; encode rejection;
+  decode of `0b000` and of a 9-bit `0x1f3`; reader underflow; full
+  round-trip across every index; Codebook 1 ↔ Codebook 2 disagreement
+  on the zero-tuple codeword length) plus 17 integration tests in
+  `tests/spectrum_huffman.rs` (six per-row PDF spot checks at indices
+  0 / 13 / 40 / 67 / 78 / 80; Table 4.95 row 2 ↔ Table 4.A.3 size
+  cross-check; full writer→reader round-trip; the §4.6.3.3 wire-index
+  ↔ tuple ↔ wire-index cross-check; tuple-equivalence cross-check
+  between Codebooks 1 and 2; three hand-pinned byte sequences
+  (`[0x00]` for index 40 padded; `[0xf9, 0x80]` for index 0 padded;
+  `[0x1f, 0x30]` for index-40 + index-0 packed); exact
+  bit-consumption invariant across every index; out-of-range and
+  truncation rejections; `HCOD2_MAX_LEN` constant consistency).
+  Suite size grows 580 → 613 tests. Codebooks 3..=11
+  (Tables 4.A.4 … 4.A.12) reuse the same encode / decode shape and
+  will land one per future round.
 - phase 2 (r219): `spectrum_huffman` module — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.2 (Spectrum Huffman Codebook 1) wire layer.
   Codebook 1 is the signed 4-tuple book (`unsigned_cb = 0`, `dim = 4`,
