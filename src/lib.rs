@@ -240,13 +240,34 @@
 //!   coefficients at the LAV cap into the §4.6.3.3 escape sequence
 //!   (`2^(N + 4) + escape_word`, capped at
 //!   [`spectral_codebook::MAX_QUANT`] = 8191 per §4.6.1.3). The
-//!   Huffman tables themselves (Tables 4.A.2 through 4.A.12) are
-//!   **not** transcribed — the codebook trees that drive the wire
-//!   `idx` are a subsequent round. The §4.4.6 `spectral_data()`
-//!   wire walker that loops over scalefactor bands and dispatches
-//!   on the per-band codebook is also **not** wired up; this
-//!   module is the per-codeword translation layer it will sit on
-//!   top of.
+//!   Huffman tables themselves (Tables 4.A.3 through 4.A.12) are
+//!   still owed — see [`spectrum_huffman`] for the first one. The
+//!   §4.4.6 `spectral_data()` wire walker that loops over
+//!   scalefactor bands and dispatches on the per-band codebook is
+//!   also **not** wired up; this module is the per-codeword
+//!   translation layer it will sit on top of.
+//! * The [`spectrum_huffman`] module — the **wire layer** for the
+//!   §4.6.3 / Annex 4.A Huffman codebooks (**new in round 219**).
+//!   Round 219 lands the first of the eleven spectrum books:
+//!   **Table 4.A.2** (Spectrum Huffman Codebook 1, signed 4-tuple,
+//!   `LAV = 1`, 81 entries indexed `0..=80`, maximum codeword
+//!   length 11 bits; the zero-tuple at index 40 carries the
+//!   single-bit codeword `0`). Public API:
+//!   [`spectrum_huffman::HCOD1_NUM_ENTRIES`] = 81,
+//!   [`spectrum_huffman::HCOD1_MAX_LEN`] = 11,
+//!   [`spectrum_huffman::hcod1_encode`] returns
+//!   `(length_in_bits, codeword)` with the codeword right-aligned
+//!   in a `u16` (MSB at bit `length − 1`),
+//!   [`spectrum_huffman::hcod1_decode`] reads MSB-first from a
+//!   [`oxideav_core::bits::BitReader`] and returns the codeword
+//!   index, and [`spectrum_huffman::hcod1_write`] is a convenience
+//!   wrapper over the encode + writer-emit pair. The codebook is
+//!   a complete prefix code (Kraft equality `Σ 2^(11 − L) = 2048`),
+//!   exhaustively verified at unit-test time by walking every
+//!   11-bit prefix. Codebooks 2..=11 (Tables 4.A.3 … 4.A.12) reuse
+//!   the same module shape and are owed in subsequent rounds; the
+//!   `spectral_data()` driver that dispatches per-band onto the
+//!   chosen codebook arrives once all eleven are in place.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three
@@ -318,6 +339,7 @@ pub mod raw_data_block;
 pub mod scale_factor_data;
 pub mod section_data;
 pub mod spectral_codebook;
+pub mod spectrum_huffman;
 pub mod swb_offset;
 pub mod tns_data;
 pub mod tns_max;

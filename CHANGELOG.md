@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r219): `spectrum_huffman` module — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.2 (Spectrum Huffman Codebook 1) wire layer.
+  Codebook 1 is the signed 4-tuple book (`unsigned_cb = 0`, `dim = 4`,
+  `LAV = 1`) so the table enumerates every 4-tuple of coefficients in
+  `(-1, 0, +1)^4` → `3^4 = 81` entries with codeword lengths
+  `1..=11` bits. Index 40 — the zero-tuple `(0, 0, 0, 0)` — carries
+  the single-bit codeword `0`. Public constants
+  `HCOD1_NUM_ENTRIES = 81`, `HCOD1_MAX_LEN = 11`. Public functions
+  `hcod1_encode(idx) -> (length, codeword)` (right-aligned in
+  `u16`), `hcod1_decode(reader) -> idx` (MSB-first prefix match,
+  linear scan against the 81-row table), and the convenience writer
+  `hcod1_write(writer, idx)`. Out-of-range indices
+  (`idx > 80`) surface as `Error::SpectralCodebookIndexOutOfRange(1)`;
+  the decoder surfaces `Error::UnexpectedEnd` on reader underflow.
+  The table is a **complete** prefix code (Kraft equality
+  `Σ 2^(11 − L) = 2048 = 2^11`), exhaustively verified by walking
+  every 11-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()` fall-through
+  is verifiably dead. Encode-then-decode round-trips every index
+  for both the direct API and the cross-check against the round-213
+  `spectral_codebook::decode_index_to_tuple` /
+  `encode_tuple_to_index` §4.6.3.3 translation. 15 unit tests in
+  `src/spectrum_huffman.rs` (table-shape: 81 entries / max 11 bits
+  / min 1 bit at index 40 / codewords fit declared length;
+  Kraft equality sum = 2048; complete-prefix walk over all 2^11
+  prefixes; per-spot-row PDF spot checks at indices 0 / 40 / 80;
+  encode rejection; decode of `0` and of an 11-bit `0x7f8`; reader
+  underflow; full round-trip across every index) plus 16 integration
+  tests in `tests/spectrum_huffman.rs` (six per-row PDF spot checks
+  at indices 0 / 31 / 40 / 54 / 67 / 80; Table 4.95 row 1 ↔ Table
+  4.A.2 size cross-check; full writer→reader round-trip; the
+  §4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check; three
+  hand-pinned byte sequences (`[0x00]` for index 40 padded;
+  `[0xff, 0x00]` for index 0 padded; `[0x7f, 0x80]` for
+  index-40 + index-0 packed); exact bit-consumption invariant
+  across every index; out-of-range and truncation rejections;
+  `HCOD1_MAX_LEN` constant consistency). Suite size grows
+  549 → 580 tests. Codebooks 2..=11 (Tables 4.A.3 … 4.A.12)
+  reuse the same encode / decode shape and will land one per future
+  round; the `spectral_data()` driver that dispatches per-band onto
+  the chosen codebook arrives once codebooks 2..=11 are in place.
 - phase 2 (r213): `spectral_codebook` module — ISO/IEC 14496-3
   §4.6.3.1 / Table 4.95 Spectrum Huffman codebook parameters plus
   the §4.6.3.3 codeword-index → spectral-tuple translation, the
