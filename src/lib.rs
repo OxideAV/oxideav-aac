@@ -217,6 +217,36 @@
 //!   writer side; the parser surfaces literal bits to keep hostile
 //!   streams from panicking. `scale_flag == true` (scalable AAC, AOT
 //!   6) rejects with [`Error::NotImplemented`].
+//! * The [`spectral_codebook`] module — ISO/IEC 14496-3 §4.6.3.1 /
+//!   Table 4.95 Spectrum Huffman codebook parameter table plus the
+//!   §4.6.3.3 codeword-index → spectral-tuple translation, the
+//!   §4.6.3.3 sign-bit fix-up, and the §4.6.3.3 ESC sequence handler
+//!   for codebook 11 (and the extension books 16..=31), **new in
+//!   round 213**. `TABLE_4_95: [Table495Row; 32]` carries the four
+//!   normative columns (`unsigned_cb`, `dimension`, `lav`,
+//!   `esc_threshold`) for every codebook in `0..=31`; `table_4_95`
+//!   is the safe accessor.
+//!   [`spectral_codebook::decode_index_to_tuple`] is the §4.6.3.3
+//!   pseudocode that translates a Huffman codeword index `idx` to a
+//!   `dim`-tuple of quantised spectral coefficients;
+//!   [`spectral_codebook::encode_tuple_to_index`] is its inverse.
+//!   The sign-bit fix-up
+//!   [`spectral_codebook::apply_sign_bits`] /
+//!   [`spectral_codebook::derive_sign_bits`] folds the
+//!   per-non-zero-coefficient sign bits the spec emits after an
+//!   unsigned-codebook codeword onto / from a signed tuple. The
+//!   ESC sequence [`spectral_codebook::decode_esc_value`] /
+//!   [`spectral_codebook::encode_esc_value`] expands codebook-11
+//!   coefficients at the LAV cap into the §4.6.3.3 escape sequence
+//!   (`2^(N + 4) + escape_word`, capped at
+//!   [`spectral_codebook::MAX_QUANT`] = 8191 per §4.6.1.3). The
+//!   Huffman tables themselves (Tables 4.A.2 through 4.A.12) are
+//!   **not** transcribed — the codebook trees that drive the wire
+//!   `idx` are a subsequent round. The §4.4.6 `spectral_data()`
+//!   wire walker that loops over scalefactor bands and dispatches
+//!   on the per-band codebook is also **not** wired up; this
+//!   module is the per-codeword translation layer it will sit on
+//!   top of.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three
@@ -287,6 +317,7 @@ pub mod pulse_data;
 pub mod raw_data_block;
 pub mod scale_factor_data;
 pub mod section_data;
+pub mod spectral_codebook;
 pub mod swb_offset;
 pub mod tns_data;
 pub mod tns_max;

@@ -313,6 +313,52 @@ pub enum Error {
     /// surfaces caller bugs at the boundary between absolute
     /// scalefactor quantisation and DPCM differential coding.
     ScaleFactorAccumulatorInvalid,
+
+    /// [`crate::spectral_codebook::table_4_95`] (or any other
+    /// public accessor in that module) was called with a `codebook`
+    /// value `> 31`. ISO/IEC 14496-3 Table 4.95 only defines rows
+    /// `0..=31`.
+    SpectralCodebookOutOfRange(u8),
+
+    /// [`crate::spectral_codebook::decode_index_to_tuple`] /
+    /// [`crate::spectral_codebook::encode_tuple_to_index`] /
+    /// [`crate::spectral_codebook::apply_sign_bits`] /
+    /// [`crate::spectral_codebook::derive_sign_bits`] was called
+    /// with a codebook whose Table 4.95 row carries no
+    /// `unsigned_cb` / `dimension` / `lav` (`0`, `12`, `13`, `14`,
+    /// `15`). Those are non-spectral books (`ZERO_HCB`, reserved,
+    /// PNS, intensity stereo); §4.6.3.3 does not translate any
+    /// codeword index for them.
+    SpectralCodebookHasNoTuple(u8),
+
+    /// [`crate::spectral_codebook::decode_index_to_tuple`] was
+    /// called with a codeword index `idx >= mod^dim` where `mod =
+    /// lav + 1` (unsigned) or `2 * lav + 1` (signed). A conforming
+    /// Huffman decoder never produces such an index; this surfaces
+    /// an incoherence between the Huffman tree and Table 4.95.
+    SpectralCodebookIndexOutOfRange(u8),
+
+    /// [`crate::spectral_codebook::encode_tuple_to_index`] /
+    /// [`crate::spectral_codebook::derive_sign_bits`] was called
+    /// with a tuple shorter than the codebook's dimension, or with
+    /// an entry outside the codebook's representable range
+    /// (`0..=lav` unsigned, `-lav..=+lav` signed). A conforming AAC
+    /// encoder never produces such a tuple.
+    SpectralCodebookTupleOutOfRange(u8),
+
+    /// [`crate::spectral_codebook::apply_sign_bits`] was called
+    /// with a `signs` slice whose length disagrees with the count
+    /// of non-zero coefficients in the unsigned-codebook tuple, or
+    /// with a non-empty `signs` slice on a signed codebook.
+    SpectralCodebookSignBitsMismatch(u8),
+
+    /// [`crate::spectral_codebook::decode_esc_value`] /
+    /// [`crate::spectral_codebook::encode_esc_value`] was called
+    /// with arguments outside the §4.6.3.3 ESC range: `prefix_len >
+    /// 9`, `escape_word` not fitting `(prefix_len + 4)` bits, a
+    /// decoded value exceeding `MAX_QUANT` (`8191`), or an encoder
+    /// value `< 16` (which is in-band, not ESC-encoded).
+    SpectralCodebookEscOutOfRange,
 }
 
 impl core::fmt::Display for Error {
@@ -458,6 +504,47 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "extension_payload: Table 4.51 / 4.52 / 4.53 / 4.59 wire-field invariant violated"
+                )
+            }
+            Error::SpectralCodebookOutOfRange(cb) => {
+                write!(
+                    f,
+                    "spectral codebook {} is outside Table 4.95 (legal range 0..=31)",
+                    cb
+                )
+            }
+            Error::SpectralCodebookHasNoTuple(cb) => {
+                write!(
+                    f,
+                    "spectral codebook {} is non-spectral (Table 4.95 row carries no dim / lav)",
+                    cb
+                )
+            }
+            Error::SpectralCodebookIndexOutOfRange(cb) => {
+                write!(
+                    f,
+                    "spectral codebook {}: codeword index out of Table 4.95 range",
+                    cb
+                )
+            }
+            Error::SpectralCodebookTupleOutOfRange(cb) => {
+                write!(
+                    f,
+                    "spectral codebook {}: tuple length or value outside Table 4.95 dimension / lav",
+                    cb
+                )
+            }
+            Error::SpectralCodebookSignBitsMismatch(cb) => {
+                write!(
+                    f,
+                    "spectral codebook {}: sign-bit count disagrees with non-zero coefficients in tuple",
+                    cb
+                )
+            }
+            Error::SpectralCodebookEscOutOfRange => {
+                write!(
+                    f,
+                    "spectral codebook 11/16..=31 ESC sequence: prefix_len, escape_word, or magnitude outside §4.6.3.3 range"
                 )
             }
         }

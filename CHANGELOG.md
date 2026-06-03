@@ -8,6 +8,68 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r213): `spectral_codebook` module — ISO/IEC 14496-3
+  §4.6.3.1 / Table 4.95 Spectrum Huffman codebook parameters plus
+  the §4.6.3.3 codeword-index → spectral-tuple translation, the
+  §4.6.3.3 sign-bit fix-up, and the §4.6.3.3 ESC sequence handling
+  for codebook 11. Public types: `Table495Row` (the four normative
+  columns of Table 4.95: `unsigned_cb`, `dimension`, `lav`,
+  `esc_threshold`, plus the source `huffman_table` index), the
+  `TABLE_4_95: [Table495Row; 32]` static (one row per codebook
+  `0..=31`, covering ZERO_HCB, the four QUAD spectrum books, the
+  six PAIR spectrum books, the ESC book, the four non-spectral
+  reserved / PNS / intensity slots, and the sixteen extension
+  books 16..=31 with their increasing ESC thresholds 15, 31, 47,
+  63, 95, 127, 159, 191, 223, 255, 319, 383, 511, 767, 1023, 2047).
+  Accessor: `table_4_95(codebook)` (rejects `> 31` with
+  `Error::SpectralCodebookOutOfRange`). §4.6.3.3 translation:
+  `decode_index_to_tuple(codebook, idx)` returns the
+  `dim`-tuple of quantised spectral coefficients (the spec's
+  pseudocode for `dim == 4`: `w = INT(idx/mod^3) - off`, etc.; for
+  `dim == 2`: `y, z`). Inverse: `encode_tuple_to_index(codebook,
+  tuple)`. Sign-bit handling: `apply_sign_bits(codebook, tuple,
+  signs)` folds the per-non-zero-coefficient sign bits from the
+  wire onto an unsigned-codebook tuple; `derive_sign_bits(codebook,
+  tuple)` extracts them in low-frequency-first order. ESC sequence:
+  `decode_esc_value(prefix_len, escape_word)` returns
+  `2^(prefix_len + 4) + escape_word`; `encode_esc_value(value)`
+  inverts it. Public constant `MAX_QUANT = 8191` (§4.6.1.3
+  maximum absolute amplitude for `x_quant`). All accessors reject
+  non-spectral codebooks (`0`, `12..=15`) with
+  `Error::SpectralCodebookHasNoTuple` and out-of-range indices /
+  tuples / sign-bit counts with dedicated error variants
+  (`SpectralCodebookIndexOutOfRange`,
+  `SpectralCodebookTupleOutOfRange`,
+  `SpectralCodebookSignBitsMismatch`,
+  `SpectralCodebookEscOutOfRange`). New `classify(sect_cb)`
+  convenience re-export of the existing `section_data::Codebook`
+  classifier. 46 new integration tests in
+  `tests/spectral_codebook.rs` cover: the 32-row table layout
+  (ZERO_HCB row, QUAD books 1..=4, PAIR books 5..=10, ESC book 11,
+  the four non-spectral books 12..=15, the sixteen extension books
+  16..=31 row-by-row); table accessor rejection (`> 31`) and
+  success paths; full §4.6.3.3 translation for codebooks 1 (signed
+  QUAD), 3 (unsigned QUAD), 5 (signed PAIR), 7 (unsigned PAIR), 11
+  (ESC unsigned PAIR); rejection of `ZERO_HCB` / `12..=15`; the
+  `idx >= mod^dim` out-of-range branch; full encoder-side
+  round-trip across every (w, x, y, z) tuple in 3^4 = 81 cells for
+  codebook 1 (signed) and codebook 3 (unsigned), and every (y, z)
+  tuple in 9² and 8² cells for codebooks 5 and 7; LAV-cap
+  rejection (signed and unsigned); short-tuple rejection;
+  non-spectral codebook rejection; sign-bit application with
+  all-non-zero and partial-zero coefficient patterns; signed-book
+  no-op + non-empty-signs rejection; sign-bit length mismatch
+  rejection; `derive_sign_bits` round-trip including signed-book
+  empty-bits and all-zero-tuple empty-bits; ESC sequence
+  round-trip for every prefix length `N ∈ 0..=8`; LAV-boundary
+  (16, 17, 31, 32) and MAX_QUANT-boundary (8191 = 2^12 + 4095)
+  ESC encoding; rejection of in-band magnitudes (`< 16`),
+  overflow (`> 8191`), prefix-length overflow (`> 9`),
+  escape-word overflow, and decoded-magnitude overflow; row helper
+  accessors (`is_unsigned`, `has_esc`) row-by-row; and the
+  cross-check `MAX_QUANT == TABLE_4_95[11].esc_threshold` plus the
+  `no in-band LAV exceeds MAX_QUANT` invariant across every row.
+  Suite grows 503 → 549 tests.
 - phase 2 (r207): `ics_body` module — ISO/IEC 14496-3 §4.4.6 /
   Table 4.50 `individual_channel_stream()` body walker. Composes
   the existing per-tool parsers / writers (`global_gain`, `ics_info`,

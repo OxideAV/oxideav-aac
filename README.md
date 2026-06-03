@@ -3,7 +3,7 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 207)
+## Status (round 213)
 
 **Phase 1 complete + Phase 2 in progress + seven tool-level encoder
 primitives + the §4.6.2.3.2 / §4.6.8.1.4 / §4.6.13 DPCM accumulator
@@ -20,7 +20,43 @@ General Audio ER object type + the §4.4.6.5 / Table 4.12
 tables and the §4.6.13 pulse-escape reconstruction loop + the
 §4.6.9.4 `TNS_MAX_ORDER` / `TNS_MAX_BANDS` clamp tables and
 §4.6.17.2.5 LD-specific `TNS_MAX_BANDS` tables + the §4.4.6 /
-Table 4.50 `individual_channel_stream()` body walker.** Round 207
+Table 4.50 `individual_channel_stream()` body walker + the
+§4.6.3 / Table 4.95 Spectrum Huffman codebook parameters and the
+§4.6.3.3 index → tuple translation (including the sign-bit fix-up
+and the codebook-11 ESC sequence).** Round 213 lands the
+`spectral_codebook` module — the foundational decoder layer for
+the upcoming `spectral_data()` parser. `TABLE_4_95: [Table495Row;
+32]` covers every codebook number `0..=31` row-by-row: the
+ZERO_HCB row (no dim/lav), the QUAD spectrum books 1..=4 (signed
+LAV 1 / unsigned LAV 2), the PAIR spectrum books 5..=10 (signed
+LAV 4 / unsigned LAV 7 / unsigned LAV 12), the ESC book 11
+(unsigned LAV 16 + ESC threshold 8191), the four non-spectral
+slots 12..=15 (reserved / PNS / intensity stereo), and the
+sixteen extension books 16..=31 with their per-row ESC thresholds
+(15, 31, 47, 63, 95, 127, 159, 191, 223, 255, 319, 383, 511, 767,
+1023, 2047). `decode_index_to_tuple(cb, idx)` implements the
+§4.6.3.3 pseudocode (`mod = lav + 1` unsigned or `2*lav + 1`
+signed; `dim == 4` slice via `mod^3 / mod^2 / mod^1`); the
+inverse `encode_tuple_to_index(cb, tuple)` round-trips every
+tuple in 3^4 / 9^2 / 8^2 cells under integration tests. The
+sign-bit fix-up `apply_sign_bits` / `derive_sign_bits` covers the
+unsigned-codebook low-frequency-first sign sequence; the ESC
+sequence `decode_esc_value` / `encode_esc_value` covers the
+§4.6.3.3 `2^(N+4) + escape_word` magnitude expansion for codebook
+11 (and the extension books). Public `MAX_QUANT = 8191`
+(§4.6.1.3 maximum absolute amplitude for `x_quant`); per-row
+helpers `is_unsigned` and `has_esc`; `Error` extends with
+`SpectralCodebookOutOfRange`, `SpectralCodebookHasNoTuple`,
+`SpectralCodebookIndexOutOfRange`,
+`SpectralCodebookTupleOutOfRange`,
+`SpectralCodebookSignBitsMismatch`, and
+`SpectralCodebookEscOutOfRange`. 46 new integration tests in
+`tests/spectral_codebook.rs` (row-by-row Table 4.95 layout,
+§4.6.3.3 round-trip every legal tuple for codebooks 1 / 3 / 5 /
+7, every legal index for codebook 11, ESC round-trip every
+prefix length `0..=8`, every boundary at the LAV cap and at
+MAX_QUANT, and every rejection branch). Suite grows 503 → 549
+tests. Round 207
 lands the channel-element body walker that composes the existing
 per-tool parsers / writers (`global_gain`, `ics_info`,
 `section_data`, `scale_factor_data`, optional `pulse_data` /
