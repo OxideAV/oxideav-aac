@@ -8,6 +8,66 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r231): `spectrum_huffman::HCOD3` — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.4 (Spectrum Huffman Codebook 3) wire layer.
+  Codebook 3 is the first *unsigned* spectrum book (Table 4.95 row 3:
+  `unsigned_cb = 1`, `dim = 4`, `LAV = 2`); the index space is still
+  `3^4 = 81` (the `(LAV + 1)^dim` polynomial for unsigned books
+  coincides with the `(2*LAV + 1)^dim` of the `LAV = 1` signed books)
+  but the tuple universe is now `0..=2` per coefficient instead of
+  `-1..=+1`, and the §4.6.3.3 sign-bit suffix carries the sign of
+  each non-zero coefficient outside the Huffman codeword. Maximum
+  codeword length is **16 bits** (vs 11 for Codebook 1 and 9 for
+  Codebook 2). The zero magnitude tuple `(0, 0, 0, 0)` lives at
+  **index 0** (not 40 as in the signed books) because the unsigned
+  polynomial puts all-zero at the origin; it carries the single-bit
+  codeword `0`. Two distinct rows carry the full 16-bit codewords:
+  index 62 (`0xffff`) and index 74 (`0xfffe`). Public constants
+  `HCOD3_NUM_ENTRIES = 81`, `HCOD3_MAX_LEN = 16`. Public functions
+  `hcod3_encode(idx) -> (length, codeword)` (right-aligned in `u16`),
+  `hcod3_decode(reader) -> idx` (MSB-first prefix match, linear scan
+  against the 81-row table), and the convenience writer
+  `hcod3_write(writer, idx)`. Out-of-range indices (`idx > 80`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(3)`; the
+  decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality
+  `Σ 2^(16 − L) = 65536 = 2^16`), exhaustively verified by walking
+  every 16-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()`
+  fall-through is verifiably dead. Encode-then-decode round-trips
+  every index for both the direct API and the cross-check against
+  the round-213 `spectral_codebook::decode_index_to_tuple` /
+  `encode_tuple_to_index` §4.6.3.3 translation. The §4.6.3.3
+  sign-bit suffix (`derive_sign_bits`) is exercised as a cross-check:
+  every Codebook 3 index emits exactly as many sign bits as it has
+  non-zero coefficients (the zero-tuple emits zero sign bits, the
+  all-twos tuple emits four). 17 new unit tests in
+  `src/spectrum_huffman.rs` (table-shape: 81 entries / max 16 bits /
+  min 1 bit at index 0 / codewords fit declared length; Kraft
+  equality sum = 65536; complete-prefix walk over all `2^16`
+  prefixes; per-row PDF spot checks at indices 0 / 62 / 80;
+  encode + decode rejection; decode of single zero bit yields
+  index 0; decode of full 16-bit codeword `0xffff` yields index 62;
+  reader underflow; full round-trip across every index;
+  cross-book zero-tuple-position contrast between Codebook 1
+  (index 40) and Codebook 3 (index 0)) plus 21 new integration
+  tests in `tests/spectrum_huffman.rs` (seven per-row PDF spot
+  checks at indices 0 / 1 / 27 / 40 / 62 / 74 / 80; Table 4.95 row
+  3 ↔ Table 4.A.4 size cross-check; full writer→reader round-trip;
+  the §4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check;
+  zero-tuple ↔ index-0 invariant; full magnitude tuple ↔ index 80
+  invariant; zero-sign-bit / four-sign-bit / per-index-sign-count
+  cross-checks against `derive_sign_bits`; three hand-pinned byte
+  sequences (`[0x00]` for index 0 padded; `[0xff, 0xff]` for index
+  62; `[0x48]` for index 0 + index 1 packed); exact
+  bit-consumption invariant across every index; out-of-range and
+  truncation rejections; `HCOD3_MAX_LEN` constant consistency; and
+  a cross-book tuple-universe disjointness check confirming a
+  negative-entry tuple cannot encode under Codebook 3 and a
+  magnitude-2 tuple cannot encode under Codebook 1). Suite size
+  grows 613 → 651 tests. Codebooks 4..=11 (Tables 4.A.5 … 4.A.12)
+  reuse the same encode / decode shape and will land one per
+  future round.
 - phase 2 (r226): `spectrum_huffman::HCOD2` — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.3 (Spectrum Huffman Codebook 2) wire layer.
   Codebook 2 shares Codebook 1's tuple universe (signed 4-tuple,

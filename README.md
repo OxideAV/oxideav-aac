@@ -3,7 +3,65 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status (round 226)
+## Status (round 231)
+
+Round 231 lands **Table 4.A.4** (Spectrum Huffman Codebook 3) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 bootstrapped for Codebooks 1 and 2. Codebook 3 is the
+first **unsigned** spectrum book: Table 4.95 row 3 declares
+`unsigned_cb = 1`, `dim = 4`, `LAV = 2` so the Huffman codeword now
+conveys magnitude n-tuples whose every coefficient lies in `0..=2`
+(rather than the signed `(-1, 0, +1)` of Codebooks 1 and 2), and the
+§4.6.3.3 sign-bit suffix carries the sign of each non-zero coefficient
+outside the codeword. The index space is still `3^4 = 81` (the
+`(LAV + 1)^dim` polynomial for unsigned books coincides with the
+`(2*LAV + 1)^dim` of the `LAV = 1` signed books) but the zero-tuple
+`(0, 0, 0, 0)` now lives at **index 0** (not 40) because the unsigned
+polynomial puts all-zero at the origin; it carries the single bit
+codeword `0`. The maximum codeword length is **16 bits** (vs 11 for
+Codebook 1 and 9 for Codebook 2) — the longer codes are a direct
+consequence of unsigned Codebook 3's smaller-effective-alphabet target
+statistics, where the magnitude-2 tuples deep in the table earn their
+length budget back via the sign bits' presence-conditioned emission.
+Two distinct rows carry the full 16-bit codewords: index 62
+(`0xffff`) and index 74 (`0xfffe`). The table is a **complete** 16-bit
+prefix code (Kraft equality `Σ 2^(16 − L) = 65536 = 2^16`),
+exhaustively verified by walking every 16-bit prefix and asserting
+each maps to exactly one entry. Public API: `HCOD3_NUM_ENTRIES = 81`,
+`HCOD3_MAX_LEN = 16`, `hcod3_encode(idx) -> (u8, u16)`,
+`hcod3_decode(reader) -> u32`, and the convenience
+`hcod3_write(writer, idx)`. Out-of-range indices surface as
+`Error::SpectralCodebookIndexOutOfRange(3)`; reader underflow surfaces
+as `Error::UnexpectedEnd`. The round-213 §4.6.3.3 translation is
+exercised as a cross-check: every Codebook 3 index round-trips through
+`decode_index_to_tuple(3, idx)` → `encode_tuple_to_index(3, &tuple)`
+back to the same index; the §4.6.3.3 sign-bit count
+(`derive_sign_bits(3, &tuple)`) matches the non-zero-coefficient count
+for every index; and an explicit cross-check confirms Codebook 3 has
+a *disjoint* tuple universe from Codebooks 1 and 2 (a negative-entry
+tuple cannot encode under Codebook 3; a magnitude-2 tuple cannot
+encode under Codebook 1). 17 new unit tests (in
+`src/spectrum_huffman.rs`: 81-entry shape / 16-bit max / 1-bit min at
+index 0 / codewords fit / Kraft equality 65536 / complete-prefix walk
+over all `2^16` prefixes / per-row PDF spot checks at indices 0 / 62 /
+80 / encode + decode rejection / single-zero-bit decode / full 16-bit
+codeword decode / writer round-trip / writer rejection / cross-book
+zero-tuple-position contrast) plus 21 new integration tests in
+`tests/spectrum_huffman.rs` (seven per-row PDF spot checks at indices
+0 / 1 / 27 / 40 / 62 / 74 / 80; Table 4.95 row 3 ↔ Table 4.A.4 size
+cross-check; full writer→reader round-trip; the §4.6.3.3 wire-index ↔
+tuple ↔ wire-index cross-check; zero-tuple ↔ index-0 invariant; full
+magnitude tuple ↔ index 80 invariant; zero-sign-bit / four-sign-bit /
+per-index-sign-count cross-checks against `derive_sign_bits`;
+three hand-pinned byte sequences (`[0x00]` for index 0 padded;
+`[0xff, 0xff]` for index 62; `[0x48]` for index 0 + index 1 packed);
+exact bit-consumption invariant across every index; out-of-range and
+truncation rejections; `HCOD3_MAX_LEN` constant consistency;
+cross-book tuple-universe disjointness). Suite grows 613 → 651 tests.
+Codebooks 4..=11 (Tables 4.A.5 … 4.A.12) reuse the same module shape
+and will land one per future round; the `spectral_data()` driver that
+dispatches per-band onto the chosen codebook arrives once all eleven
+spectrum books are in place.
 
 Round 226 lands **Table 4.A.3** (Spectrum Huffman Codebook 2) inside
 the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module
@@ -79,9 +137,10 @@ tables and the §4.6.13 pulse-escape reconstruction loop + the
 Table 4.50 `individual_channel_stream()` body walker + the
 §4.6.3 / Table 4.95 Spectrum Huffman codebook parameters and the
 §4.6.3.3 index → tuple translation (including the sign-bit fix-up
-and the codebook-11 ESC sequence) + the §4.A.1 Tables 4.A.2 / 4.A.3
-Spectrum Huffman Codebook 1 (11-bit max) and 2 (9-bit max) wire-layer
-encode / decode primitives.** Round 213 lands the
+and the codebook-11 ESC sequence) + the §4.A.1 Tables 4.A.2 / 4.A.3 /
+4.A.4 Spectrum Huffman Codebook 1 (signed, 11-bit max) / 2 (signed,
+9-bit max) / 3 (unsigned, 16-bit max) wire-layer encode / decode
+primitives.** Round 213 lands the
 `spectral_codebook` module — the foundational decoder layer for
 the upcoming `spectral_data()` parser. `TABLE_4_95: [Table495Row;
 32]` covers every codebook number `0..=31` row-by-row: the
@@ -804,13 +863,14 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
 
 - The remaining channel-stream tool after `scale_factor_data()`:
   `spectral_data()`. The walker therefore still cannot iterate past
-  a single channel-element body. Round 219 lands the first and
-  round 226 lands the second of the eleven spectrum Huffman
-  codebooks needed to drive that tool — Codebook 1 (Table 4.A.2)
-  and Codebook 2 (Table 4.A.3). Codebooks 3..=11 (Tables 4.A.4 …
-  4.A.12) reuse the same module shape and are owed in subsequent
-  rounds; the `spectral_data()` driver that dispatches per-band onto
-  the chosen codebook arrives once all eleven are in place.
+  a single channel-element body. Round 219 lands the first, round
+  226 the second, and round 231 the third of the eleven spectrum
+  Huffman codebooks needed to drive that tool — Codebook 1
+  (Table 4.A.2), Codebook 2 (Table 4.A.3), and Codebook 3
+  (Table 4.A.4). Codebooks 4..=11 (Tables 4.A.5 … 4.A.12) reuse the
+  same module shape and are owed in subsequent rounds; the
+  `spectral_data()` driver that dispatches per-band onto the chosen
+  codebook arrives once all eleven are in place.
 - The §4.6.12 `gain_control_data()` ladder-application loop. The
   Table 4.12 record is parseable / writable bit-for-bit, but
   reconstructing sample-domain attenuation factors from the
