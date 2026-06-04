@@ -8,6 +8,64 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r234): `spectrum_huffman::HCOD4` — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.5 (Spectrum Huffman Codebook 4) wire layer.
+  Codebook 4 shares Codebook 3's unsigned dim-4 LAV-2 tuple universe
+  (Table 4.95 row 4 = row 3 except for the source-table column:
+  `unsigned_cb = 1`, `dim = 4`, `LAV = 2` → `3^4 = 81` entries indexed
+  `0..=80`, each tuple coefficient in `0..=2`, with the §4.6.3.3
+  sign-bit suffix carrying the sign of every non-zero coefficient
+  outside the Huffman codeword) but uses a different per-row Huffman
+  length tuning: maximum codeword length is **12 bits** (vs 16 for
+  Codebook 3); the **shortest** codeword (4 bits `0b0000`) sits at
+  **index 40** while index 0 (still the §4.6.3.3 zero-tuple
+  `(0, 0, 0, 0)`) carries a 4-bit `0b0111`; the two 12-bit rows are
+  index 62 (`0xfff`) and index 74 (`0xffe`). Public constants
+  `HCOD4_NUM_ENTRIES = 81`, `HCOD4_MAX_LEN = 12`. Public functions
+  `hcod4_encode(idx) -> (length, codeword)` (right-aligned in `u16`),
+  `hcod4_decode(reader) -> idx` (MSB-first prefix match, linear scan
+  against the 81-row table), and the convenience writer
+  `hcod4_write(writer, idx)`. Out-of-range indices (`idx > 80`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(4)`; the
+  decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality
+  `Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified by walking
+  every 12-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()` fall-through
+  is verifiably dead. Encode-then-decode round-trips every index for
+  both the direct API and the cross-check against the round-213
+  `spectral_codebook::decode_index_to_tuple` /
+  `encode_tuple_to_index` §4.6.3.3 translation. A Codebook 3 /
+  Codebook 4 cross-check confirms the two books map every index to
+  the *same* magnitude tuple — only the codeword assignment differs,
+  since the §4.6.3.3 translation depends on the Table 4.95 row shape
+  (identical for rows 3 and 4) and not on the codeword bit pattern.
+  16 new unit tests in `src/spectrum_huffman.rs` (table-shape: 81
+  entries / max 12 bits / min 4 bits at index 40 / codewords fit
+  declared length; Kraft equality sum = 4096; complete-prefix walk
+  over all `2^12` prefixes; per-row PDF spot checks at indices 0 / 40
+  / 62 / 74 / 80; encode + decode rejection; decode of four zero bits
+  yields index 40; decode of full 12-bit codeword `0xfff` yields
+  index 62; reader underflow; full round-trip across every index;
+  cross-book Codebook 3 ↔ Codebook 4 zero-tuple-codeword
+  disagreement) plus 24 new integration tests in
+  `tests/spectrum_huffman.rs` (seven per-row PDF spot checks at
+  indices 0 / 13 / 27 / 40 / 62 / 74 / 80; Table 4.95 row 4 ↔ Table
+  4.A.5 size cross-check; full writer→reader round-trip; the §4.6.3.3
+  wire-index ↔ tuple ↔ wire-index cross-check; Codebook 3 ↔ Codebook
+  4 tuple-equivalence cross-check; zero-tuple ↔ index-0 invariant;
+  full magnitude tuple ↔ index 80 invariant; zero-sign-bit /
+  four-sign-bit / per-index-sign-count cross-checks against
+  `derive_sign_bits`; three hand-pinned byte sequences (`[0x00]` for
+  index 40 padded; `[0xff, 0xf0]` for index 62 padded; `[0x07]` for
+  index 40 + index 0 packed); exact bit-consumption invariant across
+  every index; out-of-range and truncation rejections;
+  `HCOD4_MAX_LEN` constant consistency; and a Codebook 3 / Codebook 4
+  max-codeword-length cross-check). Suite size grows 651 → 691 tests.
+  Codebooks 5..=11 (Tables 4.A.6 … 4.A.12) reuse the same encode /
+  decode shape and will land one per future round; Codebooks 5 and 6
+  are the first **pair** (`dim = 2`) books with `LAV = 4`, opening a
+  new codebook geometry (`9^2 = 81` entries per book).
 - phase 2 (r231): `spectrum_huffman::HCOD3` — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.4 (Spectrum Huffman Codebook 3) wire layer.
   Codebook 3 is the first *unsigned* spectrum book (Table 4.95 row 3:

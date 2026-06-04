@@ -1,8 +1,8 @@
 //! Integration tests for `oxideav_aac::spectrum_huffman`.
 //!
-//! Cross-checks Codebooks 1 (Table 4.A.2), 2 (Table 4.A.3), and 3
-//! (Table 4.A.4) wire round-trip against the §4.6.3.3 index ↔
-//! n-tuple translation already covered by
+//! Cross-checks Codebooks 1 (Table 4.A.2), 2 (Table 4.A.3), 3
+//! (Table 4.A.4), and 4 (Table 4.A.5) wire round-trip against the
+//! §4.6.3.3 index ↔ n-tuple translation already covered by
 //! [`oxideav_aac::spectral_codebook`].
 
 use oxideav_aac::{
@@ -11,8 +11,9 @@ use oxideav_aac::{
     },
     spectrum_huffman::{
         hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode, hcod2_encode, hcod2_write,
-        hcod3_decode, hcod3_encode, hcod3_write, HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN,
-        HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN, HCOD3_NUM_ENTRIES,
+        hcod3_decode, hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write,
+        HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN, HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN,
+        HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES,
     },
     Error,
 };
@@ -815,4 +816,315 @@ fn codebook_3_has_a_different_tuple_universe_than_codebook_1() {
         encode_tuple_to_index(1, &big_tup),
         Err(Error::SpectralCodebookTupleOutOfRange(1))
     ));
+}
+
+// =============================================================================
+// Codebook 4 — Table 4.A.5 per-row spec-PDF spot checks
+// =============================================================================
+//
+// Each spot row is taken from ISO/IEC 14496-3:2001(E) §4.A.1 Table
+// 4.A.5 verbatim. The full 81-row table-shape and Kraft completeness
+// are covered by the unit tests; this module locks the per-row
+// hexadecimal column at integration-test scope.
+
+#[test]
+fn table_4_a_5_row_0_matches_spec() {
+    // Row 0: length 4, codeword 0x7.
+    let (len, cw) = hcod4_encode(0).unwrap();
+    assert_eq!((len, cw), (4, 0x7));
+}
+
+#[test]
+fn table_4_a_5_row_13_matches_spec() {
+    // Row 13: length 4, codeword 0x1 — a low-frequency 4-bit slot.
+    let (len, cw) = hcod4_encode(13).unwrap();
+    assert_eq!((len, cw), (4, 0x1));
+}
+
+#[test]
+fn table_4_a_5_row_27_matches_spec() {
+    // Row 27: length 4, codeword 0x5.
+    let (len, cw) = hcod4_encode(27).unwrap();
+    assert_eq!((len, cw), (4, 0x5));
+}
+
+#[test]
+fn table_4_a_5_row_40_matches_spec() {
+    // Row 40 (shortest codeword): length 4, codeword 0x0 (`0b0000`).
+    let (len, cw) = hcod4_encode(40).unwrap();
+    assert_eq!((len, cw), (4, 0));
+}
+
+#[test]
+fn table_4_a_5_row_62_matches_spec() {
+    // Row 62: length 12, codeword 0xfff — one of the two 12-bit rows.
+    let (len, cw) = hcod4_encode(62).unwrap();
+    assert_eq!((len, cw), (12, 0xfff));
+}
+
+#[test]
+fn table_4_a_5_row_74_matches_spec() {
+    // Row 74: length 12, codeword 0xffe — the other 12-bit row.
+    let (len, cw) = hcod4_encode(74).unwrap();
+    assert_eq!((len, cw), (12, 0xffe));
+}
+
+#[test]
+fn table_4_a_5_row_80_matches_spec() {
+    // Row 80 (last): length 11, codeword 0x7fc.
+    let (len, cw) = hcod4_encode(80).unwrap();
+    assert_eq!((len, cw), (11, 0x7fc));
+}
+
+// =============================================================================
+// Codebook-shape cross-check vs Table 4.95 row 4
+// =============================================================================
+
+#[test]
+fn codebook_4_table_4_95_row_matches_table_4_a_5_size() {
+    // Row 4 of Table 4.95: unsigned, dim=4, lav=2 → 3^4 = 81 entries.
+    let row = table_4_95(4).unwrap();
+    assert_eq!(row.unsigned, Some(true));
+    assert_eq!(row.dimension, Some(4));
+    assert_eq!(row.lav, Some(2));
+    assert_eq!(row.huffman_table, Some(5));
+
+    let lav = row.lav.unwrap();
+    let dim = row.dimension.unwrap();
+    let modulus = lav + 1; // unsigned
+    let count: u32 = modulus.pow(u32::from(dim));
+    assert_eq!(count as usize, HCOD4_NUM_ENTRIES);
+}
+
+// =============================================================================
+// Round-trip every entry through the Codebook 4 wire writer + reader
+// =============================================================================
+
+#[test]
+fn hcod4_every_index_round_trips_writer_to_reader() {
+    for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+        let mut w = BitWriter::new();
+        hcod4_write(&mut w, idx).unwrap();
+        let bits_written = w.bit_position();
+        let pad = (8 - (bits_written % 8)) % 8;
+        if pad > 0 {
+            w.write_u32(0, pad as u32);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let got = hcod4_decode(&mut br).unwrap();
+        assert_eq!(
+            got, idx,
+            "round-trip mismatch at idx={} ({} bits written)",
+            idx, bits_written
+        );
+    }
+}
+
+// =============================================================================
+// Cross-check: decoded index → §4.6.3.3 tuple → re-encoded index
+// (Codebook 4 is unsigned dim-4: every tuple element lies in `0..=LAV
+// = 0..=2`). Codebook 4 shares Codebook 3's Table 4.95 row shape, so
+// the §4.6.3.3 translation maps every index to the same tuple in both
+// books — only the codeword assignment differs.
+// =============================================================================
+
+#[test]
+fn hcod4_every_index_translates_through_spectral_codebook_round_trip() {
+    for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+        let tup = decode_index_to_tuple(4, idx).expect("legal codebook-4 index");
+        for (k, &v) in tup.iter().take(4).enumerate() {
+            assert!(
+                (0..=2).contains(&v),
+                "idx={} k={} tuple value {} outside [0, LAV=2]",
+                idx,
+                k,
+                v
+            );
+        }
+        let round = encode_tuple_to_index(4, &tup[..4]).expect("tuple round-trip");
+        assert_eq!(round, idx, "index round-trip failed for idx={}", idx);
+    }
+}
+
+#[test]
+fn hcod3_and_hcod4_map_every_index_to_the_same_tuple() {
+    // Both books share Table 4.95's unsigned dim-4 LAV-2 row shape,
+    // so the §4.6.3.3 translation is identical even though the
+    // Huffman codeword assignments differ.
+    for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+        let t3 = decode_index_to_tuple(3, idx).unwrap();
+        let t4 = decode_index_to_tuple(4, idx).unwrap();
+        assert_eq!(
+            t3[..4],
+            t4[..4],
+            "Codebook 3 / Codebook 4 disagree at idx={}",
+            idx
+        );
+    }
+}
+
+#[test]
+fn hcod4_unsigned_book_puts_zero_tuple_at_index_zero() {
+    // The §4.6.3.3 translation polynomial puts `(0, 0, 0, 0)` at
+    // index 0 for any unsigned book; the magnitude-2 tuple
+    // `(2, 2, 2, 2)` lands at index 80 (3^4 - 1).
+    let tup = decode_index_to_tuple(4, 0).unwrap();
+    assert_eq!(tup[..4], [0, 0, 0, 0]);
+    let tup_last = decode_index_to_tuple(4, 80).unwrap();
+    assert_eq!(tup_last[..4], [2, 2, 2, 2]);
+}
+
+// =============================================================================
+// Cross-check: Codebook 4 sign bits — every non-zero coefficient gets
+// one sign bit (the codeword itself carries magnitudes only).
+// =============================================================================
+
+#[test]
+fn hcod4_zero_tuple_emits_zero_sign_bits() {
+    let tup = decode_index_to_tuple(4, 0).unwrap();
+    let signs = derive_sign_bits(4, &tup[..4]).unwrap();
+    assert!(signs.is_empty());
+}
+
+#[test]
+fn hcod4_full_magnitude_tuple_emits_four_sign_bits() {
+    let tup = decode_index_to_tuple(4, 80).unwrap();
+    let signs = derive_sign_bits(4, &tup[..4]).unwrap();
+    assert_eq!(signs.len(), 4);
+}
+
+#[test]
+fn hcod4_sign_bit_count_equals_nonzero_count_for_every_index() {
+    for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+        let tup = decode_index_to_tuple(4, idx).unwrap();
+        let signs = derive_sign_bits(4, &tup[..4]).unwrap();
+        let nonzero = tup.iter().take(4).filter(|&&v| v != 0).count();
+        assert_eq!(
+            signs.len(),
+            nonzero,
+            "idx={}: sign bits {} != non-zero count {}",
+            idx,
+            signs.len(),
+            nonzero
+        );
+    }
+}
+
+// =============================================================================
+// Wire-bit precision: hand-built byte sequences for Codebook 4
+// =============================================================================
+
+#[test]
+fn hcod4_write_index_40_then_align_yields_zero_byte() {
+    // Index 40 is 4 bits `0b0000`. Pad 4 zero bits → byte 0x00.
+    let mut w = BitWriter::new();
+    hcod4_write(&mut w, 40).unwrap();
+    w.write_u32(0, 4);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0x00]);
+}
+
+#[test]
+fn hcod4_write_index_62_yields_full_12_bit_codeword_0xfff() {
+    // Codeword 0xfff = 0b1111_1111_1111, MSB-first. Pack into 12
+    // bits + 4 zero pad bits → 0xff, 0xf0.
+    let mut w = BitWriter::new();
+    hcod4_write(&mut w, 62).unwrap();
+    w.write_u32(0, 4);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0xff, 0xf0]);
+}
+
+#[test]
+fn hcod4_write_two_indices_yields_concatenated_bitstream() {
+    // Index 40 (4 bits `0000`) followed by index 0 (4 bits `0111`)
+    // packs to: 0000_0111 = 0x07.
+    let mut w = BitWriter::new();
+    hcod4_write(&mut w, 40).unwrap();
+    hcod4_write(&mut w, 0).unwrap();
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0x07]);
+
+    let mut br = BitReader::new(&bytes);
+    assert_eq!(hcod4_decode(&mut br).unwrap(), 40);
+    assert_eq!(hcod4_decode(&mut br).unwrap(), 0);
+}
+
+// =============================================================================
+// Decoder reads only as many bits as the codeword needs
+// =============================================================================
+
+#[test]
+fn hcod4_decoder_consumes_exactly_codeword_length_bits() {
+    for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+        let (len, _) = hcod4_encode(idx).unwrap();
+        let mut w = BitWriter::new();
+        hcod4_write(&mut w, idx).unwrap();
+        let pad = (8 - (w.bit_position() % 8)) % 8;
+        if pad > 0 {
+            w.write_u32(0, pad as u32);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let _ = hcod4_decode(&mut br).unwrap();
+        assert_eq!(
+            br.bit_position(),
+            u64::from(len),
+            "idx={}: decoder consumed {} bits, expected {}",
+            idx,
+            br.bit_position(),
+            len
+        );
+    }
+}
+
+// =============================================================================
+// Rejection branches
+// =============================================================================
+
+#[test]
+fn hcod4_encode_rejects_indices_at_and_above_81() {
+    for bad in [81u32, 82, 100, 1000, u32::MAX] {
+        assert!(matches!(
+            hcod4_encode(bad),
+            Err(Error::SpectralCodebookIndexOutOfRange(4))
+        ));
+    }
+}
+
+#[test]
+fn hcod4_decoder_returns_unexpected_end_on_truncation() {
+    // Codebook 4 needs at least 4 bits for the shortest codeword
+    // (index 40). Provide zero bytes → immediate underflow.
+    let bytes: [u8; 0] = [];
+    let mut br = BitReader::new(&bytes);
+    let err = hcod4_decode(&mut br).unwrap_err();
+    assert_eq!(err, Error::UnexpectedEnd);
+}
+
+#[test]
+fn hcod4_max_len_constant_matches_table_data() {
+    let mut observed_max = 0u32;
+    for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+        let (len, _) = hcod4_encode(idx).unwrap();
+        observed_max = observed_max.max(u32::from(len));
+    }
+    assert_eq!(observed_max, HCOD4_MAX_LEN);
+}
+
+// =============================================================================
+// Cross-check: Codebook 3 / Codebook 4 share a tuple universe but use
+// different codeword assignments (the four-tuple universe is identical
+// per Table 4.95 rows 3 and 4, but Codebook 3 maxes out at 16 bits
+// while Codebook 4 maxes out at 12 bits).
+// =============================================================================
+
+#[test]
+fn codebook_3_and_4_have_the_same_tuple_universe_but_distinct_max_codeword_lengths() {
+    assert_eq!(HCOD3_NUM_ENTRIES, HCOD4_NUM_ENTRIES);
+    assert_eq!(HCOD3_NUM_ENTRIES, 81);
+    assert_ne!(HCOD3_MAX_LEN, HCOD4_MAX_LEN);
+    assert_eq!(HCOD3_MAX_LEN, 16);
+    assert_eq!(HCOD4_MAX_LEN, 12);
 }

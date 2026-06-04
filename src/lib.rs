@@ -248,26 +248,28 @@
 //!   translation layer it will sit on top of.
 //! * The [`spectrum_huffman`] module — the **wire layer** for the
 //!   §4.6.3 / Annex 4.A Huffman codebooks (**new in round 219**).
-//!   Round 219 lands the first of the eleven spectrum books:
+//!   Round 219 landed the first of the eleven spectrum books:
 //!   **Table 4.A.2** (Spectrum Huffman Codebook 1, signed 4-tuple,
 //!   `LAV = 1`, 81 entries indexed `0..=80`, maximum codeword
 //!   length 11 bits; the zero-tuple at index 40 carries the
-//!   single-bit codeword `0`). Public API:
-//!   [`spectrum_huffman::HCOD1_NUM_ENTRIES`] = 81,
-//!   [`spectrum_huffman::HCOD1_MAX_LEN`] = 11,
-//!   [`spectrum_huffman::hcod1_encode`] returns
-//!   `(length_in_bits, codeword)` with the codeword right-aligned
-//!   in a `u16` (MSB at bit `length − 1`),
-//!   [`spectrum_huffman::hcod1_decode`] reads MSB-first from a
-//!   [`oxideav_core::bits::BitReader`] and returns the codeword
-//!   index, and [`spectrum_huffman::hcod1_write`] is a convenience
-//!   wrapper over the encode + writer-emit pair. The codebook is
-//!   a complete prefix code (Kraft equality `Σ 2^(11 − L) = 2048`),
-//!   exhaustively verified at unit-test time by walking every
-//!   11-bit prefix. Codebooks 2..=11 (Tables 4.A.3 … 4.A.12) reuse
-//!   the same module shape and are owed in subsequent rounds; the
-//!   `spectral_data()` driver that dispatches per-band onto the
-//!   chosen codebook arrives once all eleven are in place.
+//!   single-bit codeword `0`). Round 226 added Codebook 2
+//!   (Table 4.A.3, same signed 4-tuple universe, 9-bit max), round
+//!   231 added Codebook 3 (Table 4.A.4, the first **unsigned** book,
+//!   `LAV = 2`, 16-bit max; the zero magnitude tuple migrates to
+//!   index 0). Round 234 adds Codebook 4 (Table 4.A.5, the second
+//!   unsigned dim-4 book, 12-bit max; the shortest codeword
+//!   `0b0000` parks at index 40 while index 0 carries a 4-bit
+//!   `0b0111`). Public API per book: `HCODN_NUM_ENTRIES` = 81,
+//!   `HCODN_MAX_LEN` (codebook-specific), `hcodN_encode(idx) ->
+//!   (length, codeword)` (right-aligned in `u16`), `hcodN_decode`
+//!   reads MSB-first from a [`oxideav_core::bits::BitReader`] and
+//!   returns the codeword index, and `hcodN_write` is a convenience
+//!   wrapper over the encode + writer-emit pair. Every book is a
+//!   complete prefix code over `HCODN_MAX_LEN` bits, exhaustively
+//!   verified at unit-test time. Codebooks 5..=11 (Tables 4.A.6 …
+//!   4.A.12) reuse the same module shape and are owed in subsequent
+//!   rounds; the `spectral_data()` driver that dispatches per-band
+//!   onto the chosen codebook arrives once all eleven are in place.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three

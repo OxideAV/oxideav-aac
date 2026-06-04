@@ -3,6 +3,70 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 234)
+
+Round 234 lands **Table 4.A.5** (Spectrum Huffman Codebook 4) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 bootstrapped for Codebooks 1, 2, and 3.
+Codebook 4 shares Codebook 3's unsigned dim-4 LAV-2 tuple universe
+(Table 4.95 row 4 is identical to row 3 except for the source-table
+column: `unsigned_cb = 1`, `dim = 4`, `LAV = 2` → `3^4 = 81` entries
+indexed `0..=80`, each tuple coefficient in `0..=2`, with the §4.6.3.3
+sign-bit suffix carrying the sign of every non-zero coefficient
+outside the Huffman codeword) but uses a different per-row Huffman
+length tuning. Where Codebook 3 puts the zero-tuple at index 0 with a
+single-bit codeword and lets the magnitude-2 tuples climb to a 16-bit
+maximum, Codebook 4 parks the **shortest codeword** (4 bits `0b0000`)
+at **index 40** while lifting index 0 (still the §4.6.3.3
+zero-tuple `(0, 0, 0, 0)`) to a 4-bit `0b0111`. The maximum codeword
+length is **12 bits** (vs 16 for Codebook 3), and exactly two rows
+reach that length: index 62 (`0xfff`) and index 74 (`0xffe`). The
+shorter, flatter distribution makes Codebook 4 a better fit for
+sections whose magnitude statistics are uniformly spread across the
+`(0, 0, 0, 0) .. (2, 2, 2, 2)` range than Codebook 3's zero-heavy
+target. The table is a **complete** 12-bit prefix code (Kraft equality
+`Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified by walking every
+12-bit prefix and asserting each maps to exactly one entry. Public
+API: `HCOD4_NUM_ENTRIES = 81`, `HCOD4_MAX_LEN = 12`,
+`hcod4_encode(idx) -> (u8, u16)`, `hcod4_decode(reader) -> u32`, and
+the convenience `hcod4_write(writer, idx)`. Out-of-range indices
+surface as `Error::SpectralCodebookIndexOutOfRange(4)`; reader
+underflow surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised as a cross-check: every Codebook 4 index
+round-trips through `decode_index_to_tuple(4, idx)` →
+`encode_tuple_to_index(4, &tuple)` back to the same index; the
+§4.6.3.3 sign-bit count (`derive_sign_bits(4, &tuple)`) matches the
+non-zero-coefficient count for every index; and a Codebook 3 ↔
+Codebook 4 cross-check confirms that the two books map every index
+to the *same* `(w, x, y, z)` magnitude tuple — only the codeword
+assignment differs, since the §4.6.3.3 translation depends on the
+Table 4.95 row shape (which is identical for rows 3 and 4) and not on
+the codeword bit pattern. 16 new unit tests (in
+`src/spectrum_huffman.rs`: 81-entry shape / 12-bit max / 4-bit min at
+index 40 / codewords fit / Kraft equality 4096 / complete-prefix walk
+over all `2^12` prefixes / per-row PDF spot checks at indices 0 / 40 /
+62 / 74 / 80 / encode + decode rejection / four-zero-bit decode at
+index 40 / full 12-bit codeword decode at index 62 / writer
+round-trip / writer rejection / Codebook 3 ↔ Codebook 4
+zero-tuple-codeword disagreement) plus 24 new integration tests in
+`tests/spectrum_huffman.rs` (seven per-row PDF spot checks at
+indices 0 / 13 / 27 / 40 / 62 / 74 / 80; Table 4.95 row 4 ↔ Table
+4.A.5 size cross-check; full writer→reader round-trip; the §4.6.3.3
+wire-index ↔ tuple ↔ wire-index cross-check; Codebook 3 / Codebook 4
+tuple-universe equivalence cross-check; zero-tuple ↔ index-0 invariant;
+full magnitude tuple ↔ index 80 invariant; zero-sign-bit /
+four-sign-bit / per-index-sign-count cross-checks against
+`derive_sign_bits`; three hand-pinned byte sequences (`[0x00]` for
+index 40 padded; `[0xff, 0xf0]` for index 62 padded; `[0x07]` for
+index 40 + index 0 packed); exact bit-consumption invariant across
+every index; out-of-range and truncation rejections; `HCOD4_MAX_LEN`
+constant consistency; and a Codebook 3 / Codebook 4 max-codeword-length
+cross-check). Suite grows 651 → 691 tests. Codebooks 5..=11
+(Tables 4.A.6 … 4.A.12) reuse the same module shape and will land
+one per future round; Codebooks 5 and 6 are the first **pair**
+(`dim = 2`) books in Table 4.95 with `LAV = 4`, opening a new
+codebook geometry (`9^2 = 81` entries per book).
+
 ## Status (round 231)
 
 Round 231 lands **Table 4.A.4** (Spectrum Huffman Codebook 3) inside

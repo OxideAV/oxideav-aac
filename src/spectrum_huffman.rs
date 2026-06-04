@@ -11,20 +11,18 @@
 //! Round 219 landed the first of the eleven spectrum Huffman
 //! codebooks — **Table 4.A.2, "Spectrum Huffman Codebook 1"**. Round
 //! 226 added the second — **Table 4.A.3, "Spectrum Huffman Codebook
-//! 2"**. Round 231 adds the third — **Table 4.A.4, "Spectrum Huffman
-//! Codebook 3"**. Codebooks 1 and 2 share the same Table 4.95 row
-//! shape (`signed`, `dim = 4`, `LAV = 1` → `3^4 = 81` entries indexed
-//! `0..=80`); Codebook 3 is the first *unsigned* book with `dim = 4`,
-//! `LAV = 2` so its index space is also `3^4 = 81` (the modulus
-//! becomes `LAV + 1 = 3` for unsigned vs `2*LAV + 1 = 3` for the
-//! signed `LAV = 1` books — coincidentally the same cardinality but
-//! a different tuple universe: each coefficient lies in `0..=2`
-//! rather than `-1..=+1`, with sign bits following the Huffman
-//! codeword for every non-zero coefficient per §4.6.3.3).
-//! Codebooks 4..=11 (Tables 4.A.5 … 4.A.12) reuse the same module
-//! shape and will be added one per future round; the traits and
-//! dispatch surface here are intentionally codebook-agnostic so the
-//! per-codebook additions land as a single static-table
+//! 2"**. Round 231 added the third — **Table 4.A.4, "Spectrum Huffman
+//! Codebook 3"**. Round 234 adds the fourth — **Table 4.A.5, "Spectrum
+//! Huffman Codebook 4"**. Codebooks 1 and 2 share the same Table 4.95
+//! row shape (`signed`, `dim = 4`, `LAV = 1` → `3^4 = 81` entries
+//! indexed `0..=80`); Codebooks 3 and 4 share the unsigned dim-4
+//! shape (Table 4.95 rows 3 and 4 both: `unsigned_cb = 1`, `dim = 4`,
+//! `LAV = 2` → `3^4 = 81` entries indexed `0..=80`, with sign bits
+//! following the Huffman codeword for every non-zero coefficient per
+//! §4.6.3.3). Codebooks 5..=11 (Tables 4.A.6 … 4.A.12) reuse the same
+//! module shape and will be added one per future round; the traits
+//! and dispatch surface here are intentionally codebook-agnostic so
+//! the per-codebook additions land as a single static-table
 //! transcription each.
 //!
 //! ## Codebook 1 invariants (Table 4.A.2)
@@ -100,6 +98,42 @@
 //! [`derive_sign_bits`](crate::spectral_codebook::derive_sign_bits)
 //! and is *not* part of the Huffman codeword itself — this module's
 //! `hcod3_encode` / `hcod3_decode` cover the codeword only.
+//!
+//! ## Codebook 4 invariants (Table 4.A.5)
+//!
+//! | property               | value      | source                       |
+//! |------------------------|------------|------------------------------|
+//! | dimension              | 4          | Table 4.95 row 4, column 3   |
+//! | `unsigned_cb`          | 1 (unsigned)| Table 4.95 row 4, column 2  |
+//! | LAV                    | 2          | Table 4.95 row 4, column 4   |
+//! | entry count            | `3^4 = 81` | `(2 + 1)^4` per §4.6.3.3     |
+//! | maximum codeword length| 12 bits    | Table 4.A.5 column 2 maximum |
+//! | shortest codeword      | 4 bits     | Table 4.A.5 row 40 (index 40)|
+//! | shortest codeword value| `0`        | Table 4.A.5 row 40           |
+//! | Kraft equality         | 4096 = 2¹² | see [`hcod4_is_complete`]    |
+//!
+//! Codebook 4 shares Codebook 3's unsigned dim-4 LAV-2 tuple universe
+//! (Table 4.95 row 4 is identical to row 3 except for the `Codebook
+//! listed in Table` column) but uses a different per-row Huffman
+//! length tuning for a different encoder target-statistics. Where
+//! Codebook 3 puts the zero-tuple at index 0 with a single-bit
+//! codeword and lets the magnitude-2 tuples climb to a 16-bit
+//! maximum, Codebook 4 puts the zero-tuple at the *same* §4.6.3.3
+//! polynomial position (index 0 maps the unsigned `(0, 0, 0, 0)`
+//! tuple via the `((w*3 + x)*3 + y)*3 + z` evaluation with no offset)
+//! — but the codeword assignment lifts the zero-tuple to a 4-bit
+//! codeword (`0b0111`) and parks the *shortest* codeword (4 bits
+//! `0b0000`) at **index 40** instead. The maximum codeword length is
+//! **12 bits** (vs 16 for Codebook 3), and two distinct rows reach
+//! that length: index 62 (`0xfff`) and index 74 (`0xffe`). The
+//! shorter overall code length distribution makes Codebook 4 a
+//! better fit for sections whose magnitude statistics are flatter
+//! across the `(0, 0, 0, 0) .. (2, 2, 2, 2)` range than Codebook 3's
+//! zero-heavy target. The §4.6.3.3 sign-bit suffix is again exposed
+//! by [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits)
+//! / [`derive_sign_bits`](crate::spectral_codebook::derive_sign_bits)
+//! and is *not* part of the Huffman codeword itself — this module's
+//! `hcod4_encode` / `hcod4_decode` cover the codeword only.
 //!
 //! * The §4.6.3.3 index → n-tuple translation. That sits in
 //!   [`crate::spectral_codebook::decode_index_to_tuple`] /
@@ -653,6 +687,195 @@ pub fn hcod3_decode(reader: &mut BitReader<'_>) -> Result<u32> {
 /// every non-zero coefficient after this call.
 pub fn hcod3_write(writer: &mut BitWriter, idx: u32) -> Result<()> {
     let (len, cw) = hcod3_encode(idx)?;
+    writer.write_u32(u32::from(cw), u32::from(len));
+    Ok(())
+}
+
+// =============================================================================
+// Table 4.A.5 — Spectrum Huffman Codebook 4
+// =============================================================================
+//
+// 81 entries, indices 0..=80. Each row is `(length_in_bits,
+// codeword)` with `codeword` right-aligned in a `u16` (MSB of the
+// wire codeword at bit `length − 1`). Transcribed verbatim from
+// ISO/IEC 14496-3:2001(E) §4.A.1 Table 4.A.5.
+//
+// The codebook is a complete prefix code: Σᵢ 2^(12 − Lᵢ) = 4096 = 2¹².
+// This is exhaustively verified by the `hcod4_is_complete` regression
+// test (which walks every 12-bit prefix and asserts each maps to
+// exactly one index).
+//
+// Codebook 4 shares Codebook 3's unsigned dim-4 LAV-2 tuple universe
+// (Table 4.95 row 4 = row 3 except for the source-table column);
+// the §4.6.3.3 index ↔ 4-tuple translation in
+// [`crate::spectral_codebook`] is reused as-is. The §4.6.3.3 sign-bit
+// suffix lives in [`crate::spectral_codebook::apply_sign_bits`] /
+// [`crate::spectral_codebook::derive_sign_bits`].
+
+/// Number of entries in Table 4.A.5 (`81`, indices `0..=80`).
+pub const HCOD4_NUM_ENTRIES: usize = 81;
+
+/// Maximum codeword length emitted by Table 4.A.5 (12 bits).
+pub const HCOD4_MAX_LEN: u32 = 12;
+
+/// Table 4.A.5 — `(length_in_bits, codeword)` per index `0..=80`.
+///
+/// Codewords are right-aligned within the `u16`. To emit one
+/// bit-for-bit, write `codeword` as `length` bits MSB-first.
+const HCOD4: [(u8, u16); HCOD4_NUM_ENTRIES] = [
+    (4, 0x007),  // 0
+    (5, 0x016),  // 1
+    (8, 0x0f6),  // 2
+    (5, 0x018),  // 3
+    (4, 0x008),  // 4
+    (8, 0x0ef),  // 5
+    (9, 0x1ef),  // 6
+    (8, 0x0f3),  // 7
+    (11, 0x7f8), // 8
+    (5, 0x019),  // 9
+    (5, 0x017),  // 10
+    (8, 0x0ed),  // 11
+    (5, 0x015),  // 12
+    (4, 0x001),  // 13
+    (8, 0x0e2),  // 14
+    (8, 0x0f0),  // 15
+    (7, 0x070),  // 16
+    (10, 0x3f0), // 17
+    (9, 0x1ee),  // 18
+    (8, 0x0f1),  // 19
+    (11, 0x7fa), // 20
+    (8, 0x0ee),  // 21
+    (8, 0x0e4),  // 22
+    (10, 0x3f2), // 23
+    (11, 0x7f6), // 24
+    (10, 0x3ef), // 25
+    (11, 0x7fd), // 26
+    (4, 0x005),  // 27
+    (5, 0x014),  // 28
+    (8, 0x0f2),  // 29
+    (4, 0x009),  // 30
+    (4, 0x004),  // 31
+    (8, 0x0e5),  // 32
+    (8, 0x0f4),  // 33
+    (8, 0x0e8),  // 34
+    (10, 0x3f4), // 35
+    (4, 0x006),  // 36
+    (4, 0x002),  // 37
+    (8, 0x0e7),  // 38
+    (4, 0x003),  // 39
+    (4, 0x000),  // 40 — shortest codeword in Codebook 4
+    (7, 0x06b),  // 41
+    (8, 0x0e3),  // 42
+    (7, 0x069),  // 43
+    (9, 0x1f3),  // 44
+    (8, 0x0eb),  // 45
+    (8, 0x0e6),  // 46
+    (10, 0x3f6), // 47
+    (7, 0x06e),  // 48
+    (7, 0x06a),  // 49
+    (9, 0x1f4),  // 50
+    (10, 0x3ec), // 51
+    (9, 0x1f0),  // 52
+    (10, 0x3f9), // 53
+    (8, 0x0f5),  // 54
+    (8, 0x0ec),  // 55
+    (11, 0x7fb), // 56
+    (8, 0x0ea),  // 57
+    (7, 0x06f),  // 58
+    (10, 0x3f7), // 59
+    (11, 0x7f9), // 60
+    (10, 0x3f3), // 61
+    (12, 0xfff), // 62
+    (8, 0x0e9),  // 63
+    (7, 0x06d),  // 64
+    (10, 0x3f8), // 65
+    (7, 0x06c),  // 66
+    (7, 0x068),  // 67
+    (9, 0x1f5),  // 68
+    (10, 0x3ee), // 69
+    (9, 0x1f2),  // 70
+    (11, 0x7f4), // 71
+    (11, 0x7f7), // 72
+    (10, 0x3f1), // 73
+    (12, 0xffe), // 74
+    (10, 0x3ed), // 75
+    (9, 0x1f1),  // 76
+    (11, 0x7f5), // 77
+    (11, 0x7fe), // 78
+    (10, 0x3f5), // 79
+    (11, 0x7fc), // 80
+];
+
+/// Encode a Codebook 4 codeword index (`0..=80`) to the wire Huffman
+/// codeword from Table 4.A.5.
+///
+/// Returns `(length_in_bits, codeword)` with `codeword` right-aligned
+/// in the `u16` (MSB at bit `length − 1`). Out-of-range `idx`
+/// produces [`Error::SpectralCodebookIndexOutOfRange`] carrying the
+/// codebook number `4`; the legal range is `0..=80` (the 81-entry
+/// `3^4` enumeration of every legal unsigned 4-tuple with each
+/// coefficient in `0..=LAV = 0..=2` — the same universe as Codebook
+/// 3).
+///
+/// The inverse of [`hcod4_decode`]. The sign-bit suffix for each
+/// non-zero coefficient is *not* part of the returned codeword — the
+/// caller emits sign bits separately per
+/// [`crate::spectral_codebook::derive_sign_bits`].
+pub fn hcod4_encode(idx: u32) -> Result<(u8, u16)> {
+    let entry = HCOD4
+        .get(idx as usize)
+        .ok_or(Error::SpectralCodebookIndexOutOfRange(4))?;
+    Ok(*entry)
+}
+
+/// Decode one Codebook 4 Huffman codeword from `reader`, returning
+/// the codeword index in `0..=80`.
+///
+/// The decoder is a straight prefix-match: read one bit at a time
+/// (MSB-first), look it up in a flat 81-entry table. The table is
+/// small (max codeword length 12 bits, 81 entries) so a single
+/// linear scan per bit-extend is cheaper than the storage and
+/// build-time cost of a multi-level lookup acceleration table.
+/// Returns [`Error::UnexpectedEnd`] on reader underflow.
+///
+/// The codebook is a **complete** prefix code over 12 bits (Kraft
+/// equality `Σᵢ 2^(12 − Lᵢ) = 4096 = 2¹²`), so any 12-bit prefix
+/// fully read from `reader` is guaranteed to match exactly one
+/// entry — the bottom of the loop is unreachable when `reader`
+/// produces 12 bits without underflowing. A purely defensive
+/// `unreachable!()` guards the loop fall-through; it is verified
+/// dead by the `hcod4_is_complete` regression test that exhaustively
+/// walks all `2¹²` 12-bit prefixes.
+///
+/// The sign-bit suffix for non-zero coefficients is *not* consumed
+/// here — the caller pairs the returned index with the §4.6.3.3
+/// translation and then reads exactly one sign bit per non-zero
+/// coefficient in low-frequency-first order.
+pub fn hcod4_decode(reader: &mut BitReader<'_>) -> Result<u32> {
+    let mut acc: u32 = 0;
+    for len in 1..=HCOD4_MAX_LEN {
+        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
+        acc = (acc << 1) | bit;
+        for (idx, &(entry_len, entry_cw)) in HCOD4.iter().enumerate() {
+            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
+                return Ok(idx as u32);
+            }
+        }
+    }
+    // Unreachable: HCOD4 is a complete 12-bit prefix code. The
+    // `hcod4_is_complete` regression test verifies every 12-bit
+    // prefix maps to exactly one entry.
+    unreachable!("HCOD4 is a complete 12-bit prefix code; the 12-bit walk must match");
+}
+
+/// Write a Codebook 4 codeword to `writer` by index.
+///
+/// Convenience over `hcod4_encode` + manual `write_u32`. Returns
+/// [`Error::SpectralCodebookIndexOutOfRange`] for `idx > 80`. The
+/// caller is responsible for emitting the §4.6.3.3 sign bits for
+/// every non-zero coefficient after this call.
+pub fn hcod4_write(writer: &mut BitWriter, idx: u32) -> Result<()> {
+    let (len, cw) = hcod4_encode(idx)?;
     writer.write_u32(u32::from(cw), u32::from(len));
     Ok(())
 }
@@ -1286,5 +1509,229 @@ mod tests {
         assert_eq!(cw1, 0);
         assert_eq!(l3, 1);
         assert_eq!(cw3, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Codebook 4 — Table 4.A.5
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn hcod4_has_exactly_81_entries() {
+        // 3^4 = 81 (unsigned LAV=2 → mod = lav+1 = 3, dim = 4) — same
+        // tuple universe as Codebook 3.
+        assert_eq!(HCOD4.len(), HCOD4_NUM_ENTRIES);
+        assert_eq!(HCOD4_NUM_ENTRIES, 81);
+    }
+
+    #[test]
+    fn hcod4_max_length_is_12_bits() {
+        let max = HCOD4.iter().map(|&(len, _)| len).max().unwrap();
+        assert_eq!(u32::from(max), HCOD4_MAX_LEN);
+        assert_eq!(HCOD4_MAX_LEN, 12);
+    }
+
+    #[test]
+    fn hcod4_min_length_is_four_bits_at_index_40() {
+        // The shortest codeword in Codebook 4 is 4 bits, parked at
+        // index 40 with the all-zero pattern `0b0000`. Every other
+        // index has length >= 4 (Codebook 4's distribution has a
+        // dense 4-bit head: indices 0, 4, 13, 27, 30, 31, 36, 37, 39,
+        // 40 all share length 4).
+        let (len_40, cw_40) = (HCOD4[40].0, HCOD4[40].1);
+        assert_eq!(len_40, 4, "index 40 must be 4-bit");
+        assert_eq!(cw_40, 0, "index 40 codeword must be `0b0000`");
+        for (idx, &(len, _)) in HCOD4.iter().enumerate() {
+            assert!(
+                len >= 4,
+                "every index must have length >= 4; idx={} len={}",
+                idx,
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn hcod4_codewords_fit_their_declared_length() {
+        for (idx, &(len, cw)) in HCOD4.iter().enumerate() {
+            let max = if len == 0 { 0 } else { (1u32 << len) - 1 };
+            assert!(
+                u32::from(cw) <= max,
+                "idx={}: codeword {:#x} does not fit {} bits",
+                idx,
+                cw,
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn hcod4_kraft_sum_is_two_to_the_twelve() {
+        // Σᵢ 2^(L_max − Lᵢ) must equal 2^L_max for a complete code.
+        let lmax = HCOD4_MAX_LEN;
+        let mut sum: u64 = 0;
+        for &(len, _) in &HCOD4 {
+            sum += 1u64 << (lmax - u32::from(len));
+        }
+        assert_eq!(sum, 1u64 << lmax, "Kraft equality failed");
+        assert_eq!(sum, 4096);
+    }
+
+    #[test]
+    fn hcod4_is_complete() {
+        // Walk every 12-bit prefix, decode it via the production
+        // decoder, and confirm every prefix yields exactly one entry.
+        // Bonus: confirm the decoded index round-trips back to the
+        // same codeword via `hcod4_encode`.
+        for prefix in 0u32..(1u32 << HCOD4_MAX_LEN) {
+            // Pack `prefix` (12 bits) left-aligned into two bytes:
+            // high byte = bits 11..4, low byte = (bits 3..0) << 4.
+            let bytes = [(prefix >> 4) as u8, ((prefix & 0xf) << 4) as u8];
+            let mut br = BitReader::new(&bytes);
+            let idx = hcod4_decode(&mut br).expect("12-bit prefix must decode");
+            let (len, cw) = hcod4_encode(idx).expect("decoded index must round-trip");
+            // The decoded codeword should match the leading `len` bits
+            // of `prefix`.
+            let lead = prefix >> (HCOD4_MAX_LEN - u32::from(len));
+            assert_eq!(
+                u32::from(cw),
+                lead,
+                "round-trip prefix={:#05x} idx={} len={} cw={:#x}",
+                prefix,
+                idx,
+                len,
+                cw
+            );
+        }
+    }
+
+    #[test]
+    fn hcod4_encode_index_40_is_4_bit_zero_codeword() {
+        // Spec PDF Table 4.A.5 row 40: length 4, codeword 0 (the
+        // shortest codeword in the table).
+        let (len, cw) = hcod4_encode(40).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(cw, 0);
+    }
+
+    #[test]
+    fn hcod4_encode_first_entry_matches_table() {
+        // Spec PDF Table 4.A.5 row 0: length 4, codeword 0x7.
+        let (len, cw) = hcod4_encode(0).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(cw, 0x7);
+    }
+
+    #[test]
+    fn hcod4_encode_last_entry_matches_table() {
+        // Spec PDF Table 4.A.5 row 80: length 11, codeword 0x7fc.
+        let (len, cw) = hcod4_encode(80).unwrap();
+        assert_eq!(len, 11);
+        assert_eq!(cw, 0x7fc);
+    }
+
+    #[test]
+    fn hcod4_encode_indices_62_and_74_are_the_full_12_bit_codewords() {
+        // Spec PDF Table 4.A.5 row 62: length 12, codeword 0xfff.
+        // Spec PDF Table 4.A.5 row 74: length 12, codeword 0xffe.
+        // These are the only two 12-bit rows in Codebook 4.
+        let (len_62, cw_62) = hcod4_encode(62).unwrap();
+        assert_eq!((len_62, cw_62), (12, 0xfff));
+        let (len_74, cw_74) = hcod4_encode(74).unwrap();
+        assert_eq!((len_74, cw_74), (12, 0xffe));
+        let count_12_bit = HCOD4.iter().filter(|&&(l, _)| l == 12).count();
+        assert_eq!(count_12_bit, 2);
+    }
+
+    #[test]
+    fn hcod4_encode_rejects_out_of_range_index() {
+        assert!(matches!(
+            hcod4_encode(81),
+            Err(Error::SpectralCodebookIndexOutOfRange(4))
+        ));
+        assert!(matches!(
+            hcod4_encode(0xffff_ffff),
+            Err(Error::SpectralCodebookIndexOutOfRange(4))
+        ));
+    }
+
+    #[test]
+    fn hcod4_decode_four_zero_bits_yields_index_40() {
+        // Leading `0b0000` → idx 40 (Codebook 4's shortest codeword).
+        // Remaining 4 bits of the byte untouched.
+        let bytes = [0b0000_1111u8];
+        let mut br = BitReader::new(&bytes);
+        let idx = hcod4_decode(&mut br).unwrap();
+        assert_eq!(idx, 40);
+        assert_eq!(br.bit_position(), 4);
+    }
+
+    #[test]
+    fn hcod4_decode_full_12_bit_codeword_round_trips_index_62() {
+        // Index 62 → length 12, codeword 0xfff = 0b1111_1111_1111.
+        // Pack left-aligned into 2 bytes: 0xff, 0xf0.
+        let bytes = [0xff, 0xf0];
+        let mut br = BitReader::new(&bytes);
+        let idx = hcod4_decode(&mut br).unwrap();
+        assert_eq!(idx, 62);
+        assert_eq!(br.bit_position(), 12);
+    }
+
+    #[test]
+    fn hcod4_decode_propagates_unexpected_end() {
+        let bytes: [u8; 0] = [];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(hcod4_decode(&mut br), Err(Error::UnexpectedEnd));
+    }
+
+    #[test]
+    fn hcod4_write_then_decode_round_trips_every_index() {
+        for idx in 0..HCOD4_NUM_ENTRIES as u32 {
+            let mut w = BitWriter::new();
+            hcod4_write(&mut w, idx).unwrap();
+            let (len, _) = hcod4_encode(idx).unwrap();
+            let mut w2 = w;
+            let pad = (8 - (u32::from(len) % 8)) % 8;
+            if pad > 0 {
+                w2.write_u32(0, pad);
+            }
+            let bytes = w2.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let decoded = hcod4_decode(&mut br).unwrap();
+            assert_eq!(
+                decoded, idx,
+                "round-trip mismatch at idx={} (encoded as {} bits)",
+                idx, len
+            );
+        }
+    }
+
+    #[test]
+    fn hcod4_write_rejects_out_of_range_index() {
+        let mut w = BitWriter::new();
+        assert!(matches!(
+            hcod4_write(&mut w, 81),
+            Err(Error::SpectralCodebookIndexOutOfRange(4))
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // Cross-check: Codebook 3 and Codebook 4 share the unsigned dim-4
+    // LAV-2 tuple universe (same Table 4.95 row shape) but assign
+    // different codewords for the same tuple — Codebook 3 gives the
+    // zero-tuple the single-bit codeword `0`; Codebook 4 lifts it to
+    // a 4-bit `0b0111` and parks the 4-bit `0b0000` shortest at
+    // index 40 instead.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn codebook_3_and_4_disagree_on_zero_tuple_codeword() {
+        let (l3, cw3) = hcod3_encode(0).unwrap();
+        let (l4, cw4) = hcod4_encode(0).unwrap();
+        assert_eq!((l3, cw3), (1, 0));
+        assert_eq!((l4, cw4), (4, 0x7));
+        // Codebook 4's shortest codeword sits at a different index
+        // (40) with a different value (`0b0000`).
+        let (l40, cw40) = hcod4_encode(40).unwrap();
+        assert_eq!((l40, cw40), (4, 0));
     }
 }
