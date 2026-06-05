@@ -1,9 +1,9 @@
 //! Integration tests for `oxideav_aac::spectrum_huffman`.
 //!
 //! Cross-checks Codebooks 1 (Table 4.A.2), 2 (Table 4.A.3), 3
-//! (Table 4.A.4), and 4 (Table 4.A.5) wire round-trip against the
-//! §4.6.3.3 index ↔ n-tuple translation already covered by
-//! [`oxideav_aac::spectral_codebook`].
+//! (Table 4.A.4), 4 (Table 4.A.5), and 5 (Table 4.A.6) wire
+//! round-trip against the §4.6.3.3 index ↔ n-tuple translation
+//! already covered by [`oxideav_aac::spectral_codebook`].
 
 use oxideav_aac::{
     spectral_codebook::{
@@ -12,8 +12,9 @@ use oxideav_aac::{
     spectrum_huffman::{
         hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode, hcod2_encode, hcod2_write,
         hcod3_decode, hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write,
-        HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN, HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN,
-        HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES,
+        hcod5_decode, hcod5_encode, hcod5_write, HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN,
+        HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN, HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES,
+        HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES,
     },
     Error,
 };
@@ -1127,4 +1128,305 @@ fn codebook_3_and_4_have_the_same_tuple_universe_but_distinct_max_codeword_lengt
     assert_ne!(HCOD3_MAX_LEN, HCOD4_MAX_LEN);
     assert_eq!(HCOD3_MAX_LEN, 16);
     assert_eq!(HCOD4_MAX_LEN, 12);
+}
+
+// =============================================================================
+// Per-row spec-PDF spot checks (Table 4.A.6 — Codebook 5)
+// =============================================================================
+//
+// Each spot row is taken from ISO/IEC 14496-3:2001(E) §4.A.1 Table
+// 4.A.6 (pages 196–197) verbatim. The four 13-bit corners
+// `(0, 8, 72, 80)`, the single 1-bit row at index 40 (the §4.6.3.3
+// zero-tuple `(0, 0)`), and three interior rows (`13`, `31`, `41`)
+// are spot-checked.
+
+#[test]
+fn table_4_a_6_row_0_matches_spec() {
+    // Row 0 — (y, z) = (-4, -4): length 13, codeword 0x1fff.
+    let (len, cw) = hcod5_encode(0).unwrap();
+    assert_eq!((len, cw), (13, 0x1fff));
+}
+
+#[test]
+fn table_4_a_6_row_8_matches_spec() {
+    // Row 8 — (y, z) = (-4, +4): length 13, codeword 0x1ffd.
+    let (len, cw) = hcod5_encode(8).unwrap();
+    assert_eq!((len, cw), (13, 0x1ffd));
+}
+
+#[test]
+fn table_4_a_6_row_13_matches_spec() {
+    // Row 13 — (y, z) = (-3, 0): length 8, codeword 0xf0.
+    let (len, cw) = hcod5_encode(13).unwrap();
+    assert_eq!((len, cw), (8, 0xf0));
+}
+
+#[test]
+fn table_4_a_6_row_31_matches_spec() {
+    // Row 31 — (y, z) = (-1, -4): length 4, codeword 0x8.
+    let (len, cw) = hcod5_encode(31).unwrap();
+    assert_eq!((len, cw), (4, 0x8));
+}
+
+#[test]
+fn table_4_a_6_row_40_matches_spec() {
+    // Row 40 (zero-tuple): length 1, codeword 0.
+    let (len, cw) = hcod5_encode(40).unwrap();
+    assert_eq!((len, cw), (1, 0));
+}
+
+#[test]
+fn table_4_a_6_row_41_matches_spec() {
+    // Row 41 — (y, z) = (0, +1): length 4, codeword 0xa.
+    let (len, cw) = hcod5_encode(41).unwrap();
+    assert_eq!((len, cw), (4, 0xa));
+}
+
+#[test]
+fn table_4_a_6_row_72_matches_spec() {
+    // Row 72 — (y, z) = (+4, -4): length 13, codeword 0x1ffc.
+    let (len, cw) = hcod5_encode(72).unwrap();
+    assert_eq!((len, cw), (13, 0x1ffc));
+}
+
+#[test]
+fn table_4_a_6_row_80_matches_spec() {
+    // Row 80 — (y, z) = (+4, +4): length 13, codeword 0x1ffe.
+    let (len, cw) = hcod5_encode(80).unwrap();
+    assert_eq!((len, cw), (13, 0x1ffe));
+}
+
+// =============================================================================
+// Codebook-shape cross-check vs Table 4.95 row 5
+// =============================================================================
+
+#[test]
+fn codebook_5_table_4_95_row_matches_table_4_a_6_size() {
+    // Row 5 of Table 4.95: signed, dim=2, lav=4 → (2*4+1)^2 = 81.
+    let row = table_4_95(5).unwrap();
+    assert_eq!(row.unsigned, Some(false));
+    assert_eq!(row.dimension, Some(2));
+    assert_eq!(row.lav, Some(4));
+    assert_eq!(row.huffman_table, Some(6));
+
+    let lav = row.lav.unwrap();
+    let dim = row.dimension.unwrap();
+    let modulus = 2 * lav + 1; // signed
+    let count: u32 = modulus.pow(u32::from(dim));
+    assert_eq!(count as usize, HCOD5_NUM_ENTRIES);
+}
+
+// =============================================================================
+// Round-trip every entry through the Codebook 5 wire writer + reader
+// =============================================================================
+
+#[test]
+fn hcod5_every_index_round_trips_writer_to_reader() {
+    for idx in 0..HCOD5_NUM_ENTRIES as u32 {
+        let mut w = BitWriter::new();
+        hcod5_write(&mut w, idx).unwrap();
+        let bits_written = w.bit_position();
+        let pad = (8 - (bits_written % 8)) % 8;
+        if pad > 0 {
+            w.write_u32(0, pad as u32);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let got = hcod5_decode(&mut br).unwrap();
+        assert_eq!(
+            got, idx,
+            "round-trip mismatch at idx={} ({} bits written)",
+            idx, bits_written
+        );
+    }
+}
+
+// =============================================================================
+// Cross-check: decoded index → §4.6.3.3 tuple → re-encoded index.
+// Codebook 5 is signed dim-2 LAV-4: every tuple element lies in
+// `-4..=+4`. Tuple lives in slots `[0..2]` ([y, z]).
+// =============================================================================
+
+#[test]
+fn hcod5_every_index_translates_through_spectral_codebook_round_trip() {
+    for idx in 0..HCOD5_NUM_ENTRIES as u32 {
+        let tup = decode_index_to_tuple(5, idx).expect("legal codebook-5 index");
+        for (k, &v) in tup.iter().take(2).enumerate() {
+            assert!(
+                (-4..=4).contains(&v),
+                "idx={} k={} tuple value {} outside [-LAV, +LAV] = [-4, +4]",
+                idx,
+                k,
+                v
+            );
+        }
+        let round = encode_tuple_to_index(5, &tup[..2]).expect("tuple round-trip");
+        assert_eq!(round, idx, "index round-trip failed for idx={}", idx);
+    }
+}
+
+#[test]
+fn hcod5_signed_pair_book_puts_zero_tuple_at_index_40() {
+    // The §4.6.3.3 translation polynomial puts `(0, 0)` at the
+    // centre row (index 40) for a signed pair book with LAV = 4:
+    // `idx = (y + 4) * 9 + (z + 4) = 4 * 9 + 4 = 40`.
+    let tup = decode_index_to_tuple(5, 40).unwrap();
+    assert_eq!(tup[..2], [0, 0]);
+    // The four corners: 0, 8, 72, 80.
+    assert_eq!(decode_index_to_tuple(5, 0).unwrap()[..2], [-4, -4]);
+    assert_eq!(decode_index_to_tuple(5, 8).unwrap()[..2], [-4, 4]);
+    assert_eq!(decode_index_to_tuple(5, 72).unwrap()[..2], [4, -4]);
+    assert_eq!(decode_index_to_tuple(5, 80).unwrap()[..2], [4, 4]);
+}
+
+// =============================================================================
+// Sign-bit cross-check: signed Codebook 5 emits zero sign bits — the
+// codeword + index alone fully specifies the signed pair (the
+// `offset = LAV = 4` shift inside the §4.6.3.3 polynomial bakes the
+// sign into the index).
+// =============================================================================
+
+#[test]
+fn hcod5_emits_zero_sign_bits_for_every_index() {
+    for idx in 0..HCOD5_NUM_ENTRIES as u32 {
+        let tup = decode_index_to_tuple(5, idx).unwrap();
+        let signs = derive_sign_bits(5, &tup[..2]).unwrap();
+        assert!(
+            signs.is_empty(),
+            "idx={}: signed book must emit no sign bits, got {} bits",
+            idx,
+            signs.len()
+        );
+    }
+}
+
+// =============================================================================
+// Wire-bit precision: hand-built byte sequences for Codebook 5
+// =============================================================================
+
+#[test]
+fn hcod5_write_index_40_then_align_yields_zero_byte() {
+    // Index 40 is 1 bit `0`. Pad 7 zero bits → byte 0x00.
+    let mut w = BitWriter::new();
+    hcod5_write(&mut w, 40).unwrap();
+    w.write_u32(0, 7);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0x00]);
+}
+
+#[test]
+fn hcod5_write_index_0_yields_full_13_bit_codeword_0x1fff() {
+    // Codeword 0x1fff = 13 bits of all-ones, MSB-first. Pack into 13
+    // bits + 3 zero pad bits → 0xff, 0xf8.
+    let mut w = BitWriter::new();
+    hcod5_write(&mut w, 0).unwrap();
+    w.write_u32(0, 3);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0xff, 0xf8]);
+}
+
+#[test]
+fn hcod5_write_two_indices_yields_concatenated_bitstream() {
+    // Index 40 (1 bit `0`) followed by index 40 again (1 bit `0`).
+    // Padded out to byte boundary with zeros: 0000_0000 = 0x00.
+    // But the more interesting concatenation: index 40 (1 bit `0`)
+    // followed by index 41 (4 bits `1010`) packs to 0_1010_xxx = 0x50
+    // when right-padded with three zero bits.
+    let mut w = BitWriter::new();
+    hcod5_write(&mut w, 40).unwrap();
+    hcod5_write(&mut w, 41).unwrap();
+    w.write_u32(0, 3);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0b0101_0000]);
+
+    let mut br = BitReader::new(&bytes);
+    assert_eq!(hcod5_decode(&mut br).unwrap(), 40);
+    assert_eq!(hcod5_decode(&mut br).unwrap(), 41);
+}
+
+// =============================================================================
+// Decoder reads only as many bits as the codeword needs
+// =============================================================================
+
+#[test]
+fn hcod5_decoder_consumes_exactly_codeword_length_bits() {
+    for idx in 0..HCOD5_NUM_ENTRIES as u32 {
+        let (len, _) = hcod5_encode(idx).unwrap();
+        let mut w = BitWriter::new();
+        hcod5_write(&mut w, idx).unwrap();
+        let pad = (8 - (w.bit_position() % 8)) % 8;
+        if pad > 0 {
+            w.write_u32(0, pad as u32);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let _ = hcod5_decode(&mut br).unwrap();
+        assert_eq!(
+            br.bit_position(),
+            u64::from(len),
+            "idx={}: decoder consumed {} bits, expected {}",
+            idx,
+            br.bit_position(),
+            len
+        );
+    }
+}
+
+// =============================================================================
+// Rejection branches
+// =============================================================================
+
+#[test]
+fn hcod5_encode_rejects_indices_at_and_above_81() {
+    for bad in [81u32, 82, 100, 1000, u32::MAX] {
+        assert!(matches!(
+            hcod5_encode(bad),
+            Err(Error::SpectralCodebookIndexOutOfRange(5))
+        ));
+    }
+}
+
+#[test]
+fn hcod5_decoder_returns_unexpected_end_on_truncation() {
+    let bytes: [u8; 0] = [];
+    let mut br = BitReader::new(&bytes);
+    let err = hcod5_decode(&mut br).unwrap_err();
+    assert_eq!(err, Error::UnexpectedEnd);
+}
+
+#[test]
+fn hcod5_max_len_constant_matches_table_data() {
+    let mut observed_max = 0u32;
+    for idx in 0..HCOD5_NUM_ENTRIES as u32 {
+        let (len, _) = hcod5_encode(idx).unwrap();
+        observed_max = observed_max.max(u32::from(len));
+    }
+    assert_eq!(observed_max, HCOD5_MAX_LEN);
+}
+
+// =============================================================================
+// Cross-check: Codebooks 1..=4 share dim-4 (quad) shape; Codebook 5
+// is the first pair (dim-2) book — the tuple universes are disjoint
+// in the dim-arity dimension even though both happen to have 81
+// entries (`3^4 = 9^2 = 81`).
+// =============================================================================
+
+#[test]
+fn codebook_5_is_the_first_pair_book_with_dim_2_distinct_from_codebooks_1_through_4() {
+    let row5 = table_4_95(5).unwrap();
+    assert_eq!(row5.dimension, Some(2));
+    for cb in 1u8..=4 {
+        let row = table_4_95(cb).unwrap();
+        assert_eq!(
+            row.dimension,
+            Some(4),
+            "Codebooks 1..=4 are dim-4 (quad); Codebook 5 is dim-2 (pair)"
+        );
+    }
+    // The 81-entry coincidence is meaningful: 3^4 (dim-4 with mod 3)
+    // and 9^2 (dim-2 with mod 9) both produce 81 codeword positions.
+    assert_eq!(HCOD5_NUM_ENTRIES, HCOD4_NUM_ENTRIES);
+    assert_eq!(HCOD5_NUM_ENTRIES, HCOD3_NUM_ENTRIES);
+    assert_eq!(HCOD5_NUM_ENTRIES, HCOD2_NUM_ENTRIES);
+    assert_eq!(HCOD5_NUM_ENTRIES, HCOD1_NUM_ENTRIES);
 }

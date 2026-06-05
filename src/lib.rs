@@ -256,17 +256,24 @@
 //!   (Table 4.A.3, same signed 4-tuple universe, 9-bit max), round
 //!   231 added Codebook 3 (Table 4.A.4, the first **unsigned** book,
 //!   `LAV = 2`, 16-bit max; the zero magnitude tuple migrates to
-//!   index 0). Round 234 adds Codebook 4 (Table 4.A.5, the second
+//!   index 0). Round 234 added Codebook 4 (Table 4.A.5, the second
 //!   unsigned dim-4 book, 12-bit max; the shortest codeword
 //!   `0b0000` parks at index 40 while index 0 carries a 4-bit
-//!   `0b0111`). Public API per book: `HCODN_NUM_ENTRIES` = 81,
+//!   `0b0111`). Round 238 adds Codebook 5 (Table 4.A.6, the first
+//!   **pair** book: `unsigned = 0`, `dim = 2`, `LAV = 4` → `9^2 =
+//!   81` entries, 13-bit max; the §4.6.3.3 polynomial puts the
+//!   zero-tuple `(0, 0)` at the centre index 40 — also the location
+//!   of the single-bit `0` shortest codeword — while the four
+//!   `(±4, ±4)` lattice corners take the four 13-bit codewords at
+//!   indices 0 / 8 / 72 / 80). Public API per book:
+//!   `HCODN_NUM_ENTRIES` = 81,
 //!   `HCODN_MAX_LEN` (codebook-specific), `hcodN_encode(idx) ->
 //!   (length, codeword)` (right-aligned in `u16`), `hcodN_decode`
 //!   reads MSB-first from a [`oxideav_core::bits::BitReader`] and
 //!   returns the codeword index, and `hcodN_write` is a convenience
 //!   wrapper over the encode + writer-emit pair. Every book is a
 //!   complete prefix code over `HCODN_MAX_LEN` bits, exhaustively
-//!   verified at unit-test time. Codebooks 5..=11 (Tables 4.A.6 …
+//!   verified at unit-test time. Codebooks 6..=11 (Tables 4.A.7 …
 //!   4.A.12) reuse the same module shape and are owed in subsequent
 //!   rounds; the `spectral_data()` driver that dispatches per-band
 //!   onto the chosen codebook arrives once all eleven are in place.

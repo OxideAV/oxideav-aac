@@ -3,6 +3,68 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 238)
+
+Round 238 lands **Table 4.A.6** (Spectrum Huffman Codebook 5) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 / 234 bootstrapped for Codebooks 1, 2, 3, and 4.
+Codebook 5 is the first **pair** spectrum book — Table 4.95 row 5
+declares `unsigned_cb = 0`, `dim = 2`, `LAV = 4` so each Huffman
+codeword conveys a signed pair `(y, z)` with each coefficient in
+`-4..=+4` rather than the dim-4 magnitude tuple of Codebooks 1..=4.
+The pair universe stays at 81 entries because `(2 * 4 + 1)^2 = 9^2 = 81`
+coincides with the dim-4 LAV-1 / LAV-2 universes of the earlier
+books. Index 40 carries the §4.6.3.3 zero-tuple `(0, 0)` — the
+`(modulus = 9, offset = LAV = 4)` polynomial evaluation puts the
+origin at the centre of the index range, not at the edges as in the
+unsigned Codebooks 3 and 4 (which placed `(0, 0, 0, 0)` at index 0)
+— and the shortest codeword (1 bit `0`) parks at index 40 (the same
+zero-tuple position as Codebook 1, since both books share the signed
+polynomial offset). The maximum codeword length is **13 bits** — one
+more than Codebook 4's 12-bit ceiling and three less than Codebook
+3's 16-bit reach — and exactly four rows occupy the 13-bit ceiling:
+indices 0 (`0x1fff`), 8 (`0x1ffd`), 72 (`0x1ffc`), and 80 (`0x1ffe`)
+— the four `(±4, ±4)` corners of the signed `9 × 9` pair lattice.
+Because Codebook 5 is signed, no §4.6.3.3 sign-bit suffix follows the
+codeword on the wire — every coefficient's sign is already baked
+into the index via the `offset = 4` shift, an invariant verified
+across every index by an explicit `derive_sign_bits(5, &tuple)`
+cross-check. The table is a **complete** 13-bit prefix code (Kraft
+equality `Σ 2^(13 − L) = 8192 = 2^13`), exhaustively verified by
+walking every 13-bit prefix and asserting each maps to exactly one
+entry. Public API: `HCOD5_NUM_ENTRIES = 81`, `HCOD5_MAX_LEN = 13`,
+`hcod5_encode(idx) -> (u8, u16)`, `hcod5_decode(reader) -> u32`, and
+the convenience `hcod5_write(writer, idx)`. Out-of-range indices
+surface as `Error::SpectralCodebookIndexOutOfRange(5)`; reader
+underflow surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised across every index: `decode_index_to_tuple(5,
+idx)` → `encode_tuple_to_index(5, &tuple)` round-trips back to the
+same index for the entire `9 × 9` signed pair lattice. 16 new unit
+tests (in `src/spectrum_huffman.rs`: 81-entry shape / 13-bit max /
+1-bit min at index 40 / codewords fit / Kraft equality 8192 /
+complete-prefix walk over all `2^13` prefixes / per-row PDF spot
+checks at indices 0 / 40 / 80 / four-13-bit-corner enumeration /
+encode + decode rejection / single-zero-bit decode at index 40 / full
+13-bit codeword decode at index 0 / writer round-trip / writer
+rejection) plus 21 new integration tests in
+`tests/spectrum_huffman.rs` (eight per-row PDF spot checks at indices
+0 / 8 / 13 / 31 / 40 / 41 / 72 / 80; Table 4.95 row 5 ↔ Table 4.A.6
+size cross-check; full writer→reader round-trip; the §4.6.3.3
+wire-index ↔ tuple ↔ wire-index cross-check; zero-tuple ↔ index-40
+invariant plus four-corner `(±4, ±4)` invariant; per-index zero-sign-
+bit invariant against `derive_sign_bits(5, …)`; three hand-pinned
+byte sequences (`[0x00]` for index 40 padded; `[0xff, 0xf8]` for
+index 0 padded; `[0x50]` for index 40 + index 41 packed); exact bit-
+consumption invariant across every index; out-of-range and truncation
+rejections; `HCOD5_MAX_LEN` constant consistency; and a Codebook
+5-is-the-first-pair-book cross-check confirming Codebooks 1..=4 are
+all dim-4 while Codebook 5 is dim-2 but all five books happen to share
+the 81-entry universe). Suite grows 691 → 728 tests. Codebooks 6..=11
+(Tables 4.A.7 … 4.A.12) reuse the same module shape and will land
+one per future round; Codebook 6 is the second signed pair
+(`unsigned = 0`, `dim = 2`, `LAV = 4`) — the same Table 4.95 row
+shape as Codebook 5.
+
 ## Status (round 234)
 
 Round 234 lands **Table 4.A.5** (Spectrum Huffman Codebook 4) inside

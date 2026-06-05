@@ -8,6 +8,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r238): `spectrum_huffman::HCOD5` — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.6 (Spectrum Huffman Codebook 5) wire layer.
+  Codebook 5 is the first **pair** spectrum book (Table 4.95 row 5:
+  `unsigned_cb = 0`, `dim = 2`, `LAV = 4` → `(2 * 4 + 1)^2 = 9^2 = 81`
+  entries indexed `0..=80`, each tuple coefficient in `-4..=+4`). The
+  zero-tuple `(0, 0)` lands at index 40 — the centre row — because
+  the §4.6.3.3 polynomial `idx = (y + LAV) * 9 + (z + LAV)` puts the
+  origin at the centre of the index range for signed pair books; the
+  shortest codeword (1 bit `0`) parks there too. The maximum
+  codeword length is **13 bits** and exactly four rows occupy the
+  ceiling: indices 0 (`0x1fff`), 8 (`0x1ffd`), 72 (`0x1ffc`), and
+  80 (`0x1ffe`) — the four `(±4, ±4)` corners of the signed `9 × 9`
+  pair lattice. No sign-bit suffix follows the codeword on the wire
+  (Codebook 5 is signed: the index alone fully specifies each
+  signed pair via the `offset = 4` shift). Public constants
+  `HCOD5_NUM_ENTRIES = 81`, `HCOD5_MAX_LEN = 13`. Public functions
+  `hcod5_encode(idx) -> (length, codeword)` (right-aligned in `u16`),
+  `hcod5_decode(reader) -> idx` (MSB-first prefix match, linear scan
+  against the 81-row table), and the convenience writer
+  `hcod5_write(writer, idx)`. Out-of-range indices (`idx > 80`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(5)`; the
+  decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality
+  `Σ 2^(13 − L) = 8192 = 2^13`), exhaustively verified by walking
+  every 13-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()` fall-through
+  is verifiably dead. Encode-then-decode round-trips every index for
+  both the direct API and the cross-check against the round-213
+  `spectral_codebook::decode_index_to_tuple` /
+  `encode_tuple_to_index` §4.6.3.3 translation across the entire
+  signed pair lattice. A `derive_sign_bits(5, &tuple)` cross-check
+  confirms every Codebook 5 index emits zero sign bits on the wire,
+  matching the signed-book contract. 16 new unit tests in
+  `src/spectrum_huffman.rs` and 21 new integration tests in
+  `tests/spectrum_huffman.rs` (eight per-row PDF spot checks at
+  indices 0 / 8 / 13 / 31 / 40 / 41 / 72 / 80; Table 4.95 row 5 ↔
+  Table 4.A.6 size cross-check; full writer→reader round-trip; the
+  §4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check; zero-tuple
+  ↔ index-40 invariant plus the four-corner `(±4, ±4)` invariant;
+  per-index zero-sign-bit invariant; three hand-pinned byte
+  sequences; exact bit-consumption invariant across every index;
+  out-of-range and truncation rejections; `HCOD5_MAX_LEN` constant
+  consistency; and a Codebook 5-is-the-first-pair-book cross-check
+  confirming Codebooks 1..=4 are all dim-4 while Codebook 5 is
+  dim-2). Suite grows 691 → 728 tests.
+
 - phase 2 (r234): `spectrum_huffman::HCOD4` — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.5 (Spectrum Huffman Codebook 4) wire layer.
   Codebook 4 shares Codebook 3's unsigned dim-4 LAV-2 tuple universe
