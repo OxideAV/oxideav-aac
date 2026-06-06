@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r244): `spectrum_huffman::HCOD7` — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.8 (Spectrum Huffman Codebook 7) wire layer.
+  Codebook 7 is the first **unsigned pair** spectrum book (Table 4.95
+  row 7: `unsigned_cb = 1`, `dim = 2`, `LAV = 7` → `(7 + 1)^2 = 8^2 =
+  64` entries indexed `0..=63`, each tuple coefficient in `0..=7`).
+  The §4.6.3.3 polynomial `idx = y * (LAV + 1) + z = y * 8 + z` parks
+  the zero-tuple `(0, 0)` at index 0 (the origin of the unsigned
+  dim-2 lattice) and the far corner `(7, 7)` at index 63. The
+  shortest codeword is a single bit `0` at index 0 — the same head
+  placement Codebook 3 uses for its unsigned dim-4 universe. The
+  maximum codeword length is **12 bits**; exactly four rows reach
+  that ceiling: indices 54 (`0xffd`), 55 (`0xffe`), 62 (`0xffc`),
+  and 63 (`0xfff`). The §4.6.3.3 sign-bit suffix applies after every
+  non-zero coefficient (one suffix bit per non-zero, low-frequency
+  first via `apply_sign_bits` / `derive_sign_bits`) and lies outside
+  the Huffman codeword carried by this module. Public constants
+  `HCOD7_NUM_ENTRIES = 64`, `HCOD7_MAX_LEN = 12`. Public functions
+  `hcod7_encode(idx) -> (length, codeword)` (right-aligned in `u16`),
+  `hcod7_decode(reader) -> idx` (MSB-first prefix match, linear scan
+  against the 64-row table), and the convenience writer
+  `hcod7_write(writer, idx)`. Out-of-range indices (`idx > 63`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(7)`; the
+  decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality
+  `Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified by walking
+  every 12-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()` fall-through
+  is verifiably dead. Encode-then-decode round-trips every index;
+  16 new unit tests cover table-shape invariants (entry count,
+  max/min length, codeword fit), Kraft equality, exhaustive
+  completeness, four spot-checks against Table 4.A.8 (rows 0, 8, 63,
+  and the four 12-bit ceiling rows), the round-trip walk, both
+  out-of-range error paths, the `UnexpectedEnd` propagation, and
+  two cross-checks against Codebook 3 (zero-tuple placement) and
+  Codebook 4 (dim-2 vs dim-4 universe size). All numeric values
+  sourced from `docs/audio/aac/ISO_IEC_14496-3-AAC-2001.pdf` §4.A.1
+  page 198. Module docstring extended with a Codebook 7 invariants
+  block (Table 4.95 row 7 mapping, entry-count derivation,
+  polynomial origin, ceiling row inventory). Codebooks 8..=11
+  (Tables 4.A.9 … 4.A.12) reuse the same module shape and will land
+  one per future round.
 - phase 2 (r241): `spectrum_huffman::HCOD6` — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.7 (Spectrum Huffman Codebook 6) wire layer.
   Codebook 6 is the second **signed pair** spectrum book and shares

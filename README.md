@@ -3,6 +3,84 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 244)
+
+Round 244 lands **Table 4.A.8** (Spectrum Huffman Codebook 7) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 / 234 / 238 / 241 bootstrapped for Codebooks 1
+through 6. Codebook 7 is the first **unsigned pair** spectrum book —
+Table 4.95 row 7 declares `unsigned_cb = 1`, `dim = 2`, `LAV = 7`, so
+the §4.6.3.3 universe shifts to `(7 + 1)^2 = 8^2 = 64` entries indexed
+`0..=63` with each `(y, z)` coefficient in `0..=7`. That is a notable
+shape change from the 81-entry universe shared by Codebooks 1..=6:
+Codebooks 1..=4 used dim-4 with `LAV ∈ {1, 2}` (`3^4 = 81`); Codebooks
+5 and 6 used dim-2 with `LAV = 4` (`(2 * 4 + 1)^2 = 9^2 = 81`); Codebook
+7 swaps signedness for range, narrowing the universe to 64 entries
+while widening the per-coefficient ceiling from `4` to `7`. The
+§4.6.3.3 unsigned polynomial `idx = y * (LAV + 1) + z = y * 8 + z`
+parks the zero-tuple `(0, 0)` at index 0 (the origin of the unsigned
+dim-2 lattice) and pins the far corner `(7, 7)` to index 63 — the same
+"zero-tuple at index 0 with the single-bit `0` codeword" head
+placement Codebook 3 uses for its unsigned dim-4 universe. The maximum
+codeword length is **12 bits**; exactly four rows reach that ceiling:
+indices 54 (`0xffd`), 55 (`0xffe`), 62 (`0xffc`), and 63 (`0xfff`) —
+the upper-right `{(6, 7), (6, 7+), (7, 6), (7, 7)}` quadrant of the
+`8 × 8` unsigned pair lattice (the rarest pair magnitudes). The table
+is a **complete** 12-bit prefix code (Kraft equality
+`Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified by walking every
+12-bit prefix and asserting each maps to exactly one entry. Because
+Codebook 7 is unsigned, the §4.6.3.3 sign-bit suffix follows the
+Huffman codeword on the wire — one sign bit per non-zero coefficient,
+delivered low-frequency-first — and is exposed by the round-213
+`apply_sign_bits` / `derive_sign_bits` helpers (the suffix lives
+outside the Huffman codeword carried by this module, an invariant
+verified across every index by an explicit `derive_sign_bits(7,
+&tuple)` cross-check that confirms a `(7, 7)` tuple emits two sign
+bits, a `(0, 0)` tuple emits zero sign bits, and the suffix length
+matches the non-zero-coefficient count for every index in between).
+Public API: `HCOD7_NUM_ENTRIES = 64`, `HCOD7_MAX_LEN = 12`,
+`hcod7_encode(idx) -> (u8, u16)`, `hcod7_decode(reader) -> u32`, and
+the convenience `hcod7_write(writer, idx)`. Out-of-range indices
+surface as `Error::SpectralCodebookIndexOutOfRange(7)`; reader
+underflow surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised across every index: `decode_index_to_tuple(7,
+idx)` → `encode_tuple_to_index(7, &tuple)` round-trips back to the
+same index for the entire `8 × 8` unsigned pair lattice, and a
+bijection cross-check builds the `64`-entry `HashSet` of legal pairs
+and confirms every `(y, z)` maps to a distinct index. 16 new unit
+tests (in `src/spectrum_huffman.rs`: 64-entry shape / 12-bit max /
+1-bit min at index 0 / codewords fit / Kraft equality 4096 /
+complete-prefix walk over all `2^12` prefixes / per-row PDF spot
+checks at indices 0 / 8 / 63 / four-12-bit-ceiling enumeration at
+indices 54 / 55 / 62 / 63 / encode + write rejection / single-zero-bit
+decode at index 0 / full 12-bit codeword decode at index 63 / writer
+round-trip / writer rejection / Codebook 3 vs Codebook 7 zero-tuple
+placement agreement / Codebook 7 entry-count = 64 vs Codebook 3/4 = 81
+shape contrast) plus 24 new integration tests in
+`tests/spectrum_huffman.rs` (eight per-row PDF spot checks at indices
+0 / 1 / 8 / 9 / 16 / 40 / 55 / 63; Table 4.95 row 7 ↔ Table 4.A.8 size
+cross-check; full writer→reader round-trip; the §4.6.3.3 wire-index ↔
+tuple ↔ wire-index cross-check; zero-tuple ↔ index-0 invariant;
+far-corner ↔ index-63 invariant; per-index sign-bit-count invariant
+against `derive_sign_bits(7, …)`; zero-tuple zero-sign-bits invariant;
+`(7, 7)` two-sign-bits invariant; three hand-pinned byte sequences
+(`[0x00]` for index 0 padded; `[0xff, 0xf0]` for index 63 padded;
+`[0x4c]` for indices 0 + 8 + 9 packed); exact bit-consumption
+invariant across every index; out-of-range and truncation rejections;
+`HCOD7_MAX_LEN` constant consistency; Codebook 7-is-the-first-unsigned-
+pair-book cross-check confirming Codebooks 6 and 7 share dim-2 but pick
+distinct signedness / LAV columns; shared-zero-tuple-placement cross-
+check confirming Codebooks 3 and 7 both park the zero-tuple at index 0
+with a single-bit `0` codeword; and a 64-pair bijection sweep that
+builds every legal `(y, z)` pair, asserts `encode_tuple_to_index(7, …)`
+produces a distinct index for each, and confirms `decode_index_to_tuple
+(7, idx)` round-trips back to the same `(y, z)`). Suite grows 768 →
+808 tests. Codebooks 8..=11 (Tables 4.A.9 … 4.A.12) reuse the same
+module shape and will land one per future round; Codebook 8 is the
+second **unsigned pair** book (Table 4.95 row 8: `unsigned = 1`,
+`dim = 2`, `LAV = 7` → again `64` entries) sharing Codebook 7's
+shape but with a different Huffman-length distribution column.
+
 ## Status (round 241)
 
 Round 241 lands **Table 4.A.7** (Spectrum Huffman Codebook 6) inside
