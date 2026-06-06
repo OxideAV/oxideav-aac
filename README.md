@@ -3,6 +3,75 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 241)
+
+Round 241 lands **Table 4.A.7** (Spectrum Huffman Codebook 6) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 / 234 / 238 bootstrapped for Codebooks 1
+through 5. Codebook 6 is the second **signed pair** spectrum book —
+Table 4.95 row 6 declares the same `unsigned_cb = 0`, `dim = 2`,
+`LAV = 4` shape as row 5 (Codebook 5), so both books share the
+`(2 * 4 + 1)^2 = 9^2 = 81`-entry signed pair lattice indexed
+`0..=80` with each `(y, z)` coefficient in `-4..=+4`. Where Codebook
+5 parks the single-bit `0` codeword at index 40 (the §4.6.3.3
+zero-tuple `(0, 0)`) and lets the four lattice corners stretch out
+to a 13-bit ceiling, Codebook 6 lifts the zero-tuple to a 4-bit
+`0b0000` and pulls the maximum codeword length back to **11 bits**.
+Exactly four rows occupy that 11-bit ceiling: indices 0 (`0x7fe`),
+8 (`0x7fd`), 72 (`0x7ff`), and 80 (`0x7fc`) — the same four
+`(±4, ±4)` lattice-corner positions Codebook 5 also pinned to its
+ceiling, confirming both books reserve their longest codewords for
+the rarest pair magnitudes. The shorter, flatter codeword
+distribution makes Codebook 6 a better fit for sections whose
+magnitude statistics put more weight in the `(±1, ±1) .. (±3, ±3)`
+interior than Codebook 5's zero-tuple-heavy target. Because Codebook
+6 is signed, no §4.6.3.3 sign-bit suffix follows the codeword on
+the wire — every coefficient's sign is already baked into the index
+via the `offset = LAV = 4` shift, an invariant verified across every
+index by an explicit `derive_sign_bits(6, &tuple)` cross-check. The
+table is a **complete** 11-bit prefix code (Kraft equality
+`Σ 2^(11 − L) = 2048 = 2^11`), exhaustively verified by walking
+every 11-bit prefix and asserting each maps to exactly one entry.
+Public API: `HCOD6_NUM_ENTRIES = 81`, `HCOD6_MAX_LEN = 11`,
+`hcod6_encode(idx) -> (u8, u16)`, `hcod6_decode(reader) -> u32`, and
+the convenience `hcod6_write(writer, idx)`. Out-of-range indices
+surface as `Error::SpectralCodebookIndexOutOfRange(6)`; reader
+underflow surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised across every index: `decode_index_to_tuple(6,
+idx)` → `encode_tuple_to_index(6, &tuple)` round-trips back to the
+same index for the entire `9 × 9` signed pair lattice. 16 new unit
+tests (in `src/spectrum_huffman.rs`: 81-entry shape / 11-bit max /
+4-bit min at index 40 / codewords fit / Kraft equality 2048 /
+complete-prefix walk over all `2^11` prefixes / per-row PDF spot
+checks at indices 0 / 40 / 80 / four-11-bit-corner enumeration /
+encode + decode rejection / four-zero-bits decode at index 40 / full
+11-bit codeword decode at index 72 / writer round-trip / writer
+rejection / Codebook 5 vs Codebook 6 zero-tuple disagreement at
+index 40 / shared lattice-corner index positions) plus 24 new
+integration tests in `tests/spectrum_huffman.rs` (eight per-row PDF
+spot checks at indices 0 / 8 / 13 / 31 / 40 / 41 / 72 / 80; Table
+4.95 row 6 ↔ Table 4.A.7 size cross-check; full writer→reader
+round-trip; the §4.6.3.3 wire-index ↔ tuple ↔ wire-index
+cross-check; zero-tuple ↔ index-40 invariant; per-index
+zero-sign-bit invariant against `derive_sign_bits(6, …)`; three
+hand-pinned byte sequences (`[0x00]` for index 40 padded;
+`[0xff, 0xe0]` for index 72 padded; `[0x03]` for indices 40 + 41
+packed); exact bit-consumption invariant across every index;
+out-of-range and truncation rejections; `HCOD6_MAX_LEN` constant
+consistency; Codebook 6-is-the-second-signed-pair-book cross-check
+confirming Codebooks 5 and 6 share the signed-pair Table 4.95 row
+but pick a different `huffman_table` column; and a shared
+lattice-corner-positions cross-check confirming both books pin the
+four `(±4, ±4)` corners to their respective maximum-length
+codewords at indices 0 / 8 / 72 / 80). Suite grows 728 → 768
+tests. Codebooks 7..=11 (Tables 4.A.8 … 4.A.12) reuse the same
+module shape and will land one per future round; Codebook 7 is the
+first **unsigned** pair book (Table 4.95 row 7: `unsigned = 1`,
+`dim = 2`, `LAV = 7` → `(7 + 1)^2 = 64` entries) — a shape change
+from the 81-entry universe shared by Codebooks 1..=6 because
+unsigned pair books use `modulus = LAV + 1` rather than the signed
+`2 * LAV + 1`.
+
 ## Status (round 238)
 
 Round 238 lands **Table 4.A.6** (Spectrum Huffman Codebook 5) inside

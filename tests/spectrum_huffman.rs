@@ -1,9 +1,10 @@
 //! Integration tests for `oxideav_aac::spectrum_huffman`.
 //!
 //! Cross-checks Codebooks 1 (Table 4.A.2), 2 (Table 4.A.3), 3
-//! (Table 4.A.4), 4 (Table 4.A.5), and 5 (Table 4.A.6) wire
-//! round-trip against the §4.6.3.3 index ↔ n-tuple translation
-//! already covered by [`oxideav_aac::spectral_codebook`].
+//! (Table 4.A.4), 4 (Table 4.A.5), 5 (Table 4.A.6), and 6
+//! (Table 4.A.7) wire round-trip against the §4.6.3.3 index ↔
+//! n-tuple translation already covered by
+//! [`oxideav_aac::spectral_codebook`].
 
 use oxideav_aac::{
     spectral_codebook::{
@@ -12,9 +13,10 @@ use oxideav_aac::{
     spectrum_huffman::{
         hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode, hcod2_encode, hcod2_write,
         hcod3_decode, hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write,
-        hcod5_decode, hcod5_encode, hcod5_write, HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN,
-        HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN, HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES,
-        HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES,
+        hcod5_decode, hcod5_encode, hcod5_write, hcod6_decode, hcod6_encode, hcod6_write,
+        HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN, HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN,
+        HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES, HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES,
+        HCOD6_MAX_LEN, HCOD6_NUM_ENTRIES,
     },
     Error,
 };
@@ -1429,4 +1431,304 @@ fn codebook_5_is_the_first_pair_book_with_dim_2_distinct_from_codebooks_1_throug
     assert_eq!(HCOD5_NUM_ENTRIES, HCOD3_NUM_ENTRIES);
     assert_eq!(HCOD5_NUM_ENTRIES, HCOD2_NUM_ENTRIES);
     assert_eq!(HCOD5_NUM_ENTRIES, HCOD1_NUM_ENTRIES);
+}
+
+// =============================================================================
+// Per-row spec-PDF spot checks (Table 4.A.7 — Codebook 6)
+// =============================================================================
+//
+// Each spot row is taken from ISO/IEC 14496-3:2001(E) §4.A.1 Table
+// 4.A.7 (pages 197–198) verbatim. The four 11-bit corners
+// `(0, 8, 72, 80)`, the 4-bit row at index 40 (the §4.6.3.3
+// zero-tuple `(0, 0)`), and three interior rows (`13`, `31`, `41`)
+// are spot-checked.
+
+#[test]
+fn table_4_a_7_row_0_matches_spec() {
+    // Row 0 — (y, z) = (-4, -4): length 11, codeword 0x7fe.
+    let (len, cw) = hcod6_encode(0).unwrap();
+    assert_eq!((len, cw), (11, 0x7fe));
+}
+
+#[test]
+fn table_4_a_7_row_8_matches_spec() {
+    // Row 8 — (y, z) = (-4, +4): length 11, codeword 0x7fd.
+    let (len, cw) = hcod6_encode(8).unwrap();
+    assert_eq!((len, cw), (11, 0x7fd));
+}
+
+#[test]
+fn table_4_a_7_row_13_matches_spec() {
+    // Row 13 — (y, z) = (-3, 0): length 7, codeword 0x71.
+    let (len, cw) = hcod6_encode(13).unwrap();
+    assert_eq!((len, cw), (7, 0x71));
+}
+
+#[test]
+fn table_4_a_7_row_31_matches_spec() {
+    // Row 31 — (y, z) = (-1, -4): length 4, codeword 0x4.
+    let (len, cw) = hcod6_encode(31).unwrap();
+    assert_eq!((len, cw), (4, 0x4));
+}
+
+#[test]
+fn table_4_a_7_row_40_matches_spec() {
+    // Row 40 (zero-tuple): length 4, codeword 0.
+    let (len, cw) = hcod6_encode(40).unwrap();
+    assert_eq!((len, cw), (4, 0));
+}
+
+#[test]
+fn table_4_a_7_row_41_matches_spec() {
+    // Row 41 — (y, z) = (0, +1): length 4, codeword 0x3.
+    let (len, cw) = hcod6_encode(41).unwrap();
+    assert_eq!((len, cw), (4, 0x3));
+}
+
+#[test]
+fn table_4_a_7_row_72_matches_spec() {
+    // Row 72 — (y, z) = (+4, -4): length 11, codeword 0x7ff.
+    let (len, cw) = hcod6_encode(72).unwrap();
+    assert_eq!((len, cw), (11, 0x7ff));
+}
+
+#[test]
+fn table_4_a_7_row_80_matches_spec() {
+    // Row 80 — (y, z) = (+4, +4): length 11, codeword 0x7fc.
+    let (len, cw) = hcod6_encode(80).unwrap();
+    assert_eq!((len, cw), (11, 0x7fc));
+}
+
+// =============================================================================
+// Codebook-shape cross-check vs Table 4.95 row 6
+// =============================================================================
+
+#[test]
+fn codebook_6_table_4_95_row_matches_table_4_a_7_size() {
+    // Row 6 of Table 4.95: signed, dim=2, lav=4 → (2*4+1)^2 = 81.
+    let row = table_4_95(6).unwrap();
+    assert_eq!(row.unsigned, Some(false));
+    assert_eq!(row.dimension, Some(2));
+    assert_eq!(row.lav, Some(4));
+    assert_eq!(row.huffman_table, Some(7));
+
+    let lav = row.lav.unwrap();
+    let dim = row.dimension.unwrap();
+    let modulus = 2 * lav + 1; // signed
+    let count: u32 = modulus.pow(u32::from(dim));
+    assert_eq!(count as usize, HCOD6_NUM_ENTRIES);
+}
+
+// =============================================================================
+// Round-trip every entry through the Codebook 6 wire writer + reader
+// =============================================================================
+
+#[test]
+fn hcod6_every_index_round_trips_writer_to_reader() {
+    for idx in 0..HCOD6_NUM_ENTRIES as u32 {
+        let mut w = BitWriter::new();
+        hcod6_write(&mut w, idx).unwrap();
+        let bits_written = w.bit_position();
+        let pad = (8 - (bits_written % 8)) % 8;
+        if pad > 0 {
+            w.write_u32(0, pad as u32);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let got = hcod6_decode(&mut br).unwrap();
+        assert_eq!(
+            got, idx,
+            "round-trip mismatch at idx={} (wrote {} bits)",
+            idx, bits_written
+        );
+    }
+}
+
+// =============================================================================
+// §4.6.3.3 translation cross-check: every Codebook 6 index translates
+// to a legal signed pair tuple and round-trips back. Codebook 6 is
+// signed dim-2 LAV-4: every tuple element lies in `-4..=+4`.
+// =============================================================================
+
+#[test]
+fn hcod6_every_index_translates_through_spectral_codebook_round_trip() {
+    for idx in 0..HCOD6_NUM_ENTRIES as u32 {
+        let tuple = decode_index_to_tuple(6, idx).expect("idx -> tuple");
+        // dim == 2 → only the first two slots are meaningful.
+        for &c in &tuple[..2] {
+            assert!(
+                (-4..=4).contains(&c),
+                "tuple coefficient {} out of [-4, 4]",
+                c
+            );
+        }
+        let back = encode_tuple_to_index(6, &tuple[..2]).expect("tuple -> idx");
+        assert_eq!(back, idx);
+    }
+}
+
+#[test]
+fn hcod6_signed_pair_book_puts_zero_tuple_at_index_40() {
+    // Index 40 → zero-tuple `(0, 0)`. Confirmed via the §4.6.3.3
+    // decode (modulus 9, offset 4: `idx = 4*9 + 4 = 40` ↔ `y = 0,
+    // z = 0`).
+    let tuple = decode_index_to_tuple(6, 40).unwrap();
+    assert_eq!(tuple[0], 0);
+    assert_eq!(tuple[1], 0);
+    // And the wire codeword is the shortest in the table.
+    let (len, cw) = hcod6_encode(40).unwrap();
+    assert_eq!((len, cw), (4, 0));
+}
+
+// =============================================================================
+// Sign-bit cross-check: signed Codebook 6 emits zero sign bits — the
+// signedness is baked into the §4.6.3.3 index via the LAV-4 offset.
+// =============================================================================
+
+#[test]
+fn hcod6_emits_zero_sign_bits_for_every_index() {
+    for idx in 0..HCOD6_NUM_ENTRIES as u32 {
+        let tuple = decode_index_to_tuple(6, idx).unwrap();
+        let signs = derive_sign_bits(6, &tuple[..2]).unwrap();
+        assert!(
+            signs.is_empty(),
+            "Codebook 6 is signed; sign-bit suffix must be empty (idx={})",
+            idx
+        );
+    }
+}
+
+// =============================================================================
+// Wire-bit precision: hand-built byte sequences for Codebook 6
+// =============================================================================
+
+#[test]
+fn hcod6_write_index_40_then_align_yields_zero_byte() {
+    let mut w = BitWriter::new();
+    hcod6_write(&mut w, 40).unwrap();
+    // Row 40 is 4 bits `0b0000`; pad 4 zero bits to reach a byte.
+    w.write_u32(0, 4);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0x00]);
+}
+
+#[test]
+fn hcod6_write_index_72_yields_full_11_bit_codeword_0x7ff() {
+    let mut w = BitWriter::new();
+    hcod6_write(&mut w, 72).unwrap();
+    // Row 72 is 11 bits `0x7ff` = `0b111_1111_1111` → pad 5 zero
+    // bits → bytes `0xff, 0xe0`.
+    w.write_u32(0, 5);
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0xff, 0xe0]);
+}
+
+#[test]
+fn hcod6_write_two_indices_yields_concatenated_bitstream() {
+    let mut w = BitWriter::new();
+    // Index 40 (4 bits `0b0000`) followed by index 41 (4 bits
+    // `0b0011`) packs into a single byte `0b0000_0011` = `0x03`.
+    hcod6_write(&mut w, 40).unwrap();
+    hcod6_write(&mut w, 41).unwrap();
+    let bytes = w.into_bytes();
+    assert_eq!(bytes, vec![0x03]);
+    let mut br = BitReader::new(&bytes);
+    assert_eq!(hcod6_decode(&mut br).unwrap(), 40);
+    assert_eq!(hcod6_decode(&mut br).unwrap(), 41);
+}
+
+// =============================================================================
+// Bit-consumption invariant for Codebook 6: each decode consumes
+// exactly its declared codeword length.
+// =============================================================================
+
+#[test]
+fn hcod6_decoder_consumes_exactly_codeword_length_bits() {
+    for idx in 0..HCOD6_NUM_ENTRIES as u32 {
+        let (len, _) = hcod6_encode(idx).unwrap();
+        let mut w = BitWriter::new();
+        hcod6_write(&mut w, idx).unwrap();
+        let pad = (8 - (u32::from(len) % 8)) % 8;
+        if pad > 0 {
+            w.write_u32(0, pad);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let _ = hcod6_decode(&mut br).unwrap();
+        assert_eq!(
+            br.bit_position() as u32,
+            u32::from(len),
+            "idx={}: decoder consumed {} bits, expected {}",
+            idx,
+            br.bit_position(),
+            len
+        );
+    }
+}
+
+// =============================================================================
+// Rejection branches for Codebook 6
+// =============================================================================
+
+#[test]
+fn hcod6_encode_rejects_indices_at_and_above_81() {
+    for bad in [81u32, 82, 100, 1000, u32::MAX] {
+        assert!(matches!(
+            hcod6_encode(bad),
+            Err(Error::SpectralCodebookIndexOutOfRange(6))
+        ));
+    }
+}
+
+#[test]
+fn hcod6_decoder_returns_unexpected_end_on_truncation() {
+    let bytes: [u8; 0] = [];
+    let mut br = BitReader::new(&bytes);
+    let err = hcod6_decode(&mut br).unwrap_err();
+    assert_eq!(err, Error::UnexpectedEnd);
+}
+
+#[test]
+fn hcod6_max_len_constant_matches_table_data() {
+    let mut observed_max = 0u32;
+    for idx in 0..HCOD6_NUM_ENTRIES as u32 {
+        let (len, _) = hcod6_encode(idx).unwrap();
+        observed_max = observed_max.max(u32::from(len));
+    }
+    assert_eq!(observed_max, HCOD6_MAX_LEN);
+}
+
+// =============================================================================
+// Cross-check: Codebooks 5 and 6 share the signed dim-2 LAV-4 pair
+// tuple universe (Table 4.95 rows 5 and 6 are identical except for
+// the `Codebook listed in Table` column) but assign different
+// codewords for the same `(y, z)` tuple.
+// =============================================================================
+
+#[test]
+fn codebook_6_is_the_second_signed_pair_book_with_dim_2() {
+    let row5 = table_4_95(5).unwrap();
+    let row6 = table_4_95(6).unwrap();
+    // Same shape — both signed, dim-2, lav-4.
+    assert_eq!(row5.unsigned, row6.unsigned);
+    assert_eq!(row5.dimension, row6.dimension);
+    assert_eq!(row5.lav, row6.lav);
+    // Different table column though.
+    assert_eq!(row5.huffman_table, Some(6));
+    assert_eq!(row6.huffman_table, Some(7));
+    // 81-entry universe shared.
+    assert_eq!(HCOD6_NUM_ENTRIES, HCOD5_NUM_ENTRIES);
+}
+
+#[test]
+fn codebook_5_and_6_share_lattice_corner_index_positions() {
+    // Both books pin the four (±4, ±4) lattice corners to their
+    // respective max-length codewords (Codebook 5 → 13 bits,
+    // Codebook 6 → 11 bits) at the same indices 0, 8, 72, 80.
+    for &corner in &[0u32, 8, 72, 80] {
+        let (l5, _) = hcod5_encode(corner).unwrap();
+        let (l6, _) = hcod6_encode(corner).unwrap();
+        assert_eq!(u32::from(l5), HCOD5_MAX_LEN);
+        assert_eq!(u32::from(l6), HCOD6_MAX_LEN);
+    }
 }
