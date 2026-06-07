@@ -3,6 +3,89 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 255)
+
+Round 255 lands **Table 4.A.11** (Spectrum Huffman Codebook 10) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 / 234 / 238 / 241 / 244 / 250 / 253 bootstrapped
+for Codebooks 1 through 9. Codebook 10 is the second **expanded-LAV
+unsigned pair** spectrum book — Table 4.95 row 10 mirrors row 9
+column-for-column (`unsigned_cb = 1`, `dim = 2`, `LAV = 12`) so the
+§4.6.3.3 universe is the same `13 × 13 = 169`-entry lattice indexed
+`0..=168` with each `(y, z)` coefficient in `0..=12`. The two books
+differ in their codeword-length distribution: where Codebook 9 parks
+the zero-tuple `(0, 0)` at index 0 with the single-bit `0` codeword
+and lets the four rarest pair magnitudes climb to a 15-bit ceiling,
+Codebook 10 lifts the zero-tuple at index 0 to a 6-bit `0b100010`
+(`0x22`), migrates the shortest 4-bit slot onto the interior `(1, 1)`
+tuple at index 14 with codeword `0b0000`, and pulls the codeword
+ceiling down to **12 bits** — the same head-displacement pattern
+Codebook 8 uses relative to Codebook 7 but at the wider `LAV = 12`
+universe. Exactly three rows reach the 4-bit floor (indices 14, 15,
+27 with codewords `0x0`, `0x1`, `0x2`) and exactly eight rows reach
+the 12-bit ceiling (indices 12, 129, 142, 155, 165, 166, 167, 168
+with codewords `0xffd`, `0xffa`, `0xff9`, `0xffb`, `0xff8`, `0xffe`,
+`0xffc`, `0xfff`). The table is a **complete** 12-bit prefix code
+(Kraft equality `Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified
+by walking every 12-bit prefix and asserting each maps to exactly
+one entry. Because Codebook 10 is unsigned, the §4.6.3.3 sign-bit
+suffix follows the Huffman codeword on the wire — one sign bit per
+non-zero coefficient, delivered low-frequency-first — and is exposed
+by the round-213 `apply_sign_bits` / `derive_sign_bits` helpers (the
+suffix lives outside the Huffman codeword carried by this module, an
+invariant verified across every index by an explicit
+`derive_sign_bits(10, &tuple)` cross-check that confirms a `(12, 12)`
+tuple emits two sign bits, a `(0, 0)` tuple emits zero sign bits,
+and the suffix length matches the non-zero-coefficient count for
+every index in between). Public API: `HCOD10_NUM_ENTRIES = 169`,
+`HCOD10_MAX_LEN = 12`, `hcod10_encode(idx) -> (u8, u16)`,
+`hcod10_decode(reader) -> u32`, and the convenience
+`hcod10_write(writer, idx)`. Out-of-range indices surface as
+`Error::SpectralCodebookIndexOutOfRange(10)`; reader underflow
+surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised across every index: `decode_index_to_tuple
+(10, idx)` → `encode_tuple_to_index(10, &tuple)` round-trips back to
+the same index for the entire `13 × 13` unsigned pair lattice, and a
+bijection cross-check builds the `169`-entry `HashSet` of legal
+pairs and confirms every `(y, z)` maps to a distinct index. 17 new
+unit tests (in `src/spectrum_huffman.rs`: 169-entry shape / 12-bit
+max / 4-bit min at indices 14, 15, 27 / zero-tuple-at-index-0-with-
+6-bit-codeword / codewords fit / Kraft equality 4096 / complete-
+prefix walk over all `2^12` prefixes / per-row PDF spot checks at
+indices 0 / 14 / 15 / 27 / 168 / eight-12-bit-ceiling enumeration
+at indices 12 / 129 / 142 / 155 / 165 / 166 / 167 / 168 / encode +
+write rejection / 4-bit codeword decode at index 14 / full 12-bit
+codeword decode at index 168 / writer round-trip / unsigned-pair
+LAV-12 universe parity with Codebook 9 / 3-bit ceiling pull-down vs
+Codebook 9 / zero-tuple head-displacement vs Codebook 9) plus 22 new
+integration tests in `tests/spectrum_huffman.rs` (ten per-row PDF
+spot checks at indices 0 / 1 / 12 / 14 / 15 / 27 / 129 / 142 / 155 /
+168; Table 4.95 row 10 ↔ Table 4.A.11 size cross-check; full
+writer→reader round-trip; the §4.6.3.3 wire-index ↔ tuple ↔
+wire-index cross-check; zero-tuple ↔ index-0 carries 6-bit `0x22`
+invariant; shortest 4-bit codeword sits on interior `(1, 1)` tuple
+at index 14 invariant; far-corner `(12, 12)` ↔ index-168 invariant;
+per-index sign-bit-count invariant against `derive_sign_bits(10,
+…)`; zero-tuple zero-sign-bits invariant; `(12, 12)` two-sign-bits
+invariant; two hand-pinned byte sequences (`[0x00]` for index 14
+padded; `[0xff, 0xf0]` for index 168 packed); exact bit-consumption
+invariant across every index; out-of-range and truncation rejections;
+`HCOD10_MAX_LEN` constant consistency; Codebook-9-and-10-share-the-
+LAV-12-unsigned-pair-universe cross-check confirming both rows
+declare `unsigned, dim = 2, LAV = 12` but route to different
+Annex 4.A tables; 169-pair bijection sweep that builds every legal
+`(y, z)` pair, asserts `encode_tuple_to_index(10, …)` produces a
+distinct index for each, and confirms `decode_index_to_tuple(10,
+idx)` round-trips back to the same `(y, z)`; ceiling pull-down
+invariant `HCOD9_MAX_LEN - HCOD10_MAX_LEN = 3`; head-displacement
+vs Codebook 9 contrasted against Codebook 9's single-bit zero-tuple
+slot). Codebook 11 (Table 4.A.12) reuses the same module shape and
+will land in a future round; Codebook 11 is the **ESC** book — its
+16 + ESC shape (Table 4.95 row 11: `unsigned = 1`, `dim = 2`,
+`LAV = 16` with the §4.6.3 ESC-sequence reconstruction already landed
+in round 213's `spectral_codebook` module) exercises the in-band
+universe-extension path that Codebooks 1..=10 do not.
+
 ## Status (round 253)
 
 Round 253 lands **Table 4.A.10** (Spectrum Huffman Codebook 9) inside

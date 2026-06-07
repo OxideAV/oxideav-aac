@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r255): `spectrum_huffman::HCOD10` — ISO/IEC 14496-3 §4.6.3
+  / Annex 4.A Table 4.A.11 (Spectrum Huffman Codebook 10) wire layer.
+  Codebook 10 is the second **expanded-LAV unsigned pair** spectrum
+  book — Table 4.95 row 10 mirrors row 9 column-for-column
+  (`unsigned_cb = 1`, `dim = 2`, `LAV = 12`) so the §4.6.3.3 universe
+  is the same `13 × 13 = 169`-entry lattice indexed `0..=168` with
+  each `(y, z)` coefficient in `0..=12`. Codebook 10 differs from
+  Codebook 9 in its codeword-length distribution: where Codebook 9
+  parks the §4.6.3.3 zero-tuple `(0, 0)` at index 0 with a single-bit
+  `0` codeword and lets the rarest pair magnitudes reach a 15-bit
+  ceiling, Codebook 10 lifts the zero-tuple at index 0 to a 6-bit
+  `0b100010` (`0x22`), migrates the shortest 4-bit slot onto the
+  interior `(1, 1)` tuple at index 14 with codeword `0b0000`, and
+  pulls the codeword ceiling down to **12 bits** — the same head-
+  displacement pattern Codebook 8 uses relative to Codebook 7 at the
+  narrower `LAV = 7` universe. Exactly three rows reach the 4-bit
+  floor (indices 14, 15, 27) and exactly eight rows reach the 12-bit
+  ceiling (indices 12, 129, 142, 155, 165, 166, 167, 168), reflecting
+  an encoder target whose magnitude statistics put more weight in the
+  `(1..=4, 1..=4)` interior than Codebook 9's zero-heavy
+  distribution. The §4.6.3.3 sign-bit suffix applies after every
+  non-zero coefficient (one suffix bit per non-zero, low-frequency
+  first via `apply_sign_bits` / `derive_sign_bits`) and lies outside
+  the Huffman codeword carried by this module. Public constants
+  `HCOD10_NUM_ENTRIES = 169`, `HCOD10_MAX_LEN = 12`. Public functions
+  `hcod10_encode(idx) -> (length, codeword)` (right-aligned in
+  `u16`), `hcod10_decode(reader) -> idx` (MSB-first prefix match,
+  linear scan against the 169-row table), and the convenience writer
+  `hcod10_write(writer, idx)`. Out-of-range indices (`idx > 168`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(10)`; the
+  decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality `Σ 2^(12 − L)
+  = 4096 = 2^12`), exhaustively verified by walking every 12-bit
+  prefix at unit-test time and asserting each maps to exactly one
+  entry — so the decoder's `unreachable!()` fall-through is dead by
+  construction. Adds 17 new unit tests and 22 new integration tests
+  covering table shape, Kraft completeness, per-row PDF spot checks,
+  the §4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check, the
+  169-pair bijection sweep, per-index sign-bit-count invariants
+  against `derive_sign_bits(10, …)`, hand-pinned byte sequences for
+  indices 14 and 168, rejection paths, and the Codebooks 9 / 10
+  shared-universe / pulled-down-ceiling / displaced-zero-tuple
+  cross-checks.
 - phase 2 (r253): `spectrum_huffman::HCOD9` — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.10 (Spectrum Huffman Codebook 9) wire layer.
   Codebook 9 is the first **expanded-LAV unsigned pair** spectrum

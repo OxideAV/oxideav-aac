@@ -64,11 +64,24 @@
 //! widens the per-coefficient ceiling to `LAV = 12` — the §4.6.3.3
 //! universe grows from `8 × 8 = 64` to `13 × 13 = 169` entries —
 //! making it the largest of the non-ESC spectrum books.
-//! Codebooks 10..=11 (Tables 4.A.11 … 4.A.12) reuse the same module
-//! shape and will be added one per future round; the traits and
-//! dispatch surface here are intentionally codebook-agnostic so the
-//! per-codebook additions land as a single static-table
-//! transcription each.
+//! Round 255 adds the tenth — **Table 4.A.11, "Spectrum Huffman
+//! Codebook 10"** — the second **expanded-LAV unsigned pair** book
+//! (Table 4.95 row 10: `unsigned_cb = 1`, `dim = 2`, `LAV = 12` →
+//! 169 entries indexed `0..=168`, the same `13 × 13` universe
+//! Codebook 9 covers). Codebook 10 trades Codebook 9's
+//! zero-tuple-at-the-1-bit-head distribution for a flatter codeword
+//! profile: the zero-tuple `(0, 0)` at index 0 now carries a 6-bit
+//! `0b100010` (`0x22`), the shortest slot (4 bits, codeword `0b0000`)
+//! migrates onto the interior `(1, 1)` tuple at index 14, and the
+//! codeword ceiling pulls down from Codebook 9's 15 bits to **12
+//! bits** — matching the head-displacement pattern Codebook 8 uses
+//! relative to Codebook 7 (one row lifted from the 1-bit slot,
+//! shortest codeword moved off the zero-tuple) but at the wider
+//! `LAV = 12` universe.
+//! Codebook 11 (Table 4.A.12) reuses the same module shape and will
+//! be added in a future round; the traits and dispatch surface here
+//! are intentionally codebook-agnostic so the per-codebook addition
+//! lands as a single static-table transcription.
 //!
 //! ## Codebook 1 invariants (Table 4.A.2)
 //!
@@ -342,6 +355,50 @@
 //! [`derive_sign_bits`](crate::spectral_codebook::derive_sign_bits)
 //! and is *not* part of the Huffman codeword itself — this module's
 //! `hcod9_encode` / `hcod9_decode` cover the codeword only.
+//!
+//! ## Codebook 10 invariants (Table 4.A.11)
+//!
+//! | property               | value         | source                        |
+//! |------------------------|---------------|-------------------------------|
+//! | dimension              | 2 (pair)      | Table 4.95 row 10, column 3   |
+//! | `unsigned_cb`          | 1 (unsigned)  | Table 4.95 row 10, column 2   |
+//! | LAV                    | 12            | Table 4.95 row 10, column 4   |
+//! | entry count            | `13^2 = 169`  | `(12 + 1)^2` per §4.6.3.3     |
+//! | maximum codeword length| 12 bits       | Table 4.A.11 column 2 maximum |
+//! | shortest codeword      | 4 bits        | Table 4.A.11 row 14 (index 14)|
+//! | shortest codeword value| `0`           | Table 4.A.11 row 14           |
+//! | Kraft equality         | 4096 = 2¹²    | see [`hcod10_is_complete`]    |
+//!
+//! Codebook 10 shares Codebook 9's expanded-LAV unsigned pair tuple
+//! universe (Table 4.95 row 10 is identical to row 9 except for the
+//! `Codebook listed in Table` column pointing at Table 4.A.11) but
+//! uses a different per-row Huffman length tuning for a different
+//! encoder target-statistics. Where Codebook 9 parks the §4.6.3.3
+//! zero-tuple `(0, 0)` at index 0 with the single-bit `0` codeword
+//! and lets the four rarest pair magnitudes climb to a 15-bit
+//! ceiling, Codebook 10 keeps the zero-tuple at index 0 (the
+//! §4.6.3.3 polynomial position is fixed by the tuple) but its
+//! codeword swells to 6 bits (`0x22`), the shortest 4-bit slot
+//! migrates onto the interior `(1, 1)` tuple at index 14 with
+//! codeword `0b0000`, and the codeword ceiling pulls down to
+//! **12 bits**. Exactly three rows reach the 4-bit floor (indices
+//! 14, 15, 27 with codewords `0x0`, `0x1`, `0x2`) and exactly eight
+//! rows reach the 12-bit ceiling (indices 12, 129, 142, 155, 165,
+//! 166, 167, 168 with codewords `0xffd`, `0xffa`, `0xff9`, `0xffb`,
+//! `0xff8`, `0xffe`, `0xffc`, `0xfff`) — the four corners and four
+//! near-edges of the `13 × 13` unsigned lattice. The flatter,
+//! pull-down distribution makes Codebook 10 a better fit for
+//! sections whose magnitude statistics put more weight in the
+//! `(1..=4, 1..=4)` interior than Codebook 9's
+//! more-zero-tuple-heavy target. The encoder chooses between the
+//! two books per-section via `section_data()`'s `sect_cb` field;
+//! the §4.6.3.3 sign-bit suffix follows the Huffman codeword on the
+//! wire — one sign bit per non-zero coefficient, low-frequency-
+//! first — and is exposed by
+//! [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits) /
+//! [`derive_sign_bits`](crate::spectral_codebook::derive_sign_bits)
+//! and is *not* part of the Huffman codeword itself — this module's
+//! `hcod10_encode` / `hcod10_decode` cover the codeword only.
 //!
 //! Codebook 6 shares Codebook 5's signed pair tuple universe
 //! (Table 4.95 row 6 is identical to row 5 except for the `Codebook
@@ -2129,6 +2186,297 @@ pub fn hcod9_decode(reader: &mut BitReader<'_>) -> Result<u32> {
 /// suffix bit per non-zero coefficient, low-frequency-first).
 pub fn hcod9_write(writer: &mut BitWriter, idx: u32) -> Result<()> {
     let (len, cw) = hcod9_encode(idx)?;
+    writer.write_u32(u32::from(cw), u32::from(len));
+    Ok(())
+}
+
+// =====================================================================
+// Codebook 10 — Table 4.A.11
+// =====================================================================
+//
+// Codebook 10 is the second expanded-LAV unsigned pair spectrum book —
+// Table 4.95 row 10 mirrors Codebook 9's row 9 column-for-column
+// (`unsigned_cb = 1`, `dim = 2`, `LAV = 12`) so the §4.6.3.3 universe
+// is the same `13 × 13 = 169`-entry lattice indexed `0..=168` with
+// each `(y, z)` coefficient in `0..=12`. The §4.6.3.3 unsigned
+// polynomial `idx = y * (LAV + 1) + z = y * 13 + z` places the
+// zero-tuple `(0, 0)` at index 0 and the maximum tuple `(12, 12)` at
+// index 168 (`12 * 13 + 12 = 168`). Where Codebook 9 parks the
+// single-bit codeword `0` on the zero-tuple at index 0, Codebook 10
+// lifts the zero-tuple to a 6-bit `0b100010` (`0x22`) and migrates
+// the shortest codeword (4 bits) onto the interior `(1, 1)` at
+// index 14 with codeword `0b0000` — the same head-displacement
+// pattern Codebook 8 uses to relocate its shortest slot off the
+// zero-tuple. Exactly three rows reach the 4-bit floor (indices
+// 14, 15, 27 with codewords `0x0`, `0x1`, `0x2`), reflecting an
+// encoder target whose magnitude statistics are denser around
+// `(±1, ±1) .. (±2, ±2)` than Codebook 9's zero-heavy distribution.
+// The maximum codeword length is **12 bits** — a 3-bit pull-down
+// from Codebook 9's 15-bit ceiling — and exactly eight rows reach
+// that 12-bit ceiling (indices 12, 129, 142, 155, 165, 166, 167,
+// 168 with codewords `0xffd, 0xffa, 0xff9, 0xffb, 0xff8, 0xffe,
+// 0xffc, 0xfff`), the rarest pair magnitudes near the `LAV = 12`
+// cap.
+//
+// Because Codebook 10 is unsigned, a sign-bit suffix follows the
+// Huffman codeword for every non-zero coefficient per §4.6.3.3 —
+// the suffix is delivered by `crate::spectral_codebook::apply_sign_bits`
+// / `crate::spectral_codebook::derive_sign_bits`, separate from the
+// Huffman codeword carried here.
+
+/// Number of entries in Table 4.A.11 (`169`, indices `0..=168`).
+pub const HCOD10_NUM_ENTRIES: usize = 169;
+
+/// Maximum codeword length emitted by Table 4.A.11 (12 bits).
+pub const HCOD10_MAX_LEN: u32 = 12;
+
+/// Table 4.A.11 — `(length_in_bits, codeword)` per index `0..=168`.
+///
+/// Codewords are right-aligned within the `u16`. To emit one
+/// bit-for-bit, write `codeword` as `length` bits MSB-first.
+const HCOD10: [(u8, u16); HCOD10_NUM_ENTRIES] = [
+    (6, 0x0022),  // 0 — zero-tuple (y, z) = (0, 0)
+    (5, 0x0008),  // 1
+    (6, 0x001d),  // 2
+    (6, 0x0026),  // 3
+    (7, 0x005f),  // 4
+    (8, 0x00d3),  // 5
+    (9, 0x01cf),  // 6
+    (10, 0x03d0), // 7
+    (10, 0x03d7), // 8
+    (10, 0x03ed), // 9
+    (11, 0x07f0), // 10
+    (11, 0x07f6), // 11
+    (12, 0x0ffd), // 12
+    (5, 0x0007),  // 13
+    (4, 0x0000),  // 14 — interior (y, z) = (1, 1), shortest 4-bit `0b0000`
+    (4, 0x0001),  // 15
+    (5, 0x0009),  // 16
+    (6, 0x0020),  // 17
+    (7, 0x0054),  // 18
+    (7, 0x0060),  // 19
+    (8, 0x00d5),  // 20
+    (8, 0x00dc),  // 21
+    (9, 0x01d4),  // 22
+    (10, 0x03cd), // 23
+    (10, 0x03de), // 24
+    (11, 0x07e7), // 25
+    (6, 0x001c),  // 26
+    (4, 0x0002),  // 27
+    (5, 0x0006),  // 28
+    (5, 0x000c),  // 29
+    (6, 0x001e),  // 30
+    (6, 0x0028),  // 31
+    (7, 0x005b),  // 32
+    (8, 0x00cd),  // 33
+    (8, 0x00d9),  // 34
+    (9, 0x01ce),  // 35
+    (9, 0x01dc),  // 36
+    (10, 0x03d9), // 37
+    (10, 0x03f1), // 38
+    (6, 0x0025),  // 39
+    (5, 0x000b),  // 40
+    (5, 0x000a),  // 41
+    (5, 0x000d),  // 42
+    (6, 0x0024),  // 43
+    (7, 0x0057),  // 44
+    (7, 0x0061),  // 45
+    (8, 0x00cc),  // 46
+    (8, 0x00dd),  // 47
+    (9, 0x01cc),  // 48
+    (9, 0x01de),  // 49
+    (10, 0x03d3), // 50
+    (10, 0x03e7), // 51
+    (7, 0x005d),  // 52
+    (6, 0x0021),  // 53
+    (6, 0x001f),  // 54
+    (6, 0x0023),  // 55
+    (6, 0x0027),  // 56
+    (7, 0x0059),  // 57
+    (7, 0x0064),  // 58
+    (8, 0x00d8),  // 59
+    (8, 0x00df),  // 60
+    (9, 0x01d2),  // 61
+    (9, 0x01e2),  // 62
+    (10, 0x03dd), // 63
+    (10, 0x03ee), // 64
+    (8, 0x00d1),  // 65
+    (7, 0x0055),  // 66
+    (6, 0x0029),  // 67
+    (7, 0x0056),  // 68
+    (7, 0x0058),  // 69
+    (7, 0x0062),  // 70
+    (8, 0x00ce),  // 71
+    (8, 0x00e0),  // 72
+    (8, 0x00e2),  // 73
+    (9, 0x01da),  // 74
+    (10, 0x03d4), // 75
+    (10, 0x03e3), // 76
+    (11, 0x07eb), // 77
+    (9, 0x01c9),  // 78
+    (7, 0x005e),  // 79
+    (7, 0x005a),  // 80
+    (7, 0x005c),  // 81
+    (7, 0x0063),  // 82
+    (8, 0x00ca),  // 83
+    (8, 0x00da),  // 84
+    (9, 0x01c7),  // 85
+    (9, 0x01ca),  // 86
+    (9, 0x01e0),  // 87
+    (10, 0x03db), // 88
+    (10, 0x03e8), // 89
+    (11, 0x07ec), // 90
+    (9, 0x01e3),  // 91
+    (8, 0x00d2),  // 92
+    (8, 0x00cb),  // 93
+    (8, 0x00d0),  // 94
+    (8, 0x00d7),  // 95
+    (8, 0x00db),  // 96
+    (9, 0x01c6),  // 97
+    (9, 0x01d5),  // 98
+    (9, 0x01d8),  // 99
+    (10, 0x03ca), // 100
+    (10, 0x03da), // 101
+    (11, 0x07ea), // 102
+    (11, 0x07f1), // 103
+    (9, 0x01e1),  // 104
+    (8, 0x00d4),  // 105
+    (8, 0x00cf),  // 106
+    (8, 0x00d6),  // 107
+    (8, 0x00de),  // 108
+    (8, 0x00e1),  // 109
+    (9, 0x01d0),  // 110
+    (9, 0x01d6),  // 111
+    (10, 0x03d1), // 112
+    (10, 0x03d5), // 113
+    (10, 0x03f2), // 114
+    (11, 0x07ee), // 115
+    (11, 0x07fb), // 116
+    (10, 0x03e9), // 117
+    (9, 0x01cd),  // 118
+    (9, 0x01c8),  // 119
+    (9, 0x01cb),  // 120
+    (9, 0x01d1),  // 121
+    (9, 0x01d7),  // 122
+    (9, 0x01df),  // 123
+    (10, 0x03cf), // 124
+    (10, 0x03e0), // 125
+    (10, 0x03ef), // 126
+    (11, 0x07e6), // 127
+    (11, 0x07f8), // 128
+    (12, 0x0ffa), // 129
+    (10, 0x03eb), // 130
+    (9, 0x01dd),  // 131
+    (9, 0x01d3),  // 132
+    (9, 0x01d9),  // 133
+    (9, 0x01db),  // 134
+    (10, 0x03d2), // 135
+    (10, 0x03cc), // 136
+    (10, 0x03dc), // 137
+    (10, 0x03ea), // 138
+    (11, 0x07ed), // 139
+    (11, 0x07f3), // 140
+    (11, 0x07f9), // 141
+    (12, 0x0ff9), // 142
+    (11, 0x07f2), // 143
+    (10, 0x03ce), // 144
+    (9, 0x01e4),  // 145
+    (10, 0x03cb), // 146
+    (10, 0x03d8), // 147
+    (10, 0x03d6), // 148
+    (10, 0x03e2), // 149
+    (10, 0x03e5), // 150
+    (11, 0x07e8), // 151
+    (11, 0x07f4), // 152
+    (11, 0x07f5), // 153
+    (11, 0x07f7), // 154
+    (12, 0x0ffb), // 155
+    (11, 0x07fa), // 156
+    (10, 0x03ec), // 157
+    (10, 0x03df), // 158
+    (10, 0x03e1), // 159
+    (10, 0x03e4), // 160
+    (10, 0x03e6), // 161
+    (10, 0x03f0), // 162
+    (11, 0x07e9), // 163
+    (11, 0x07ef), // 164
+    (12, 0x0ff8), // 165
+    (12, 0x0ffe), // 166
+    (12, 0x0ffc), // 167
+    (12, 0x0fff), // 168 — far corner (y, z) = (12, 12)
+];
+
+/// Encode a Codebook 10 codeword index (`0..=168`) to the wire Huffman
+/// codeword from Table 4.A.11.
+///
+/// Returns `(length_in_bits, codeword)` with `codeword` right-aligned
+/// in the `u16` (MSB at bit `length − 1`). Out-of-range `idx`
+/// produces [`Error::SpectralCodebookIndexOutOfRange`]; the legal
+/// range is `0..=168` (the 169-entry `13^2` enumeration of every
+/// legal unsigned pair with each coefficient in `0..=12`).
+///
+/// The inverse of [`hcod10_decode`]. Because Codebook 10 is unsigned,
+/// callers transmit one sign bit after the codeword for each non-zero
+/// coefficient via
+/// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits) /
+/// [`derive_sign_bits`](crate::spectral_codebook::derive_sign_bits)
+/// — the §4.6.3.3 suffix sits outside the Huffman codeword carried
+/// here.
+pub fn hcod10_encode(idx: u32) -> Result<(u8, u16)> {
+    let entry = HCOD10
+        .get(idx as usize)
+        .ok_or(Error::SpectralCodebookIndexOutOfRange(10))?;
+    Ok(*entry)
+}
+
+/// Decode one Codebook 10 Huffman codeword from `reader`, returning
+/// the codeword index in `0..=168`.
+///
+/// The decoder is a straight prefix-match: read one bit at a time
+/// (MSB-first), look it up in a flat 169-entry table. The table is
+/// small enough (max codeword length 12 bits, 169 entries) that a
+/// single linear scan per bit-extend is cheaper than the storage
+/// and build-time cost of a multi-level lookup acceleration table.
+/// Returns [`Error::UnexpectedEnd`] on reader underflow.
+///
+/// The codebook is a **complete** prefix code over 12 bits (Kraft
+/// equality `Σᵢ 2^(12 − Lᵢ) = 4096 = 2¹²`), so any 12-bit prefix
+/// fully read from `reader` is guaranteed to match exactly one
+/// entry — the bottom of the loop is unreachable when `reader`
+/// produces 12 bits without underflowing. A purely defensive
+/// `unreachable!()` guards the loop fall-through; it is verified
+/// dead by the `hcod10_is_complete` regression test that
+/// exhaustively walks all `2¹²` 12-bit prefixes.
+///
+/// The §4.6.3.3 sign-bit suffix lies outside this routine — for
+/// unsigned Codebook 10 the caller consumes one sign bit per
+/// non-zero coefficient after the Huffman codeword via
+/// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits).
+pub fn hcod10_decode(reader: &mut BitReader<'_>) -> Result<u32> {
+    let mut acc: u32 = 0;
+    for len in 1..=HCOD10_MAX_LEN {
+        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
+        acc = (acc << 1) | bit;
+        for (idx, &(entry_len, entry_cw)) in HCOD10.iter().enumerate() {
+            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
+                return Ok(idx as u32);
+            }
+        }
+    }
+    // Unreachable: HCOD10 is a complete 12-bit prefix code. The
+    // `hcod10_is_complete` regression test verifies every 12-bit
+    // prefix maps to exactly one entry.
+    unreachable!("HCOD10 is a complete 12-bit prefix code; the 12-bit walk must match");
+}
+
+/// Write a Codebook 10 codeword to `writer` by index.
+///
+/// Convenience over `hcod10_encode` + manual `write_u32`. Returns
+/// [`Error::SpectralCodebookIndexOutOfRange`] for `idx > 168`. The
+/// §4.6.3.3 sign-bit suffix is the caller's responsibility (one
+/// suffix bit per non-zero coefficient, low-frequency-first).
+pub fn hcod10_write(writer: &mut BitWriter, idx: u32) -> Result<()> {
+    let (len, cw) = hcod10_encode(idx)?;
     writer.write_u32(u32::from(cw), u32::from(len));
     Ok(())
 }
@@ -4232,5 +4580,292 @@ mod tests {
         assert_eq!((l8, cw8), (10, 0x3ff));
         // Codebook 9's ceiling is 5 bits wider than Codebook 8's.
         assert_eq!(HCOD9_MAX_LEN - HCOD8_MAX_LEN, 5);
+    }
+
+    // -------------------------------------------------------------------
+    // Codebook 10 — Table 4.A.11
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn hcod10_has_exactly_169_entries() {
+        // 13^2 = 169 (unsigned LAV=12 → mod = lav+1 = 13, dim = 2).
+        assert_eq!(HCOD10.len(), HCOD10_NUM_ENTRIES);
+        assert_eq!(HCOD10_NUM_ENTRIES, 169);
+    }
+
+    #[test]
+    fn hcod10_max_length_is_12_bits() {
+        let max = HCOD10.iter().map(|&(len, _)| len).max().unwrap();
+        assert_eq!(u32::from(max), HCOD10_MAX_LEN);
+        assert_eq!(HCOD10_MAX_LEN, 12);
+    }
+
+    #[test]
+    fn hcod10_min_length_is_four_bits_at_interior_tuple_index_14() {
+        // Codebook 10 lifts the zero-tuple off the shortest slot (it
+        // sits at 6 bits at index 0) and parks the 4-bit shortest
+        // codeword on the interior `(1, 1)` tuple at index 14, the
+        // same head-displacement pattern Codebook 8 uses.
+        // Exactly three rows reach 4 bits: indices 14, 15, 27.
+        let mut four_bit_indices = Vec::new();
+        for (idx, &(len, _)) in HCOD10.iter().enumerate() {
+            if len == 4 {
+                four_bit_indices.push(idx);
+            }
+            assert!(
+                len >= 4,
+                "every row must have length >= 4; idx={} len={}",
+                idx,
+                len
+            );
+        }
+        assert_eq!(four_bit_indices, vec![14, 15, 27]);
+    }
+
+    #[test]
+    fn hcod10_zero_tuple_lives_at_index_0_with_six_bit_codeword() {
+        // Codebook 10 places the §4.6.3.3 zero-tuple `(0, 0)` at
+        // index 0 via the unsigned polynomial idx = 0 * 13 + 0 = 0,
+        // but the Huffman row carries a 6-bit `0b100010` (`0x22`)
+        // codeword — not the 1-bit `0` that Codebook 9 uses.
+        let (len, cw) = HCOD10[0];
+        assert_eq!(len, 6);
+        assert_eq!(cw, 0x22);
+    }
+
+    #[test]
+    fn hcod10_codewords_fit_their_declared_length() {
+        for (idx, &(len, cw)) in HCOD10.iter().enumerate() {
+            let max = if len == 0 { 0 } else { (1u32 << len) - 1 };
+            assert!(
+                u32::from(cw) <= max,
+                "idx={}: codeword {:#x} does not fit {} bits",
+                idx,
+                cw,
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn hcod10_kraft_sum_is_two_to_the_twelve() {
+        // Σᵢ 2^(L_max − Lᵢ) must equal 2^L_max for a complete code.
+        let lmax = HCOD10_MAX_LEN;
+        let mut sum: u64 = 0;
+        for &(len, _) in &HCOD10 {
+            sum += 1u64 << (lmax - u32::from(len));
+        }
+        assert_eq!(sum, 1u64 << lmax, "Kraft equality failed");
+        assert_eq!(sum, 4096);
+    }
+
+    #[test]
+    fn hcod10_is_complete() {
+        // Walk every 12-bit prefix, decode it via the production
+        // decoder, and confirm every prefix yields exactly one entry.
+        // Bonus: confirm the decoded index round-trips back to the
+        // same codeword via `hcod10_encode`.
+        for prefix in 0u32..(1u32 << HCOD10_MAX_LEN) {
+            // Pack `prefix` (12 bits) left-aligned into two bytes:
+            // high byte = bits 11..4, low byte = (bits 3..0) << 4.
+            let bytes = [(prefix >> 4) as u8, ((prefix & 0xf) << 4) as u8];
+            let mut br = BitReader::new(&bytes);
+            let idx = hcod10_decode(&mut br).expect("12-bit prefix must decode");
+            let (len, cw) = hcod10_encode(idx).expect("decoded index must round-trip");
+            // The decoded codeword should match the leading `len`
+            // bits of `prefix`.
+            let lead = prefix >> (HCOD10_MAX_LEN - u32::from(len));
+            assert_eq!(
+                u32::from(cw),
+                lead,
+                "round-trip prefix={:#05x} idx={} len={} cw={:#x}",
+                prefix,
+                idx,
+                len,
+                cw
+            );
+        }
+    }
+
+    #[test]
+    fn hcod10_encode_index_0_is_six_bit_codeword_0x22() {
+        // Spec PDF Table 4.A.11 row 0: length 6, codeword 0x22 — the
+        // §4.6.3.3 zero-tuple `(0, 0)` does NOT carry the shortest
+        // possible codeword in Codebook 10.
+        let (len, cw) = hcod10_encode(0).unwrap();
+        assert_eq!(len, 6);
+        assert_eq!(cw, 0x22);
+    }
+
+    #[test]
+    fn hcod10_encode_shortest_codewords_match_spec() {
+        // Spec PDF Table 4.A.11 spot checks: the three 4-bit rows are
+        // indices 14, 15, 27 with codewords 0, 1, 2.
+        assert_eq!(hcod10_encode(14).unwrap(), (4, 0x0));
+        assert_eq!(hcod10_encode(15).unwrap(), (4, 0x1));
+        assert_eq!(hcod10_encode(27).unwrap(), (4, 0x2));
+    }
+
+    #[test]
+    fn hcod10_encode_last_entry_matches_table() {
+        // Spec PDF Table 4.A.11 row 168: length 12, codeword 0xfff —
+        // the far corner `(12, 12)` of the unsigned `13 × 13` pair
+        // lattice.
+        let (len, cw) = hcod10_encode(168).unwrap();
+        assert_eq!(len, 12);
+        assert_eq!(cw, 0xfff);
+    }
+
+    #[test]
+    fn hcod10_encode_eight_12_bit_rows_match_table() {
+        // Exactly eight rows reach the 12-bit ceiling in
+        // Table 4.A.11. Their indices and codewords are pinned here.
+        let expected = [
+            (12u32, 0x0ffdu16),
+            (129u32, 0x0ffau16),
+            (142u32, 0x0ff9u16),
+            (155u32, 0x0ffbu16),
+            (165u32, 0x0ff8u16),
+            (166u32, 0x0ffeu16),
+            (167u32, 0x0ffcu16),
+            (168u32, 0x0fffu16),
+        ];
+        let observed: Vec<_> = HCOD10
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(l, cw))| if l == 12 { Some((i as u32, cw)) } else { None })
+            .collect();
+        assert_eq!(observed.len(), 8);
+        for (e, o) in expected.iter().zip(observed.iter()) {
+            assert_eq!(*e, *o, "expected {:?} got {:?}", e, o);
+        }
+    }
+
+    #[test]
+    fn hcod10_encode_rejects_out_of_range_index() {
+        assert!(matches!(
+            hcod10_encode(169),
+            Err(Error::SpectralCodebookIndexOutOfRange(10))
+        ));
+        assert!(matches!(
+            hcod10_encode(0xffff_ffff),
+            Err(Error::SpectralCodebookIndexOutOfRange(10))
+        ));
+    }
+
+    #[test]
+    fn hcod10_decode_four_bit_zero_codeword_yields_index_14() {
+        // Index 14 → length 4, codeword 0 = 0b0000. Pack
+        // left-aligned in a single byte: top 4 bits = 0, bottom 4
+        // bits arbitrary.
+        let bytes = [0b0000_1111u8];
+        let mut br = BitReader::new(&bytes);
+        let idx = hcod10_decode(&mut br).unwrap();
+        assert_eq!(idx, 14);
+        assert_eq!(br.bit_position(), 4);
+    }
+
+    #[test]
+    fn hcod10_decode_full_12_bit_codeword_round_trips_index_168() {
+        // Index 168 → length 12, codeword 0xfff = 0b1111_1111_1111.
+        // Pack left-aligned: high byte = 0xff (bits 11..4), low byte
+        // = (0xf << 4) = 0xf0 (bits 3..0 in the top of the low byte).
+        let bytes = [0xff, 0xf0];
+        let mut br = BitReader::new(&bytes);
+        let idx = hcod10_decode(&mut br).unwrap();
+        assert_eq!(idx, 168);
+        assert_eq!(br.bit_position(), 12);
+    }
+
+    #[test]
+    fn hcod10_decode_propagates_unexpected_end() {
+        let bytes: [u8; 0] = [];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(hcod10_decode(&mut br), Err(Error::UnexpectedEnd));
+    }
+
+    #[test]
+    fn hcod10_write_then_decode_round_trips_every_index() {
+        for idx in 0..HCOD10_NUM_ENTRIES as u32 {
+            let mut w = BitWriter::new();
+            hcod10_write(&mut w, idx).unwrap();
+            let (len, _) = hcod10_encode(idx).unwrap();
+            let mut w2 = w;
+            let pad = (8 - (u32::from(len) % 8)) % 8;
+            if pad > 0 {
+                w2.write_u32(0, pad);
+            }
+            let bytes = w2.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let decoded = hcod10_decode(&mut br).unwrap();
+            assert_eq!(
+                decoded, idx,
+                "round-trip mismatch at idx={} (encoded as {} bits)",
+                idx, len
+            );
+        }
+    }
+
+    #[test]
+    fn hcod10_write_rejects_out_of_range_index() {
+        let mut w = BitWriter::new();
+        assert!(matches!(
+            hcod10_write(&mut w, 169),
+            Err(Error::SpectralCodebookIndexOutOfRange(10))
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // Cross-check: Codebooks 9 and 10 share the unsigned dim-2 LAV-12
+    // universe (169 entries each) but differ in codeword distribution.
+    // Codebook 9's ceiling is 15 bits with the zero-tuple at the
+    // 1-bit head; Codebook 10's ceiling pulls down to 12 bits and
+    // lifts the zero-tuple off the head — the shortest 4-bit slot
+    // sits on the interior `(1, 1)` tuple at index 14.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn codebook_10_matches_codebook_9_universe_size() {
+        assert_eq!(HCOD9_NUM_ENTRIES, 169);
+        assert_eq!(HCOD10_NUM_ENTRIES, 169);
+    }
+
+    #[test]
+    fn codebook_10_ceiling_is_3_bits_below_codebook_9() {
+        // Codebook 9's ceiling is 15 bits; Codebook 10's ceiling
+        // is 12 bits — a 3-bit pull-down reflecting the flatter
+        // codeword distribution targeted by Codebook 10's
+        // encoder-statistics tuning.
+        assert_eq!(HCOD9_MAX_LEN, 15);
+        assert_eq!(HCOD10_MAX_LEN, 12);
+        assert_eq!(HCOD9_MAX_LEN - HCOD10_MAX_LEN, 3);
+    }
+
+    #[test]
+    fn codebook_10_lifts_zero_tuple_off_codebook_9_head_placement() {
+        // Codebook 9 parks the §4.6.3.3 zero-tuple at index 0 with
+        // the 1-bit `0` codeword (shortest possible slot). Codebook
+        // 10 keeps the zero-tuple at index 0 (the §4.6.3.3 polynomial
+        // index is fixed by the tuple, not the codebook) but the
+        // codeword swells to 6 bits — the shortest 4-bit slot
+        // migrates onto the interior `(1, 1)` tuple at index 14.
+        let (l9_0, cw9_0) = hcod9_encode(0).unwrap();
+        let (l10_0, cw10_0) = hcod10_encode(0).unwrap();
+        let (l10_14, cw10_14) = hcod10_encode(14).unwrap();
+        assert_eq!((l9_0, cw9_0), (1, 0));
+        assert_eq!((l10_0, cw10_0), (6, 0x22));
+        assert_eq!((l10_14, cw10_14), (4, 0));
+    }
+
+    #[test]
+    fn codebook_10_far_corner_matches_codebook_9_far_corner_index() {
+        // Both codebooks share LAV = 12, so the §4.6.3.3 unsigned
+        // polynomial parks `(12, 12)` at index 12 * 13 + 12 = 168.
+        // Codeword shapes differ: Codebook 9 → 15-bit 0x7fff;
+        // Codebook 10 → 12-bit 0xfff.
+        let (l9, cw9) = hcod9_encode(168).unwrap();
+        let (l10, cw10) = hcod10_encode(168).unwrap();
+        assert_eq!((l9, cw9), (15, 0x7fff));
+        assert_eq!((l10, cw10), (12, 0xfff));
     }
 }
