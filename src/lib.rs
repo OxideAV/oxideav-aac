@@ -273,10 +273,16 @@
 //!   returns the codeword index, and `hcodN_write` is a convenience
 //!   wrapper over the encode + writer-emit pair. Every book is a
 //!   complete prefix code over `HCODN_MAX_LEN` bits, exhaustively
-//!   verified at unit-test time. Codebooks 6..=11 (Tables 4.A.7 …
-//!   4.A.12) reuse the same module shape and are owed in subsequent
-//!   rounds; the `spectral_data()` driver that dispatches per-band
-//!   onto the chosen codebook arrives once all eleven are in place.
+//!   verified at unit-test time. Round 250 added Codebook 8
+//!   (Table 4.A.9, the second **unsigned pair** book sharing
+//!   Codebook 7's `unsigned = 1`, `dim = 2`, `LAV = 7` → 64-entry
+//!   universe; 10-bit max; the zero-tuple at index 0 carries a
+//!   5-bit `0b01110` and the shortest 3-bit `0` codeword migrates
+//!   to the interior tuple `(1, 1)` at index 9). Codebooks 9..=11
+//!   (Tables 4.A.10 … 4.A.12) reuse the same module shape and are
+//!   owed in subsequent rounds; the `spectral_data()` driver that
+//!   dispatches per-band onto the chosen codebook arrives once all
+//!   eleven are in place.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three

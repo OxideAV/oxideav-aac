@@ -8,6 +8,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r250): `spectrum_huffman::HCOD8` — ISO/IEC 14496-3 §4.6.3 /
+  Annex 4.A Table 4.A.9 (Spectrum Huffman Codebook 8) wire layer.
+  Codebook 8 is the second **unsigned pair** spectrum book and
+  shares Codebook 7's Table 4.95 row shape (row 8: `unsigned_cb =
+  1`, `dim = 2`, `LAV = 7` → `(7 + 1)^2 = 8^2 = 64` entries indexed
+  `0..=63`, each tuple coefficient in `0..=7`) but uses a different
+  per-row Huffman length tuning. Where Codebook 7 puts the zero-tuple
+  `(0, 0)` at index 0 with a 1-bit `0` codeword and lets the
+  upper-right quadrant of the lattice climb to a 12-bit ceiling,
+  Codebook 8 lifts the zero-tuple at index 0 to a 5-bit `0xe` and
+  migrates the shortest codeword (3 bits `0b000`) to the interior
+  tuple `(y, z) = (1, 1)` at **index 9**. The maximum codeword
+  length is **10 bits** (vs 12 for Codebook 7); exactly four rows
+  reach the ceiling: indices 7 (`0x3fe`), 47 (`0x3fc`), 56
+  (`0x3fd`), and 63 (`0x3ff`) — the rarest pair magnitudes. The
+  §4.6.3.3 sign-bit suffix applies after every non-zero coefficient
+  (one suffix bit per non-zero, low-frequency first via
+  `apply_sign_bits` / `derive_sign_bits`) and lies outside the
+  Huffman codeword carried by this module. Public constants
+  `HCOD8_NUM_ENTRIES = 64`, `HCOD8_MAX_LEN = 10`. Public functions
+  `hcod8_encode(idx) -> (length, codeword)` (right-aligned in `u16`),
+  `hcod8_decode(reader) -> idx` (MSB-first prefix match, linear scan
+  against the 64-row table), and the convenience writer
+  `hcod8_write(writer, idx)`. Out-of-range indices (`idx > 63`)
+  surface as `Error::SpectralCodebookIndexOutOfRange(8)`; the
+  decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality
+  `Σ 2^(10 − L) = 1024 = 2^10`), exhaustively verified by walking
+  every 10-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()` fall-through
+  is verifiably dead. Encode-then-decode round-trips every index;
+  17 new unit tests cover table-shape invariants (entry count,
+  max/min length at index 9, codeword fit), Kraft equality,
+  exhaustive completeness, four spot-checks against Table 4.A.9
+  (rows 0, 8, 9, 63, and the four 10-bit ceiling rows), the
+  round-trip walk, both out-of-range error paths, the
+  `UnexpectedEnd` propagation, and two cross-checks against
+  Codebook 7 (shortest-codeword-slot disagreement and shared
+  far-corner `(7, 7)` placement at index 63). All numeric values
+  sourced from `docs/audio/aac/ISO_IEC_14496-3-AAC-2001.pdf` §4.A.1
+  page 198. Module docstring extended with a Codebook 8 invariants
+  block (Table 4.95 row 8 mapping, entry-count derivation,
+  polynomial origin, ceiling row inventory). Codebooks 9..=11
+  (Tables 4.A.10 … 4.A.12) reuse the same module shape and will
+  land one per future round; Codebook 9 (Table 4.A.10) is the
+  first **expanded-LAV pair** book (Table 4.95 row 9: `unsigned =
+  1`, `dim = 2`, `LAV = 12` → 169 entries on a `13 × 13` lattice).
 - phase 2 (r244): `spectrum_huffman::HCOD7` — ISO/IEC 14496-3 §4.6.3 /
   Annex 4.A Table 4.A.8 (Spectrum Huffman Codebook 7) wire layer.
   Codebook 7 is the first **unsigned pair** spectrum book (Table 4.95
