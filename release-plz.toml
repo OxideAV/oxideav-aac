@@ -18,9 +18,9 @@ semver_check = false
 # default the release-PR job decides "no releasable change" and
 # returns `{"prs":[]}`. With every published 0.1.x yanked (see #1025),
 # downstream consumers (oxideav-meta) can't resolve `oxideav-aac =
-# "0.1"`. `release_always = true` lifts the per-commit conventional-
-# commits gating so any commit since the last release triggers a PR.
-#
-# Per release-plz's JSON schema, `release_always` is a `[workspace]`-
-# level option (not per-package).
-release_always = true
+# "0.1"`. The fix is `custom_minor_increment_regex` (per the schema:
+# "Custom regex to match commit types that should trigger a minor
+# version increment. Useful when using non-conventional commit
+# prefixes."). Each round adds a feature-shaped delta, so minor
+# bump matches semantics.
+custom_minor_increment_regex = "^phase\\b"
