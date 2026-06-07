@@ -3,6 +3,86 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 253)
+
+Round 253 lands **Table 4.A.10** (Spectrum Huffman Codebook 9) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 / 234 / 238 / 241 / 244 / 250 bootstrapped for
+Codebooks 1 through 8. Codebook 9 is the first **expanded-LAV
+unsigned pair** spectrum book — Table 4.95 row 9 declares
+`unsigned_cb = 1`, `dim = 2`, `LAV = 12`, so the §4.6.3.3 universe
+shifts from Codebooks 7 / 8's shared `8 × 8 = 64`-entry `LAV = 7`
+lattice to a `(12 + 1)^2 = 13^2 = 169`-entry lattice indexed
+`0..=168` with each `(y, z)` coefficient in `0..=12`. The §4.6.3.3
+unsigned polynomial `idx = y * (LAV + 1) + z = y * 13 + z` parks the
+zero-tuple `(0, 0)` at index 0 with the single-bit `0` codeword —
+matching the head placement Codebook 7 uses — and pins the maximum
+tuple `(12, 12)` at index 168 (`12 * 13 + 12 = 168`) with a 15-bit
+`0x7fff`. The maximum codeword length is **15 bits** — a 5-bit jump
+over Codebook 8's 10-bit ceiling and the widest non-ESC codeword in
+the entire Annex 4.A book set — reflecting the `169 / 64 ≈ 2.6×`
+universe expansion that widens the distribution's tail. Exactly four
+rows reach the 15-bit ceiling: indices 142 (`0x7ffc`), 154
+(`0x7ffd`), 155 (`0x7ffe`), and 168 (`0x7fff`) — the rarest pair
+magnitudes near the `LAV = 12` cap. The table is a **complete**
+15-bit prefix code (Kraft equality `Σ 2^(15 − L) = 32768 = 2^15`),
+exhaustively verified by walking every 15-bit prefix and asserting
+each maps to exactly one entry. Because Codebook 9 is unsigned, the
+§4.6.3.3 sign-bit suffix follows the Huffman codeword on the wire —
+one sign bit per non-zero coefficient, delivered low-frequency-
+first — and is exposed by the round-213 `apply_sign_bits` /
+`derive_sign_bits` helpers (the suffix lives outside the Huffman
+codeword carried by this module, an invariant verified across every
+index by an explicit `derive_sign_bits(9, &tuple)` cross-check that
+confirms a `(12, 12)` tuple emits two sign bits, a `(0, 0)` tuple
+emits zero sign bits, and the suffix length matches the non-zero-
+coefficient count for every index in between). Public API:
+`HCOD9_NUM_ENTRIES = 169`, `HCOD9_MAX_LEN = 15`, `hcod9_encode(idx)
+-> (u8, u16)`, `hcod9_decode(reader) -> u32`, and the convenience
+`hcod9_write(writer, idx)`. Out-of-range indices surface as
+`Error::SpectralCodebookIndexOutOfRange(9)`; reader underflow
+surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised across every index: `decode_index_to_tuple
+(9, idx)` → `encode_tuple_to_index(9, &tuple)` round-trips back to
+the same index for the entire `13 × 13` unsigned pair lattice, and a
+bijection cross-check builds the `169`-entry `HashSet` of legal
+pairs and confirms every `(y, z)` maps to a distinct index. 16 new
+unit tests (in `src/spectrum_huffman.rs`: 169-entry shape / 15-bit
+max / 1-bit min at index 0 / codewords fit / Kraft equality 32768 /
+complete-prefix walk over all `2^15` prefixes / per-row PDF spot
+checks at indices 0 / 1 / 13 / 14 / 168 / four-15-bit-ceiling
+enumeration at indices 142 / 154 / 155 / 168 / encode + write
+rejection / single-zero-bit decode at index 0 / full 15-bit codeword
+decode at index 168 / writer round-trip / unsigned-pair universe
+expansion from Codebook 8 / shared head-placement with Codebook 7 /
+5-bit ceiling delta vs Codebook 8) plus 25 new integration tests in
+`tests/spectrum_huffman.rs` (eight per-row PDF spot checks at
+indices 0 / 1 / 13 / 14 / 142 / 154 / 155 / 168; Table 4.95 row 9 ↔
+Table 4.A.10 size cross-check; full writer→reader round-trip; the
+§4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check; zero-tuple ↔
+index-0 carries 1-bit `0` invariant; far-corner `(12, 12)` ↔
+index-168 invariant; per-index sign-bit-count invariant against
+`derive_sign_bits(9, …)`; zero-tuple zero-sign-bits invariant;
+`(12, 12)` two-sign-bits invariant; two hand-pinned byte sequences
+(`[0x00]` for index 0 padded; `[0xff, 0xfe]` for index 168 packed);
+exact bit-consumption invariant across every index; out-of-range
+and truncation rejections; `HCOD9_MAX_LEN` constant consistency;
+Codebook-9-is-the-first-expanded-LAV-unsigned-pair-book cross-check
+confirming Codebooks 7 / 8 / 9 all share the `unsigned`, `dim = 2`
+columns but only Codebook 9 widens `LAV` from `7` to `12`; 169-pair
+bijection sweep that builds every legal `(y, z)` pair, asserts
+`encode_tuple_to_index(9, …)` produces a distinct index for each,
+and confirms `decode_index_to_tuple(9, idx)` round-trips back to the
+same `(y, z)`; ceiling-jump invariant `HCOD9_MAX_LEN -
+HCOD8_MAX_LEN = 5`; head-placement parity with Codebook 7 contrasted
+against Codebook 8's lifted zero-tuple). Codebooks 10..=11 (Tables
+4.A.11 … 4.A.12) reuse the same module shape and will land one per
+future round; Codebook 11 is the **ESC** book — its 16 + ESC shape
+(Table 4.95 row 11: `unsigned = 1`, `dim = 2`, `LAV = 16` with the
+§4.6.3 ESC-sequence reconstruction already landed in round 213's
+`spectral_codebook` module) exercises the in-band universe-extension
+path that Codebooks 1..=10 do not.
+
 ## Status (round 250)
 
 Round 250 lands **Table 4.A.9** (Spectrum Huffman Codebook 8) inside

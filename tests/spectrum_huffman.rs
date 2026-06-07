@@ -2,9 +2,9 @@
 //!
 //! Cross-checks Codebooks 1 (Table 4.A.2), 2 (Table 4.A.3), 3
 //! (Table 4.A.4), 4 (Table 4.A.5), 5 (Table 4.A.6), 6 (Table 4.A.7),
-//! 7 (Table 4.A.8), and 8 (Table 4.A.9) wire round-trip against the
-//! §4.6.3.3 index ↔ n-tuple translation already covered by
-//! [`oxideav_aac::spectral_codebook`].
+//! 7 (Table 4.A.8), 8 (Table 4.A.9), and 9 (Table 4.A.10) wire
+//! round-trip against the §4.6.3.3 index ↔ n-tuple translation
+//! already covered by [`oxideav_aac::spectral_codebook`].
 
 use oxideav_aac::{
     spectral_codebook::{
@@ -15,10 +15,10 @@ use oxideav_aac::{
         hcod3_decode, hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write,
         hcod5_decode, hcod5_encode, hcod5_write, hcod6_decode, hcod6_encode, hcod6_write,
         hcod7_decode, hcod7_encode, hcod7_write, hcod8_decode, hcod8_encode, hcod8_write,
-        HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN, HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN,
-        HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES, HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES,
-        HCOD6_MAX_LEN, HCOD6_NUM_ENTRIES, HCOD7_MAX_LEN, HCOD7_NUM_ENTRIES, HCOD8_MAX_LEN,
-        HCOD8_NUM_ENTRIES,
+        hcod9_decode, hcod9_encode, hcod9_write, HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN,
+        HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN, HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES,
+        HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES, HCOD6_MAX_LEN, HCOD6_NUM_ENTRIES, HCOD7_MAX_LEN,
+        HCOD7_NUM_ENTRIES, HCOD8_MAX_LEN, HCOD8_NUM_ENTRIES, HCOD9_MAX_LEN, HCOD9_NUM_ENTRIES,
     },
     Error,
 };
@@ -2514,4 +2514,335 @@ fn codebook_7_and_8_share_far_corner_index_position() {
     let (l8, cw8) = hcod8_encode(63).unwrap();
     assert_eq!((l7, cw7), (12, 0xfff));
     assert_eq!((l8, cw8), (10, 0x3ff));
+}
+
+// =============================================================================
+// Per-row spec-PDF spot checks (Table 4.A.10)
+// =============================================================================
+//
+// Each spot row is taken from ISO/IEC 14496-3:2009(E) §4.A.1 Table
+// 4.A.10 verbatim. The full 169-row table-shape and Kraft completeness
+// is covered by the unit-tests; this module locks the per-row
+// hexadecimal column at integration-test scope.
+
+#[test]
+fn table_4_a_10_row_0_matches_spec() {
+    // Row 0: length 1, codeword 0 (the §4.6.3.3 zero-tuple `(0, 0)`).
+    let (len, cw) = hcod9_encode(0).unwrap();
+    assert_eq!((len, cw), (1, 0));
+}
+
+#[test]
+fn table_4_a_10_row_1_matches_spec() {
+    // Row 1: length 3, codeword 0x5.
+    let (len, cw) = hcod9_encode(1).unwrap();
+    assert_eq!((len, cw), (3, 0x5));
+}
+
+#[test]
+fn table_4_a_10_row_13_matches_spec() {
+    // Row 13: length 3, codeword 0x4. The other 3-bit row in the
+    // table.
+    let (len, cw) = hcod9_encode(13).unwrap();
+    assert_eq!((len, cw), (3, 0x4));
+}
+
+#[test]
+fn table_4_a_10_row_14_matches_spec() {
+    // Row 14: length 4, codeword 0xc. `(y, z) = (1, 1)` since
+    // idx = 1 * 13 + 1 = 14.
+    let (len, cw) = hcod9_encode(14).unwrap();
+    assert_eq!((len, cw), (4, 0xc));
+}
+
+#[test]
+fn table_4_a_10_row_142_matches_spec() {
+    // Row 142: length 15, codeword 0x7ffc — the first of the four
+    // rows that reach the table's maximum codeword length.
+    let (len, cw) = hcod9_encode(142).unwrap();
+    assert_eq!((len, cw), (15, 0x7ffc));
+}
+
+#[test]
+fn table_4_a_10_row_154_matches_spec() {
+    // Row 154: length 15, codeword 0x7ffd.
+    let (len, cw) = hcod9_encode(154).unwrap();
+    assert_eq!((len, cw), (15, 0x7ffd));
+}
+
+#[test]
+fn table_4_a_10_row_155_matches_spec() {
+    // Row 155: length 15, codeword 0x7ffe.
+    let (len, cw) = hcod9_encode(155).unwrap();
+    assert_eq!((len, cw), (15, 0x7ffe));
+}
+
+#[test]
+fn table_4_a_10_row_168_matches_spec() {
+    // Row 168: length 15, codeword 0x7fff — the far corner
+    // `(12, 12)` of the unsigned `13 × 13` pair lattice.
+    let (len, cw) = hcod9_encode(168).unwrap();
+    assert_eq!((len, cw), (15, 0x7fff));
+}
+
+// =============================================================================
+// Table 4.95 row 9 ↔ Table 4.A.10 size cross-check.
+// =============================================================================
+
+#[test]
+fn table_4_95_row_9_declares_unsigned_dim_2_lav_12() {
+    let row = table_4_95(9).unwrap();
+    assert_eq!(row.unsigned, Some(true));
+    assert_eq!(row.dimension, Some(2));
+    assert_eq!(row.lav, Some(12));
+    assert_eq!(row.huffman_table, Some(10));
+    assert!(row.esc_threshold.is_none());
+    // 169 entries follow from (LAV + 1)^dim = 13^2.
+    assert_eq!(HCOD9_NUM_ENTRIES, 169);
+}
+
+// =============================================================================
+// Full writer → reader round-trip for every legal index, with the
+// §4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check threaded
+// through `spectral_codebook::decode_index_to_tuple` /
+// `spectral_codebook::encode_tuple_to_index`.
+// =============================================================================
+
+#[test]
+fn hcod9_every_index_round_trips_writer_to_reader() {
+    for idx in 0..HCOD9_NUM_ENTRIES as u32 {
+        let mut w = BitWriter::new();
+        hcod9_write(&mut w, idx).unwrap();
+        let (len, _) = hcod9_encode(idx).unwrap();
+        let pad = (8 - (u32::from(len) % 8)) % 8;
+        let mut w2 = w;
+        if pad > 0 {
+            w2.write_u32(0, pad);
+        }
+        let bytes = w2.into_bytes();
+        let mut br = BitReader::new(&bytes);
+        let got = hcod9_decode(&mut br).unwrap();
+        assert_eq!(got, idx, "round-trip mismatch at idx={}", idx);
+        assert_eq!(
+            br.bit_position(),
+            u64::from(len),
+            "bit consumption mismatch at idx={}",
+            idx
+        );
+    }
+}
+
+#[test]
+fn hcod9_every_index_translates_through_spectral_codebook_round_trip() {
+    for idx in 0..HCOD9_NUM_ENTRIES as u32 {
+        let tuple = decode_index_to_tuple(9, idx).unwrap();
+        // dim = 2: only the first two slots carry the pair.
+        let y = tuple[0];
+        let z = tuple[1];
+        assert!((0..=12).contains(&y), "y out of range at idx={}", idx);
+        assert!((0..=12).contains(&z), "z out of range at idx={}", idx);
+        let back = encode_tuple_to_index(9, &[y, z]).unwrap();
+        assert_eq!(back, idx, "tuple round-trip mismatch at idx={}", idx);
+    }
+}
+
+#[test]
+fn hcod9_zero_tuple_at_index_0_carries_1_bit_codeword() {
+    // The §4.6.3.3 unsigned polynomial idx = y * 13 + z places
+    // `(0, 0)` at index 0; Codebook 9 hands it the 1-bit `0`
+    // codeword — the shortest possible slot.
+    let tuple = decode_index_to_tuple(9, 0).unwrap();
+    assert_eq!(tuple[0], 0);
+    assert_eq!(tuple[1], 0);
+    let (len, cw) = hcod9_encode(0).unwrap();
+    assert_eq!((len, cw), (1, 0));
+}
+
+#[test]
+fn hcod9_far_corner_lives_at_index_168() {
+    // `(12, 12)` at index 12 * 13 + 12 = 168.
+    let tuple = decode_index_to_tuple(9, 168).unwrap();
+    assert_eq!(tuple[0], 12);
+    assert_eq!(tuple[1], 12);
+    let (len, cw) = hcod9_encode(168).unwrap();
+    assert_eq!((len, cw), (15, 0x7fff));
+}
+
+// =============================================================================
+// Sign-bit cross-check: Codebook 9 is unsigned, so the §4.6.3.3
+// sign-bit suffix follows the Huffman codeword for every non-zero
+// coefficient. The sign-bit count must match the count of non-zero
+// pair coefficients for every legal index.
+// =============================================================================
+
+#[test]
+fn hcod9_emits_one_sign_bit_per_nonzero_coefficient() {
+    for idx in 0..HCOD9_NUM_ENTRIES as u32 {
+        let tuple = decode_index_to_tuple(9, idx).unwrap();
+        // dim = 2: only the first two slots carry the pair.
+        let pair = [tuple[0], tuple[1], 0, 0];
+        let signs = derive_sign_bits(9, &pair).unwrap();
+        let nonzero_count = pair[..2].iter().filter(|&&v| v != 0).count();
+        assert_eq!(
+            signs.len(),
+            nonzero_count,
+            "sign-bit count mismatch at idx={} pair={:?}",
+            idx,
+            &pair[..2]
+        );
+    }
+}
+
+#[test]
+fn hcod9_zero_tuple_emits_zero_sign_bits() {
+    // The zero-tuple `(0, 0)` has no non-zero coefficient — no
+    // sign bits follow.
+    let tuple = decode_index_to_tuple(9, 0).unwrap();
+    let signs = derive_sign_bits(9, &tuple).unwrap();
+    assert!(signs.is_empty());
+}
+
+#[test]
+fn hcod9_max_tuple_emits_two_sign_bits() {
+    // `(12, 12)` at index 168 — both coefficients are non-zero so
+    // two sign bits follow the Huffman codeword.
+    let tuple = decode_index_to_tuple(9, 168).unwrap();
+    let signs = derive_sign_bits(9, &tuple).unwrap();
+    assert_eq!(signs.len(), 2);
+}
+
+// =============================================================================
+// Hand-pinned byte sequences — these lock the exact wire bits the
+// decoder must accept.
+// =============================================================================
+
+#[test]
+fn hcod9_write_index_0_then_align_yields_zero_byte() {
+    // Index 0 → 1-bit `0`. Padding to a byte boundary with zeros
+    // produces 0x00.
+    let mut w = BitWriter::new();
+    hcod9_write(&mut w, 0).unwrap();
+    w.write_u32(0, 7); // pad to byte boundary
+    assert_eq!(w.into_bytes(), vec![0x00]);
+}
+
+#[test]
+fn hcod9_decode_full_15_bit_far_corner_codeword() {
+    // Index 168 → 15-bit 0x7fff packed left-aligned: high byte =
+    // 0xff (bits 14..7), low byte = (0x7f << 1) = 0xfe (bits 6..0
+    // shifted into the top of the low byte).
+    let bytes = [0xff, 0xfe];
+    let mut br = BitReader::new(&bytes);
+    let idx = hcod9_decode(&mut br).unwrap();
+    assert_eq!(idx, 168);
+    assert_eq!(br.bit_position(), 15u64);
+}
+
+// =============================================================================
+// Rejection paths.
+// =============================================================================
+
+#[test]
+fn hcod9_encode_rejects_indices_at_and_above_169() {
+    for bad in [169u32, 170, 200, 1000, u32::MAX] {
+        assert!(matches!(
+            hcod9_encode(bad),
+            Err(Error::SpectralCodebookIndexOutOfRange(9))
+        ));
+    }
+}
+
+#[test]
+fn hcod9_decoder_returns_unexpected_end_on_truncation() {
+    let bytes: [u8; 0] = [];
+    let mut br = BitReader::new(&bytes);
+    let err = hcod9_decode(&mut br).unwrap_err();
+    assert_eq!(err, Error::UnexpectedEnd);
+}
+
+#[test]
+fn hcod9_max_len_constant_matches_table_data() {
+    let mut observed_max = 0u32;
+    for idx in 0..HCOD9_NUM_ENTRIES as u32 {
+        let (len, _) = hcod9_encode(idx).unwrap();
+        observed_max = observed_max.max(u32::from(len));
+    }
+    assert_eq!(observed_max, HCOD9_MAX_LEN);
+}
+
+// =============================================================================
+// Cross-check: Codebook 9 widens the unsigned pair universe from
+// `8 × 8 = 64` entries (Codebooks 7 / 8 with `LAV = 7`) to
+// `13 × 13 = 169` entries (`LAV = 12`). The encoder chooses Codebook
+// 9 when a section's magnitude statistics need range Codebooks 7 / 8
+// cannot reach without ESC.
+// =============================================================================
+
+#[test]
+fn codebook_9_is_the_first_expanded_lav_unsigned_pair_book() {
+    let row7 = table_4_95(7).unwrap();
+    let row8 = table_4_95(8).unwrap();
+    let row9 = table_4_95(9).unwrap();
+    // 7, 8, 9 are all unsigned pair books.
+    for row in [row7, row8, row9] {
+        assert_eq!(row.unsigned, Some(true));
+        assert_eq!(row.dimension, Some(2));
+    }
+    // Books 7 / 8 share LAV = 7; book 9 widens to LAV = 12.
+    assert_eq!(row7.lav, Some(7));
+    assert_eq!(row8.lav, Some(7));
+    assert_eq!(row9.lav, Some(12));
+    // Different Annex 4.A table for each book.
+    assert_eq!(row7.huffman_table, Some(8));
+    assert_eq!(row8.huffman_table, Some(9));
+    assert_eq!(row9.huffman_table, Some(10));
+}
+
+#[test]
+fn codebook_9_universe_is_169_distinct_unsigned_pairs() {
+    // Every legal `(y, z)` pair with `y, z` in `0..=12` must map to a
+    // distinct index, and every index must map back to a distinct
+    // pair. This is the §4.6.3.3 bijection at dim-2 LAV-12.
+    let mut seen = std::collections::HashSet::new();
+    for y in 0..=12i32 {
+        for z in 0..=12i32 {
+            let idx = encode_tuple_to_index(9, &[y, z]).unwrap();
+            assert!(idx < HCOD9_NUM_ENTRIES as u32);
+            assert!(
+                seen.insert(idx),
+                "duplicate idx={} for tuple ({}, {})",
+                idx,
+                y,
+                z
+            );
+            let back = decode_index_to_tuple(9, idx).unwrap();
+            assert_eq!(back[0], y);
+            assert_eq!(back[1], z);
+        }
+    }
+    assert_eq!(seen.len(), HCOD9_NUM_ENTRIES);
+}
+
+#[test]
+fn codebook_9_ceiling_is_5_bits_wider_than_codebook_8() {
+    // Codebook 8's ceiling is 10 bits; Codebook 9's ceiling is 15
+    // bits — a 5-bit jump that reflects the `169 / 64 ≈ 2.6×`
+    // universe expansion.
+    assert_eq!(HCOD8_MAX_LEN, 10);
+    assert_eq!(HCOD9_MAX_LEN, 15);
+    assert_eq!(HCOD9_MAX_LEN - HCOD8_MAX_LEN, 5);
+}
+
+#[test]
+fn codebook_9_zero_tuple_shares_codebook_7_head_placement() {
+    // Codebook 7 parks `(0, 0)` at index 0 with the 1-bit `0`
+    // codeword; Codebook 9 does the same. Codebook 8 lifts the
+    // zero-tuple off the 1-bit slot (5 bits at index 0) and migrates
+    // the shortest codeword to the (1, 1) interior at index 9.
+    let (l7, cw7) = hcod7_encode(0).unwrap();
+    let (l8, cw8) = hcod8_encode(0).unwrap();
+    let (l9, cw9) = hcod9_encode(0).unwrap();
+    assert_eq!((l7, cw7), (1, 0));
+    assert_eq!((l8, cw8), (5, 0xe));
+    assert_eq!((l9, cw9), (1, 0));
 }
