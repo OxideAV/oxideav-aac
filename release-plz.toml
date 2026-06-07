@@ -13,19 +13,13 @@ git_release_name = "v{{ version }}"
 # patch-only until we deliberately cut 1.0.
 semver_check = false
 
-# Recognise this crate's round-work commit convention as "Features"
-# so release-plz auto-bumps when a round lands. Without this, commits
-# shaped `phase N (rNNN): ...` look like unstructured prose to the
-# default conventional-commits parser, no PR is opened, and downstream
-# consumers (oxideav-meta) can't resolve `oxideav-aac = "0.1"`.
-#
-# The first three rules are the defaults release-plz applies; the
-# fourth lifts the `phase` subject convention into the same group.
-[changelog]
-commit_parsers = [
-    { message = "^feat", group = "Features" },
-    { message = "^fix", group = "Bug Fixes" },
-    { message = "^chore\\(release\\)", skip = true },
-    { message = "^phase\\b", group = "Features" },
-    { message = ".*", group = "Other" },
-]
+# The round-work commit convention (`phase N (rNNN): ...`) doesn't
+# match release-plz's default conventional-commits matcher, so by
+# default the release-PR job decides "no releasable change" and
+# returns `{"prs":[]}`. With every published 0.1.x yanked (see #1025),
+# downstream consumers (oxideav-meta) can't resolve `oxideav-aac =
+# "0.1"`. Force a PR on every push so the round-work commits flow
+# through the publish wave automatically.
+[[package]]
+name = "oxideav-aac"
+release_always = true
