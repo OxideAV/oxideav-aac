@@ -3,6 +3,57 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 263)
+
+Round 263 adds the [`tns_coef`](src/tns_coef.rs) module — the
+ISO/IEC 14496-3 §4.6.9.3 `tns_decode_coef` inverse-quantisation and
+conversion-to-LPC step-up surface, plus the §C.6 encoder-side
+companion `tns_encode_coef`. This is the missing bridge between the
+existing [`tns_data`](src/tns_data.rs) wire parser (which surfaces
+the unsigned-magnitude `coef[i]` field as transmitted, packed into
+`coef_res2 = coef_res_bits − coef_compress ∈ {2, 3, 4}` bits) and
+the eventual `tns_ar_filter()` all-pole IIR pass that operates on
+the reconstructed MDCT spectrum. The decode path follows the
+§4.6.9.3 pseudocode literally: the wire `coef[i]` is sign-extended
+via the §4.6.9.3 `sgn_mask` / `neg_mask` pair (two's-complement
+extension of the truncated `coef_res2`-bit field, validated by
+walking every legal wire pattern across all three field widths),
+then inverse-quantised via `sin(tmp[i] / iqfac_branch)` where the
+divisor branches on the sign of the sign-extended index: `iqfac =
+((1 << (coef_res_bits-1)) - 0.5) / (π/2)` for non-negative,
+`iqfac_m = ((1 << (coef_res_bits-1)) + 0.5) / (π/2)` for negative.
+The half-bit offset matches the §C.6 encoder's rounded
+`NINT(arcsin(r) * iqfac_branch)` quantisation so every legal wire
+value round-trips through decode → encode bit-exactly (a full
+enumeration across all four `(coef_res_bits, coef_compress)`
+combinations confirms the invariant: 16 patterns at `(4, 0)`, 8 at
+both `(3, 0)` and `(4, 1)`, 4 at `(3, 1)`). The §4.6.9.3
+conversion-to-LPC step-up loop is implemented as `lpc_step_up`: it
+takes the inverse-quantised PARCOR array and produces the
+`order + 1` direct-form LPC `a[]` vector with `a[0] = 1.0` and
+`a[order] = parcor[order-1]`, intermediate slots derived by the
+spec's `b[i] = a[i] + k * a[m-i]` cross-term recurrence (validated
+against hand-arithmetic at orders 1, 2, and 3). The combined
+`tns_decode_coef_to_lpc` wrapper runs both passes in one call for
+the eventual `tns_decode_frame()` orchestration. Encoder-side
+saturation lands at the field extrema: `r = +1.0` rounds to
+`NINT(π/2 · iqfac(4)) = NINT(7.5) = 8` clamped to the 4-bit signed
+max `+7` (wire `0b0111`), and `r = -1.0` rounds to
+`NINT(-π/2 · iqfac_m(4)) = -9` clamped to `-8` (wire `0b1000`).
+Argument validation: invalid `coef_res_bits` (anything outside
+`{3, 4}`), `coef_compress > 1`, wire `coef[i]` that overflows the
+`coef_res2`-bit field, encode PARCOR values `|r| > 1.0` (or NaN /
+±∞ — `arcsin` undefined), or `pack_coef` values outside the
+field-representable signed range all surface as the new
+`Error::TnsCoefOutOfRange`. The §4.6.9.3 `tns_ar_filter()` all-pole
+IIR pass and the `tns_decode_frame()` orchestration that chains
+`tns_decode_coef_to_lpc` / `tns_ar_filter` per `(window, filter)`
+are deferred until the IMDCT back-end lands. The §4.6.17.3.4 ER
+AAC LD `int_tns_decode_coef()` integer variant is deferred until
+the LD reconstruction path is wired. 36 new unit tests
+(`src/tns_coef.rs`) plus 11 new integration tests
+(`tests/tns_coef.rs`) lift the total green test count to **1050**.
+
 ## Status (round 259)
 
 Round 259 lands **Table 4.A.12** (Spectrum Huffman Codebook 11) inside

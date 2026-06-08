@@ -359,6 +359,21 @@ pub enum Error {
     /// decoded value exceeding `MAX_QUANT` (`8191`), or an encoder
     /// value `< 16` (which is in-band, not ESC-encoded).
     SpectralCodebookEscOutOfRange,
+
+    /// [`crate::tns_coef::tns_decode_coef`] /
+    /// [`crate::tns_coef::tns_encode_coef`] /
+    /// [`crate::tns_coef::iqfac`] / [`crate::tns_coef::iqfac_m`] /
+    /// [`crate::tns_coef::sign_extend_coef`] /
+    /// [`crate::tns_coef::pack_coef`] was called with an argument
+    /// outside the §4.6.9.3 / §C.6 legal range. Examples:
+    /// `coef_res_bits` not in `{3, 4}` (the spec's `coef_res[w] + 3`
+    /// envelope); `coef_compress > 1` (a 1-bit wire flag); a wire
+    /// `coef[i]` value that does not fit in `coef_res2 =
+    /// coef_res_bits - coef_compress` bits; a `pack_coef` `value`
+    /// outside `-(1 << (coef_res2-1))..=(1 << (coef_res2-1)) - 1`;
+    /// or an encode-side PARCOR coefficient `|r| > 1.0` (or NaN /
+    /// ±∞) — `arcsin` is undefined outside `[-1, 1]`.
+    TnsCoefOutOfRange,
 }
 
 impl core::fmt::Display for Error {
@@ -545,6 +560,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "spectral codebook 11/16..=31 ESC sequence: prefix_len, escape_word, or magnitude outside §4.6.3.3 range"
+                )
+            }
+            Error::TnsCoefOutOfRange => {
+                write!(
+                    f,
+                    "tns_coef: coef_res_bits / coef_compress / wire coef / PARCOR value outside §4.6.9.3 / §C.6 legal range"
                 )
             }
         }

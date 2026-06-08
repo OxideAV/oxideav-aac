@@ -8,6 +8,81 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r263): `tns_coef` module — ISO/IEC 14496-3 §4.6.9.3
+  `tns_decode_coef` inverse-quantisation and conversion-to-LPC
+  step-up procedure, plus the §C.6 encoder-side companion
+  `tns_encode_coef`. This is the bridge between the
+  [`tns_data`](src/tns_data.rs) wire parser (which surfaces the
+  unsigned-magnitude `coef[i]` field as transmitted, packed into
+  `coef_res2 ∈ {2, 3, 4}` bits per the `coef_res[w] +
+  3 − coef_compress` arithmetic) and the eventual `tns_ar_filter()`
+  all-pole IIR pass that operates on the reconstructed MDCT
+  spectrum. The decode path follows the §4.6.9.3 pseudocode literally:
+  the wire `coef[i]` is sign-extended via the §4.6.9.3 `sgn_mask` /
+  `neg_mask` pair (equivalent to a two's-complement extension of the
+  truncated `coef_res2`-bit field), then inverse-quantised via
+  `sin(tmp[i] / iqfac_branch)` where the divisor branches on the sign
+  of the sign-extended index: `iqfac = ((1 << (coef_res_bits-1)) -
+  0.5) / (π/2)` for non-negative indices and `iqfac_m = ((1 <<
+  (coef_res_bits-1)) + 0.5) / (π/2)` for negative indices. The
+  half-bit offset matches the §C.6 encoder's rounded
+  `NINT(arcsin(r) * iqfac_branch)` quantisation so every legal wire
+  value round-trips through decode → encode bit-exactly (35 wire
+  patterns across all four `(coef_res_bits, coef_compress)`
+  combinations, enumerated at unit-test time). The §4.6.9.3
+  conversion-to-LPC step-up loop is implemented as [`lpc_step_up`]:
+  it takes the inverse-quantised PARCOR array and produces the
+  `order + 1` direct-form LPC `a[]` vector with `a[0] = 1.0` and
+  `a[order] = parcor[order-1]`, with intermediate slots derived by
+  the spec's `b[i] = a[i] + k * a[m-i]` cross-term recurrence
+  (validated against hand-arithmetic at orders 1, 2, and 3). The
+  combined wrapper [`tns_decode_coef_to_lpc`] runs both passes for
+  the eventual `tns_decode_frame()` orchestration. Encoder-side
+  saturation: `r = ±1.0` rounds to `±NINT(π/2 * iqfac_branch)` and
+  clamps to the `coef_res2`-bit signed field extrema (`±7` /
+  `±8`-clamped-to-`+7,-8` at `coef_res2 = 4`). Public API:
+  [`iqfac`] / [`iqfac_m`] (the §4.6.9.3 scaling constants),
+  [`sign_extend_coef`] / [`pack_coef`] (signed-magnitude wire ↔
+  signed integer), [`tns_decode_coef`] / [`tns_encode_coef`] (the
+  full inverse-quantisation surface), [`lpc_step_up`] (the §4.6.9.3
+  conversion-to-LPC second loop), and [`tns_decode_coef_to_lpc`]
+  (the combined wrapper). Argument-validation errors all surface as
+  the new [`Error::TnsCoefOutOfRange`] variant: invalid
+  `coef_res_bits` (anything outside `{3, 4}`), `coef_compress > 1`,
+  wire `coef[i]` that overflows the `coef_res2`-bit field, encode
+  PARCOR values `|r| > 1.0` (or NaN / ±∞ — `arcsin` undefined), or
+  `pack_coef` values outside the field-representable signed range.
+  Adds 36 new unit tests (the `iqfac` / `iqfac_m` per-width formula
+  / branch ordering invariant / full sign-extension enumeration
+  across 4 / 3 / 2-bit widths / `pack_coef` ↔ `sign_extend_coef`
+  round-trip across 4 / 3 / 2-bit widths / `pack_coef` rejection
+  outside field / decode zero-wire ↔ zero-PARCOR / decode extrema
+  match hand-arithmetic / negative branch uses `iqfac_m` / 3-bit
+  `coef_res_bits` decode / decode rejects oversized wire value under
+  `coef_compress = 1` / decode rejects invalid `coef_res_bits` /
+  decode rejects invalid `coef_compress` / decode empty input /
+  encode zero ↔ zero / encode `±1.0` saturates to field extrema /
+  encode rejects `|r| > 1.0` / encode rejects invalid
+  `coef_res_bits` / full decode→encode round-trip across every
+  4-bit / 3-bit / compressed wire pattern / step-up unit at order 0
+  / 1 / 2 / 3 / `a[0] = 1` invariant / `a[order] = parcor[order-1]`
+  invariant / combined `decode_to_lpc` wrapper / wrapper propagates
+  decode errors) plus 11 new integration tests in
+  `tests/tns_coef.rs` (`iqfac_m − iqfac == 2/π` invariant /
+  full sign-extend↔pack round-trip enumeration / decoded PARCOR
+  magnitudes are `|·| ≤ 1` across every config / full decode→encode
+  round-trip across every legal wire pattern / batch of mixed signs
+  preserves per-element branch selection / `coef_compress` shrinks
+  field but not iqfac contrast / `decode_to_lpc` matches manual
+  composition / step-up stability for `|k| < 1` PARCOR / canonical
+  `Error::TnsCoefOutOfRange` propagation / realistic order-8 filter
+  decay invariant). Lays the groundwork for the eventual
+  `tns_ar_filter()` IIR pass; the §4.6.9 `tns_decode_frame()`
+  orchestration that chains `tns_decode_coef_to_lpc` and
+  `tns_ar_filter` per (window, filter) lands once the IMDCT
+  back-end is present. The §4.6.17.3.4 ER AAC LD
+  `int_tns_decode_coef()` integer variant is deferred until the LD
+  reconstruction path is wired.
 - phase 2 (r259): `spectrum_huffman::HCOD11` — ISO/IEC 14496-3 §4.6.3
   / Annex 4.A Table 4.A.12 (Spectrum Huffman Codebook 11) wire layer.
   Codebook 11 is the only **ESC** spectrum book — Table 4.95 row 11
