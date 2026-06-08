@@ -8,6 +8,61 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r259): `spectrum_huffman::HCOD11` — ISO/IEC 14496-3 §4.6.3
+  / Annex 4.A Table 4.A.12 (Spectrum Huffman Codebook 11) wire layer.
+  Codebook 11 is the only **ESC** spectrum book — Table 4.95 row 11
+  declares `unsigned_cb = 1`, `dim = 2`, `LAV = 16` with an ESC
+  threshold of `8191` (the §4.6.1.3 `x_quant` ceiling). The §4.6.3.3
+  in-band universe widens to a `17 × 17 = 289`-entry lattice indexed
+  `0..=288` with each `(y, z)` coefficient in `0..=16`; a coefficient
+  value of `16` in either slot is the `escape_flag` whose actual
+  magnitude is reconstructed from the `escape_sequence` bridged by
+  `crate::spectral_codebook::decode_esc_value` /
+  `crate::spectral_codebook::encode_esc_value` (round 213) — separate
+  from the Huffman codeword carried by this module. The §4.6.3.3
+  unsigned polynomial `idx = y * 17 + z` parks the zero-tuple `(0, 0)`
+  at index 0 with the shortest 4-bit codeword `0b0000`, shares that
+  4-bit floor with the interior `(1, 1)` pair at index 18 (codeword
+  `0b0001`), pins the half-ESC tuples `(0, 16)` and `(16, 0)` to
+  10-bit `0x38e` (index 16) and 9-bit `0x1c2` (index 272), and parks
+  the full-ESC corner `(16, 16)` at index 288 with the 5-bit `0b00100`
+  (`0x04`) — the wire layout extends with two sign bits and two
+  escape sequences for that corner, so the in-band Huffman codeword
+  stays short. The codeword ceiling matches Codebook 10's 12 bits —
+  exactly six rows reach it (indices 12, 14, 15, 255, 269, 270 with
+  codewords `0xffb`, `0xffa`, `0xffe`, `0xffd`, `0xffc`, `0xfff`) —
+  because Codebook 11 pushes its tail distribution into the §4.6.3
+  ESC sequence rather than spending longer Huffman codewords on it.
+  Public constants `HCOD11_NUM_ENTRIES = 289`, `HCOD11_MAX_LEN = 12`.
+  Public functions `hcod11_encode(idx) -> (length, codeword)`
+  (right-aligned in `u16`), `hcod11_decode(reader) -> idx` (MSB-first
+  prefix match, linear scan against the 289-row table), and the
+  convenience writer `hcod11_write(writer, idx)`. Out-of-range indices
+  (`idx > 288`) surface as `Error::SpectralCodebookIndexOutOfRange(11)`;
+  the decoder surfaces `Error::UnexpectedEnd` on reader underflow. The
+  table is a **complete** prefix code (Kraft equality
+  `Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified by walking
+  every 12-bit prefix at unit-test time and asserting each maps to
+  exactly one entry — so the decoder's `unreachable!()` fall-through
+  is dead by construction. Adds 20 new unit tests and 30 new
+  integration tests covering 289-entry shape / 12-bit max / 4-bit
+  min at indices 0 and 18 / per-row PDF spot checks at indices 0 / 1
+  / 12 / 14 / 15 / 16 / 18 / 255 / 269 / 270 / 272 / 288 /
+  six-12-bit-ceiling enumeration / half-ESC tuple ↔ index 16 and 272
+  cross-check / Kraft equality / complete-prefix walk over all `2^12`
+  prefixes / Table 4.95 row 11 ↔ Table 4.A.12 size cross-check /
+  full writer→reader round-trip with bit-consumption invariant /
+  the §4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check / 289-pair
+  bijection sweep / per-index sign-bit-count invariant against
+  `derive_sign_bits(11, …)` / zero-tuple zero-sign-bits invariant /
+  far-corner two-sign-bits invariant / hand-pinned byte sequences for
+  indices 0 and 270 / encode and write rejection at and above 289 /
+  truncation rejection / Codebook-10-and-11-share-12-bit-ceiling
+  cross-check / Codebook-11-is-the-only-ESC-spectrum-book cross-check
+  / in-band ↔ ESC-border disjoint-set partition (256 in-band pairs +
+  33 ESC-border pairs = 289). Completes the AAC spectrum Huffman
+  Codebook 1..=11 table set; the next step is the §4.4.6
+  `spectral_data()` wire walker.
 - phase 2 (r255): `spectrum_huffman::HCOD10` — ISO/IEC 14496-3 §4.6.3
   / Annex 4.A Table 4.A.11 (Spectrum Huffman Codebook 10) wire layer.
   Codebook 10 is the second **expanded-LAV unsigned pair** spectrum

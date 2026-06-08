@@ -78,10 +78,37 @@
 //! relative to Codebook 7 (one row lifted from the 1-bit slot,
 //! shortest codeword moved off the zero-tuple) but at the wider
 //! `LAV = 12` universe.
-//! Codebook 11 (Table 4.A.12) reuses the same module shape and will
-//! be added in a future round; the traits and dispatch surface here
-//! are intentionally codebook-agnostic so the per-codebook addition
-//! lands as a single static-table transcription.
+//! Round 259 adds the eleventh — **Table 4.A.12, "Spectrum Huffman
+//! Codebook 11"** — the only **ESC** spectrum book (Table 4.95
+//! row 11: `unsigned_cb = 1`, `dim = 2`, `LAV = 16` with an ESC
+//! threshold of `8191` — the §4.6.1.3 `x_quant` ceiling). The
+//! §4.6.3.3 in-band universe widens to a `17 × 17 = 289`-entry
+//! lattice indexed `0..=288` with each `(y, z)` coefficient in
+//! `0..=16`; a coefficient value of `16` in either slot is the
+//! §4.6.3.3 `escape_flag` whose actual magnitude is reconstructed
+//! from the `escape_sequence` (`escape_prefix` of N `1`s, a `0`
+//! `escape_separator`, and an `(N + 4)`-bit `escape_word`) bridged
+//! by [`crate::spectral_codebook::decode_esc_value`] /
+//! [`crate::spectral_codebook::encode_esc_value`] — both already
+//! landed in round 213, separate from the Huffman codeword this
+//! module carries. Codebook 11 parks the zero-tuple `(0, 0)` at
+//! index 0 with the shortest 4-bit codeword `0b0000`, shares that
+//! 4-bit floor with the interior `(1, 1)` pair at index 18 (the
+//! second 4-bit slot, codeword `0b0001`), pins the half-ESC tuples
+//! `(0, 16)` and `(16, 0)` to 10-bit `0x38e` (index 16) and 9-bit
+//! `0x1c2` (index 272), and parks the full-ESC corner `(16, 16)`
+//! at index 288 with the surprisingly short 5-bit `0b00100`
+//! (`0x04`) — the wire layout extends with two sign bits and two
+//! escape sequences for that corner, so the Huffman codeword
+//! itself stays short. The codeword ceiling matches Codebook 10's
+//! 12 bits — exactly six rows reach it (indices 12, 14, 15, 255,
+//! 269, 270) — because Codebook 11 pushes its tail distribution
+//! out of the Huffman table and into the §4.6.3 ESC sequence.
+//! With Codebook 11 the per-codebook AAC spectrum Huffman tables
+//! are complete (Tables 4.A.2 through 4.A.12 all land in this
+//! module); the next step is the §4.4.6 `spectral_data()` wire
+//! walker that loops over scalefactor bands and dispatches per-band
+//! onto the codebook chosen by `section_data()`.
 //!
 //! ## Codebook 1 invariants (Table 4.A.2)
 //!
@@ -2481,6 +2508,451 @@ pub fn hcod10_write(writer: &mut BitWriter, idx: u32) -> Result<()> {
     Ok(())
 }
 
+// =====================================================================
+// Codebook 11 — Table 4.A.12
+// =====================================================================
+//
+// Codebook 11 is the only AAC spectrum book that carries an **escape
+// (ESC) sequence**. Table 4.95 row 11 declares `unsigned_cb = 1`,
+// `dim = 2`, `LAV = 16` and an ESC threshold of `8191` — the §4.6.1.3
+// `x_quant` ceiling. The in-band Huffman universe is therefore the
+// `(LAV + 1)^dim = 17^2 = 289`-entry lattice indexed `0..=288` with
+// each `(y, z)` coefficient in `0..=16`. A coefficient value of `16`
+// in either `y` or `z` is **not** a literal 16: per §4.6.3.3 it is the
+// `escape_flag` that signals an `escape_sequence` follows the
+// Huffman codeword (and any sign-bit suffix). The
+// `escape_sequence` is a unary `escape_prefix` of N `1` bits, a
+// `0` `escape_separator`, and an `(N + 4)`-bit unsigned `escape_word`,
+// whose reconstructed magnitude is `2^(N + 4) + escape_word`. The
+// ESC bridge sits in [`crate::spectral_codebook::decode_esc_value`]
+// / [`crate::spectral_codebook::encode_esc_value`] and is **not**
+// part of the Huffman codeword carried here; this module's
+// `hcod11_encode` / `hcod11_decode` cover the codeword only.
+//
+// The §4.6.3.3 unsigned polynomial `idx = y * (LAV + 1) + z = y * 17
+// + z` parks the zero-tuple `(0, 0)` at index 0 with the 4-bit
+// codeword `0b0000` — the shortest slot. The interior pair `(1, 1)`
+// lives at index `1 * 17 + 1 = 18` and shares the 4-bit floor with
+// the zero-tuple (codeword `0b0001`). The far corner `(16, 16)` —
+// both coefficients flagged as ESC — lives at index `16 * 17 + 16 =
+// 288` with the 5-bit `0b00100` (`0x04`); the `(0, 16)` half-ESC
+// tuple lives at index 16 with the 10-bit `0x38e`; the `(16, 0)`
+// half-ESC tuple lives at index `16 * 17 = 272` with the 9-bit
+// `0x1c2`. The maximum codeword length is **12 bits** — matching
+// Codebook 10's ceiling — and exactly six rows reach that 12-bit
+// ceiling (indices 12, 14, 15, 255, 269, 270 with codewords
+// `0xffb`, `0xffa`, `0xffe`, `0xffd`, `0xffc`, `0xfff`). Exactly two
+// rows reach the 4-bit floor: indices 0 and 18 (the zero-tuple and
+// the interior `(1, 1)` pair). The codeword-length histogram is
+// `{4: 2, 5: 6, 6: 7, 7: 16, 8: 59, 9: 55, 10: 95, 11: 43, 12: 6}`.
+//
+// Because Codebook 11 is unsigned, a sign-bit suffix follows the
+// Huffman codeword for every non-zero coefficient per §4.6.3.3 —
+// the suffix is delivered by `crate::spectral_codebook::apply_sign_bits`
+// / `crate::spectral_codebook::derive_sign_bits`, separate from the
+// Huffman codeword carried here. The §4.6.3.3 wire layout for an
+// in-band coefficient pair is: `<Huffman codeword>` then `0..=2`
+// sign bits (one per non-zero coefficient). When `y` or `z` is at
+// the ESC threshold (`= 16`), the wire layout extends with the
+// `escape_sequence` bridge per §4.6.3 (handled outside this
+// module).
+
+/// Number of entries in Table 4.A.12 (`289`, indices `0..=288`).
+pub const HCOD11_NUM_ENTRIES: usize = 289;
+
+/// Maximum codeword length emitted by Table 4.A.12 (12 bits).
+pub const HCOD11_MAX_LEN: u32 = 12;
+
+/// Table 4.A.12 — `(length_in_bits, codeword)` per index `0..=288`.
+///
+/// Codewords are right-aligned within the `u16`. To emit one
+/// bit-for-bit, write `codeword` as `length` bits MSB-first.
+///
+/// A coefficient value of `16` in either slot of the decoded
+/// `(y, z)` pair is the §4.6.3.3 `escape_flag` — the actual
+/// magnitude is reconstructed by the
+/// [`crate::spectral_codebook::decode_esc_value`] bridge from the
+/// `escape_sequence` that follows the Huffman codeword (and any
+/// sign-bit suffix) on the wire.
+const HCOD11: [(u8, u16); HCOD11_NUM_ENTRIES] = [
+    (4, 0x0000),  // 0 — zero-tuple (y, z) = (0, 0)
+    (5, 0x0006),  // 1
+    (6, 0x0019),  // 2
+    (7, 0x003d),  // 3
+    (8, 0x009c),  // 4
+    (8, 0x00c6),  // 5
+    (9, 0x01a7),  // 6
+    (10, 0x0390), // 7
+    (10, 0x03c2), // 8
+    (10, 0x03df), // 9
+    (11, 0x07e6), // 10
+    (11, 0x07f3), // 11
+    (12, 0x0ffb), // 12
+    (11, 0x07ec), // 13
+    (12, 0x0ffa), // 14
+    (12, 0x0ffe), // 15
+    (10, 0x038e), // 16 — (y, z) = (0, 16) — z at ESC threshold
+    (5, 0x0005),  // 17
+    (4, 0x0001),  // 18 — interior (y, z) = (1, 1), shortest 4-bit `0b0000`
+    (5, 0x0008),  // 19
+    (6, 0x0014),  // 20
+    (7, 0x0037),  // 21
+    (7, 0x0042),  // 22
+    (8, 0x0092),  // 23
+    (8, 0x00af),  // 24
+    (9, 0x0191),  // 25
+    (9, 0x01a5),  // 26
+    (9, 0x01b5),  // 27
+    (10, 0x039e), // 28
+    (10, 0x03c0), // 29
+    (10, 0x03a2), // 30
+    (10, 0x03cd), // 31
+    (11, 0x07d6), // 32
+    (8, 0x00ae),  // 33
+    (6, 0x0017),  // 34
+    (5, 0x0007),  // 35
+    (5, 0x0009),  // 36
+    (6, 0x0018),  // 37
+    (7, 0x0039),  // 38
+    (7, 0x0040),  // 39
+    (8, 0x008e),  // 40
+    (8, 0x00a3),  // 41
+    (8, 0x00b8),  // 42
+    (9, 0x0199),  // 43
+    (9, 0x01ac),  // 44
+    (9, 0x01c1),  // 45
+    (10, 0x03b1), // 46
+    (10, 0x0396), // 47
+    (10, 0x03be), // 48
+    (10, 0x03ca), // 49
+    (8, 0x009d),  // 50
+    (7, 0x003c),  // 51
+    (6, 0x0015),  // 52
+    (6, 0x0016),  // 53
+    (6, 0x001a),  // 54
+    (7, 0x003b),  // 55
+    (7, 0x0044),  // 56
+    (8, 0x0091),  // 57
+    (8, 0x00a5),  // 58
+    (8, 0x00be),  // 59
+    (9, 0x0196),  // 60
+    (9, 0x01ae),  // 61
+    (9, 0x01b9),  // 62
+    (10, 0x03a1), // 63
+    (10, 0x0391), // 64
+    (10, 0x03a5), // 65
+    (10, 0x03d5), // 66
+    (8, 0x0094),  // 67
+    (8, 0x009a),  // 68
+    (7, 0x0036),  // 69
+    (7, 0x0038),  // 70
+    (7, 0x003a),  // 71
+    (7, 0x0041),  // 72
+    (8, 0x008c),  // 73
+    (8, 0x009b),  // 74
+    (8, 0x00b0),  // 75
+    (8, 0x00c3),  // 76
+    (9, 0x019e),  // 77
+    (9, 0x01ab),  // 78
+    (9, 0x01bc),  // 79
+    (10, 0x039f), // 80
+    (10, 0x038f), // 81
+    (10, 0x03a9), // 82
+    (10, 0x03cf), // 83
+    (8, 0x0093),  // 84
+    (8, 0x00bf),  // 85
+    (7, 0x003e),  // 86
+    (7, 0x003f),  // 87
+    (7, 0x0043),  // 88
+    (7, 0x0045),  // 89
+    (8, 0x009e),  // 90
+    (8, 0x00a7),  // 91
+    (8, 0x00b9),  // 92
+    (9, 0x0194),  // 93
+    (9, 0x01a2),  // 94
+    (9, 0x01ba),  // 95
+    (9, 0x01c3),  // 96
+    (10, 0x03a6), // 97
+    (10, 0x03a7), // 98
+    (10, 0x03bb), // 99
+    (10, 0x03d4), // 100
+    (8, 0x009f),  // 101
+    (9, 0x01a0),  // 102
+    (8, 0x008f),  // 103
+    (8, 0x008d),  // 104
+    (8, 0x0090),  // 105
+    (8, 0x0098),  // 106
+    (8, 0x00a6),  // 107
+    (8, 0x00b6),  // 108
+    (8, 0x00c4),  // 109
+    (9, 0x019f),  // 110
+    (9, 0x01af),  // 111
+    (9, 0x01bf),  // 112
+    (10, 0x0399), // 113
+    (10, 0x03bf), // 114
+    (10, 0x03b4), // 115
+    (10, 0x03c9), // 116
+    (10, 0x03e7), // 117
+    (8, 0x00a8),  // 118
+    (9, 0x01b6),  // 119
+    (8, 0x00ab),  // 120
+    (8, 0x00a4),  // 121
+    (8, 0x00aa),  // 122
+    (8, 0x00b2),  // 123
+    (8, 0x00c2),  // 124
+    (8, 0x00c5),  // 125
+    (9, 0x0198),  // 126
+    (9, 0x01a4),  // 127
+    (9, 0x01b8),  // 128
+    (10, 0x038c), // 129
+    (10, 0x03a4), // 130
+    (10, 0x03c4), // 131
+    (10, 0x03c6), // 132
+    (10, 0x03dd), // 133
+    (10, 0x03e8), // 134
+    (8, 0x00ad),  // 135
+    (10, 0x03af), // 136
+    (9, 0x0192),  // 137
+    (8, 0x00bd),  // 138
+    (8, 0x00bc),  // 139
+    (9, 0x018e),  // 140
+    (9, 0x0197),  // 141
+    (9, 0x019a),  // 142
+    (9, 0x01a3),  // 143
+    (9, 0x01b1),  // 144
+    (10, 0x038d), // 145
+    (10, 0x0398), // 146
+    (10, 0x03b7), // 147
+    (10, 0x03d3), // 148
+    (10, 0x03d1), // 149
+    (10, 0x03db), // 150
+    (11, 0x07dd), // 151
+    (8, 0x00b4),  // 152
+    (10, 0x03de), // 153
+    (9, 0x01a9),  // 154
+    (9, 0x019b),  // 155
+    (9, 0x019c),  // 156
+    (9, 0x01a1),  // 157
+    (9, 0x01aa),  // 158
+    (9, 0x01ad),  // 159
+    (9, 0x01b3),  // 160
+    (10, 0x038b), // 161
+    (10, 0x03b2), // 162
+    (10, 0x03b8), // 163
+    (10, 0x03ce), // 164
+    (10, 0x03e1), // 165
+    (10, 0x03e0), // 166
+    (11, 0x07d2), // 167
+    (11, 0x07e5), // 168
+    (8, 0x00b7),  // 169
+    (11, 0x07e3), // 170
+    (9, 0x01bb),  // 171
+    (9, 0x01a8),  // 172
+    (9, 0x01a6),  // 173
+    (9, 0x01b0),  // 174
+    (9, 0x01b2),  // 175
+    (9, 0x01b7),  // 176
+    (10, 0x039b), // 177
+    (10, 0x039a), // 178
+    (10, 0x03ba), // 179
+    (10, 0x03b5), // 180
+    (10, 0x03d6), // 181
+    (11, 0x07d7), // 182
+    (10, 0x03e4), // 183
+    (11, 0x07d8), // 184
+    (11, 0x07ea), // 185
+    (8, 0x00ba),  // 186
+    (11, 0x07e8), // 187
+    (10, 0x03a0), // 188
+    (9, 0x01bd),  // 189
+    (9, 0x01b4),  // 190
+    (10, 0x038a), // 191
+    (9, 0x01c4),  // 192
+    (10, 0x0392), // 193
+    (10, 0x03aa), // 194
+    (10, 0x03b0), // 195
+    (10, 0x03bc), // 196
+    (10, 0x03d7), // 197
+    (11, 0x07d4), // 198
+    (11, 0x07dc), // 199
+    (11, 0x07db), // 200
+    (11, 0x07d5), // 201
+    (11, 0x07f0), // 202
+    (8, 0x00c1),  // 203
+    (11, 0x07fb), // 204
+    (10, 0x03c8), // 205
+    (10, 0x03a3), // 206
+    (10, 0x0395), // 207
+    (10, 0x039d), // 208
+    (10, 0x03ac), // 209
+    (10, 0x03ae), // 210
+    (10, 0x03c5), // 211
+    (10, 0x03d8), // 212
+    (10, 0x03e2), // 213
+    (10, 0x03e6), // 214
+    (11, 0x07e4), // 215
+    (11, 0x07e7), // 216
+    (11, 0x07e0), // 217
+    (11, 0x07e9), // 218
+    (11, 0x07f7), // 219
+    (9, 0x0190),  // 220
+    (11, 0x07f2), // 221
+    (10, 0x0393), // 222
+    (9, 0x01be),  // 223
+    (9, 0x01c0),  // 224
+    (10, 0x0394), // 225
+    (10, 0x0397), // 226
+    (10, 0x03ad), // 227
+    (10, 0x03c3), // 228
+    (10, 0x03c1), // 229
+    (10, 0x03d2), // 230
+    (11, 0x07da), // 231
+    (11, 0x07d9), // 232
+    (11, 0x07df), // 233
+    (11, 0x07eb), // 234
+    (11, 0x07f4), // 235
+    (11, 0x07fa), // 236
+    (9, 0x0195),  // 237
+    (11, 0x07f8), // 238
+    (10, 0x03bd), // 239
+    (10, 0x039c), // 240
+    (10, 0x03ab), // 241
+    (10, 0x03a8), // 242
+    (10, 0x03b3), // 243
+    (10, 0x03b9), // 244
+    (10, 0x03d0), // 245
+    (10, 0x03e3), // 246
+    (10, 0x03e5), // 247
+    (11, 0x07e2), // 248
+    (11, 0x07de), // 249
+    (11, 0x07ed), // 250
+    (11, 0x07f1), // 251
+    (11, 0x07f9), // 252
+    (11, 0x07fc), // 253
+    (9, 0x0193),  // 254
+    (12, 0x0ffd), // 255
+    (10, 0x03dc), // 256
+    (10, 0x03b6), // 257
+    (10, 0x03c7), // 258
+    (10, 0x03cc), // 259
+    (10, 0x03cb), // 260
+    (10, 0x03d9), // 261
+    (10, 0x03da), // 262
+    (11, 0x07d3), // 263
+    (11, 0x07e1), // 264
+    (11, 0x07ee), // 265
+    (11, 0x07ef), // 266
+    (11, 0x07f5), // 267
+    (11, 0x07f6), // 268
+    (12, 0x0ffc), // 269
+    (12, 0x0fff), // 270
+    (9, 0x019d),  // 271
+    (9, 0x01c2),  // 272 — (y, z) = (16, 0) — y at ESC threshold
+    (8, 0x00b5),  // 273
+    (8, 0x00a1),  // 274
+    (8, 0x0096),  // 275
+    (8, 0x0097),  // 276
+    (8, 0x0095),  // 277
+    (8, 0x0099),  // 278
+    (8, 0x00a0),  // 279
+    (8, 0x00a2),  // 280
+    (8, 0x00ac),  // 281
+    (8, 0x00a9),  // 282
+    (8, 0x00b1),  // 283
+    (8, 0x00b3),  // 284
+    (8, 0x00bb),  // 285
+    (8, 0x00c0),  // 286
+    (9, 0x018f),  // 287
+    (5, 0x0004),  // 288 — far corner (y, z) = (16, 16) — both at ESC threshold
+];
+
+/// Encode a Codebook 11 codeword index (`0..=288`) to the wire Huffman
+/// codeword from Table 4.A.12.
+///
+/// Returns `(length_in_bits, codeword)` with `codeword` right-aligned
+/// in the `u16` (MSB at bit `length − 1`). Out-of-range `idx`
+/// produces [`Error::SpectralCodebookIndexOutOfRange`]; the legal
+/// range is `0..=288` (the 289-entry `17^2` enumeration of every
+/// legal unsigned pair with each coefficient in `0..=16` where `16`
+/// is the §4.6.3.3 escape flag).
+///
+/// The inverse of [`hcod11_decode`]. Because Codebook 11 is unsigned,
+/// callers transmit one sign bit after the codeword for each non-zero
+/// coefficient via
+/// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits) /
+/// [`derive_sign_bits`](crate::spectral_codebook::derive_sign_bits)
+/// — the §4.6.3.3 suffix sits outside the Huffman codeword carried
+/// here. When either coefficient is `16`, the ESC sequence from
+/// [`encode_esc_value`](crate::spectral_codebook::encode_esc_value)
+/// follows the sign-bit suffix; the ESC bridge is also outside this
+/// module.
+pub fn hcod11_encode(idx: u32) -> Result<(u8, u16)> {
+    let entry = HCOD11
+        .get(idx as usize)
+        .ok_or(Error::SpectralCodebookIndexOutOfRange(11))?;
+    Ok(*entry)
+}
+
+/// Decode one Codebook 11 Huffman codeword from `reader`, returning
+/// the codeword index in `0..=288`.
+///
+/// The decoder is a straight prefix-match: read one bit at a time
+/// (MSB-first), look it up in a flat 289-entry table. The table is
+/// small enough (max codeword length 12 bits, 289 entries) that a
+/// single linear scan per bit-extend is cheaper than the storage
+/// and build-time cost of a multi-level lookup acceleration table.
+/// Returns [`Error::UnexpectedEnd`] on reader underflow.
+///
+/// The codebook is a **complete** prefix code over 12 bits (Kraft
+/// equality `Σᵢ 2^(12 − Lᵢ) = 4096 = 2¹²`), so any 12-bit prefix
+/// fully read from `reader` is guaranteed to match exactly one
+/// entry — the bottom of the loop is unreachable when `reader`
+/// produces 12 bits without underflowing. A purely defensive
+/// `unreachable!()` guards the loop fall-through; it is verified
+/// dead by the `hcod11_is_complete` regression test that
+/// exhaustively walks all `2¹²` 12-bit prefixes.
+///
+/// The §4.6.3.3 sign-bit suffix and the ESC sequence (when either
+/// coefficient is `16`) lie outside this routine — for unsigned
+/// Codebook 11 the caller consumes one sign bit per non-zero
+/// coefficient after the Huffman codeword via
+/// [`apply_sign_bits`](crate::spectral_codebook::apply_sign_bits)
+/// and dispatches onto the
+/// [`decode_esc_value`](crate::spectral_codebook::decode_esc_value)
+/// bridge when the §4.6.3.3 index translation surfaces a `16` in
+/// either slot.
+pub fn hcod11_decode(reader: &mut BitReader<'_>) -> Result<u32> {
+    let mut acc: u32 = 0;
+    for len in 1..=HCOD11_MAX_LEN {
+        let bit = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)?;
+        acc = (acc << 1) | bit;
+        for (idx, &(entry_len, entry_cw)) in HCOD11.iter().enumerate() {
+            if u32::from(entry_len) == len && u32::from(entry_cw) == acc {
+                return Ok(idx as u32);
+            }
+        }
+    }
+    // Unreachable: HCOD11 is a complete 12-bit prefix code. The
+    // `hcod11_is_complete` regression test verifies every 12-bit
+    // prefix maps to exactly one entry.
+    unreachable!("HCOD11 is a complete 12-bit prefix code; the 12-bit walk must match");
+}
+
+/// Write a Codebook 11 codeword to `writer` by index.
+///
+/// Convenience over `hcod11_encode` + manual `write_u32`. Returns
+/// [`Error::SpectralCodebookIndexOutOfRange`] for `idx > 288`. The
+/// §4.6.3.3 sign-bit suffix and the ESC sequence are the caller's
+/// responsibility — the suffix is one bit per non-zero coefficient
+/// emitted low-frequency-first, and the ESC sequence is appended
+/// after the sign bits for each coefficient whose value reaches the
+/// `16` flag.
+pub fn hcod11_write(writer: &mut BitWriter, idx: u32) -> Result<()> {
+    let (len, cw) = hcod11_encode(idx)?;
+    writer.write_u32(u32::from(cw), u32::from(len));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4867,5 +5339,255 @@ mod tests {
         let (l10, cw10) = hcod10_encode(168).unwrap();
         assert_eq!((l9, cw9), (15, 0x7fff));
         assert_eq!((l10, cw10), (12, 0xfff));
+    }
+
+    // -------------------------------------------------------------------
+    // Codebook 11 invariants (Table 4.A.12)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn hcod11_has_exactly_289_entries() {
+        // 17^2 = 289 (unsigned LAV=16 → mod = 17, dim = 2).
+        assert_eq!(HCOD11.len(), HCOD11_NUM_ENTRIES);
+        assert_eq!(HCOD11_NUM_ENTRIES, 289);
+    }
+
+    #[test]
+    fn hcod11_max_length_is_12_bits() {
+        let max = HCOD11.iter().map(|&(len, _)| len).max().unwrap();
+        assert_eq!(u32::from(max), HCOD11_MAX_LEN);
+        assert_eq!(HCOD11_MAX_LEN, 12);
+    }
+
+    #[test]
+    fn hcod11_min_length_is_four_bits_at_zero_tuple_and_interior_pair() {
+        // The 4-bit floor is shared by exactly two rows: index 0
+        // (the zero-tuple (0, 0)) and index 18 (the interior (1, 1)
+        // pair, since 1 * 17 + 1 = 18). The zero-tuple carries
+        // 0b0000 and (1, 1) carries 0b0001.
+        let mut min: u32 = u32::MAX;
+        let mut min_indices: Vec<usize> = Vec::new();
+        for (idx, &(len, _)) in HCOD11.iter().enumerate() {
+            let l = u32::from(len);
+            if l < min {
+                min = l;
+                min_indices.clear();
+                min_indices.push(idx);
+            } else if l == min {
+                min_indices.push(idx);
+            }
+        }
+        assert_eq!(min, 4);
+        assert_eq!(min_indices, vec![0, 18]);
+    }
+
+    #[test]
+    fn hcod11_zero_tuple_lives_at_index_0_with_four_bit_codeword() {
+        // The §4.6.3.3 unsigned polynomial idx = y * 17 + z places
+        // the zero-tuple (0, 0) at index 0; Codebook 11 hands it
+        // the shortest 4-bit codeword 0b0000.
+        let (len, cw) = HCOD11[0];
+        assert_eq!(len, 4);
+        assert_eq!(cw, 0x0000);
+    }
+
+    #[test]
+    fn hcod11_interior_one_one_tuple_lives_at_index_18_with_four_bit_codeword() {
+        // 1 * 17 + 1 = 18 → the second 4-bit slot, codeword 0b0001.
+        let (len, cw) = HCOD11[18];
+        assert_eq!(len, 4);
+        assert_eq!(cw, 0x0001);
+    }
+
+    #[test]
+    fn hcod11_far_corner_lives_at_index_288_with_five_bit_codeword() {
+        // (16, 16) at 16 * 17 + 16 = 288 — both coefficients flagged
+        // as ESC. Codebook 11 spends only 5 bits on this far corner
+        // (codeword 0b00100), keeping the in-band codeword short
+        // because the wire layout extends with two escape sequences
+        // and (where the magnitudes are non-zero) two sign bits.
+        let (len, cw) = HCOD11[288];
+        assert_eq!(len, 5);
+        assert_eq!(cw, 0x0004);
+    }
+
+    #[test]
+    fn hcod11_codewords_fit_their_declared_length() {
+        for (idx, &(len, cw)) in HCOD11.iter().enumerate() {
+            assert!(
+                u32::from(cw) < (1u32 << u32::from(len)),
+                "row {idx}: codeword 0x{cw:x} >= 2^{len}",
+            );
+        }
+    }
+
+    #[test]
+    fn hcod11_kraft_sum_is_two_to_the_twelve() {
+        // Σ 2^(L_max - L) = 2^L_max ⇔ complete prefix code.
+        let lmax = HCOD11_MAX_LEN;
+        let mut sum: u32 = 0;
+        for &(len, _) in &HCOD11 {
+            sum += 1u32 << (lmax - u32::from(len));
+        }
+        assert_eq!(sum, 1u32 << lmax);
+        assert_eq!(sum, 4096);
+    }
+
+    #[test]
+    fn hcod11_is_complete() {
+        // Exhaustively walk every 12-bit prefix and verify each
+        // matches exactly one entry. This is the strongest
+        // possible check that the table is a complete prefix code
+        // and that `hcod11_decode`'s `unreachable!()` is dead.
+        for prefix in 0u32..(1u32 << HCOD11_MAX_LEN) {
+            let bytes = [((prefix >> 4) & 0xff) as u8, ((prefix & 0xf) << 4) as u8];
+            let mut br = BitReader::new(&bytes);
+            let idx = hcod11_decode(&mut br).expect("12-bit prefix must decode");
+            let (len, cw) = hcod11_encode(idx).expect("decoded index must round-trip");
+            // The decoded prefix must match the leading `len` bits
+            // of our 12-bit walk.
+            let lead = prefix >> (HCOD11_MAX_LEN - u32::from(len));
+            assert_eq!(
+                lead,
+                u32::from(cw),
+                "prefix 0b{prefix:012b} decoded idx={idx} → codeword ({len}, 0x{cw:x})",
+            );
+        }
+    }
+
+    #[test]
+    fn hcod11_twelve_bit_ceiling_hits_exactly_six_indices() {
+        // Indices 12, 14, 15, 255, 269, 270 are the only rows whose
+        // codeword length reaches the 12-bit ceiling.
+        let ceiling: Vec<usize> = HCOD11
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &(len, _))| if len == 12 { Some(i) } else { None })
+            .collect();
+        assert_eq!(ceiling, vec![12, 14, 15, 255, 269, 270]);
+        assert_eq!(HCOD11[12], (12, 0x0ffb));
+        assert_eq!(HCOD11[14], (12, 0x0ffa));
+        assert_eq!(HCOD11[15], (12, 0x0ffe));
+        assert_eq!(HCOD11[255], (12, 0x0ffd));
+        assert_eq!(HCOD11[269], (12, 0x0ffc));
+        assert_eq!(HCOD11[270], (12, 0x0fff));
+    }
+
+    #[test]
+    fn hcod11_half_esc_rows_match_spec() {
+        // Index 16 corresponds to (y, z) = (0, 16), index 272 to
+        // (16, 0). Both are half-ESC tuples — exactly one
+        // coefficient at the §4.6.3.3 escape flag.
+        assert_eq!(HCOD11[16], (10, 0x038e));
+        assert_eq!(HCOD11[272], (9, 0x01c2));
+    }
+
+    #[test]
+    fn hcod11_encode_rejects_out_of_range_indices() {
+        for bad in [289u32, 290, 300, 1000, u32::MAX] {
+            assert!(matches!(
+                hcod11_encode(bad),
+                Err(Error::SpectralCodebookIndexOutOfRange(11))
+            ));
+        }
+    }
+
+    #[test]
+    fn hcod11_write_rejects_out_of_range_indices() {
+        let mut w = BitWriter::new();
+        for bad in [289u32, 1000, u32::MAX] {
+            assert!(matches!(
+                hcod11_write(&mut w, bad),
+                Err(Error::SpectralCodebookIndexOutOfRange(11))
+            ));
+        }
+    }
+
+    #[test]
+    fn hcod11_decode_index_0_zero_bits() {
+        // Index 0 → 4-bit `0`. Padding to a byte boundary with zeros
+        // keeps the wire byte at 0x00.
+        let bytes = [0x00u8];
+        let mut br = BitReader::new(&bytes);
+        let idx = hcod11_decode(&mut br).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(br.bit_position(), 4u64);
+    }
+
+    #[test]
+    fn hcod11_decode_index_270_full_12_bit_far_codeword() {
+        // Index 270 → 12-bit 0xfff packed left-aligned: high byte =
+        // 0xff (bits 11..4), low byte = (0xf << 4) = 0xf0 (bits
+        // 3..0 in the high nibble of the low byte).
+        let bytes = [0xffu8, 0xf0];
+        let mut br = BitReader::new(&bytes);
+        let idx = hcod11_decode(&mut br).unwrap();
+        assert_eq!(idx, 270);
+        assert_eq!(br.bit_position(), 12u64);
+    }
+
+    #[test]
+    fn hcod11_writer_round_trip_pins_every_index() {
+        // Writer → reader round-trip for every legal index. Each
+        // index must produce the exact bit-stream the encode
+        // function claims, and decode must recover the original
+        // index using exactly `len` bits.
+        for idx in 0..HCOD11_NUM_ENTRIES as u32 {
+            let mut w = BitWriter::new();
+            hcod11_write(&mut w, idx).unwrap();
+            let (len, _) = hcod11_encode(idx).unwrap();
+            let pad = (8 - (u32::from(len) % 8)) % 8;
+            let mut w2 = w;
+            if pad > 0 {
+                w2.write_u32(0, pad);
+            }
+            let bytes = w2.into_bytes();
+            let mut br = BitReader::new(&bytes);
+            let got = hcod11_decode(&mut br).unwrap();
+            assert_eq!(got, idx, "round-trip mismatch at idx={idx}");
+            assert_eq!(
+                br.bit_position(),
+                u64::from(len),
+                "bit consumption mismatch at idx={idx}",
+            );
+        }
+    }
+
+    #[test]
+    fn hcod11_decoder_returns_unexpected_end_on_truncation() {
+        let bytes: [u8; 0] = [];
+        let mut br = BitReader::new(&bytes);
+        let err = hcod11_decode(&mut br).unwrap_err();
+        assert_eq!(err, Error::UnexpectedEnd);
+    }
+
+    #[test]
+    fn hcod11_max_len_constant_matches_table_data() {
+        let mut observed_max = 0u32;
+        for idx in 0..HCOD11_NUM_ENTRIES as u32 {
+            let (len, _) = hcod11_encode(idx).unwrap();
+            observed_max = observed_max.max(u32::from(len));
+        }
+        assert_eq!(observed_max, HCOD11_MAX_LEN);
+    }
+
+    #[test]
+    fn hcod11_ceiling_matches_codebook_10_ceiling() {
+        // Codebook 10 caps at 12 bits; Codebook 11 also caps at 12
+        // bits — the universe widens (169 → 289 entries) but the
+        // codeword ceiling stays the same because the ESC sequence
+        // soaks up the tail-distribution rather than spending
+        // longer Huffman codewords on it.
+        assert_eq!(HCOD10_MAX_LEN, HCOD11_MAX_LEN);
+        assert_eq!(HCOD11_MAX_LEN, 12);
+    }
+
+    #[test]
+    fn hcod11_universe_is_69_entries_wider_than_codebook_10() {
+        // 289 - 169 = 120 extra rows = (17 + 17 - 1) extra entries
+        // along the ESC border `y == 16 || z == 16`.
+        assert_eq!(HCOD11_NUM_ENTRIES - HCOD10_NUM_ENTRIES, 120);
+        assert_eq!(HCOD11_NUM_ENTRIES, 289);
+        assert_eq!(HCOD10_NUM_ENTRIES, 169);
     }
 }

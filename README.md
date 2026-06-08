@@ -3,6 +3,101 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 259)
+
+Round 259 lands **Table 4.A.12** (Spectrum Huffman Codebook 11) inside
+the existing [`spectrum_huffman`](src/spectrum_huffman.rs) module that
+rounds 219 / 226 / 231 / 234 / 238 / 241 / 244 / 250 / 253 / 255
+bootstrapped for Codebooks 1 through 10. Codebook 11 is the only
+**ESC** spectrum book — Table 4.95 row 11 declares `unsigned_cb = 1`,
+`dim = 2`, `LAV = 16` with an ESC threshold of `8191` (the §4.6.1.3
+`x_quant` ceiling). The §4.6.3.3 in-band universe widens to a
+`17 × 17 = 289`-entry lattice indexed `0..=288` with each `(y, z)`
+coefficient in `0..=16`; a coefficient value of `16` in either slot
+is **not** a literal 16 — it is the §4.6.3.3 `escape_flag` whose
+actual magnitude is reconstructed from the `escape_sequence`
+(`escape_prefix` of N `1`s, a `0` `escape_separator`, and an
+`(N + 4)`-bit `escape_word`) bridged by the round-213
+[`spectral_codebook::decode_esc_value`](src/spectral_codebook.rs) /
+`encode_esc_value` helpers — outside the Huffman codeword carried
+by this module. The §4.6.3.3 unsigned polynomial `idx = y * 17 + z`
+parks the zero-tuple `(0, 0)` at index 0 with the shortest 4-bit
+codeword `0b0000`, shares that 4-bit floor with the interior `(1, 1)`
+pair at index 18 (codeword `0b0001`), pins the half-ESC tuples
+`(0, 16)` and `(16, 0)` to a 10-bit `0x38e` at index 16 and a 9-bit
+`0x1c2` at index 272, and parks the full-ESC corner `(16, 16)` at
+index 288 with the 5-bit `0b00100` (`0x04`) — the wire layout
+extends with two sign bits and two escape sequences for that corner,
+so the in-band Huffman codeword stays short. The codeword ceiling
+matches Codebook 10's **12 bits** — exactly six rows reach that
+ceiling (indices 12, 14, 15, 255, 269, 270 with codewords `0xffb`,
+`0xffa`, `0xffe`, `0xffd`, `0xffc`, `0xfff`) — because Codebook 11
+pushes its tail distribution out of the Huffman table and into the
+§4.6.3 ESC sequence. The table is a **complete** 12-bit prefix code
+(Kraft equality `Σ 2^(12 − L) = 4096 = 2^12`), exhaustively verified
+by walking every 12-bit prefix and asserting each maps to exactly
+one entry. Because Codebook 11 is unsigned, the §4.6.3.3 sign-bit
+suffix follows the Huffman codeword on the wire — one sign bit per
+non-zero coefficient, delivered low-frequency-first — and is exposed
+by the round-213 `apply_sign_bits` / `derive_sign_bits` helpers (the
+suffix lives outside the Huffman codeword carried by this module, an
+invariant verified across every index by an explicit
+`derive_sign_bits(11, &tuple)` cross-check that confirms a `(16, 16)`
+tuple emits two sign bits, a `(0, 0)` tuple emits zero sign bits,
+and the suffix length matches the non-zero-coefficient count for
+every index in between). Public API: `HCOD11_NUM_ENTRIES = 289`,
+`HCOD11_MAX_LEN = 12`, `hcod11_encode(idx) -> (u8, u16)`,
+`hcod11_decode(reader) -> u32`, and the convenience
+`hcod11_write(writer, idx)`. Out-of-range indices surface as
+`Error::SpectralCodebookIndexOutOfRange(11)`; reader underflow
+surfaces as `Error::UnexpectedEnd`. The round-213 §4.6.3.3
+translation is exercised across every index:
+`decode_index_to_tuple(11, idx)` →
+`encode_tuple_to_index(11, &tuple)` round-trips back to the same
+index for the entire `17 × 17` unsigned pair lattice, and a
+bijection cross-check builds the `289`-entry `HashSet` of legal
+pairs and confirms every `(y, z)` maps to a distinct index. A
+disjoint-set partition cross-check splits the 289 indices into the
+`256` in-band pairs (`y, z ∈ 0..=15`) and the `33` ESC-border pairs
+(`y == 16 || z == 16`) and confirms the two sets cover the universe
+without overlap. 20 new unit tests (in `src/spectrum_huffman.rs`:
+289-entry shape / 12-bit max / 4-bit min at indices 0 and 18 /
+zero-tuple-at-index-0 / interior-`(1, 1)`-at-index-18 / far-corner-
+at-index-288 / codewords fit / Kraft equality 4096 / complete-
+prefix walk over all `2^12` prefixes / six-12-bit-ceiling
+enumeration at indices 12 / 14 / 15 / 255 / 269 / 270 / half-ESC
+rows at indices 16 and 272 / encode and write rejection / 4-bit
+codeword decode at index 0 / full 12-bit codeword decode at
+index 270 / writer round-trip / truncation rejection /
+`HCOD11_MAX_LEN` constant consistency / 12-bit ceiling parity with
+Codebook 10 / `289 − 169 = 120` universe expansion) plus 30 new
+integration tests in `tests/spectrum_huffman.rs` (twelve per-row PDF
+spot checks at indices 0 / 1 / 12 / 14 / 15 / 16 / 18 / 255 / 269 /
+270 / 272 / 288; Table 4.95 row 11 ↔ Table 4.A.12 size cross-check
+including ESC threshold = `8191` and `has_esc()`; full
+writer→reader round-trip with bit-consumption invariant; the
+§4.6.3.3 wire-index ↔ tuple ↔ wire-index cross-check; zero-tuple ↔
+index-0-with-4-bit-codeword invariant; interior `(1, 1)` ↔ index-18
+invariant; far-corner `(16, 16)` ↔ index-288-with-5-bit-codeword
+invariant; half-ESC tuple ↔ index 16 and 272 cross-check; per-index
+sign-bit-count invariant against `derive_sign_bits(11, …)`;
+zero-tuple zero-sign-bits invariant; `(16, 16)` two-sign-bits
+invariant; two hand-pinned byte sequences (`[0x00]` for index 0
+padded; `[0xff, 0xf0]` for index 270 packed); out-of-range and
+truncation rejections; `HCOD11_MAX_LEN` constant consistency;
+Codebook-11-shares-12-bit-ceiling-with-Codebook-10 cross-check;
+Codebook-11-is-the-only-ESC-spectrum-book cross-check confirming
+`row11.has_esc() == true` and `row10.has_esc() == false`; 289-pair
+bijection sweep that builds every legal `(y, z)` pair, asserts
+`encode_tuple_to_index(11, …)` produces a distinct index for each,
+and confirms `decode_index_to_tuple(11, idx)` round-trips back to
+the same `(y, z)`; in-band/ESC-border disjoint-set partition that
+splits the 289 indices into `256` in-band pairs and `33` ESC-border
+pairs with `0` overlap). Completes the AAC spectrum Huffman
+Codebook 1..=11 table set; the next step is the §4.4.6
+`spectral_data()` wire walker that loops over scalefactor bands and
+dispatches per-band onto the codebook chosen by `section_data()`.
+
 ## Status (round 255)
 
 Round 255 lands **Table 4.A.11** (Spectrum Huffman Codebook 10) inside
