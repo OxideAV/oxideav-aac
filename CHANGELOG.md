@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-aac/compare/v0.1.3...v0.1.4) - 2026-06-08
+
+### Other
+
+- phase 2 (r263): tns_coef — §4.6.9.3 tns_decode_coef + §C.6 encode + LPC step-up
+- phase 2 (r259): spectrum_huffman::HCOD11 — Table 4.A.12 Spectrum Huffman Codebook 11
+- phase 2 (r255): spectrum_huffman::HCOD10 — Table 4.A.11 Spectrum Huffman Codebook 10
+- phase 2 (r253): spectrum_huffman::HCOD9 — Table 4.A.10 Spectrum Huffman Codebook 9
+- phase 2 (r250): spectrum_huffman::HCOD8 — Table 4.A.9 Spectrum Huffman Codebook 8
+- drop release-plz.toml — use release-plz defaults across the workspace
+
 ### Added
 
 - phase 2 (r263): `tns_coef` module — ISO/IEC 14496-3 §4.6.9.3
