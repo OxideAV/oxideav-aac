@@ -85,13 +85,14 @@
 //!   [`tns_decode_coef`] followed by [`lpc_step_up`]; the
 //!   reconstruction loop will call this once per `(window, filter)`
 //!   pair.
+//! * [`tns_ar_filter`] — the §4.6.9.3 `tns_ar_filter()` all-pole IIR
+//!   pass. Operates in place over a strided region of the dequantised
+//!   spectrum (`start` / `size` / `inc`) driven by the `lpc[]` array
+//!   from [`lpc_step_up`]. Filter state is zero-seeded per
+//!   invocation, exactly as the spec mandates.
 //!
 //! ## What this module does *not* cover
 //!
-//! * The §4.6.9.3 `tns_ar_filter()` all-pole IIR pass over the
-//!   spectrum. That needs a `&mut [f64]` view of the per-window MDCT
-//!   spectrum sliced by `start`/`end`/`inc` and is deferred until the
-//!   IMDCT back-end lands.
 //! * The §4.6.9 `tns_decode_frame()` orchestration that dispatches
 //!   `tns_decode_coef_to_lpc` / `tns_ar_filter` per filter per window.
 //!   That orchestration is the responsibility of the eventual
@@ -358,6 +359,120 @@ pub fn tns_decode_coef_to_lpc(
 ) -> Result<Vec<f64>> {
     let parcor = tns_decode_coef(coef_res_bits, coef_compress, coef)?;
     Ok(lpc_step_up(&parcor))
+}
+
+/// §4.6.9.3 `tns_ar_filter()` — the simple all-pole (auto-regressive)
+/// IIR filter that TNS slides across a strided region of the
+/// dequantised MDCT spectrum, in place.
+///
+/// The §4.6.9.3 pseudocode defines the filter by the recurrence
+///
+/// ```text
+/// y(n) = x(n) - lpc[1]*y(n-1) - ... - lpc[order]*y(n-order)
+/// ```
+///
+/// with these spec-mandated properties:
+///
+/// * the filter state (`y(n-1) .. y(n-order)`) is **initialised to
+///   zero** at every invocation;
+/// * the output overwrites the input (**in-place operation**);
+/// * `size` samples are processed, stepping to the next sample by the
+///   index increment `inc` (`+1` upward, `−1` downward).
+///
+/// `lpc` is the direct-form `a[]` array produced by [`lpc_step_up`] /
+/// [`tns_decode_coef_to_lpc`]: `lpc[0] == 1.0` and `lpc[1..=order]`
+/// are the predictor taps. The filter order is `lpc.len() - 1`; a
+/// `lpc` of length 1 (order 0) leaves the spectrum untouched.
+///
+/// `spectrum` is the full per-window coefficient buffer. `start` is
+/// the index of the first sample to process — for an upward filter
+/// (`inc = 1`) this is the §4.6.9.3 `start = swb_offset[bottom]`; for
+/// a downward filter (`inc = -1`) the §4.6.9.3 `tns_decode_frame`
+/// outer loop has already set `start = end - 1`, so the same `start`
+/// argument is the top of the region and the walk proceeds toward
+/// lower indices.
+///
+/// The recurrence is evaluated literally: because the output is
+/// written over the input and the filter reads back its own previous
+/// *outputs* (`y`), the per-tap history is a small ring of the last
+/// `order` produced samples, seeded with zeros.
+///
+/// Returns [`Error::TnsCoefOutOfRange`] when:
+///
+/// * `lpc` is empty (no `a[0]`),
+/// * `inc` is neither `+1` nor `-1`,
+/// * the strided walk of `size` samples starting at `start` with step
+///   `inc` would leave the bounds of `spectrum` (an out-of-range
+///   `start`/`size`/`inc` triple the caller fabricated; the
+///   §4.6.9.3 `size = end - start <= 0` guard and the `swb_offset`
+///   clamping in `tns_decode_frame` keep legitimate callers in range).
+pub fn tns_ar_filter(
+    spectrum: &mut [f64],
+    start: usize,
+    size: usize,
+    inc: i32,
+    lpc: &[f64],
+) -> Result<()> {
+    if lpc.is_empty() {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    if inc != 1 && inc != -1 {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    let order = lpc.len() - 1;
+    if size == 0 || order == 0 {
+        // Nothing to shape: an order-0 filter (`lpc == [1.0]`) is the
+        // identity, and a zero-length region is a no-op. Still
+        // bounds-check the (degenerate) walk so a bad `start` is
+        // rejected consistently.
+        if size > 0 {
+            walk_bounds_check(spectrum.len(), start, size, inc)?;
+        }
+        return Ok(());
+    }
+
+    walk_bounds_check(spectrum.len(), start, size, inc)?;
+
+    // Filter-state ring: the last `order` *output* samples y(n-1) ..
+    // y(n-order). Index `0` is the most recent output; the ring is
+    // shifted by one each iteration. Seeded with zeros per §4.6.9.3.
+    let mut history = vec![0.0_f64; order];
+
+    let mut idx = start as isize;
+    for _ in 0..size {
+        let x = spectrum[idx as usize];
+        // y(n) = x(n) - Σ_{k=1..order} lpc[k] * y(n-k)
+        let mut y = x;
+        for k in 1..=order {
+            y -= lpc[k] * history[k - 1];
+        }
+        spectrum[idx as usize] = y;
+        // Shift the history ring: y becomes the new y(n-1).
+        for k in (1..order).rev() {
+            history[k] = history[k - 1];
+        }
+        history[0] = y;
+        idx += inc as isize;
+    }
+    Ok(())
+}
+
+/// Bounds-check the §4.6.9.3 strided walk: `size` samples starting at
+/// `start`, stepping by `inc ∈ {-1, +1}`, must all land inside a
+/// buffer of `len` elements. Returns [`Error::TnsCoefOutOfRange`]
+/// otherwise.
+fn walk_bounds_check(len: usize, start: usize, size: usize, inc: i32) -> Result<()> {
+    if start >= len {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    // Last visited index = start + (size-1)*inc. Validate it stays in
+    // `0..len` without overflowing.
+    let span = (size - 1) as isize;
+    let last = start as isize + span * inc as isize;
+    if last < 0 || last >= len as isize {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -777,5 +892,181 @@ mod tests {
             tns_decode_coef_to_lpc(5, 0, &[0]),
             Err(Error::TnsCoefOutOfRange)
         ));
+    }
+
+    // ---------- tns_ar_filter ----------
+
+    /// Reference implementation of the §4.6.9.3 recurrence written the
+    /// straightforward (non-ring-buffer) way, for cross-checking the
+    /// production `tns_ar_filter`. Operates on a contiguous copy.
+    fn ref_ar_filter(x: &[f64], lpc: &[f64]) -> Vec<f64> {
+        let order = lpc.len() - 1;
+        let mut y = vec![0.0_f64; x.len()];
+        for n in 0..x.len() {
+            let mut acc = x[n];
+            for k in 1..=order {
+                if n >= k {
+                    acc -= lpc[k] * y[n - k];
+                }
+            }
+            y[n] = acc;
+        }
+        y
+    }
+
+    #[test]
+    fn ar_filter_order0_is_identity() {
+        let mut spec = [1.0, 2.0, 3.0, 4.0];
+        let before = spec;
+        // lpc = [1.0] ⇒ order 0.
+        tns_ar_filter(&mut spec, 0, 4, 1, &[1.0]).unwrap();
+        assert_eq!(spec, before);
+    }
+
+    #[test]
+    fn ar_filter_order1_matches_recurrence_upward() {
+        // y(n) = x(n) - lpc[1]*y(n-1).
+        let lpc = [1.0, 0.5];
+        let x = [1.0, 0.0, 0.0, 0.0, 0.0];
+        let want = ref_ar_filter(&x, &lpc);
+        let mut spec = x;
+        tns_ar_filter(&mut spec, 0, 5, 1, &lpc).unwrap();
+        for (g, w) in spec.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-12, "got {g} want {w}");
+        }
+        // Hand-check: unit impulse through y(n)+0.5 y(n-1) = x gives
+        // y = 1, -0.5, 0.25, -0.125, 0.0625.
+        let hand = [1.0, -0.5, 0.25, -0.125, 0.0625];
+        for (g, h) in spec.iter().zip(hand.iter()) {
+            assert!((g - h).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn ar_filter_order3_matches_reference() {
+        let lpc = [1.0, -0.4, 0.2, 0.1];
+        let x = [0.7, -1.3, 2.1, 0.0, -0.5, 1.1, 0.9, -0.2];
+        let want = ref_ar_filter(&x, &lpc);
+        let mut spec = x;
+        tns_ar_filter(&mut spec, 0, x.len(), 1, &lpc).unwrap();
+        for (g, w) in spec.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-12, "got {g} want {w}");
+        }
+    }
+
+    #[test]
+    fn ar_filter_downward_walks_high_to_low() {
+        // direction = 1 ⇒ inc = -1, start = end - 1. The §4.6.9.3
+        // filter then processes the region top-to-bottom. Cross-check
+        // by reversing the region, filtering forward, and reversing
+        // back.
+        let lpc = [1.0, 0.3, -0.15];
+        let region = [0.5, -0.2, 0.9, 1.4, -0.7];
+        // Place region inside a larger buffer with sentinel padding to
+        // confirm only the targeted span is touched.
+        let mut spec = vec![100.0, 0.5, -0.2, 0.9, 1.4, -0.7, 200.0];
+        let start = 5; // end-1, where end = 6 (one past last region idx)
+        let size = 5;
+        tns_ar_filter(&mut spec, start, size, -1, &lpc).unwrap();
+
+        // Reference: process region in reverse order (high→low).
+        let mut rev: Vec<f64> = region.iter().rev().copied().collect();
+        let want_rev = ref_ar_filter(&rev, &lpc);
+        rev.copy_from_slice(&want_rev);
+        let want: Vec<f64> = rev.into_iter().rev().collect();
+
+        assert_eq!(spec[0], 100.0, "lower sentinel untouched");
+        assert_eq!(spec[6], 200.0, "upper sentinel untouched");
+        for (i, w) in want.iter().enumerate() {
+            assert!(
+                (spec[1 + i] - w).abs() < 1e-12,
+                "idx {i}: {} vs {w}",
+                spec[1 + i]
+            );
+        }
+    }
+
+    #[test]
+    fn ar_filter_only_touches_targeted_region() {
+        let lpc = [1.0, 0.5];
+        let mut spec = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        // Filter only indices 2..=4 (size 3, upward).
+        tns_ar_filter(&mut spec, 2, 3, 1, &lpc).unwrap();
+        assert_eq!(spec[0], 1.0);
+        assert_eq!(spec[1], 2.0);
+        assert_eq!(spec[5], 6.0);
+        // Region recomputed independently.
+        let want = ref_ar_filter(&[3.0, 4.0, 5.0], &lpc);
+        for i in 0..3 {
+            assert!((spec[2 + i] - want[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn ar_filter_zero_size_is_noop() {
+        let mut spec = [1.0, 2.0, 3.0];
+        let before = spec;
+        tns_ar_filter(&mut spec, 0, 0, 1, &[1.0, 0.5]).unwrap();
+        assert_eq!(spec, before);
+    }
+
+    #[test]
+    fn ar_filter_rejects_empty_lpc() {
+        let mut spec = [1.0, 2.0];
+        assert!(matches!(
+            tns_ar_filter(&mut spec, 0, 2, 1, &[]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn ar_filter_rejects_bad_inc() {
+        let mut spec = [1.0, 2.0];
+        assert!(matches!(
+            tns_ar_filter(&mut spec, 0, 2, 0, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+        assert!(matches!(
+            tns_ar_filter(&mut spec, 0, 2, 2, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn ar_filter_rejects_out_of_bounds_walk() {
+        let mut spec = [1.0, 2.0, 3.0];
+        // start in range but size overruns the top.
+        assert!(matches!(
+            tns_ar_filter(&mut spec, 1, 5, 1, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+        // downward walk underruns below 0.
+        assert!(matches!(
+            tns_ar_filter(&mut spec, 1, 3, -1, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+        // start past the end.
+        assert!(matches!(
+            tns_ar_filter(&mut spec, 3, 1, 1, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn ar_filter_end_to_end_from_wire_coef() {
+        // Decode a wire TNS filter to LPC, then shape a spectrum.
+        // Confirms the lpc_step_up output drives tns_ar_filter without
+        // any glue. coef_res_bits = 4, coef_compress = 0, order 2.
+        let wire = [3_u32, 0xE]; // one positive, one negative reflection
+        let lpc = tns_decode_coef_to_lpc(4, 0, &wire).unwrap();
+        assert_eq!(lpc.len(), 3);
+        assert_eq!(lpc[0], 1.0);
+        let x = [0.3, -0.9, 1.2, 0.4, -0.6, 0.1];
+        let want = ref_ar_filter(&x, &lpc);
+        let mut spec = x;
+        tns_ar_filter(&mut spec, 0, x.len(), 1, &lpc).unwrap();
+        for (g, w) in spec.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-12);
+        }
     }
 }

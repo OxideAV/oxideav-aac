@@ -148,9 +148,12 @@
 //!   serialises the same structure back bit-for-bit. The §4.6.9.3
 //!   `tns_decode_coef` LPC reconstruction (signed conversion,
 //!   `iqfac` arcsine inverse-quantisation, Levinson-style conversion
-//!   to LPC) and the §4.6.9.3 `tns_ar_filter` all-pole pass over the
-//!   spectrum are **not** performed; they need the spectral context
-//!   that arrives with the per-AOT IMDCT back-end.
+//!   to LPC) lives in [`tns_coef`], as does the §4.6.9.3
+//!   `tns_ar_filter` all-pole pass over a strided spectrum region.
+//!   What remains owed is the §4.6.9 `tns_decode_frame` orchestration
+//!   that slices the per-window spectrum by `swb_offset` /
+//!   `direction` / `length` and dispatches the filter — that walker
+//!   belongs with the per-AOT IMDCT reconstruction driver.
 //! * The [`gain_control_data`] module — ISO/IEC 14496-3 §4.4.6.5 /
 //!   Table 4.12 *gain_control_data()* parser **and** encoder
 //!   primitive (**new in round 183**). Carries the SSR (AOT 3)

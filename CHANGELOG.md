@@ -19,6 +19,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r272): `tns_coef::tns_ar_filter` — the ISO/IEC 14496-3
+  §4.6.9.3 `tns_ar_filter()` all-pole (auto-regressive) IIR pass.
+  Runs the spec recurrence `y(n) = x(n) − lpc[1]·y(n−1) − … −
+  lpc[order]·y(n−order)` in place over a strided region of the
+  dequantised MDCT spectrum, consuming the direct-form `lpc[]` array
+  produced by [`tns_coef::tns_decode_coef_to_lpc`]. Filter state is
+  zero-seeded at every invocation, the output overwrites the input,
+  and the strided walk honours both the upward (`inc = +1`) and the
+  downward (`inc = −1`, `start = end − 1`) directions that
+  §4.6.9.3 `tns_decode_frame` sets from the per-filter `direction`
+  flag. An empty `lpc`, an `inc ∉ {−1, +1}`, or a `start`/`size`/`inc`
+  triple whose strided walk leaves the spectrum bounds is rejected
+  with [`Error::TnsCoefOutOfRange`]; an order-0 filter (`lpc ==
+  [1.0]`) and a zero-length region are well-defined no-ops. With the
+  inverse-quantisation + LPC step-up from r263, both TNS building
+  blocks the §4.6.9 `tns_decode_frame` orchestration chains are now
+  in place; only the `swb_offset` / grouping region slicer (which
+  needs the per-frame spectral context) remains. 10 new unit tests
+  (`src/tns_coef.rs`): order-0 identity, hand-checked order-1 impulse
+  response, order-2/3 cross-checks against an independent reference
+  recurrence, the downward-walk equivalence, region-isolation
+  (sentinel-padded buffer), and the four argument-validation
+  rejections, plus an end-to-end wire-`coef` → LPC → filter path.
+
 - phase 2 (r263): `tns_coef` module — ISO/IEC 14496-3 §4.6.9.3
   `tns_decode_coef` inverse-quantisation and conversion-to-LPC
   step-up procedure, plus the §C.6 encoder-side companion

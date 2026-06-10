@@ -45,14 +45,25 @@ Argument validation: invalid `coef_res_bits` (anything outside
 `coef_res2`-bit field, encode PARCOR values `|r| > 1.0` (or NaN /
 ±∞ — `arcsin` undefined), or `pack_coef` values outside the
 field-representable signed range all surface as the new
-`Error::TnsCoefOutOfRange`. The §4.6.9.3 `tns_ar_filter()` all-pole
-IIR pass and the `tns_decode_frame()` orchestration that chains
-`tns_decode_coef_to_lpc` / `tns_ar_filter` per `(window, filter)`
-are deferred until the IMDCT back-end lands. The §4.6.17.3.4 ER
-AAC LD `int_tns_decode_coef()` integer variant is deferred until
-the LD reconstruction path is wired. 36 new unit tests
-(`src/tns_coef.rs`) plus 11 new integration tests
-(`tests/tns_coef.rs`) lift the total green test count to **1050**.
+`Error::TnsCoefOutOfRange`. Round 272 adds the §4.6.9.3
+`tns_ar_filter()` all-pole IIR pass itself —
+`tns_ar_filter(spectrum, start, size, inc, lpc)` runs the
+`y(n) = x(n) − Σ lpc[k]·y(n−k)` recurrence in place over a strided
+region of the dequantised spectrum, zero-seeding the filter state
+each invocation and supporting both the upward (`inc = +1`) and
+downward (`inc = −1`, `start = end − 1`) walks from
+`tns_decode_frame`. Out-of-bounds `start` / `size` / `inc` triples,
+an empty `lpc`, and `inc ∉ {−1, +1}` are rejected with
+`Error::TnsCoefOutOfRange`; an order-0 filter (`lpc == [1.0]`) is the
+identity. Only the §4.6.9 `tns_decode_frame()` orchestration — the
+`swb_offset` / `direction` / `length` region slicer that dispatches
+`tns_decode_coef_to_lpc` / `tns_ar_filter` per `(window, filter)` —
+remains, deferred to the per-AOT IMDCT reconstruction driver. The
+§4.6.17.3.4 ER AAC LD `int_tns_decode_coef()` integer variant is
+deferred until the LD reconstruction path is wired. 36 unit tests
+(`src/tns_coef.rs`) plus 11 integration tests (`tests/tns_coef.rs`)
+landed the coefficient path; round 272 adds 10 more `ar_filter`
+unit tests.
 
 ## Status (round 259)
 
@@ -1553,13 +1564,16 @@ earlier rounds (121 / 126) the ADTS framing, out-of-band
   fix-up itself is complete; what's still owed is the
   *already-Huffman-decoded* spectrum that it operates on, which
   arrives with `spectral_data()`.
-- The §4.6.9.3 `tns_decode_coef` LPC reconstruction and the
-  §4.6.9.3 `tns_ar_filter` all-pole pass. The `tns_data()` block
-  is parseable / writable bit-for-bit, but applying the all-pole
-  filter to the dequantised MDCT spectrum requires both the LPC
-  reconstruction (signed conversion + `iqfac` arcsine inverse-
-  quantisation + Levinson-style conversion to LPC coefficients)
-  and a real spectral context.
+- The §4.6.9 `tns_decode_frame()` orchestration. The two building
+  blocks it chains are now both in place: the §4.6.9.3
+  `tns_decode_coef` LPC reconstruction (`tns_coef::tns_decode_coef_to_lpc`,
+  round 263) and the §4.6.9.3 `tns_ar_filter` all-pole pass
+  (`tns_coef::tns_ar_filter`, round 272). What remains is the
+  per-window region slicer that, given `ics_info()` grouping and the
+  `swb_offset` tables, computes each filter's `bottom`/`top` band span
+  (`start`/`end`/`inc` clamped by `TNS_MAX_BANDS` / `max_sfb`) and
+  drives the filter across the dequantised MDCT spectrum — which needs
+  the real spectral context that arrives with `spectral_data()`.
 - The full per-AOT IMDCT + windowing back-end (filterbank, TNS
   reconstruction, PNS / IS pair routing).
 - The decoder-side channel-element body walker that drives
