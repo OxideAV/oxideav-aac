@@ -374,6 +374,20 @@ pub enum Error {
     /// or an encode-side PARCOR coefficient `|r| > 1.0` (or NaN /
     /// ±∞) — `arcsin` is undefined outside `[-1, 1]`.
     TnsCoefOutOfRange,
+
+    /// [`crate::tns_frame::tns_decode_frame`] was called with a
+    /// frame-level argument combination that violates the §4.6.9.3
+    /// `tns_decode_frame()` preconditions: the `spec` buffer length
+    /// differs from `num_windows × window_len` (8 × 128 for
+    /// `EIGHT_SHORT_SEQUENCE`, 1 × 1024 otherwise); the
+    /// [`crate::tns_data::TnsData`] window count disagrees with the
+    /// `window_sequence`; or a filter's `coef` vector is shorter than
+    /// the `TNS_MAX_ORDER`-clamped `tns_order` it must supply. A
+    /// [`crate::tns_data::TnsData`] produced by
+    /// [`crate::tns_data::TnsData::parse`] under the same
+    /// `window_sequence` never trips the structural checks — this
+    /// surfaces caller-fabricated structures.
+    TnsFrameInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -566,6 +580,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "tns_coef: coef_res_bits / coef_compress / wire coef / PARCOR value outside §4.6.9.3 / §C.6 legal range"
+                )
+            }
+            Error::TnsFrameInvalid => {
+                write!(
+                    f,
+                    "tns_decode_frame: spec length, TnsData window count, or per-filter coef length violates a §4.6.9.3 precondition"
                 )
             }
         }

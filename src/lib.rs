@@ -361,6 +361,7 @@ pub mod spectrum_huffman;
 pub mod swb_offset;
 pub mod tns_coef;
 pub mod tns_data;
+pub mod tns_frame;
 pub mod tns_max;
 
 mod error;

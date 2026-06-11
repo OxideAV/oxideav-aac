@@ -3,6 +3,48 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 278)
+
+Round 278 lands the [`tns_frame`](src/tns_frame.rs) module — the
+ISO/IEC 14496-3 §4.6.9.3 `tns_decode_frame()` per-frame Temporal
+Noise Shaping orchestration that chains the three TNS building
+blocks previous rounds landed: the [`tns_data`](src/tns_data.rs)
+Table 4.54 wire parser (r210), the `tns_decode_coef` /
+`lpc_step_up` inverse-quantisation + conversion-to-LPC surface
+(r263), and the `tns_ar_filter` all-pole IIR pass (r272). The
+implementation follows the §4.6.9.3 pseudocode literally: per
+window, filter regions are sliced top-down from `bottom = num_swb`
+(`top = bottom; bottom = max(top − length, 0)`), the wire `order`
+is clamped by the object-type-dependent `TNS_MAX_ORDER` (Table
+4.102, via the r216 [`tns_max`](src/tns_max.rs) accessors) with
+only the first `tns_order` transmitted magnitudes participating,
+band indices map to coefficient indices through the
+[`swb_offset`](src/swb_offset.rs) tables under the three-way
+`min(band, TNS_MAX_BANDS, max_sfb)` clamp (Table 4.103), and the
+per-filter `direction` flag selects the upward (`inc = +1`,
+`start = swb_offset[bottom]`) or downward (`inc = −1`,
+`start = end − 1`) strided walk handed to `tns_ar_filter`. Order-0
+filters and regions fully clamped away (`end ≤ start`) are the
+pseudocode's `continue` no-ops. Frame-level precondition violations
+(spectrum length ≠ `num_windows × window_len`, `TnsData` window
+count disagreeing with the `window_sequence`, fabricated `coef`
+shorter than the clamped order) surface as the new
+`Error::TnsFrameInvalid`; `fs_index ≥ 12` and overflowing wire
+magnitudes propagate the existing errors. Scope is the canonical
+1024-line long / 8 × 128-line short frames; the ER AAC LD 480/512
+variants (Tables 4.119 / 4.120) stay deferred with the standing
+`int_tns_decode_coef()` deferral until the LD reconstruction path
+is wired. With this round the **complete §4.6.9 TNS decode tool**
+is in place — wire parse → coefficient decode → region slicing →
+in-place spectral filtering — awaiting only the dequantised
+spectrum from the future reconstruction driver. 18 unit tests
+(no-op paths, manual-composition equivalence for upward / downward
+/ multi-filter / order-clamped / Main-vs-LC runs, region isolation
+on long and short sequences, `max_sfb` + `TNS_MAX_BANDS` clamp
+boundaries, the validation rejections) plus 5 integration tests
+(`tests/tns_frame.rs`) that drive the orchestrator from
+`TnsData::write` → `TnsData::parse` wire round-trips.
+
 ## Status (round 263)
 
 Round 263 adds the [`tns_coef`](src/tns_coef.rs) module — the

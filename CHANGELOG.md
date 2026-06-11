@@ -6,6 +6,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- phase 2 (r278): `tns_frame::tns_decode_frame` — the ISO/IEC
+  14496-3 §4.6.9.3 per-frame TNS orchestration. Chains the
+  `tns_data` wire parser, `tns_coef::tns_decode_coef_to_lpc`, and
+  `tns_coef::tns_ar_filter` per the spec pseudocode: top-down
+  region slicing from `bottom = num_swb` in units of scalefactor
+  bands, `TNS_MAX_ORDER` clamping of the wire `order` (only the
+  first `tns_order` magnitudes participate), the three-way
+  `min(band, TNS_MAX_BANDS, max_sfb)` band clamp through the
+  `swb_offset` tables, and direction-dependent upward/downward
+  strided walks over each window's slice of the dequantised
+  spectrum. Order-0 filters and fully-clamped regions are the
+  pseudocode's `continue` no-ops. New `Error::TnsFrameInvalid`
+  covers frame-level precondition violations (spectrum length ≠
+  `num_windows × window_len`, window-count mismatch, `coef`
+  shorter than the clamped order); `swb_offset` / `TNS_MAX_BANDS`
+  coverage and wire-magnitude errors propagate unchanged. ER AAC
+  LD 480/512-line frames stay deferred with the standing
+  `int_tns_decode_coef()` deferral. The complete §4.6.9 TNS decode
+  tool — wire parse → coefficient decode → region slicing →
+  in-place filtering — is now in place. 18 unit tests
+  (`src/tns_frame.rs`) + 5 wire-round-trip integration tests
+  (`tests/tns_frame.rs`).
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-aac/compare/v0.1.3...v0.1.4) - 2026-06-08
 
 ### Other
