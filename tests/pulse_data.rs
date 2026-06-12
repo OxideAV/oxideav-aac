@@ -12,7 +12,7 @@
 //! 2. The parser's terminal bit-position matches the writer's
 //!    bit-position (no over- or under-read).
 //!
-//! No external reference encoder is invoked; the only inputs are the
+//! The only inputs are the
 //! spec-defined wire field widths (2 + 6 + (5+4) × (1..=4) bits) and
 //! the `number_pulse + 1` loop bound semantics from Table 4.7.
 

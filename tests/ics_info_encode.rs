@@ -6,7 +6,7 @@
 //! synthetic bit-stream constructed with `BitWriter`), runs
 //! `IcsInfo::write` into a fresh `BitWriter`, parses the resulting
 //! buffer back, and asserts structural equality plus matching bit
-//! count. No external encoder is invoked; the inputs are the
+//! count. The inputs are the
 //! spec-defined wire field widths (Table 4.6: `ics_reserved_bit` 1 +
 //! `window_sequence` 2 + `window_shape` 1 + `max_sfb` 4 / 6 + the
 //! per-branch tail) and the §4.6.7.2 / Table 4.55 LTP body.

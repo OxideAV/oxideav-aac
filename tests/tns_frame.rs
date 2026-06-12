@@ -10,7 +10,7 @@
 //! over the band regions the spec's
 //! `min(band, TNS_MAX_BANDS, max_sfb)` arithmetic selects.
 //!
-//! No external reference decoder is invoked; the only truth is the
+//! The only truth is the
 //! §4.6.9.3 pseudocode plus the Table 4.102 / 4.103 caps and the
 //! Table 4.140 / 4.141 `swb_offset` tables already in the crate.
 

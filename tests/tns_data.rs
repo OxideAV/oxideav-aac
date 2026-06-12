@@ -12,7 +12,7 @@
 //! 2. The parser's terminal bit-position matches the writer's
 //!    bit-position (no over- or under-read).
 //!
-//! No external reference encoder is invoked; the only inputs are the
+//! The only inputs are the
 //! spec-defined wire field widths from Table 4.54 + Table 4.155 + the
 //! §4.6.9.3 `coef_bits = (3 + coef_res) - coef_compress` rule.
 //!
