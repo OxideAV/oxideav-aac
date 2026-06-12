@@ -3,6 +3,56 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 284)
+
+Round 284 lands the first **numeric reconstruction** stages — the
+parse-complete channel body now decodes to a real-valued spectrum,
+one step short of the §4.6.11 filterbank (IMDCT +
+window-overlap-add, the next round's tool).
+
+* [`dequant`](src/dequant.rs) — §4.6.1.3 inverse quantization and
+  §4.6.2.3.3 scalefactor application. `inverse_quantize` is the
+  non-uniform inverse quantizer `Sign(x_quant) · |x_quant|^(4/3)`
+  (computed as `|x| · cbrt(|x|)` so perfect cubes invert exactly);
+  `scale_factor_gain` is `get_scale_factor_gain()` —
+  `2^(0.25 · (sf − SF_OFFSET))` with the normative
+  `SF_OFFSET = 100`; `rescale_spectrum` applies both band-wise over
+  the §4.5.2.3.4 `sect_sfb_offset` ranges directly in the
+  §4.5.2.3.5 interleaved transmission order, consuming the r152
+  `accumulate` absolute scalefactor records in wire-order lockstep
+  with `sfb_cb`. PNS / intensity records are consumed for lockstep
+  but produce silence — their §4.6.13 / §4.6.8 synthesis is a later
+  channel-pair / noise tool.
+* [`decoded_spectrum`](src/decoded_spectrum.rs) — the §4.6.3.3
+  `quant_to_spec()` de-interleaver (group-interleaved transmission
+  order → window-major `spec[w][k]`, an identity copy for long
+  windows) and `decode_channel_spectrum`, the per-channel pipeline
+  stage composing §4.6.3.3 pulse fix-up (on `x_quant`, before
+  inverse quantization) → §4.6.2.3.2 scalefactor accumulation →
+  inverse quantization + rescaling → `quant_to_spec()` → the r278
+  §4.6.9 `tns_decode_frame`.
+* [`tests/docs_adts_corpus.rs`](tests/docs_adts_corpus.rs) — a
+  structural corpus driver that walks **all 12 staged ADTS
+  fixtures** frame-by-frame (ADTS header → `raw_data_block()`
+  element walk → SCE / LFE / CPE bodies — including the Table 4.4
+  `common_window` / shared `ics_info` / `ms_mask_present` /
+  `ms_used` header — → `spectral_data()` → pipeline) and asserts
+  every decoded spectrum is finite with plausible energy. All
+  fixtures pass: mono/stereo at 8/11.025/22.05/44.1 kHz,
+  chirp short-window sequences, TNS-active, PNS, M/S, intensity
+  stereo, ID3v2-prefixed, and the HE-AAC v1 LC core (SBR fill
+  payloads skipped). The driver skips cleanly when `docs/` is
+  absent (standalone-repo CI layout).
+
+Hand-derived spec-formula vectors pin the math: `8^(4/3) = 16`,
+`27^(4/3) = 81`, `4096^(4/3) = 65536`, `gain(104) = 2`,
+`gain(96) = 0.5`, and the worked end-to-end value
+`x_quant = 8` at `sf = 104` → `32.0`. New `Error::DequantInvalid` /
+`Error::QuantToSpecInvalid` cover structural rejections. What
+remains for PCM: the §4.6.11 filterbank, then M/S (§4.6.8.1),
+intensity (§4.6.8.2), and PNS (§4.6.13) on the way to
+`expected.wav` comparison.
+
 ## Status (round 281)
 
 Round 281 lands the [`spectral_data`](src/spectral_data.rs) module —

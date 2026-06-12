@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r284): `dequant` + `decoded_spectrum` — the first numeric
+  reconstruction stages after the wire walk, ending one step short of
+  the §4.6.11 filterbank. `dequant::inverse_quantize` is the
+  §4.6.1.3 non-uniform inverse quantizer
+  (`Sign(x_quant) · |x_quant|^(4/3)`, computed as `|x| · cbrt(|x|)`
+  so perfect cubes invert exactly); `dequant::scale_factor_gain` is
+  the §4.6.2.3.3 `get_scale_factor_gain()`
+  (`2^(0.25 · (sf − SF_OFFSET))`, `SF_OFFSET = 100`);
+  `dequant::rescale_spectrum` applies both band-wise over the
+  §4.5.2.3.4 `sect_sfb_offset` ranges directly in the §4.5.2.3.5
+  interleaved transmission order, consuming the
+  `scale_factor_data::accumulate` absolute records in wire-order
+  lockstep with `sfb_cb` (PNS / intensity records are consumed but
+  produce silence — their §4.6.13 / §4.6.8 synthesis is a later
+  tool). `decoded_spectrum::quant_to_spec` is the §4.6.3.3
+  de-interleaver from group-interleaved order to the window-major
+  `spec[w][k]` layout TNS / the filterbank consume;
+  `decoded_spectrum::decode_channel_spectrum` composes the full
+  per-channel stage — §4.6.3.3 pulse fix-up on `x_quant` →
+  scalefactor accumulation → inverse quantization + rescaling →
+  `quant_to_spec()` → §4.6.9 `tns_decode_frame`. New
+  `Error::DequantInvalid` / `Error::QuantToSpecInvalid` cover the
+  structural rejections. 16 unit tests (hand-derived spec-formula
+  vectors: exact cubes, exact power-of-two gains, grouped-short
+  shared gains, layout rejections) + 5 pipeline integration tests
+  (`tests/decoded_spectrum.rs`: stage-composition equivalence,
+  pulse-before-dequant ordering, TNS-stage equivalence) + the new
+  `tests/docs_adts_corpus.rs` structural driver that walks all 12
+  staged ADTS fixtures frame-by-frame (ADTS header →
+  `raw_data_block()` walk → SCE / LFE / CPE bodies including the
+  Table 4.4 `common_window` / `ms_mask_present` header →
+  `spectral_data()` → pipeline) and asserts every decoded spectrum
+  is finite with plausible energy (skips cleanly when `docs/` is
+  absent in standalone-repo CI).
 - phase 2 (r281): `spectral_data` — the ISO/IEC 14496-3 Table 4.56
   `spectral_data()` wire walker plus its bit-exact writer, the §4.4.6
   driver the codebook rounds were building toward. `SpectralData::

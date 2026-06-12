@@ -408,6 +408,27 @@ pub enum Error {
     /// above `max_sfb`), or a magnitude exceeding the section
     /// codebook's LAV (`MAX_QUANT` = 8191 for the ESC book).
     SpectralDataEncodeInvalid,
+
+    /// [`crate::dequant::rescale_spectrum`] found a structural
+    /// mismatch between its inputs: group counts disagreeing with
+    /// `num_window_groups`, a per-group `x_quant` buffer length
+    /// disagreeing with the `ics_info` grouping, or an
+    /// [`crate::scale_factor_data::AbsoluteScaleFactorEntry`]
+    /// sequence that does not match the non-`ZERO_HCB` codebook
+    /// classification of `sfb_cb` (including the reserved codebook
+    /// 12, which has no spectrum semantics to rescale). Inputs
+    /// produced by the wire parsers plus
+    /// [`crate::scale_factor_data::accumulate`] under one shared
+    /// `ics_info` / `section_data` never trip this — it surfaces
+    /// caller-fabricated structures.
+    DequantInvalid,
+
+    /// [`crate::decoded_spectrum::quant_to_spec`] was handed a group
+    /// buffer set whose shape disagrees with the `ics_info`
+    /// grouping: wrong group count, a group buffer length that is
+    /// not `window_group_length[g] × window_len`, or a
+    /// `window_group_length[]` whose sum is not `num_windows`.
+    QuantToSpecInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -618,6 +639,18 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "spectral_data encode: coefficient buffer shape, zero-section content, or magnitude range cannot be represented per Table 4.56"
+                )
+            }
+            Error::DequantInvalid => {
+                write!(
+                    f,
+                    "rescale_spectrum: x_quant / scalefactor-entry / sfb_cb layout violates a §4.6.1.3 / §4.6.2.3.3 precondition"
+                )
+            }
+            Error::QuantToSpecInvalid => {
+                write!(
+                    f,
+                    "quant_to_spec: group buffer shape disagrees with the §4.5.2.3.4 ics_info grouping"
                 )
             }
         }

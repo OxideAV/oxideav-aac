@@ -286,6 +286,22 @@
 //!   owed in subsequent rounds; the `spectral_data()` driver that
 //!   dispatches per-band onto the chosen codebook arrives once all
 //!   eleven are in place.
+//! * The [`dequant`] module — ISO/IEC 14496-3 §4.6.1.3 inverse
+//!   quantization (`Sign(x_quant) · |x_quant|^(4/3)`) and §4.6.2.3.3
+//!   scalefactor application (`gain = 2^(0.25 · (sf − SF_OFFSET))`,
+//!   `SF_OFFSET = 100`), **new in round 284** — the first numeric
+//!   reconstruction stage after the wire walk.
+//!   [`dequant::rescale_spectrum`] applies both band-wise over the
+//!   §4.5.2.3.4 `sect_sfb_offset` ranges in the §4.5.2.3.5
+//!   interleaved transmission order.
+//! * The [`decoded_spectrum`] module — the §4.6.3.3
+//!   `quant_to_spec()` de-interleaver (transmission order →
+//!   window-major `spec[w][k]`) and
+//!   [`decoded_spectrum::decode_channel_spectrum`], the per-channel
+//!   pipeline stage (pulse fix-up → scalefactor accumulation →
+//!   inverse quantization + rescaling → de-interleave → TNS),
+//!   **new in round 284**. Ends one step short of the §4.6.11
+//!   filterbank.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
 //!   primitive (**new in round 187**). Implements the three
@@ -342,7 +358,16 @@
 //!   consumes the spectrum from that position, completing the
 //!   Table 4.50 body. Driving that pair from the `raw_data_block()`
 //!   walker (plus the CPE `common_window` / `ms_mask_present`
-//!   header) is the remaining wiring.
+//!   header) is the remaining wiring; the `tests/docs_adts_corpus.rs`
+//!   driver demonstrates the full composition over the staged ADTS
+//!   fixture corpus.
+//! * Numeric reconstruction (round 284): a parsed channel body now
+//!   decodes to a window-major real-valued spectrum via
+//!   [`decoded_spectrum::decode_channel_spectrum`] — §4.6.3.3 pulse
+//!   fix-up, §4.6.2.3.2 scalefactor accumulation, §4.6.1.3 inverse
+//!   quantization, §4.6.2.3.3 rescaling, §4.6.3.3 `quant_to_spec()`,
+//!   §4.6.9 TNS. PCM requires the §4.6.11 filterbank (IMDCT +
+//!   window-overlap-add) plus the M/S / intensity / PNS tools.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -351,6 +376,8 @@ use oxideav_core::RuntimeContext;
 
 pub mod adts;
 pub mod asc;
+pub mod decoded_spectrum;
+pub mod dequant;
 pub mod extension_payload;
 pub mod gain_control_data;
 pub mod ics_body;
