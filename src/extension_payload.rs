@@ -43,8 +43,8 @@
 //! `FrameAssembler::push_fill` accepts an opaque payload byte
 //! slice. Neither side decodes or encodes the structured
 //! `extension_payload()` body — and the FIL element is where the
-//! DRC metadata (per-band gain factors), the libfdk encoder
-//! identifier, and the SBR enhancement bytes ride. This module is
+//! DRC metadata (per-band gain factors), encoder-identifier fill
+//! bytes, and the SBR enhancement bytes ride. This module is
 //! the §4.4.2.7 wire-level decode/encode for the three non-SBR
 //! extension types whose body layouts are fully specified by
 //! fixed-width fields (no Huffman, no spectral context). The

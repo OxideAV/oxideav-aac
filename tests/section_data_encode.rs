@@ -8,8 +8,7 @@
 //! bit-exact recovery (same sections, same `sfb_cb` map, same byte
 //! buffer down to the bit position the parser consumed).
 //!
-//! Pure encoder ↔ parser symmetry: no external reference encoder is
-//! invoked, and the only inputs are the spec-defined wire field
+//! Pure encoder ↔ parser symmetry: the only inputs are the spec-defined wire field
 //! widths (4-bit `sect_cb` + 3- or 5-bit `sect_len_incr`) and the
 //! §6.3 escape mechanism (`sect_esc_val == 7` or `31`).
 

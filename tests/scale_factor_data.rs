@@ -14,7 +14,7 @@
 //! 2. The parser's terminal bit-position matches the writer's
 //!    bit-position (no over- or under-read).
 //!
-//! No external reference encoder is invoked; the only inputs are the
+//! The only inputs are the
 //! 121-entry Table 4.A.1 codebook (transcribed verbatim in
 //! `src/scale_factor_data.rs`), the `index_offset = -60` from Table
 //! 4.150, and the `noise_pcm_flag` frame-scope behaviour from Table
