@@ -388,6 +388,26 @@ pub enum Error {
     /// `window_sequence` never trips the structural checks — this
     /// surfaces caller-fabricated structures.
     TnsFrameInvalid,
+
+    /// [`crate::spectral_data::SpectralData::parse`] (or the
+    /// [`crate::spectral_data::sect_sfb_offset`] helper) found a
+    /// structural violation of Table 4.56 / §4.5.2.3.4: `max_sfb`
+    /// exceeding `num_swb` for the active window sequence, a
+    /// [`crate::section_data::SectionData`] whose group count
+    /// disagrees with the [`crate::ics_info::IcsInfo`], a section
+    /// carrying the reserved codebook 12 into `spectral_data()`,
+    /// or a section span that is not a whole number of
+    /// `QUAD_LEN` / `PAIR_LEN` n-tuples.
+    SpectralDataInvalid,
+
+    /// [`crate::spectral_data::SpectralData::write`] was handed a
+    /// coefficient buffer that cannot be represented on the wire:
+    /// per-group buffer lengths disagreeing with
+    /// `window_group_length[g] × window_len`, a non-zero coefficient
+    /// inside a `ZERO_HCB` / `NOISE_HCB` / intensity section (or
+    /// above `max_sfb`), or a magnitude exceeding the section
+    /// codebook's LAV (`MAX_QUANT` = 8191 for the ESC book).
+    SpectralDataEncodeInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -586,6 +606,18 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "tns_decode_frame: spec length, TnsData window count, or per-filter coef length violates a §4.6.9.3 precondition"
+                )
+            }
+            Error::SpectralDataInvalid => {
+                write!(
+                    f,
+                    "spectral_data: max_sfb / section layout / codebook violates a Table 4.56 or §4.5.2.3.4 structural constraint"
+                )
+            }
+            Error::SpectralDataEncodeInvalid => {
+                write!(
+                    f,
+                    "spectral_data encode: coefficient buffer shape, zero-section content, or magnitude range cannot be represented per Table 4.56"
                 )
             }
         }

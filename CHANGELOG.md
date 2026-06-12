@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r281): `spectral_data` — the ISO/IEC 14496-3 Table 4.56
+  `spectral_data()` wire walker plus its bit-exact writer, the §4.4.6
+  driver the codebook rounds were building toward. `SpectralData::
+  parse` loops over the window groups and sections established by
+  `ics_info()` / `section_data()`, dispatches per section onto the
+  Codebook 1..=11 Huffman decoders, applies the §4.6.3.3
+  `quad_sign_bits` / `pair_sign_bits` suffix on unsigned books, and
+  reconstructs ESC-book magnitudes ≥ 16 from the `hcod_esc_y` /
+  `hcod_esc_z` escape sequences (`2^(N+4) + escape_word`, capped at
+  `MAX_QUANT` per §4.6.1.3). Loop bounds come from the new public
+  `sect_sfb_offset()` helper implementing the §4.5.2.3.4 derivation
+  (long windows mirror `swb_offset_long_window`; eight-short groups
+  scale the short-window band widths by `window_group_length[g]`).
+  Coefficients are surfaced per group in the §4.5.2.3.5 transmission
+  (interleaved) order; the `quant_to_spec()` deinterleave into the
+  window-major layout TNS/the filterbank consume is the next tool.
+  `SpectralData::write` is the symmetric inverse (ESC clamping to the
+  in-band `ESC_FLAG`, sign-bit derivation, escape re-encoding). New
+  `Error::SpectralDataInvalid` / `Error::SpectralDataEncodeInvalid`
+  cover the structural and encode-side rejections (reserved codebook
+  12, `max_sfb > num_swb`, group-count/buffer-shape mismatches,
+  non-zero coefficients in spectrum-less bands). 20 unit tests
+  (`src/spectral_data.rs`) + 9 integration tests
+  (`tests/spectral_data.rs`), including an `IcsBody` → `SpectralData`
+  composition that parses a complete Table 4.50 channel-element body
+  from one reader.
 - phase 2 (r278): `tns_frame::tns_decode_frame` — the ISO/IEC
   14496-3 §4.6.9.3 per-frame TNS orchestration. Chains the
   `tns_data` wire parser, `tns_coef::tns_decode_coef_to_lpc`, and

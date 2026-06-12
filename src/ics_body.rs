@@ -10,19 +10,18 @@
 //!
 //! ## Why "up to but not including"
 //!
-//! `spectral_data()` (Table 4.51) is the per-band Huffman-coded
-//! quantised MDCT-coefficient block. Its parser depends on the
-//! `swb_offset_long_window[]` / `swb_offset_short_window[]` tables
-//! (which already landed in [`crate::swb_offset`] in round 194) **and**
-//! the per-codebook spectrum Huffman tables (codebooks 1..=11), which
-//! have not yet landed as a unified accessor module. Decoding the
-//! spectrum is the next obvious tool to add; until it lands the body
+//! `spectral_data()` (Table 4.56) is the per-band Huffman-coded
+//! quantised MDCT-coefficient block. Its walker lives in the
+//! dedicated [`crate::spectral_data`] module (round 281): this body
 //! walker stops at the bit position immediately after
-//! `gain_control_data()` (or the dispatching `gain_control_data_present`
-//! bit when the tool is omitted), and surfaces that position so the
-//! caller can advance the bit-reader manually (or, more usefully,
-//! drive a follow-up call that consumes the spectrum block in
-//! place).
+//! `gain_control_data()` (or the dispatching
+//! `gain_control_data_present` bit when the tool is omitted) and
+//! surfaces that position as [`IcsBody::spectral_data_bit_offset`],
+//! from which [`crate::spectral_data::SpectralData::parse`] consumes
+//! the spectrum in place — see `tests/spectral_data.rs` for the
+//! sequential composition. Keeping the two stages separate mirrors
+//! the CPE shared-`ics_info` split: the caller owns the reader and
+//! decides when to hand off.
 //!
 //! This is consistent with the round-200 README ("Phase 2 in
 //! progress + channel-element body walker still pending") — the

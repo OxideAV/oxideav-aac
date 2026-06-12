@@ -336,9 +336,13 @@
 //!   walker (Table 4.50): `global_gain` → [`ics_info`] →
 //!   [`section_data`] → [`scale_factor_data`] → optional
 //!   [`pulse_data`] / [`tns_data`] / [`gain_control_data`]. The
-//!   remaining channel-stream tool (`spectral_data`) is deferred;
-//!   `ics_body` surfaces the start bit-offset of that tool so the
-//!   caller can hand off the spectrum slice to a future parser.
+//!   trailing channel-stream tool, Table 4.56 `spectral_data()`, is
+//!   covered by the [`spectral_data`] walker: `ics_body` surfaces
+//!   the start bit-offset and [`spectral_data::SpectralData::parse`]
+//!   consumes the spectrum from that position, completing the
+//!   Table 4.50 body. Driving that pair from the `raw_data_block()`
+//!   walker (plus the CPE `common_window` / `ms_mask_present`
+//!   header) is the remaining wiring.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -357,6 +361,7 @@ pub mod raw_data_block;
 pub mod scale_factor_data;
 pub mod section_data;
 pub mod spectral_codebook;
+pub mod spectral_data;
 pub mod spectrum_huffman;
 pub mod swb_offset;
 pub mod tns_coef;

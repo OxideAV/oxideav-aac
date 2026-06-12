@@ -3,6 +3,62 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 281)
+
+Round 281 lands the [`spectral_data`](src/spectral_data.rs) module —
+the ISO/IEC 14496-3 Table 4.56 `spectral_data()` wire walker the
+round-259 README named as the next step once the Codebook 1..=11
+table set completed, plus its bit-exact writer. The parser follows
+the Table 4.56 pseudocode literally: per window group, per section,
+codebooks `ZERO_HCB` / `NOISE_HCB` / `INTENSITY_HCB` /
+`INTENSITY_HCB2` transmit no spectrum (their bands stay zero), the
+reserved codebook 12 is rejected, and the spectrum books 1..=11
+loop `k` from `sect_sfb_offset[g][sect_start]` to
+`sect_sfb_offset[g][sect_end]` in `QUAD_LEN = 4` / `PAIR_LEN = 2`
+steps, dispatching each codeword onto the
+[`spectrum_huffman`](src/spectrum_huffman.rs) decoders and
+translating the index through the round-213
+[`spectral_codebook`](src/spectral_codebook.rs) §4.6.3.3 helpers.
+Unsigned books read the `quad_sign_bits` / `pair_sign_bits` suffix
+(one bit per non-zero coefficient, low frequency first); the ESC
+book reads up to two `hcod_esc_y` / `hcod_esc_z` escape sequences
+after the sign bits (prefix of `N` ones, zero separator,
+`(N + 4)`-bit word → `2^(N+4) + escape_word`, capped at
+`MAX_QUANT = 8191` per §4.6.1.3, so a prefix run past 9 is
+rejected). Loop bounds come from the new public `sect_sfb_offset()`
+helper implementing the §4.5.2.3.4 derivation — long windows mirror
+the `swb_offset_long_window` table verbatim; `EIGHT_SHORT_SEQUENCE`
+groups scale each short-window band width by
+`window_group_length[g]` — and `max_sfb > num_swb`, group-count
+mismatches, and non-tuple-aligned section spans surface as the new
+`Error::SpectralDataInvalid`. Coefficients are surfaced per group
+in the §4.5.2.3.5 transmission (interleaved) order
+(`SpectralData::x_quant[g]`, allocated at the full group span with
+spectrum-less bands zeroed); the §4.6.3.3 `quant_to_spec()`
+deinterleave into the window-major `spec[w][k]` layout that
+[`tns_frame`](src/tns_frame.rs) and the future filterbank consume
+is the next tool. `SpectralData::write` is the symmetric inverse —
+ESC magnitudes ≥ 16 clamp to the in-band `ESC_FLAG` with the true
+magnitude re-encoded as an escape sequence, sign bits re-derived,
+and buffer-shape / zero-band / LAV violations surfacing as
+`Error::SpectralDataEncodeInvalid` or the propagated codebook
+errors. With this round the **complete Table 4.50 channel-element
+body is parseable**: [`ics_body`](src/ics_body.rs) stops at the
+`spectral_data_bit_offset` it surfaces and `SpectralData::parse`
+consumes the spectrum from that exact position — the remaining
+wiring is teaching the [`raw_data_block`](src/raw_data_block.rs)
+walker to drive that pair (and the CPE `common_window` /
+`ms_mask_present` header) so multi-element frames advance past
+channel-element bodies. 20 unit tests (per-book round-trips
+including the spec's worked escape examples 00000→16 / 01111→31 /
+1000000→32 / 1011111→63, short-grouping offset arithmetic,
+structural and encode rejections) plus 9 integration tests
+(`tests/spectral_data.rs`: all-11-codebook round-trip sweep,
+hand-pinned zero-spectrum bytes, double-escape corner, 1+2+5
+grouped mixed-codebook frame, and an `IcsBody` → `SpectralData`
+composition that parses a complete channel-element body
+sequentially from one reader).
+
 ## Status (round 278)
 
 Round 278 lands the [`tns_frame`](src/tns_frame.rs) module — the
