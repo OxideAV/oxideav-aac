@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r289): `filterbank` — the §4.6.11 filterbank and block
+  switching, the time-domain reconstruction stage that consumes the
+  round-284 window-major decoded spectrum and emits PCM-domain
+  samples. `Filterbank::synthesize` runs the §4.6.11.3.1 IMDCT
+  (`x[n] = (2/N)·Σ spec[k]·cos((2π/N)(n + n0)(k + 1/2))`,
+  `n0 = (N/2 + 1)/2`, `N ∈ {2048, 256}`), applies the §4.6.11.3.2
+  sine and Kaiser-Bessel-derived windows for all four
+  `window_sequence` shapes (`ONLY_LONG` / `LONG_START` /
+  `EIGHT_SHORT` / `LONG_STOP`) — with the left-half shape inherited
+  from the previous block — and performs the §4.6.11.3.3 inter-frame
+  overlap-add, carried across frames as stateful overlap. The KBD
+  window is the normalized running sum of the Kaiser-Bessel kernel
+  `W'(n, α)` (`α = 4` long, `α = 6` short) over a power-series `I0`.
+  Pinned by streaming TDAC perfect-reconstruction tests (sine + KBD,
+  long + eight-short), `W(n)^2 + W(n + N/2)^2 = 1` window-power
+  identities, tabulated `I0` values, and a mono-ADTS-fixture
+  integration driver that confirms finite PCM with the overlap tail
+  coupling consecutive frames. New `Error::FilterbankInvalid` covers
+  spectrum-length / `window_sequence` mismatches. The frame-length-960
+  (`N = 1920 / 240`) transform family is out of scope, matching the
+  crate's 1024-coefficient `swb_offset` layout.
 - phase 2 (r284): `dequant` + `decoded_spectrum` — the first numeric
   reconstruction stages after the wire walk, ending one step short of
   the §4.6.11 filterbank. `dequant::inverse_quantize` is the

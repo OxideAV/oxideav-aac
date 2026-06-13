@@ -3,6 +3,49 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 289)
+
+Round 289 lands the **§4.6.11 filterbank** — the time-domain
+reconstruction stage that turns the round-284 window-major decoded
+spectrum into PCM-domain samples. This closes the parse → dequant →
+spectrum → time-domain chain for a single channel; the remaining gap
+to byte-exact `expected.wav` is the channel-pair / noise synthesis
+tools (M/S §4.6.8.1, intensity §4.6.8.2, PNS §4.6.13).
+
+* [`filterbank`](src/filterbank.rs) — `Filterbank::synthesize`, the
+  stateful per-channel §4.6.11 filterbank. It runs the §4.6.11.3.1
+  IMDCT `x[n] = (2/N)·Σ_k spec[k]·cos((2π/N)·(n + n0)·(k + 1/2))`
+  with `n0 = (N/2 + 1)/2` and `N ∈ {2048, 256}` (the crate's
+  1024-coefficient layout); applies the §4.6.11.3.2 sine
+  (`W_SIN(n) = sin((π/N)·(n + 1/2))`) and Kaiser-Bessel-derived
+  windows; assembles all four `window_sequence` shapes
+  (`ONLY_LONG` / `LONG_START` / `EIGHT_SHORT` / `LONG_STOP`),
+  inheriting each block's left-half window shape from the previous
+  block per §4.6.11.3.2; overlaps and adds the eight short windows
+  inside an `EIGHT_SHORT` frame; and performs the §4.6.11.3.3
+  inter-frame overlap-add `out[n] = z[i][n] + z[i-1][n + N/2]`,
+  carrying the right-half tail across frames. The KBD window is the
+  normalized running sum of the Kaiser-Bessel kernel
+  `W'(n, α) = I0(πα·√(1 − ((n − N/4)/(N/4))²)) / I0(πα)` with
+  `α = 4` (long) / `α = 6` (short), `I0` via its power series.
+* [`tests/filterbank.rs`](tests/filterbank.rs) — an integration
+  driver that walks the `aac-lc-mono-44100-64kbps-adts` fixture,
+  decodes each SCE frame's spectrum through the round-284 pipeline,
+  feeds every frame to one stateful `Filterbank`, and asserts finite
+  PCM plus an overlap tail that demonstrably couples consecutive
+  frames. Skips cleanly when `docs/` is absent.
+
+The filterbank is pinned by streaming **TDAC perfect-reconstruction**
+tests (a 50%-overlap forward MDCT analysis of a known signal is
+recovered sample-exact by the decoder's IMDCT + synthesis window +
+overlap-add, for both sine and KBD long windows and the eight-short
+internal overlap-add), the `W(n)² + W(n + N/2)² = 1` window-power
+identity for both window types, tabulated `I0(0/1/2)` values, and a
+hand-checked length-8 IMDCT basis vector. New
+`Error::FilterbankInvalid` covers spectrum-length / `window_sequence`
+mismatches. The frame-length-960 (`N = 1920 / 240`) transform family
+is out of scope, matching the crate's `swb_offset` tables.
+
 ## Status (round 284)
 
 Round 284 lands the first **numeric reconstruction** stages — the

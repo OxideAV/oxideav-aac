@@ -429,6 +429,16 @@ pub enum Error {
     /// not `window_group_length[g] × window_len`, or a
     /// `window_group_length[]` whose sum is not `num_windows`.
     QuantToSpecInvalid,
+
+    /// [`crate::filterbank::Filterbank::synthesize`] was handed a
+    /// window-major spectrum whose length disagrees with the
+    /// [`crate::ics_info::IcsInfo`] `window_sequence`: a long
+    /// sequence (`ONLY_LONG` / `LONG_START` / `LONG_STOP`) requires
+    /// exactly [`crate::swb_offset::LONG_WINDOW_LEN`] (1024)
+    /// coefficients, an `EIGHT_SHORT` sequence requires `8 ×`
+    /// [`crate::swb_offset::SHORT_WINDOW_LEN`] (1024 total). The
+    /// §4.6.11.3.1 IMDCT cannot run against any other length.
+    FilterbankInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -651,6 +661,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "quant_to_spec: group buffer shape disagrees with the §4.5.2.3.4 ics_info grouping"
+                )
+            }
+            Error::FilterbankInvalid => {
+                write!(
+                    f,
+                    "filterbank: window-major spectrum length disagrees with the §4.6.11 window_sequence"
                 )
             }
         }

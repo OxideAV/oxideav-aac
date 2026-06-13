@@ -377,6 +377,7 @@ pub mod asc;
 pub mod decoded_spectrum;
 pub mod dequant;
 pub mod extension_payload;
+pub mod filterbank;
 pub mod gain_control_data;
 pub mod ics_body;
 pub mod ics_info;
