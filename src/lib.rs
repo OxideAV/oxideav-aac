@@ -364,8 +364,11 @@
 //!   [`decoded_spectrum::decode_channel_spectrum`] — §4.6.3.3 pulse
 //!   fix-up, §4.6.2.3.2 scalefactor accumulation, §4.6.1.3 inverse
 //!   quantization, §4.6.2.3.3 rescaling, §4.6.3.3 `quant_to_spec()`,
-//!   §4.6.9 TNS. PCM requires the §4.6.11 filterbank (IMDCT +
-//!   window-overlap-add) plus the M/S / intensity / PNS tools.
+//!   §4.6.9 TNS. The §4.6.11 filterbank (round 289) turns that
+//!   spectrum into PCM-domain samples. M/S (§4.6.8.1) stereo
+//!   reconstruction is [`ms_stereo::apply_ms_stereo`] (round 293), a
+//!   CPE-level de-matrix over the channel pair before TNS; intensity
+//!   (§4.6.8.2) and PNS (§4.6.13) synthesis remain the byte-exact gap.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -381,6 +384,7 @@ pub mod filterbank;
 pub mod gain_control_data;
 pub mod ics_body;
 pub mod ics_info;
+pub mod ms_stereo;
 pub mod pce;
 pub mod pulse_data;
 pub mod raw_data_block;

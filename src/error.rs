@@ -439,6 +439,18 @@ pub enum Error {
     /// [`crate::swb_offset::SHORT_WINDOW_LEN`] (1024 total). The
     /// §4.6.11.3.1 IMDCT cannot run against any other length.
     FilterbankInvalid,
+
+    /// [`crate::ms_stereo::apply_ms_stereo`] was handed a channel
+    /// pair whose shapes disagree with the shared
+    /// [`crate::ics_info::IcsInfo`]: the two window-major spectra
+    /// have different lengths, a length that is not
+    /// `num_windows × window_len`, an `ms_used` mask whose group
+    /// count is not `num_window_groups` (or a per-group row shorter
+    /// than `max_sfb`), or a per-channel `sfb_cb` whose group/band
+    /// extents do not cover `max_sfb`. The §4.6.8.1.3 de-matrix is
+    /// undefined without a consistent group/band geometry across
+    /// both channels.
+    MsStereoInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -667,6 +679,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "filterbank: window-major spectrum length disagrees with the §4.6.11 window_sequence"
+                )
+            }
+            Error::MsStereoInvalid => {
+                write!(
+                    f,
+                    "M/S stereo: channel-pair spectra / ms_used / sfb_cb shapes disagree with the §4.6.8.1 ics_info geometry"
                 )
             }
         }

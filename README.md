@@ -3,6 +3,43 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 293)
+
+Round 293 lands the **§4.6.8.1 M/S (mid/side) stereo de-matrix** — the
+first of the three channel-pair / noise synthesis tools that stand
+between the round-289 single-channel chain and byte-exact
+`expected.wav`. M/S is the deterministic one: the de-matrix is an exact
+algebraic reconstruction with no rounding or RNG, so a band whose
+`ms_used` bit is set comes out byte-exact.
+
+* [`ms_stereo`](src/ms_stereo.rs) — `apply_ms_stereo`, an in-place pass
+  over a [`ChannelPairSpectra`](src/ms_stereo.rs) (the two channels'
+  de-interleaved, **pre-TNS** window-major spectra plus each channel's
+  `sfb_cb`). For every `(group, window, sfb)` whose mask bit is set it
+  applies the §4.6.8.1.3 inverse matrix `l' = m + s`, `r' = m − s`
+  (mid in the left slot, side in the right). The `MsMaskPresent` enum
+  decodes the two-bit `ms_mask_present` field: `00` all-zeros (identity
+  no-op), `01` per-band `ms_used` mask, `10` all-ones; `11` is reserved
+  and rejected. Per §4.6.8.1.3 / §4.6.8.2.3 / §4.6.13.3 the de-matrix
+  is suppressed on intensity-coded bands (right-channel `INTENSITY_HCB`
+  / `INTENSITY_HCB2`) and on noise-substituted bands (`NOISE_HCB` in
+  *either* channel), keeping M/S mutually exclusive with intensity and
+  PNS. Short-window grouping maps `(group, in-group window)` to the
+  absolute window index via `window_group_length`.
+* [`tests/ms_stereo.rs`](tests/ms_stereo.rs) — an encode→decode
+  round-trip over a full 20-band long frame (an encoder `m=(l+r)/2`,
+  `s=(l−r)/2` on alternating bands is recovered exactly), plus a
+  `mask_present == 0` no-op check. `src/` unit tests cover all three
+  mask modes, the intensity / either-channel-noise exclusions,
+  short-window grouping, exact integer invertibility, and the
+  shape-validation error paths.
+
+New `Error::MsStereoInvalid` covers channel-pair / `ms_used` / `sfb_cb`
+shapes that disagree with the shared `common_window` `ics_info`
+geometry. Intensity stereo (§4.6.8.2) and PNS (§4.6.13) synthesis are
+the remaining followups; PNS output is RNG-defined and so not
+byte-exact against a specific decoder.
+
 ## Status (round 289)
 
 Round 289 lands the **§4.6.11 filterbank** — the time-domain

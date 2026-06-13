@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r293): `ms_stereo` — the §4.6.8.1 M/S (mid/side) stereo
+  de-matrix, the first of the channel-pair / noise synthesis tools
+  between the round-289 single-channel chain and byte-exact PCM.
+  `apply_ms_stereo` runs the §4.6.8.1.3 inverse matrix
+  (`l' = m + s`, `r' = m − s`) in place over a `ChannelPairSpectra`
+  (both channels' de-interleaved, pre-TNS window-major spectra plus
+  per-channel `sfb_cb`), per `(group, window, sfb)` selected by the
+  decoded `MsMaskPresent` (`00` no-op / `01` per-band `ms_used` mask /
+  `10` all-ones; `11` reserved → rejected). Suppressed on
+  intensity-coded bands (right-channel `INTENSITY_HCB` /
+  `INTENSITY_HCB2`) and noise-substituted bands (`NOISE_HCB` in either
+  channel), keeping M/S mutually exclusive with intensity and PNS.
+  Pinned by an encode→decode round-trip over a 20-band long frame plus
+  unit tests for all three mask modes, the intensity / noise
+  exclusions, short-window grouping, exact integer invertibility, and
+  the shape-validation paths. New `Error::MsStereoInvalid` covers
+  channel-pair / `ms_used` / `sfb_cb` shapes that disagree with the
+  shared `common_window` `ics_info` geometry.
 - phase 2 (r289): `filterbank` — the §4.6.11 filterbank and block
   switching, the time-domain reconstruction stage that consumes the
   round-284 window-major decoded spectrum and emits PCM-domain

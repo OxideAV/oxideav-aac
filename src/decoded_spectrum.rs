@@ -55,9 +55,14 @@
 //!
 //! Intensity stereo (§4.6.8.2), M/S (§4.6.8.1), and PNS (§4.6.13)
 //! reconstruction are channel-*pair* / noise-synthesis tools that
-//! slot between steps 4 and 5; they are not part of this
-//! single-channel stage yet, so intensity / `NOISE_HCB` bands come
-//! out as silence. The Main-profile predictor (§4.6.7) and LTP
+//! slot between steps 4 and 5 (de-interleave → joint-stereo → TNS).
+//! The M/S de-matrix is implemented as
+//! [`crate::ms_stereo::apply_ms_stereo`], a CPE-level pass over the
+//! two channels' de-interleaved spectra; this single-channel stage
+//! does not invoke it (the caller runs it on the pair before each
+//! channel's TNS). Intensity stereo and PNS synthesis remain
+//! follow-ups, so intensity / `NOISE_HCB` bands still come out as
+//! silence here. The Main-profile predictor (§4.6.7) and LTP
 //! (§4.6.6) are likewise deferred.
 
 use crate::dequant::rescale_spectrum;
