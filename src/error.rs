@@ -451,6 +451,19 @@ pub enum Error {
     /// undefined without a consistent group/band geometry across
     /// both channels.
     MsStereoInvalid,
+    /// [`crate::intensity_stereo::apply_intensity_stereo`] was handed a
+    /// channel pair whose shapes disagree with the shared
+    /// [`crate::ics_info::IcsInfo`]: the two window-major spectra have
+    /// different lengths, a length that is not
+    /// `num_windows × window_len`, an `ms_used` mask whose group count
+    /// is not `num_window_groups` (or a per-group row shorter than
+    /// `max_sfb`), a right-channel `sfb_cb` that does not cover
+    /// `max_sfb`, or an `is_pos[g][sfb]` table whose group/band extents
+    /// do not cover every intensity-coded band. The §4.6.8.2.3 scale
+    /// `is_intensity · invert_intensity · 0.5^(0.25·is_pos)` is
+    /// undefined without a consistent group/band geometry and an
+    /// intensity-stereo position for every intensity band.
+    IntensityStereoInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -685,6 +698,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "M/S stereo: channel-pair spectra / ms_used / sfb_cb shapes disagree with the §4.6.8.1 ics_info geometry"
+                )
+            }
+            Error::IntensityStereoInvalid => {
+                write!(
+                    f,
+                    "intensity stereo: channel-pair spectra / ms_used / right sfb_cb / is_pos shapes disagree with the §4.6.8.2 ics_info geometry"
                 )
             }
         }

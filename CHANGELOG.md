@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r300): `intensity_stereo` — the §4.6.8.2 intensity stereo
+  (IS) synthesis, the second deterministic channel-pair tool.
+  `apply_intensity_stereo` derives the right channel from the left in
+  place over an `IntensityPairSpectra` (the pair's de-interleaved
+  window-major spectra, the right `sfb_cb`, and its accumulated
+  `is_pos[g][sfb]`), for every `(group, window, sfb)` whose right
+  codebook is an intensity book, via the §4.6.8.2.3 scale
+  `is_intensity · invert_intensity · 0.5^(0.25·is_pos)` — left channel
+  untouched. Public helpers `is_intensity` (`+1`/`−1`/`0` for
+  `INTENSITY_HCB` / `INTENSITY_HCB2` / other), `invert_intensity`
+  (`1 − 2·ms_used` under a per-band M/S mask, the §4.6.8.2.3 phase
+  reversal; `+1` otherwise), and `intensity_gain` (`0.5^(0.25·is_pos)`).
+  Runs after M/S and before TNS in the §4.6 block order. Pinned by an
+  encode→decode round-trip over a 20-band long frame plus unit tests
+  for the sign, both invert branches, the gain ladder, in/out-of-phase
+  copy, position scaling, mask-on/off phase distinction, short-window
+  grouping, and the shape-validation rejections. New
+  `Error::IntensityStereoInvalid`. PNS (§4.6.13) is the remaining
+  channel-pair / noise tool.
 - phase 2 (r293): `ms_stereo` — the §4.6.8.1 M/S (mid/side) stereo
   de-matrix, the first of the channel-pair / noise synthesis tools
   between the round-289 single-channel chain and byte-exact PCM.

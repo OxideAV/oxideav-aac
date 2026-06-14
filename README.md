@@ -3,6 +3,54 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 300)
+
+Round 300 lands the **§4.6.8.2 intensity stereo (IS) synthesis** — the
+second of the three channel-pair / noise tools and, like M/S, a fully
+deterministic one: an intensity-coded band's right channel is an exact
+real-scaled copy of the left, so it comes out byte-exact. This leaves
+only PNS (§4.6.13) — the one RNG-defined tool — between the chain and
+`expected.wav`.
+
+* [`intensity_stereo`](src/intensity_stereo.rs) —
+  `apply_intensity_stereo`, an in-place pass over an
+  [`IntensityPairSpectra`](src/intensity_stereo.rs) (the channel
+  pair's de-interleaved window-major spectra, the **right** channel's
+  `sfb_cb`, and its accumulated `is_pos[g][sfb]` track). For every
+  `(group, window, sfb)` whose right codebook is an intensity book it
+  derives the right channel from the left via the §4.6.8.2.3 scale
+  `is_intensity · invert_intensity · 0.5^(0.25·is_pos)`, leaving the
+  left channel untouched. The three factors are exposed as the public
+  helpers `is_intensity(right_cb)` (`+1` for `INTENSITY_HCB` 15
+  in-phase, `-1` for `INTENSITY_HCB2` 14 out-of-phase, `0` otherwise),
+  `invert_intensity(mask, ms_used)` (`1 − 2·ms_used` under a per-band
+  M/S mask, `+1` otherwise — the §4.6.8.2.3 phase reversal that
+  repurposes the `ms_used` bit on an intensity band), and
+  `intensity_gain(is_pos)` (`0.5^(0.25·is_pos)`, the same
+  per-quarter-step ladder as the §4.6.2.3.3 scalefactor gain but on a
+  base of `1/2`). The pass runs after M/S and before TNS in the §4.6
+  block order; non-intensity bands are the inverse-quantised
+  passthrough. Short-window grouping maps `(group, in-group window)` to
+  the absolute window index via `window_group_length`.
+* [`tests/intensity_stereo.rs`](tests/intensity_stereo.rs) — an
+  encode→decode round-trip over a full 20-band long frame (an encoder
+  that intensity-codes every third band with mixed positions and
+  alternating in/out-of-phase books is recovered exactly, real bands
+  left untouched), plus a per-band-mask phase-reversal check. `src/`
+  unit tests cover the `is_intensity` sign, both `invert_intensity`
+  branches, the `0.5^(0.25·is_pos)` gain ladder (`pos 0/4/8/−4` →
+  `1/0.5/0.25/2`), in/out-of-phase copy, position scaling, the
+  mask-on/mask-off phase distinction, short-window grouping, and the
+  shape-validation error paths.
+
+New `Error::IntensityStereoInvalid` covers channel-pair / `ms_used` /
+`right_sfb_cb` / `is_pos` shapes that disagree with the shared
+`common_window` `ics_info` geometry. PNS (§4.6.13) synthesis is the
+remaining followup; PNS output is RNG-defined and so not byte-exact
+against a specific decoder. The dependently-switched coupling-channel
+(CCE) contribution of the "intensity stereo / coupling" tool is also
+deferred.
+
 ## Status (round 293)
 
 Round 293 lands the **§4.6.8.1 M/S (mid/side) stereo de-matrix** — the

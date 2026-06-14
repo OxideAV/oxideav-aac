@@ -367,8 +367,14 @@
 //!   §4.6.9 TNS. The §4.6.11 filterbank (round 289) turns that
 //!   spectrum into PCM-domain samples. M/S (§4.6.8.1) stereo
 //!   reconstruction is [`ms_stereo::apply_ms_stereo`] (round 293), a
-//!   CPE-level de-matrix over the channel pair before TNS; intensity
-//!   (§4.6.8.2) and PNS (§4.6.13) synthesis remain the byte-exact gap.
+//!   CPE-level de-matrix over the channel pair before TNS. Intensity
+//!   stereo (§4.6.8.2) reconstruction is
+//!   [`intensity_stereo::apply_intensity_stereo`] (round 300), the
+//!   deterministic left→right derivation
+//!   `r = is_intensity·invert_intensity·0.5^(0.25·is_pos)·l` that runs
+//!   after M/S and before TNS; PNS (§4.6.13) synthesis — the one
+//!   RNG-defined tool, not byte-exact against a specific decoder —
+//!   remains the byte-exact gap.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -384,6 +390,7 @@ pub mod filterbank;
 pub mod gain_control_data;
 pub mod ics_body;
 pub mod ics_info;
+pub mod intensity_stereo;
 pub mod ms_stereo;
 pub mod pce;
 pub mod pulse_data;
