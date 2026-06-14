@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r307): `pns` — the §4.6.13 Perceptual Noise Substitution
+  synthesis, the third and last channel-pair / noise tool. `apply_pns`
+  fills every `NOISE_HCB` (13) band of a channel in place over a
+  `PnsChannel` (the de-interleaved window-major spectrum, the per-band
+  `sfb_cb`, and the accumulated `noise_nrg[g][sfb]`) by drawing a
+  random vector and applying the 2009 measured-energy normalisation
+  `scale = 2^(0.25·noise_nrg) / sqrt(Σ spec²)`, so each band's L2 norm
+  is exactly `2^(0.25·noise_nrg)` — a deterministic, spec-determined
+  invariant (only the per-coefficient phase is generator-dependent,
+  which §4.6.13.3 leaves open). Public `noise_target_norm`, `is_noise`,
+  and the default `gen_rand_vector` generator; `apply_pns` takes the
+  generator as a closure. `apply_pns_pair` implements the §4.6.13.3
+  shared-random-vector correlation rule for a channel pair (same vector
+  for both channels when both are noise on a band and the band signals
+  correlation; independent otherwise; no M/S de-matrix on noise bands,
+  §4.6.13.5). Runs prior to TNS in the §4.6 block order. New
+  `Error::PnsInvalid`. With PNS landed, all three channel-pair / noise
+  tools (M/S, intensity, PNS) are synthesised.
 - phase 2 (r300): `intensity_stereo` — the §4.6.8.2 intensity stereo
   (IS) synthesis, the second deterministic channel-pair tool.
   `apply_intensity_stereo` derives the right channel from the left in

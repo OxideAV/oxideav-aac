@@ -372,9 +372,14 @@
 //!   [`intensity_stereo::apply_intensity_stereo`] (round 300), the
 //!   deterministic left→right derivation
 //!   `r = is_intensity·invert_intensity·0.5^(0.25·is_pos)·l` that runs
-//!   after M/S and before TNS; PNS (§4.6.13) synthesis — the one
-//!   RNG-defined tool, not byte-exact against a specific decoder —
-//!   remains the byte-exact gap.
+//!   after M/S and before TNS. PNS (§4.6.13) synthesis is
+//!   [`pns::apply_pns`] / [`pns::apply_pns_pair`] (round 307), the
+//!   noise-band fill `scale = 2^(0.25·noise_nrg)/sqrt(Σ spec²)` whose
+//!   per-band L2 norm is the spec-determined `2^(0.25·noise_nrg)` (only
+//!   the per-coefficient phase is RNG-defined, so the band energy — not
+//!   the exact samples — is byte-exact). All three channel-pair / noise
+//!   tools are now synthesised; the §4.6.11 → output PCM wiring that
+//!   chains them per element remains.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -393,6 +398,7 @@ pub mod ics_info;
 pub mod intensity_stereo;
 pub mod ms_stereo;
 pub mod pce;
+pub mod pns;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod scale_factor_data;

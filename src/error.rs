@@ -464,6 +464,19 @@ pub enum Error {
     /// undefined without a consistent group/band geometry and an
     /// intensity-stereo position for every intensity band.
     IntensityStereoInvalid,
+    /// [`crate::pns::apply_pns`] / [`crate::pns::apply_pns_pair`] was
+    /// handed a channel (or pair) whose shapes disagree with the
+    /// [`crate::ics_info::IcsInfo`]: a window-major spectrum whose
+    /// length is not `num_windows × window_len`, a
+    /// `window_group_length` whose sum is not `num_windows`, a
+    /// `max_sfb` beyond the active window's band count, a `sfb_cb` or
+    /// `noise_nrg` table whose group/band extents do not cover
+    /// `max_sfb`, two paired channels with differing window geometry,
+    /// or (for the pair) an `ms_used` mask whose group count is not
+    /// `num_window_groups` (or a per-group row shorter than `max_sfb`).
+    /// The §4.6.13.3 noise synthesis is undefined without a consistent
+    /// group/band geometry and a `noise_nrg` for every noise band.
+    PnsInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -704,6 +717,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "intensity stereo: channel-pair spectra / ms_used / right sfb_cb / is_pos shapes disagree with the §4.6.8.2 ics_info geometry"
+                )
+            }
+            Error::PnsInvalid => {
+                write!(
+                    f,
+                    "PNS: channel spectrum / sfb_cb / noise_nrg / ms_used shapes disagree with the §4.6.13 ics_info geometry"
                 )
             }
         }

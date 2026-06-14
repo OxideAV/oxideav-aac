@@ -3,6 +3,58 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 307)
+
+Round 307 lands the **§4.6.13 Perceptual Noise Substitution (PNS)
+synthesis** — the third and last of the channel-pair / noise tools,
+and the only RNG-defined one. A noise-coded band (`sfb_cb ==
+NOISE_HCB`, 13) carries no spectral coefficients; this tool fills it
+with a freshly generated random vector scaled to a transmitted target
+energy.
+
+* [`pns`](src/pns.rs) — `apply_pns`, an in-place per-channel pass over
+  a [`PnsChannel`](src/pns.rs) (the de-interleaved window-major
+  spectrum, the per-band `sfb_cb`, and the accumulated
+  `noise_nrg[g][sfb]` energies). For every `(group, window, sfb)`
+  whose codebook is `NOISE_HCB` it draws a fresh random vector and
+  applies the **2009 measured-energy** normalisation
+  (`scale = 2^(0.25·noise_nrg) / sqrt(Σ spec²)`), so the band comes
+  out with L2 norm **exactly** `2^(0.25·noise_nrg)` regardless of the
+  generator's variance — a spec-determined, deterministic invariant.
+  Only the per-coefficient *phase* depends on the generator, which
+  §4.6.13.3 deliberately leaves open ("a suitable random number
+  generator … one multiplication/accumulation per random value"), so
+  PNS output is not byte-exact against any one decoder but its band
+  energy is. The energy ladder `2^(0.25·noise_nrg)` is the same
+  per-quarter-step gain as the §4.6.2.3.3 scalefactor gain.
+* `noise_target_norm(noise_nrg)` (`2^(0.25·noise_nrg)`),
+  `is_noise(cb)` (the §4.6.13.3 `NOISE_HCB` predicate), and
+  `gen_rand_vector(out, &mut state)` (the default 32-bit
+  multiply-accumulate LCG generator) are public; `apply_pns` takes the
+  generator as a closure so a caller may substitute a different source
+  without changing the synthesis maths.
+* `apply_pns_pair` implements the §4.6.13.3 channel-pair correlation
+  rule: when the **same** `(group, sfb)` is `NOISE_HCB` in **both**
+  channels and the band signals correlation (`ms_used` set under
+  `ms_mask_present == 1`, or `ms_mask_present == 2`), the **same**
+  random vector is used for both channels (scaled independently to
+  each channel's energy); otherwise each draws an independent vector.
+  No M/S de-matrix runs on such a band — PNS and M/S are mutually
+  exclusive (§4.6.13.5). When only one channel of a pair is noise the
+  `ms_used` bit is ignored.
+* The pass injects noise **prior to** the §4.6.9 TNS step
+  (§4.6.13.5), after M/S and intensity in the §4.6 block order.
+
+New `Error::PnsInvalid` covers channel / `sfb_cb` / `noise_nrg` /
+`ms_used` shapes that disagree with the `ics_info` geometry. `src/`
+unit tests cover the exact-target-norm invariant, the energy ladder,
+the signed/non-zero generator, non-noise passthrough, the shared- vs
+independent-vector pair paths, the one-channel-noise `ms_used`
+ignore, and the shape-validation error path. With PNS landed, all
+three channel-pair / noise tools (M/S §4.6.8.1, intensity §4.6.8.2,
+PNS §4.6.13) are now synthesised. The RVLC backward-DPCM noise-energy
+decode and the §4.6.13.6 scalable-coder integration remain followups.
+
 ## Status (round 300)
 
 Round 300 lands the **§4.6.8.2 intensity stereo (IS) synthesis** — the
