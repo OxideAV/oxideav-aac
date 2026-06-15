@@ -477,6 +477,20 @@ pub enum Error {
     /// The §4.6.13.3 noise synthesis is undefined without a consistent
     /// group/band geometry and a `noise_nrg` for every noise band.
     PnsInvalid,
+    /// [`crate::element_decode`] was asked to decode a channel element
+    /// whose component shapes are mutually inconsistent: a channel-pair
+    /// element (`CPE`) whose two channels disagree on `window_sequence`
+    /// (so the shared `common_window` geometry the §4.6.8 joint-stereo
+    /// tools require is violated), an `ms_used` row that does not cover
+    /// `num_window_groups × max_sfb`, or a per-channel
+    /// `AbsoluteScaleFactors` whose wire-order record count does not
+    /// match its `sfb_cb` non-`ZERO_HCB` band count when expanded to the
+    /// band-indexed `is_pos[g][sfb]` / `noise_nrg[g][sfb]` layout the
+    /// §4.6.8.2 / §4.6.13 synthesis passes consume. The element-level
+    /// §4.6 block-order chain (de-quantise → M/S → intensity → PNS →
+    /// TNS → filterbank) cannot run without a consistent geometry across
+    /// the composed stages.
+    ElementDecodeInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -723,6 +737,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "PNS: channel spectrum / sfb_cb / noise_nrg / ms_used shapes disagree with the §4.6.13 ics_info geometry"
+                )
+            }
+            Error::ElementDecodeInvalid => {
+                write!(
+                    f,
+                    "element decode: channel-element component shapes (window_sequence pairing, ms_used extent, or scalefactor-record count) are mutually inconsistent for the §4.6 block-order chain"
                 )
             }
         }

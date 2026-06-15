@@ -377,9 +377,14 @@
 //!   noise-band fill `scale = 2^(0.25·noise_nrg)/sqrt(Σ spec²)` whose
 //!   per-band L2 norm is the spec-determined `2^(0.25·noise_nrg)` (only
 //!   the per-coefficient phase is RNG-defined, so the band energy — not
-//!   the exact samples — is byte-exact). All three channel-pair / noise
-//!   tools are now synthesised; the §4.6.11 → output PCM wiring that
-//!   chains them per element remains.
+//!   the exact samples — is byte-exact). The §4.6 element-level decode
+//!   driver [`element_decode::ElementDecoder`] (round 311) chains the
+//!   whole stack per channel element: `decode_sce` for SCE / LFE and
+//!   `decode_cpe` for a CPE run pulse → dequant → `quant_to_spec()` →
+//!   M/S → intensity → PNS → TNS → §4.6.11 filterbank to PCM, carrying
+//!   the per-channel overlap-add tail across frames. `expected.wav` PCM
+//!   comparison (resampler / clipper, and the RNG-phase PNS caveat) is
+//!   the remaining followup.
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -390,6 +395,7 @@ pub mod adts;
 pub mod asc;
 pub mod decoded_spectrum;
 pub mod dequant;
+pub mod element_decode;
 pub mod extension_payload;
 pub mod filterbank;
 pub mod gain_control_data;

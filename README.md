@@ -3,6 +3,59 @@
 A pure-Rust **AAC** (Advanced Audio Coding) codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
+## Status (round 311)
+
+Round 311 lands the **element-level decode driver** — the §4.6
+block-order glue that chains every per-tool primitive earlier rounds
+built into PCM-domain samples for a `single_channel_element()` (SCE /
+LFE) and a `channel_pair_element()` (CPE). This is the "§4.6.11 → output
+PCM wiring that chains them per element" that the round-289 / 293 / 300 /
+307 status lines named as the standing remainder once all three
+channel-pair / noise tools were synthesised.
+
+* [`element_decode`](src/element_decode.rs) — `ElementDecoder`, a
+  stateful per-element decoder holding one [`filterbank`](src/filterbank.rs)
+  `Filterbank` per channel slot (so the §4.6.11.3.3 inter-frame
+  overlap-add tail and the §4.6.11.3.2 previous-block window shape
+  persist across frames) plus the §4.6.13.3 PNS generator state.
+  `decode_sce` runs the single-channel chain (pulse §4.6.3.3 → dequant
+  §4.6.1.3 → rescale §4.6.2.3.3 → `quant_to_spec()` §4.6.3.3 → PNS
+  §4.6.13 → TNS §4.6.9 → filterbank §4.6.11); `decode_cpe` runs the
+  pair chain with the §4.6.8 / §4.6.13 joint-stereo / noise tools in the
+  normative block order — per-channel pulse/dequant/de-interleave, then
+  **M/S §4.6.8.1 → intensity §4.6.8.2 → PNS §4.6.13** on the pre-TNS
+  pair, then per-channel TNS + filterbank. The pair tools sit *between*
+  `quant_to_spec()` and TNS (§4.6.13.5: noise injected prior to TNS), so
+  the CPE path composes the fine-grained primitives directly rather than
+  reusing the single-channel `decode_channel_spectrum` (which runs TNS
+  internally).
+* `ChannelInput` bundles a parsed `IcsBody` + `IcsInfo` +
+  `SpectralData`; `CpeJointStereo` carries the decoded Table 4.4
+  `ms_mask_present` + per-band `ms_used`. A private `band_indexed_track`
+  helper expands the wire-order `AbsoluteScaleFactors` (one record per
+  non-`ZERO_HCB` band) into the band-indexed `is_pos[g][sfb]` /
+  `noise_nrg[g][sfb]` `[g][sfb]` layout the intensity / PNS passes
+  consume, in lock-step with `sfb_cb`.
+* [`tests/element_decode.rs`](tests/element_decode.rs) — an end-to-end
+  driver that runs **all 12 staged ADTS fixtures** through the element
+  decoder to PCM (one stateful `ElementDecoder` per element-instance
+  tag), asserting finite, plausibly-bounded PCM, at least one non-silent
+  frame per fixture, and witnessed inter-frame overlap coupling. Every
+  fixture decodes — mono/stereo at 8/11.025/22.05/44.1 kHz, chirp
+  short-window sequences, TNS-active, PNS, M/S, intensity stereo,
+  ID3v2-prefixed, and the HE-AAC v1 LC core. Skips cleanly when `docs/`
+  is absent.
+
+New `Error::ElementDecodeInvalid` covers a CPE whose two channels
+disagree on window geometry (the `common_window` invariant the §4.6.8
+tools require), an `ms_used` mask that does not cover
+`num_window_groups × max_sfb`, or a scalefactor-record count that does
+not match the `sfb_cb` non-`ZERO_HCB` band count when expanded. The
+Main predictor (§4.6.7), LTP (§4.6.6), and SSR gain-control ladder
+(§4.6.12) remain unapplied (their side-info is parsed); `expected.wav`
+PCM comparison is still a followup (the crate carries no resampler /
+clipper and PNS output is RNG-phase per §4.6.13.3, energy-exact only).
+
 ## Status (round 307)
 
 Round 307 lands the **§4.6.13 Perceptual Noise Substitution (PNS)

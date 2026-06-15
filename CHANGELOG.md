@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- phase 2 (r311): `element_decode` — the element-level decode driver,
+  the §4.6 block-order glue that chains every per-tool primitive into
+  PCM-domain samples for a `single_channel_element()` (SCE / LFE) and a
+  `channel_pair_element()` (CPE). `ElementDecoder` is stateful: it holds
+  one `Filterbank` per channel slot (the §4.6.11.3.3 overlap-add tail
+  and §4.6.11.3.2 previous-block window shape persist across frames) and
+  the §4.6.13.3 PNS generator state. `decode_sce` runs pulse §4.6.3.3 →
+  dequant §4.6.1.3 → rescale §4.6.2.3.3 → `quant_to_spec()` §4.6.3.3 →
+  PNS §4.6.13 → TNS §4.6.9 → filterbank §4.6.11. `decode_cpe` runs the
+  pair chain with the joint-stereo / noise tools in normative block
+  order — per-channel pulse/dequant/de-interleave, then M/S §4.6.8.1 →
+  intensity §4.6.8.2 → PNS §4.6.13 on the pre-TNS pair (the tools sit
+  between `quant_to_spec()` and TNS per §4.6.13.5), then per-channel TNS
+  + filterbank. `ChannelInput` bundles a parsed body + `ics_info` +
+  spectrum; `CpeJointStereo` carries the Table 4.4 `ms_mask_present` +
+  `ms_used`. New `Error::ElementDecodeInvalid` covers a CPE with
+  mismatched window geometry, an under-covered `ms_used` mask, or a
+  scalefactor-record count that does not match the `sfb_cb`
+  non-`ZERO_HCB` band count. Pinned by 9 unit tests (band-indexed track
+  expansion, SCE finite/non-silent PCM, inter-frame overlap coupling,
+  CPE M/S reconstruction, mask-off independence, window-mismatch
+  rejection, single-channel noise synthesis) and an end-to-end
+  integration driver (`tests/element_decode.rs`) that decodes all 12
+  staged ADTS fixtures to PCM with finite output, non-silent frames, and
+  witnessed overlap coupling. The Main predictor (§4.6.7), LTP
+  (§4.6.6), and SSR gain-control (§4.6.12) remain unapplied;
+  `expected.wav` PCM comparison is a followup.
 - phase 2 (r307): `pns` — the §4.6.13 Perceptual Noise Substitution
   synthesis, the third and last channel-pair / noise tool. `apply_pns`
   fills every `NOISE_HCB` (13) band of a channel in place over a
