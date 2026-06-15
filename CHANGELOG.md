@@ -6,6 +6,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-aac/compare/v0.1.4...v0.1.5) - 2026-06-15
+
+### Other
+
+- §4.6 element-level decode driver — SCE/CPE to PCM (r311)
+- §4.6.13 Perceptual Noise Substitution synthesis (r307)
+- §4.6.8.2 intensity stereo synthesis (r300)
+- §4.6.8.1 M/S stereo de-matrix (r293)
+- §4.6.11 filterbank — IMDCT + sine/KBD windows + overlap-add
+- finish the positive-provenance sweep (README + remaining test preambles)
+- state provenance positively in module/test docs
+- dequant + decoded_spectrum: §4.6.1.3/§4.6.2.3.3 dequantisation and the per-channel decoded-spectrum pipeline
+- add Table 4.56 spectral_data() wire walker + §4.5.2.3.4 sect_sfb_offset
+- add §4.6.9.3 tns_decode_frame per-frame TNS orchestration
+- add §4.6.9.3 tns_ar_filter all-pole IIR pass
+
 ### Added
 
 - phase 2 (r311): `element_decode` — the element-level decode driver,
