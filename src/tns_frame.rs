@@ -61,7 +61,7 @@ use crate::ics_info::WindowSequence;
 use crate::swb_offset::{
     long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
 };
-use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc};
+use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc, tns_ma_filter};
 use crate::tns_data::{num_windows, TnsData};
 use crate::tns_max::{clamp_tns_band, clamp_tns_order};
 use crate::{Error, Result};
@@ -116,6 +116,77 @@ pub fn tns_decode_frame(
     max_sfb: u8,
     aot: u8,
     fs_index: u8,
+) -> Result<()> {
+    tns_frame_filter(
+        spec,
+        tns,
+        window_sequence,
+        max_sfb,
+        aot,
+        fs_index,
+        TnsFilterKind::Synthesis,
+    )
+}
+
+/// §4.6.7.4.1 TNS **analysis** pass — the same per-window / per-filter
+/// region walk as [`tns_decode_frame`], but applying the all-zero
+/// [`tns_ma_filter`] (the inverse of the §4.6.9.3 all-pole synthesis
+/// filter) instead.
+///
+/// Figure 4.30 requires this forward filter inside the LTP loop: the
+/// LTP-predicted spectrum `X_est = MDCT(x_est)` must be moved into the
+/// noise-shaped residual domain (the domain the transmitted `Y_rec`
+/// lives in, *before* TNS synthesis) so that `X_rec = X_est + Y_rec`
+/// adds like-for-like. The subsequent §4.6.9 TNS synthesis pass over
+/// `X_rec` then undoes the analysis on the LTP contribution while
+/// shaping the residual, exactly as the all-pole filter inverts the
+/// all-zero one over a shared region.
+///
+/// Inputs, scope and errors mirror [`tns_decode_frame`]; the only
+/// difference is the filter polarity. When `tns` carries no filters
+/// (or only order-0 / empty-region filters) the spectrum is untouched,
+/// so a channel without TNS needs no analysis pass.
+pub fn tns_analysis_frame(
+    spec: &mut [f64],
+    tns: &TnsData,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+    aot: u8,
+    fs_index: u8,
+) -> Result<()> {
+    tns_frame_filter(
+        spec,
+        tns,
+        window_sequence,
+        max_sfb,
+        aot,
+        fs_index,
+        TnsFilterKind::Analysis,
+    )
+}
+
+/// Which TNS filter polarity [`tns_frame_filter`] applies over each
+/// region: the §4.6.9.3 all-pole synthesis filter (the normal decode
+/// path) or the §4.6.7.4.1 all-zero analysis filter (the LTP loop).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TnsFilterKind {
+    /// All-pole [`tns_ar_filter`] — §4.6.9.3 decode.
+    Synthesis,
+    /// All-zero [`tns_ma_filter`] — §4.6.7.4.1 LTP-loop analysis.
+    Analysis,
+}
+
+/// Shared §4.6.9.3 region walk for both TNS polarities. Identical band
+/// clamping, coefficient decode and region selection; only the final
+/// per-region filter call differs (`kind`).
+fn tns_frame_filter(
+    spec: &mut [f64],
+    tns: &TnsData,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+    aot: u8,
+    fs_index: u8,
+    kind: TnsFilterKind,
 ) -> Result<()> {
     let windows = num_windows(window_sequence);
     let (window_len, offsets) = if window_sequence.is_eight_short() {
@@ -181,7 +252,14 @@ pub fn tns_decode_frame(
             } else {
                 (start, 1)
             };
-            tns_ar_filter(window_spec, filter_start, size, inc, &lpc)?;
+            match kind {
+                TnsFilterKind::Synthesis => {
+                    tns_ar_filter(window_spec, filter_start, size, inc, &lpc)?;
+                }
+                TnsFilterKind::Analysis => {
+                    tns_ma_filter(window_spec, filter_start, size, inc, &lpc)?;
+                }
+            }
         }
     }
     Ok(())
@@ -815,5 +893,79 @@ mod tests {
             ),
             Err(Error::TnsCoefOutOfRange)
         ));
+    }
+
+    // ===== §4.6.7.4.1 analysis pass =====
+
+    #[test]
+    fn analysis_then_synthesis_is_identity() {
+        // The LTP-loop analysis filter (all-zero) followed by the §4.6.9
+        // synthesis filter (all-pole), over the same frame, reconstructs
+        // the spectrum exactly — the §4.6.7.4.1 invariant that lets the
+        // single TNS synthesis pass after the LTP add undo the analysis
+        // on X_est while shaping the residual.
+        let tns = long_window(
+            vec![
+                TnsFilter {
+                    length: 12,
+                    order: 3,
+                    direction: false,
+                    coef_compress: false,
+                    coef: vec![1, 7, 2],
+                },
+                TnsFilter {
+                    length: 8,
+                    order: 2,
+                    direction: true,
+                    coef_compress: false,
+                    coef: vec![6, 3],
+                },
+            ],
+            false,
+        );
+        let original = ramp(1024);
+        let mut spec = original.clone();
+        tns_analysis_frame(
+            &mut spec,
+            &tns,
+            WindowSequence::OnlyLong,
+            49,
+            AOT_AAC_LC,
+            FS_48K,
+        )
+        .unwrap();
+        // The analysis pass actually changed the spectrum.
+        assert_ne!(spec, original);
+        tns_decode_frame(
+            &mut spec,
+            &tns,
+            WindowSequence::OnlyLong,
+            49,
+            AOT_AAC_LC,
+            FS_48K,
+        )
+        .unwrap();
+        for (g, w) in spec.iter().zip(original.iter()) {
+            assert!((g - w).abs() < 1e-9, "analysis∘synthesis drift: {g} vs {w}");
+        }
+    }
+
+    #[test]
+    fn analysis_no_filters_is_noop() {
+        let tns = TnsData {
+            windows: vec![no_filter_window()],
+        };
+        let original = ramp(1024);
+        let mut spec = original.clone();
+        tns_analysis_frame(
+            &mut spec,
+            &tns,
+            WindowSequence::OnlyLong,
+            49,
+            AOT_AAC_LC,
+            FS_48K,
+        )
+        .unwrap();
+        assert_eq!(spec, original);
     }
 }

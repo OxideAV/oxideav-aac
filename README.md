@@ -82,11 +82,23 @@ driver that chains it.
   `ltp_long_used`. LTP is restricted to long windows for the AAC LTP
   object type (§4.6.7.1); short-window LTP and the ER AAC LD `M = N/2`
   lag offset are out of scope.
+- **TNS analysis filter** (`tns_coef::tns_ma_filter`,
+  `tns_frame::tns_analysis_frame`) — §4.6.7.4.1 / Figure 4.30: the
+  all-zero (moving-average, FIR) inverse of the §4.6.9.3 all-pole
+  synthesis filter, `y(n) = x(n) + Σ lpc[k]·x(n−k)`. Run over the same
+  per-window region walk as `tns_decode_frame`; analysis ∘ synthesis is
+  the identity over a shared region, which is the §4.6.7.4.1
+  noise-shaping invariant.
 - **Element decode driver** (`element_decode`) — `ElementDecoder` chains
   the whole stack per element: `decode_sce` for SCE / LFE and
   `decode_cpe` for a CPE (pulse → dequant → `quant_to_spec()` → M/S →
-  intensity → PNS → TNS → filterbank), carrying the per-channel
-  overlap-add tail across frames.
+  intensity → PNS → **LTP → TNS** → filterbank), carrying the
+  per-channel overlap-add tail **and the §4.6.7.3 LTP reconstruction
+  history** across frames. LTP runs in the §4.6.7.4.1 / Figure 4.30
+  block order — long-term synthesis (with the all-zero TNS analysis
+  filter applied to `X_est`) *before* the §4.6.9 TNS synthesis filter,
+  so the single synthesis pass shapes the residual while undoing the
+  analysis on the LTP contribution.
 
 ## Not yet supported
 
@@ -96,10 +108,10 @@ driver that chains it.
   clipper, and PNS bands are energy-exact rather than sample-exact).
 - The Main frequency-domain predictor (§4.6.6) and SSR gain-control
   ladder (§4.6.12) — their side-info is parsed but not applied. (LTP,
-  §4.6.7, is now synthesised for long windows — see above. Wiring the
-  `ltp` tool into the `element_decode` driver, with the
-  TNS-analysis-in-loop ordering of §4.6.7.4.1 / Figure 4.30, is the
-  next LTP increment.)
+  §4.6.7, is now fully wired into `element_decode` for long windows
+  with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering — see
+  above. Short-window LTP and the ER AAC LD `M = N/2` lag offset remain
+  out of scope per the §4.6.7.1 long-window restriction.)
 - SBR / PS synthesis (needs a QMF / patching back-end), the
   coupling-channel (CCE) contribution, and the ER AAC LD 480/512
   transform variants.

@@ -457,6 +457,88 @@ pub fn tns_ar_filter(
     Ok(())
 }
 
+/// §4.6.7.4.1 TNS **analysis** filter — the all-zero (moving-average,
+/// FIR) inverse of the §4.6.9.3 [`tns_ar_filter`] all-pole synthesis
+/// filter, applied in place over a strided region.
+///
+/// Figure 4.30 puts an additional TNS analysis filter in the LTP loop:
+/// because TNS is applied to a *reconstructed* spectrum, the
+/// LTP-predicted spectrum `X_est` has to be pushed through the same
+/// noise-shaping the residual carries before it can be added to the
+/// transmitted residual `Y_rec` (which sits in the pre-synthesis,
+/// noise-shaped domain). That forward filter is the exact inverse of
+/// the synthesis recurrence: where [`tns_ar_filter`] computes
+///
+/// ```text
+/// y(n) = x(n) - Σ_{k=1..order} lpc[k] * y(n-k)      (all-pole)
+/// ```
+///
+/// the analysis filter computes
+///
+/// ```text
+/// y(n) = x(n) + Σ_{k=1..order} lpc[k] * x(n-k)      (all-zero)
+/// ```
+///
+/// reading back its own *inputs* (`x`) rather than its outputs. Running
+/// the analysis filter and then the synthesis filter over the same
+/// region with the same `lpc` is the identity, which is the §4.6.7.4.1
+/// requirement: the analysis step in the LTP loop is undone by the
+/// §4.6.9 TNS synthesis step that follows the `X_est + Y_rec` add.
+///
+/// Argument and error semantics mirror [`tns_ar_filter`] exactly: the
+/// filter state is seeded with zeros at every invocation, the output
+/// overwrites the input in place, and `size` samples are processed
+/// stepping by `inc ∈ {-1, +1}`. `lpc[0]` is the implicit `1.0`;
+/// `lpc[1..=order]` are the predictor taps. An order-0 filter
+/// (`lpc == [1.0]`) is the identity.
+pub fn tns_ma_filter(
+    spectrum: &mut [f64],
+    start: usize,
+    size: usize,
+    inc: i32,
+    lpc: &[f64],
+) -> Result<()> {
+    if lpc.is_empty() {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    if inc != 1 && inc != -1 {
+        return Err(Error::TnsCoefOutOfRange);
+    }
+    let order = lpc.len() - 1;
+    if size == 0 || order == 0 {
+        if size > 0 {
+            walk_bounds_check(spectrum.len(), start, size, inc)?;
+        }
+        return Ok(());
+    }
+
+    walk_bounds_check(spectrum.len(), start, size, inc)?;
+
+    // Filter-state ring: the last `order` *input* samples x(n-1) ..
+    // x(n-order). Index `0` is the most recent input. Seeded with zeros,
+    // matching the all-pole filter's zero-initialised state so the two
+    // are mutual inverses over the region.
+    let mut history = vec![0.0_f64; order];
+
+    let mut idx = start as isize;
+    for _ in 0..size {
+        let x = spectrum[idx as usize];
+        // y(n) = x(n) + Σ_{k=1..order} lpc[k] * x(n-k)
+        let mut y = x;
+        for k in 1..=order {
+            y += lpc[k] * history[k - 1];
+        }
+        spectrum[idx as usize] = y;
+        // Shift the history ring: x becomes the new x(n-1).
+        for k in (1..order).rev() {
+            history[k] = history[k - 1];
+        }
+        history[0] = x;
+        idx += inc as isize;
+    }
+    Ok(())
+}
+
 /// Bounds-check the §4.6.9.3 strided walk: `size` samples starting at
 /// `start`, stepping by `inc ∈ {-1, +1}`, must all land inside a
 /// buffer of `len` elements. Returns [`Error::TnsCoefOutOfRange`]
@@ -1068,5 +1150,90 @@ mod tests {
         for (g, w) in spec.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-12);
         }
+    }
+
+    // ---------- tns_ma_filter (analysis / all-zero) ----------
+
+    /// Reference all-zero (analysis) filter for an upward, in-order
+    /// region: y(n) = x(n) + Σ lpc[k]·x(n-k), zero-seeded history.
+    fn ref_ma_filter(x: &[f64], lpc: &[f64]) -> Vec<f64> {
+        let order = lpc.len() - 1;
+        let mut y = vec![0.0; x.len()];
+        for n in 0..x.len() {
+            let mut acc = x[n];
+            for k in 1..=order {
+                if n >= k {
+                    acc += lpc[k] * x[n - k];
+                }
+            }
+            y[n] = acc;
+        }
+        y
+    }
+
+    #[test]
+    fn ma_filter_order_zero_is_identity() {
+        let mut spec = [0.3, -0.9, 1.2, 0.4];
+        let before = spec;
+        let n = spec.len();
+        tns_ma_filter(&mut spec, 0, n, 1, &[1.0]).unwrap();
+        assert_eq!(spec, before);
+    }
+
+    #[test]
+    fn ma_filter_matches_reference_upward() {
+        let lpc = [1.0, 0.5, -0.25];
+        let x = [0.3, -0.9, 1.2, 0.4, -0.6, 0.1];
+        let want = ref_ma_filter(&x, &lpc);
+        let mut spec = x;
+        tns_ma_filter(&mut spec, 0, x.len(), 1, &lpc).unwrap();
+        for (g, w) in spec.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-12, "got {g} want {w}");
+        }
+    }
+
+    #[test]
+    fn ma_then_ar_is_identity() {
+        // §4.6.7.4.1: the analysis filter followed by the synthesis
+        // filter (same region, same lpc) reconstructs the input exactly.
+        let lpc = tns_decode_coef_to_lpc(4, 0, &[3, 0xE]).unwrap();
+        let x = [0.7, -0.2, 1.1, -1.3, 0.05, 0.9, -0.4];
+        let mut spec = x;
+        tns_ma_filter(&mut spec, 0, x.len(), 1, &lpc).unwrap();
+        tns_ar_filter(&mut spec, 0, x.len(), 1, &lpc).unwrap();
+        for (g, w) in spec.iter().zip(x.iter()) {
+            assert!((g - w).abs() < 1e-12, "ma∘ar not identity: {g} vs {w}");
+        }
+    }
+
+    #[test]
+    fn ma_then_ar_is_identity_downward() {
+        // Same inverse relationship for the downward (direction=1) walk.
+        let lpc = [1.0, -0.4, 0.2];
+        let x = [0.7, -0.2, 1.1, -1.3, 0.05];
+        let mut spec = x;
+        let end = x.len();
+        tns_ma_filter(&mut spec, end - 1, end, -1, &lpc).unwrap();
+        tns_ar_filter(&mut spec, end - 1, end, -1, &lpc).unwrap();
+        for (g, w) in spec.iter().zip(x.iter()) {
+            assert!((g - w).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn ma_filter_rejects_bad_args() {
+        let mut spec = [1.0, 2.0, 3.0];
+        assert!(matches!(
+            tns_ma_filter(&mut spec, 0, 1, 2, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+        assert!(matches!(
+            tns_ma_filter(&mut spec, 1, 5, 1, &[1.0, 0.5]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
+        assert!(matches!(
+            tns_ma_filter(&mut spec, 0, 1, 1, &[]),
+            Err(Error::TnsCoefOutOfRange)
+        ));
     }
 }

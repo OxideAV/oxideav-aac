@@ -49,11 +49,18 @@
 //!
 //! ## Scope
 //!
-//! * The Main-profile predictor (§4.6.7) and LTP (§4.6.6) are not
-//!   applied — `ics_info()` surfaces their side-info but the
-//!   prediction loops are a later tool, so a stream that flips those
-//!   bits decodes as if prediction were off (the spec's behaviour when
-//!   `predictor_data_present == 0`).
+//! * **LTP (§4.6.7)** is wired in for long windows: [`finish_channel`]
+//!   runs the §4.6.7.4.1 / Figure 4.30 block order — long-term
+//!   synthesis (with the all-zero TNS analysis filter on `X_est`)
+//!   *before* the §4.6.9 TNS synthesis filter — and advances the
+//!   per-channel [`crate::ltp::LtpState`] reconstruction history each
+//!   frame. Short-window LTP and the ER AAC LD `M = N/2` lag offset
+//!   remain out of scope (the predictor is left off for those, per the
+//!   §4.6.7.1 long-window restriction).
+//! * The Main-profile frequency-domain predictor (§4.6.6) is not
+//!   applied — `ics_info()` surfaces its side-info but the prediction
+//!   loop is a later tool, so a stream that flips `predictor_data_present`
+//!   decodes as if backward prediction were off.
 //! * The SSR (AOT 3) gain-control ladder (§4.6.12) is parsed but not
 //!   applied; this driver targets the LC / Main / LTP filterbank.
 //! * PNS output is RNG-defined per §4.6.13.3 (only the per-band L2 norm
@@ -67,13 +74,14 @@ use crate::filterbank::Filterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
 use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
+use crate::ltp::LtpState;
 use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
 use crate::pns::{apply_pns, apply_pns_pair, gen_rand_vector, PnsChannel};
 use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::apply_pulse_data;
-use crate::tns_frame::tns_decode_frame;
+use crate::tns_frame::{tns_analysis_frame, tns_decode_frame};
 use crate::{Error, Result};
 
 /// One channel's parsed Table 4.50 body plus its Table 4.56 spectrum,
@@ -214,16 +222,54 @@ fn reconstruct_pre_pair(
     Ok((spec, abs))
 }
 
-/// Run §4.6 steps 6–7 for one channel: TNS (§4.6.9) in place, then the
-/// §4.6.11 filterbank to PCM, advancing `fb`'s overlap state.
+/// Run the §4.6.7.4.1 / §4.6.9 / §4.6.11 tail for one channel in the
+/// Figure 4.30 block order: **LTP long-term synthesis** (§4.6.7) →
+/// **TNS synthesis** (§4.6.9) → **filterbank** (§4.6.11), then update
+/// the per-channel LTP reconstruction history (§4.6.7.3).
+///
+/// Figure 4.30 places long-term synthesis *before* the TNS synthesis
+/// filter; because the transmitted residual `Y_rec` in `spec` is in the
+/// noise-shaped (pre-synthesis) domain, the LTP-predicted spectrum
+/// `X_est` is first passed through the matching all-zero **TNS analysis
+/// filter** ([`tns_analysis_frame`]) so the `X_rec = X_est + Y_rec` add
+/// is like-for-like. The single TNS synthesis pass that follows then
+/// shapes the residual while undoing the analysis on the LTP
+/// contribution (the §4.6.7.4.1 inverse-filter relationship).
+///
+/// `ltp` is the channel's parsed [`crate::ics_info::LtpData`] (from
+/// `ics_info.ltp_data` for an SCE / CPE channel 0, or `ltp_data_pair`
+/// for the shared-window CPE channel 1); `None` when
+/// `ltp_data_present == 0`, in which case no prediction is added but the
+/// history is still advanced so it stays continuous across frames.
+#[allow(clippy::too_many_arguments)]
 fn finish_channel(
     spec: &mut [f64],
     body: &IcsBody,
     ics_info: &IcsInfo,
+    ltp: Option<&crate::ics_info::LtpData>,
     aot: u8,
     fs_index: u8,
     fb: &mut Filterbank,
+    ltp_state: &mut LtpState,
 ) -> Result<Vec<f64>> {
+    // §4.6.7 long-term synthesis (long windows only). The analysis
+    // filter applied to X_est mirrors this frame's TNS; an order-0 /
+    // filter-less TNS makes tns_analysis_frame a no-op, so a channel
+    // without TNS gets the plain X_est + Y_rec add.
+    if let Some(ltp) = ltp {
+        let prev_shape = fb.prev_shape();
+        let tns = body.tns_data.as_ref();
+        let ws = ics_info.window_sequence;
+        let max_sfb = ics_info.max_sfb;
+        ltp_state.apply_long_with_analysis(spec, ics_info, ltp, prev_shape, fs_index, |x_est| {
+            if let Some(tns) = tns {
+                tns_analysis_frame(x_est, tns, ws, max_sfb, aot, fs_index)?;
+            }
+            Ok(())
+        })?;
+    }
+
+    // §4.6.9 TNS synthesis.
     if let Some(tns) = &body.tns_data {
         tns_decode_frame(
             spec,
@@ -234,7 +280,12 @@ fn finish_channel(
             fs_index,
         )?;
     }
-    fb.synthesize(spec, ics_info)
+
+    // §4.6.11 filterbank → PCM, then advance the LTP history with this
+    // frame's output and aliased IMDCT tail (§4.6.7.3).
+    let out = fb.synthesize(spec, ics_info)?;
+    ltp_state.push_frame(&out, fb.aliased_tail());
+    Ok(out)
 }
 
 /// The shared `channel_pair_element()` joint-stereo header (Table 4.4)
@@ -277,6 +328,10 @@ pub struct ElementDecoder {
     /// Per-channel filterbanks. `[0]` for the SCE / LFE or the CPE's
     /// first channel; `[1]` for the CPE's second channel.
     filterbanks: [Filterbank; 2],
+    /// Per-channel §4.6.7.3 LTP reconstruction history, advanced once
+    /// per frame (whether or not LTP fired) so the predictor buffer
+    /// stays continuous. Same channel-slot indexing as `filterbanks`.
+    ltp_states: [LtpState; 2],
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
     pns_state: u32,
@@ -294,6 +349,7 @@ impl ElementDecoder {
     pub fn new() -> Self {
         ElementDecoder {
             filterbanks: [Filterbank::new(), Filterbank::new()],
+            ltp_states: [LtpState::new(), LtpState::new()],
             // Any non-zero seed yields a non-degenerate sequence; the
             // §4.6.13.3 normalisation makes the per-band energy
             // independent of the seed, so this choice only fixes the
@@ -308,6 +364,7 @@ impl ElementDecoder {
     pub fn with_pns_seed(seed: u32) -> Self {
         ElementDecoder {
             filterbanks: [Filterbank::new(), Filterbank::new()],
+            ltp_states: [LtpState::new(), LtpState::new()],
             pns_state: seed,
         }
     }
@@ -338,13 +395,16 @@ impl ElementDecoder {
             gen_rand_vector(out, state)
         })?;
 
+        let ltp = ltp_for_channel(ch.ics_info, false);
         finish_channel(
             &mut spec,
             ch.body,
             ch.ics_info,
+            ltp,
             aot,
             fs_index,
             &mut self.filterbanks[0],
+            &mut self.ltp_states[0],
         )
     }
 
@@ -464,25 +524,55 @@ impl ElementDecoder {
             )?;
         }
 
-        // §4.6.9 TNS + §4.6.11 filterbank, per channel.
+        // §4.6.7 LTP + §4.6.9 TNS + §4.6.11 filterbank, per channel.
+        // Channel 0 reads the first ltp_data; channel 1 of a shared-
+        // window CPE reads ltp_data_pair (the second ltp_data_present
+        // subtree, Table 4.4), falling back to its own ltp_data in the
+        // non-shared form where each channel carries separate side info.
+        let left_ltp = ltp_for_channel(left.ics_info, false);
+        let right_ltp = ltp_for_channel(right.ics_info, true);
         let out_left = finish_channel(
             &mut left_spec,
             left.body,
             left.ics_info,
+            left_ltp,
             aot,
             fs_index,
             &mut self.filterbanks[0],
+            &mut self.ltp_states[0],
         )?;
         let out_right = finish_channel(
             &mut right_spec,
             right.body,
             right.ics_info,
+            right_ltp,
             aot,
             fs_index,
             &mut self.filterbanks[1],
+            &mut self.ltp_states[1],
         )?;
         Ok((out_left, out_right))
     }
+}
+
+/// Select the parsed §4.6.7.2 [`crate::ics_info::LtpData`] that drives
+/// one channel's long-term prediction, or `None` when LTP is off for
+/// that channel this frame (`ltp_data_present == 0`).
+///
+/// * `is_pair_slot == false` (SCE, CPE channel 0) reads the primary
+///   `ltp_data` subtree.
+/// * `is_pair_slot == true` (CPE channel 1) reads the second
+///   `ltp_data_pair` subtree carried after `common_window == 1`
+///   (Table 4.4). In the non-shared CPE form the second channel parses
+///   its own `ics_info()` with the side info in `ltp_data` and
+///   `ltp_data_pair == None`; the fall-through keeps that case working.
+fn ltp_for_channel(ics_info: &IcsInfo, is_pair_slot: bool) -> Option<&crate::ics_info::LtpData> {
+    if is_pair_slot {
+        if let Some(pair) = ics_info.ltp_data_pair.as_ref() {
+            return Some(pair);
+        }
+    }
+    ics_info.ltp_data.as_ref()
 }
 
 /// Validate that an `ms_used[g][sfb]` mask covers
@@ -794,5 +884,127 @@ mod tests {
             pcm.iter().any(|&v| v != 0.0),
             "PNS-filled noise band should produce non-silent PCM"
         );
+    }
+
+    // ---- §4.6.7.4.1 LTP wiring ----
+
+    use crate::ics_info::LtpData;
+
+    /// Attach long-window LTP side info to a body's `ics_info`: the
+    /// `ltp_data_present` flag plus an `ltp_data` carrying `coef` / `lag`
+    /// and `long_used` bands.
+    fn with_ltp(mut body: IcsBody, coef: u8, lag: u16, long_used: Vec<bool>) -> IcsBody {
+        let mut ics = body.ics_info.clone().unwrap();
+        ics.ltp_data_present = true;
+        ics.ltp_data = Some(LtpData {
+            lag_update: None,
+            lag: Some(lag),
+            coef,
+            long_used,
+        });
+        body.ics_info = Some(ics);
+        body
+    }
+
+    #[test]
+    fn ltp_off_first_frame_zero_history_matches_no_ltp() {
+        // §4.6.7.3 init: with all-zero history the predictor is zero, so
+        // an LTP-flagged first frame must decode identically to one with
+        // LTP off (X_est == 0 ⇒ X_rec == Y_rec).
+        let plain = make_body(4, 2, &[0, 0, 0, 0]);
+        let ltp_body = with_ltp(make_body(4, 2, &[0, 0, 0, 0]), 7, 50, vec![true; 4]);
+        let spectral = make_spectral(3);
+
+        let p_ics = plain.ics_info.clone().unwrap();
+        let l_ics = ltp_body.ics_info.clone().unwrap();
+        let plain_ch = ChannelInput {
+            body: &plain,
+            ics_info: &p_ics,
+            spectral: &spectral,
+        };
+        let ltp_ch = ChannelInput {
+            body: &ltp_body,
+            ics_info: &l_ics,
+            spectral: &spectral,
+        };
+        let f_plain = ElementDecoder::new().decode_sce(&plain_ch, 2, 4).unwrap();
+        let f_ltp = ElementDecoder::new().decode_sce(&ltp_ch, 2, 4).unwrap();
+        for (a, b) in f_plain.iter().zip(f_ltp.iter()) {
+            assert!((a - b).abs() < 1e-12, "first-frame LTP add must be zero");
+        }
+    }
+
+    #[test]
+    fn ltp_fires_on_second_frame_and_diverges() {
+        // After a non-silent first frame seeds the §4.6.7.3 history, the
+        // second frame's predictor is non-zero on the flagged bands, so
+        // an LTP-active decoder diverges from an LTP-off one — proof the
+        // driver wires predict() → MDCT → add into the chain.
+        let plain = make_body(4, 2, &[0, 0, 0, 0]);
+        let ltp_body = with_ltp(make_body(4, 2, &[0, 0, 0, 0]), 5, 30, vec![true; 4]);
+        let spectral = make_spectral(4);
+        let p_ics = plain.ics_info.clone().unwrap();
+        let l_ics = ltp_body.ics_info.clone().unwrap();
+        let plain_ch = ChannelInput {
+            body: &plain,
+            ics_info: &p_ics,
+            spectral: &spectral,
+        };
+        let ltp_ch = ChannelInput {
+            body: &ltp_body,
+            ics_info: &l_ics,
+            spectral: &spectral,
+        };
+
+        let mut dec_plain = ElementDecoder::new();
+        let mut dec_ltp = ElementDecoder::new();
+        // Frame 0 — identical (zero history).
+        let _ = dec_plain.decode_sce(&plain_ch, 2, 4).unwrap();
+        let _ = dec_ltp.decode_sce(&ltp_ch, 2, 4).unwrap();
+        // Frame 1 — LTP now has non-zero history to predict from.
+        let f1_plain = dec_plain.decode_sce(&plain_ch, 2, 4).unwrap();
+        let f1_ltp = dec_ltp.decode_sce(&ltp_ch, 2, 4).unwrap();
+        assert!(f1_ltp.iter().all(|v| v.is_finite()));
+        let diff = f1_plain
+            .iter()
+            .zip(f1_ltp.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(diff, "second-frame LTP should change the output");
+    }
+
+    #[test]
+    fn ltp_with_tns_stays_finite() {
+        // LTP active on a TNS-carrying channel exercises the
+        // §4.6.7.4.1 analysis-filter-in-loop path; the decode must stay
+        // finite across two frames.
+        use crate::tns_data::{TnsData, TnsFilter, TnsWindow};
+        let mut body = with_ltp(make_body(20, 2, &[0i16; 20]), 4, 64, vec![true; 20]);
+        body.tns_data_present = true;
+        body.tns_data = Some(TnsData {
+            windows: vec![TnsWindow {
+                coef_res: false,
+                filters: vec![TnsFilter {
+                    length: 10,
+                    order: 3,
+                    direction: false,
+                    coef_compress: false,
+                    coef: vec![1, 7, 2],
+                }],
+            }],
+        });
+        let ics = body.ics_info.clone().unwrap();
+        let spectral = make_spectral(3);
+        let ch = ChannelInput {
+            body: &body,
+            ics_info: &ics,
+            spectral: &spectral,
+        };
+        let mut dec = ElementDecoder::new();
+        let f0 = dec.decode_sce(&ch, 2, 4).unwrap();
+        let f1 = dec.decode_sce(&ch, 2, 4).unwrap();
+        assert!(f0.iter().all(|v| v.is_finite()));
+        assert!(f1.iter().all(|v| v.is_finite()));
+        // Second frame predicts from a seeded history → not identical.
+        assert_ne!(f0, f1);
     }
 }

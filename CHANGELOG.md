@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.6.7.4.1 LTP-with-TNS integration — LTP is now wired into the
+  `element_decode` driver in the Figure 4.30 block order.
+  `finish_channel` runs long-term synthesis *before* the §4.6.9 TNS
+  synthesis filter, with the LTP-predicted spectrum `X_est` first passed
+  through the matching all-zero **TNS analysis filter** so the
+  `X_rec = X_est + Y_rec` add is like-for-like; the subsequent TNS
+  synthesis pass shapes the residual while undoing the analysis on the
+  LTP contribution. `ElementDecoder` now holds a per-channel
+  `ltp::LtpState`, advanced every frame (whether or not LTP fired) via
+  the filterbank's new `aliased_tail()` / `prev_shape()` accessors so
+  the §4.6.7.3 reconstruction history stays continuous. New
+  `tns_coef::tns_ma_filter` (the all-zero inverse of the §4.6.9.3
+  `tns_ar_filter`) and `tns_frame::tns_analysis_frame` (its per-window
+  frame driver); `ltp::LtpState::apply_long_with_analysis` inserts the
+  analysis filter between `MDCT(x_est)` and the per-sfb add.
+  Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
+  scope. Pinned by analysis∘synthesis identity tests and three
+  element-level LTP tests (zero-history no-op, second-frame divergence,
+  LTP+TNS finiteness).
+
 - §4.6.7 Long-Term Prediction (LTP) long-window synthesis (`ltp`): the
   Table 4.98 coefficient codebook, the `predict()` single-tap
   time-domain predictor over the §4.6.7.3 `x_rec` reconstruction

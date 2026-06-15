@@ -203,6 +203,40 @@ impl LtpState {
         prev_shape: Option<WindowShape>,
         fs_index: u8,
     ) -> Result<()> {
+        self.apply_long_with_analysis(spec, ics_info, ltp, prev_shape, fs_index, |_| Ok(()))
+    }
+
+    /// §4.6.7.3 + §4.6.7.4.1 — the LTP long-window add with the
+    /// Figure 4.30 **TNS analysis filter** inserted between
+    /// `X_est = MDCT(x_est)` and the per-sfb `X_rec = X_est + Y_rec`.
+    ///
+    /// When TNS is active on the channel, the transmitted residual
+    /// `Y_rec` carried in `spec` lives in the noise-shaped (pre-TNS-
+    /// synthesis) domain. The LTP-predicted spectrum `X_est` is a clean
+    /// MDCT, so it has to be pushed through the same all-zero TNS
+    /// analysis filter before it can be added like-for-like. `analyze`
+    /// applies that filter in place to the freshly transformed `X_est`
+    /// (length `LONG_WINDOW_LEN`); pass a no-op closure when the channel
+    /// carries no TNS (which is what [`Self::apply_long`] does).
+    ///
+    /// The subsequent §4.6.9 TNS *synthesis* pass over the combined
+    /// `X_rec` (run by the element driver after this add) undoes the
+    /// analysis on the LTP contribution while shaping the residual,
+    /// per the §4.6.7.4.1 inverse-filter relationship.
+    ///
+    /// All other semantics match [`Self::apply_long`].
+    pub fn apply_long_with_analysis<F>(
+        &self,
+        spec: &mut [f64],
+        ics_info: &IcsInfo,
+        ltp: &LtpData,
+        prev_shape: Option<WindowShape>,
+        fs_index: u8,
+        analyze: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut [f64]) -> Result<()>,
+    {
         // §4.6.7.3 / short-block note: prediction is disabled for
         // EIGHT_SHORT_SEQUENCE in the long-window LTP path.
         if ics_info.window_sequence == WindowSequence::EightShort {
@@ -228,7 +262,10 @@ impl LtpState {
             .zip(window.iter())
             .map(|(&x, &w)| x * w)
             .collect();
-        let x_est_spec = forward_mdct(&z, LONG_TRANSFORM_LEN);
+        let mut x_est_spec = forward_mdct(&z, LONG_TRANSFORM_LEN);
+
+        // §4.6.7.4.1 / Figure 4.30: TNS analysis filter on X_est.
+        analyze(&mut x_est_spec)?;
 
         // Per-sfb: X_rec = X_est + Y_rec where ltp_long_used[sfb].
         let offsets = long_window_offsets(fs_index)?;

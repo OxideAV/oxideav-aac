@@ -281,6 +281,35 @@ impl Filterbank {
         }
     }
 
+    /// §4.6.7.3 — the current frame's *aliased half window*
+    /// `x_rec(0 … N/2 − 1)`: the right half of the just-synthesized
+    /// frame's windowed (pre-overlap-add) time signal `z[i][N/2 … N]`.
+    ///
+    /// After a [`Self::synthesize`] call the internal overlap buffer
+    /// holds exactly this tail (it is reused as the *next* frame's
+    /// overlap-add term, §4.6.11.3.3). The LTP reconstruction history
+    /// ([`crate::ltp::LtpState`]) needs the same vector — its
+    /// `x_rec(0 … N/2 − 1)` region — so the element driver reads it here
+    /// after each synthesis and feeds it to
+    /// [`crate::ltp::LtpState::push_frame`]. Before the first frame this
+    /// is the zero buffer, matching the §4.6.7.3 zero initialisation.
+    pub fn aliased_tail(&self) -> &[f64] {
+        &self.overlap
+    }
+
+    /// §4.6.11.3.2 — the previous block's `window_shape`, which governs
+    /// the left-half shape of the *next* block's analysis/synthesis
+    /// window. [`None`] before the first frame (the first block uses its
+    /// own shape for both halves).
+    ///
+    /// The §4.6.7.4.1 LTP analysis MDCT must window `x_est` with the
+    /// same composite long window the filterbank uses for this frame, so
+    /// the element driver reads the previous shape here before
+    /// synthesizing.
+    pub fn prev_shape(&self) -> Option<WindowShape> {
+        self.prev_shape
+    }
+
     /// §4.6.11 — synthesize one frame of `LONG_WINDOW_LEN` (1024) PCM
     /// samples from `spec`, the window-major decoded spectrum produced
     /// by [`crate::decoded_spectrum::decode_channel_spectrum`].
