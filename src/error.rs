@@ -477,6 +477,14 @@ pub enum Error {
     /// The §4.6.13.3 noise synthesis is undefined without a consistent
     /// group/band geometry and a `noise_nrg` for every noise band.
     PnsInvalid,
+    /// [`crate::ltp::LtpState::apply_long`] was handed §4.6.7 Long-Term
+    /// Prediction inputs that are mutually inconsistent: an `ltp_coef`
+    /// index outside the Table 4.98 codebook (`> 7`), an active
+    /// `ltp_long_used` mask with no transmitted `ltp_lag`, or a channel
+    /// spectrum whose length is not `LONG_WINDOW_LEN` (1024). The
+    /// §4.6.7.3 `X_rec = X_est + Y_rec` combination is undefined without
+    /// a valid predictor coefficient, lag, and long-window spectrum.
+    LtpInvalid,
     /// [`crate::element_decode`] was asked to decode a channel element
     /// whose component shapes are mutually inconsistent: a channel-pair
     /// element (`CPE`) whose two channels disagree on `window_sequence`
@@ -737,6 +745,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "PNS: channel spectrum / sfb_cb / noise_nrg / ms_used shapes disagree with the §4.6.13 ics_info geometry"
+                )
+            }
+            Error::LtpInvalid => {
+                write!(
+                    f,
+                    "LTP: ltp_coef index, ltp_lag presence, or long-window spectrum length disagree with the §4.6.7 decoding process"
                 )
             }
             Error::ElementDecodeInvalid => {

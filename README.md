@@ -72,6 +72,16 @@ driver that chains it.
   Perceptual Noise Substitution (`pns`, §4.6.13). PNS produces
   energy-exact bands; only the per-coefficient phase is RNG-defined per
   §4.6.13.3, so its output is not byte-exact against any one decoder.
+- **Long-Term Prediction** (`ltp`) — §4.6.7 long-window LTP: the
+  Table 4.98 coefficient codebook, the §4.6.7.3 `predict()` single-tap
+  time-domain predictor (`x_est(i) = ltp_coef·x_rec(i − ltp_lag)`) over
+  a per-channel `x_rec` reconstruction history, the windowed analysis
+  `MDCT(x_est)` (the §4.6.15.3.3 / §4.6.11.3.1 forward transform, now a
+  reusable `filterbank` primitive), and the per-sfb
+  `X_rec = X_est + Y_rec` combination on the bands flagged by
+  `ltp_long_used`. LTP is restricted to long windows for the AAC LTP
+  object type (§4.6.7.1); short-window LTP and the ER AAC LD `M = N/2`
+  lag offset are out of scope.
 - **Element decode driver** (`element_decode`) — `ElementDecoder` chains
   the whole stack per element: `decode_sce` for SCE / LFE and
   `decode_cpe` for a CPE (pulse → dequant → `quant_to_spec()` → M/S →
@@ -84,8 +94,12 @@ driver that chains it.
   and the factory functions return `Error::NotImplemented`.
 - `expected.wav` PCM comparison (the crate carries no resampler /
   clipper, and PNS bands are energy-exact rather than sample-exact).
-- The Main predictor (§4.6.7), LTP (§4.6.6), and SSR gain-control ladder
-  (§4.6.12) — their side-info is parsed but not applied.
+- The Main frequency-domain predictor (§4.6.6) and SSR gain-control
+  ladder (§4.6.12) — their side-info is parsed but not applied. (LTP,
+  §4.6.7, is now synthesised for long windows — see above. Wiring the
+  `ltp` tool into the `element_decode` driver, with the
+  TNS-analysis-in-loop ordering of §4.6.7.4.1 / Figure 4.30, is the
+  next LTP increment.)
 - SBR / PS synthesis (needs a QMF / patching back-end), the
   coupling-channel (CCE) contribution, and the ER AAC LD 480/512
   transform variants.

@@ -6,6 +6,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- §4.6.7 Long-Term Prediction (LTP) long-window synthesis (`ltp`): the
+  Table 4.98 coefficient codebook, the `predict()` single-tap
+  time-domain predictor over the §4.6.7.3 `x_rec` reconstruction
+  history (`x_est(i) = ltp_coef·x_rec(i − ltp_lag)`), the windowed
+  analysis `MDCT(x_est)`, and the per-sfb `X_rec = X_est + Y_rec`
+  spectral combination on the bands flagged by `ltp_long_used`. The
+  forward (analysis) MDCT (§4.6.15.3.3 / §4.6.11.3.1) is promoted to a
+  reusable `filterbank` primitive. Short-window and ER AAC LD (`M =
+  N/2`) LTP remain out of scope; the side info was already parsed.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-aac/compare/v0.1.4...v0.1.5) - 2026-06-15
 
 ### Other

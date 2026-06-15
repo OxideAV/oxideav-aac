@@ -87,6 +87,53 @@ fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
     out
 }
 
+/// §4.6.15.3.3 / §4.6.11.3.1 — the forward (analysis) MDCT for a
+/// length-`n_transform` window.
+///
+/// `time` holds the `N` windowed time-domain values `z[n]`; the
+/// returned vector holds the `N/2` spectral coefficients
+/// `X[k] = 2 · Σ_n z[n] · cos((2π/N)·(n + n0)·(k + 1/2))`,
+/// `0 ≤ k < N/2`, with the §4.6.11.3.1 phase `n0 = (N/2 + 1)/2`.
+///
+/// This is the exact analysis pair of [`imdct`]: the IMDCT carries the
+/// `2/N` scale, the analysis here carries the matching factor `2`, so
+/// the windowed-and-overlap-added round trip is unity for a
+/// power-complementary §4.6.11.3.2 window. The same transform is the
+/// `MDCT(x_est)` of the §4.6.7.3 Long-Term-Prediction loop.
+pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
+    let half = n_transform / 2;
+    debug_assert_eq!(time.len(), n_transform);
+    let n0 = (half + 1) as f64 / 2.0;
+    let step = 2.0 * core::f64::consts::PI / n_transform as f64;
+    (0..half)
+        .map(|k| {
+            2.0 * time
+                .iter()
+                .enumerate()
+                .map(|(n, &t)| t * (step * (n as f64 + n0) * (k as f64 + 0.5)).cos())
+                .sum::<f64>()
+        })
+        .collect()
+}
+
+/// §4.6.11.3.2 — build the length-2048 `ONLY_LONG_SEQUENCE` analysis
+/// window `[W_LEFT_l | W_RIGHT_l]` for the given left/right shapes.
+///
+/// Exposed for the §4.6.7.3 LTP loop, which windows the predicted time
+/// signal `x_est` with the current long window before the analysis
+/// [`forward_mdct`]. (LTP for the AAC LTP object type is restricted to
+/// long windows, §4.6.7.1.)
+pub(crate) fn long_only_window(left_shape: WindowShape, right_shape: WindowShape) -> Vec<f64> {
+    let halves = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
+    let half_l = LONG_TRANSFORM_LEN / 2;
+    let mut w = vec![0.0f64; LONG_TRANSFORM_LEN];
+    w[..half_l].copy_from_slice(&halves.left);
+    for (m, &rv) in halves.right.iter().enumerate() {
+        w[half_l + m] = rv;
+    }
+    w
+}
+
 /// Modified Bessel function of the first kind, order 0, via its power
 /// series `I0(x) = Σ_k ((x/2)^k / k!)^2` (§4.6.11.3.2). The series
 /// converges quickly for the `x = π·α` arguments the KBD window uses
@@ -576,31 +623,11 @@ mod tests {
     /// Time-domain aliasing cancellation (TDAC): for a windowed MDCT/
     /// IMDCT pair, two consecutive identical frames overlap-add to
     /// reconstruct the windowed input exactly in the steady state. We
-    /// drive the filterbank with a forward MDCT of a known signal and
-    /// confirm perfect reconstruction over the second frame.
-    fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
-        // Forward MDCT (analysis): X[k] = Σ_n time[n]·cos((2π/N)(n+n0)(k+1/2)).
-        // This is the transpose of the decoder's §4.6.11.3.1 IMDCT
-        // basis. The IMDCT carries the 2/N normalization; the standard
-        // TDAC reconstruction of an analysis/synthesis pair built from
-        // the same cosine basis recovers the windowed input scaled by
-        // N/2 per the orthogonality sum, leaving an overall factor of
-        // 2 once the IMDCT's 2/N is applied. Folding that constant into
-        // the analysis here makes the round trip unity for a
-        // power-complementary window.
-        let half = n_transform / 2;
-        let n0 = (half + 1) as f64 / 2.0;
-        let step = 2.0 * core::f64::consts::PI / n_transform as f64;
-        (0..half)
-            .map(|k| {
-                2.0 * time
-                    .iter()
-                    .enumerate()
-                    .map(|(n, &t)| t * (step * (n as f64 + n0) * (k as f64 + 0.5)).cos())
-                    .sum::<f64>()
-            })
-            .collect()
-    }
+    /// drive the filterbank with the production analysis [`forward_mdct`]
+    /// of a known signal and confirm perfect reconstruction over the
+    /// second frame. (The analysis/synthesis pair is unity for a
+    /// power-complementary §4.6.11.3.2 window.)
+    use super::forward_mdct;
 
     /// The full symmetric (sine) `OnlyLong` window, length `N`.
     fn long_sine_window() -> Vec<f64> {
