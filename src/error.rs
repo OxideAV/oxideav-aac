@@ -499,6 +499,17 @@ pub enum Error {
     /// TNS → filterbank) cannot run without a consistent geometry across
     /// the composed stages.
     ElementDecodeInvalid,
+    /// [`crate::predictor::PredictorBank`] was handed §4.6.6
+    /// frequency-domain-prediction inputs that are mutually inconsistent:
+    /// a long-window scalefactor-band offset table too short to cover
+    /// `PRED_SFB_MAX` for the sampling rate, a reconstructed spectrum
+    /// shorter than the per-line predictor bank, or a
+    /// `predictor_reset_group_number` outside the Table 4.97 range
+    /// (`1 ..= 30`; the values `0` and `31` are reserved). The
+    /// §4.6.6.3.2.1 `x_rec = x_est + y_rec` reconstruction and the
+    /// §4.6.6.3.3 reset are undefined without a full predictor bank and a
+    /// valid reset group.
+    PredictorInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -757,6 +768,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "element decode: channel-element component shapes (window_sequence pairing, ms_used extent, or scalefactor-record count) are mutually inconsistent for the §4.6 block-order chain"
+                )
+            }
+            Error::PredictorInvalid => {
+                write!(
+                    f,
+                    "predictor: long-window offset table, spectrum length, or reset-group number disagree with the §4.6.6 frequency-domain prediction process"
                 )
             }
         }

@@ -72,6 +72,19 @@ driver that chains it.
   Perceptual Noise Substitution (`pns`, §4.6.13). PNS produces
   energy-exact bands; only the per-coefficient phase is RNG-defined per
   §4.6.13.3, so its output is not byte-exact against any one decoder.
+- **Frequency-domain prediction** (`predictor`) — §4.6.6 MPEG-2
+  backward-adaptive intra-channel predictor for the AAC **Main** object
+  type (AOT 1). A bank of second-order lattice predictors (one per MDCT
+  line up to the §4.6.6.2 `PRED_SFB_MAX` limit) reconstructs
+  `x_rec = x_est + y_rec` on the signalled bands. Implements the
+  §4.6.6.3.2.1 lattice `predict()` + LMS adaptation
+  (`α = 0.90625`, `a = b = 0.953125`), the §4.6.6.3.2.3
+  `flt_round_inf()` 16-bit-float rounding applied to every stored state
+  variable and the predicted value, and the §4.6.6.3.3 reset (the 30
+  Table 4.97 cyclic groups + the short-block reset-all). Wired into
+  `element_decode`: the bank runs every long frame *before* TNS (and is
+  mutually exclusive with LTP by object type), persisting the
+  backward-adaptive state across frames.
 - **Long-Term Prediction** (`ltp`) — §4.6.7 long-window LTP: the
   Table 4.98 coefficient codebook, the §4.6.7.3 `predict()` single-tap
   time-domain predictor (`x_est(i) = ltp_coef·x_rec(i − ltp_lag)`) over
@@ -106,12 +119,13 @@ driver that chains it.
   and the factory functions return `Error::NotImplemented`.
 - `expected.wav` PCM comparison (the crate carries no resampler /
   clipper, and PNS bands are energy-exact rather than sample-exact).
-- The Main frequency-domain predictor (§4.6.6) and SSR gain-control
-  ladder (§4.6.12) — their side-info is parsed but not applied. (LTP,
-  §4.6.7, is now fully wired into `element_decode` for long windows
-  with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering — see
-  above. Short-window LTP and the ER AAC LD `M = N/2` lag offset remain
-  out of scope per the §4.6.7.1 long-window restriction.)
+- The SSR gain-control ladder (§4.6.12) — its side-info is parsed but
+  not applied. (The Main frequency-domain predictor, §4.6.6, is now
+  fully wired into `element_decode` for the AAC Main object type on long
+  windows — see `predictor` above. LTP, §4.6.7, is likewise wired in
+  with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
+  Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
+  scope per the §4.6.7.1 long-window restriction.)
 - SBR / PS synthesis (needs a QMF / patching back-end), the
   coupling-channel (CCE) contribution, and the ER AAC LD 480/512
   transform variants.

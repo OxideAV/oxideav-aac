@@ -406,6 +406,7 @@ pub mod ltp;
 pub mod ms_stereo;
 pub mod pce;
 pub mod pns;
+pub mod predictor;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod scale_factor_data;

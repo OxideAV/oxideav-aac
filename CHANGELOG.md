@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.6.6 MPEG-2 frequency-domain prediction (`predictor` module) — the
+  backward-adaptive intra-channel predictor of the AAC Main object type
+  (AOT 1). A `PredictorBank` of second-order lattice `Predictor`s (one
+  per MDCT line up to the §4.6.6.2 `PRED_SFB_MAX` limit) reconstructs
+  `x_rec = x_est + y_rec` on the signalled bands. Implements the
+  §4.6.6.3.2.1 lattice `predict()` + LMS adaptation (`α = 0.90625`,
+  `a = b = 0.953125`), the §4.6.6.3.2.3 `flt_round_inf()` 16-bit-float
+  rounding applied to every stored state variable and the predicted
+  value, and the §4.6.6.3.3 reset (the 30 Table 4.97 cyclic groups plus
+  the short-block reset-all). Wired into `element_decode`: each channel
+  now carries a lazily-built per-rate predictor bank, run every long
+  frame *before* §4.6.7 LTP / §4.6.9 TNS and reset on a short block, so
+  the backward-adaptive state persists across frames. Prediction and LTP
+  are mutually exclusive by object type. New `Error::PredictorInvalid`
+  for an inconsistent offset table / spectrum length / reset-group
+  number.
 - §4.6.7.4.1 LTP-with-TNS integration — LTP is now wired into the
   `element_decode` driver in the Figure 4.30 block order.
   `finish_channel` runs long-term synthesis *before* the §4.6.9 TNS

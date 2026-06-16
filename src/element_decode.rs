@@ -57,10 +57,16 @@
 //!   frame. Short-window LTP and the ER AAC LD `M = N/2` lag offset
 //!   remain out of scope (the predictor is left off for those, per the
 //!   §4.6.7.1 long-window restriction).
-//! * The Main-profile frequency-domain predictor (§4.6.6) is not
-//!   applied — `ics_info()` surfaces its side-info but the prediction
-//!   loop is a later tool, so a stream that flips `predictor_data_present`
-//!   decodes as if backward prediction were off.
+//! * **Frequency-domain prediction (§4.6.6)** is wired in for the AAC
+//!   Main object type (AOT 1): [`finish_channel`] runs the
+//!   §4.6.6.3.2.1 backward-adaptive predictor bank
+//!   ([`crate::predictor::PredictorBank`]) on every long frame *before*
+//!   §4.6.7 LTP / §4.6.9 TNS, adding `x_est + y_rec` on the signalled
+//!   bands and resetting the signalled group / the whole bank on a short
+//!   block. The per-channel bank persists across frames so the LMS
+//!   coefficients keep adapting. Prediction and LTP are mutually
+//!   exclusive by object type (AOT 1 carries no `ltp_data`), so only one
+//!   predictor ever fires per channel.
 //! * The SSR (AOT 3) gain-control ladder (§4.6.12) is parsed but not
 //!   applied; this driver targets the LC / Main / LTP filterbank.
 //! * PNS output is RNG-defined per §4.6.13.3 (only the per-band L2 norm
@@ -77,6 +83,7 @@ use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
 use crate::ltp::LtpState;
 use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
 use crate::pns::{apply_pns, apply_pns_pair, gen_rand_vector, PnsChannel};
+use crate::predictor::PredictorBank;
 use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
@@ -251,7 +258,24 @@ fn finish_channel(
     fs_index: u8,
     fb: &mut Filterbank,
     ltp_state: &mut LtpState,
+    predictor_bank: &mut Option<PredictorBank>,
 ) -> Result<Vec<f64>> {
+    // §4.6.6 MPEG-2 frequency-domain prediction (AAC Main, AOT 1 only).
+    // The backward-adaptive predictor bank is run on EVERY frame so its
+    // coefficients keep tracking the signal statistics, whether or not
+    // prediction is signalled this frame; a short block resets the whole
+    // bank. The bank is created lazily on the first Main frame.
+    if aot == 1 {
+        let bank = match predictor_bank {
+            Some(b) => b,
+            None => {
+                *predictor_bank = Some(PredictorBank::new(fs_index)?);
+                predictor_bank.as_mut().expect("just inserted")
+            }
+        };
+        bank.apply_long(spec, ics_info, ics_info.predictor_data.as_ref(), fs_index)?;
+    }
+
     // §4.6.7 long-term synthesis (long windows only). The analysis
     // filter applied to X_est mirrors this frame's TNS; an order-0 /
     // filter-less TNS makes tns_analysis_frame a no-op, so a channel
@@ -332,6 +356,12 @@ pub struct ElementDecoder {
     /// per frame (whether or not LTP fired) so the predictor buffer
     /// stays continuous. Same channel-slot indexing as `filterbanks`.
     ltp_states: [LtpState; 2],
+    /// Per-channel §4.6.6 frequency-domain predictor bank (AAC Main,
+    /// AOT 1). `None` until the first Main frame creates the bank for the
+    /// stream's sampling rate; thereafter the backward-adaptive state
+    /// persists and is advanced every frame. Same channel-slot indexing
+    /// as `filterbanks`.
+    predictor_banks: [Option<PredictorBank>; 2],
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
     pns_state: u32,
@@ -350,6 +380,7 @@ impl ElementDecoder {
         ElementDecoder {
             filterbanks: [Filterbank::new(), Filterbank::new()],
             ltp_states: [LtpState::new(), LtpState::new()],
+            predictor_banks: [None, None],
             // Any non-zero seed yields a non-degenerate sequence; the
             // §4.6.13.3 normalisation makes the per-band energy
             // independent of the seed, so this choice only fixes the
@@ -365,6 +396,7 @@ impl ElementDecoder {
         ElementDecoder {
             filterbanks: [Filterbank::new(), Filterbank::new()],
             ltp_states: [LtpState::new(), LtpState::new()],
+            predictor_banks: [None, None],
             pns_state: seed,
         }
     }
@@ -405,6 +437,7 @@ impl ElementDecoder {
             fs_index,
             &mut self.filterbanks[0],
             &mut self.ltp_states[0],
+            &mut self.predictor_banks[0],
         )
     }
 
@@ -540,6 +573,7 @@ impl ElementDecoder {
             fs_index,
             &mut self.filterbanks[0],
             &mut self.ltp_states[0],
+            &mut self.predictor_banks[0],
         )?;
         let out_right = finish_channel(
             &mut right_spec,
@@ -550,6 +584,7 @@ impl ElementDecoder {
             fs_index,
             &mut self.filterbanks[1],
             &mut self.ltp_states[1],
+            &mut self.predictor_banks[1],
         )?;
         Ok((out_left, out_right))
     }
@@ -1006,5 +1041,68 @@ mod tests {
         assert!(f1.iter().all(|v| v.is_finite()));
         // Second frame predicts from a seeded history → not identical.
         assert_ne!(f0, f1);
+    }
+
+    /// Attach a §4.6.6 Main `predictor_data()` to a channel body's
+    /// `ics_info`, enabling prediction on bands `0..max_sfb`.
+    fn with_main_prediction(mut body: IcsBody, max_sfb: u8) -> IcsBody {
+        use crate::ics_info::PredictorData;
+        let ics = body.ics_info.as_mut().unwrap();
+        ics.predictor_data_present = true;
+        ics.predictor_data = Some(PredictorData {
+            reset: false,
+            reset_group_number: None,
+            prediction_used: vec![true; max_sfb as usize],
+        });
+        body
+    }
+
+    #[test]
+    fn decode_sce_main_aot_runs_predictor() {
+        // AOT 1 (Main) with predictor_data_present must run the §4.6.6
+        // backward-adaptive bank; decode must stay finite across frames
+        // and the predictor state must build up so successive frames
+        // diverge from the AOT-2 (LC, no predictor) decode of the same
+        // input.
+        let body = with_main_prediction(make_body(20, 2, &[0i16; 20]), 20);
+        let ics = body.ics_info.clone().unwrap();
+        let spectral = make_spectral(3);
+        let ch = ChannelInput {
+            body: &body,
+            ics_info: &ics,
+            spectral: &spectral,
+        };
+
+        // Main (AOT 1): the predictor bank fires.
+        let mut main_dec = ElementDecoder::new();
+        let mut main_frames = Vec::new();
+        for _ in 0..6 {
+            let f = main_dec.decode_sce(&ch, 1, 4).unwrap();
+            assert!(f.iter().all(|v| v.is_finite()));
+            main_frames.push(f);
+        }
+
+        // LC (AOT 2): no §4.6.6 predictor, same input.
+        let lc_body = make_body(20, 2, &[0i16; 20]);
+        let lc_ics = lc_body.ics_info.clone().unwrap();
+        let lc_ch = ChannelInput {
+            body: &lc_body,
+            ics_info: &lc_ics,
+            spectral: &spectral,
+        };
+        let mut lc_dec = ElementDecoder::new();
+        let mut lc_frames = Vec::new();
+        for _ in 0..6 {
+            lc_frames.push(lc_dec.decode_sce(&lc_ch, 2, 4).unwrap());
+        }
+
+        // Once the lattice has adapted, the predicted spectrum diverges
+        // from the un-predicted one, so the late Main frames differ from
+        // their LC counterparts.
+        assert_ne!(
+            main_frames.last().unwrap(),
+            lc_frames.last().unwrap(),
+            "Main predictor produced no spectral change"
+        );
     }
 }
