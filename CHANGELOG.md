@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Stream-level ADTS decode driver (`decode` module) — the §4.4.2.1
+  `raw_data_block()` walk above the per-element driver. `StreamDecoder`
+  holds one `ElementDecoder` per `(syntactic-element-id,
+  element_instance_tag)` slot so each element's §4.6.11 overlap, §4.6.7
+  LTP history, and §4.6.6 predictor state persist across frames;
+  `decode_frame` dispatches each `id_syn_ele` (SCE / LFE / CPE, including
+  the §4.4.2.3 `common_window` / `ms_mask_present` header for a CPE) onto
+  the matching slot and renders the frame's channels to element-order
+  interleaved 16-bit PCM via the new `pcm` module, and `decode_all`
+  walks a whole raw-ADTS buffer (ID3v2-skip + `aac_frame_length`
+  framing) to a `Vec<DecodedFrame>`. With this driver the crate decodes
+  a raw ADTS stream end to end to comparable s16 PCM. CCE / multi-RDB /
+  SBR remain out of scope (the element driver's limits). New
+  `tests/pcm_byte_exact.rs` compares the decoded PCM against each
+  fixture's `expected.wav`: the two PNS-free fixtures
+  (`aac-lc-mono-8000-16kbps-adts`, `aac-lc-intensity-stereo`) match the
+  reference s16 output at **99.9% byte-exact, max error 1 LSB** (the
+  residual being the f64-direct-sum vs float32-fast-transform IMDCT
+  difference); the PNS-bearing fixtures are pinned at their
+  deterministic-sample-population fraction (§4.6.13.3 RNG-phase noise
+  precludes full byte-exactness, as the spec leaves the generator open).
 - §4.6.11 integer-PCM rendering (`pcm` module) — the final output stage
   that turns the §4.6.11 filterbank's `f64` time signal (already on the
   `±32768` full-scale amplitude axis from the `2/N` IMDCT normalisation +

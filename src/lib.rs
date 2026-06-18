@@ -394,6 +394,7 @@ use oxideav_core::RuntimeContext;
 pub mod adts;
 pub mod asc;
 pub mod crc;
+pub mod decode;
 pub mod decoded_spectrum;
 pub mod dequant;
 pub mod element_decode;

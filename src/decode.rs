@@ -1,0 +1,335 @@
+//! Stream-level ADTS decode driver — raw_data_block walk to interleaved
+//! 16-bit PCM.
+//!
+//! [`crate::element_decode::ElementDecoder`] decodes *one* channel
+//! element per call and carries that element's §4.6.11 overlap-add tail
+//! across frames. This module is the layer above it: it walks the
+//! §4.4.2.1 `raw_data_block()` of one ADTS frame
+//! ([`crate::raw_data_block::Walker`]), dispatches each `id_syn_ele`
+//! onto a per-element-slot [`ElementDecoder`] (keyed by `(syntactic
+//! element id, element_instance_tag)` so each element's filterbank state
+//! is independent), composes the channel-element bodies via
+//! [`crate::ics_body`] / [`crate::spectral_data`], and renders the
+//! frame's per-channel time signals to the element-order interleaved
+//! 16-bit PCM layout via [`crate::pcm`].
+//!
+//! Scope: AAC-LC (and the other General-Audio object types the
+//! per-tool chain covers) carried in ADTS, single `raw_data_block` per
+//! frame, the channel elements the FFmpeg-native and reference encoders
+//! emit (SCE / LFE / CPE, plus the consumed-and-ignored FIL / DSE /
+//! PCE). SBR / PS up-sampling, the coupling-channel (CCE) contribution,
+//! and multi-`raw_data_block` ADTS frames are out of scope (the same
+//! limits the element driver carries).
+//!
+//! ## Provenance
+//!
+//! The §4.4.2.1 `raw_data_block()` walk, the §4.4.2.3 `channel_pair_
+//! element()` `common_window` / `ms_mask_present` header, and the
+//! §4.6.11 PCM output contract are from ISO/IEC 14496-3 / 13818-7 staged
+//! under `docs/audio/aac/`. No part of the byte ordering or the element
+//! dispatch comes from any external decoder.
+
+use std::collections::HashMap;
+
+use oxideav_core::bits::BitReader;
+
+use crate::adts::AdtsHeader;
+use crate::element_decode::{ChannelInput, CpeJointStereo, ElementDecoder};
+use crate::ics_body::IcsBody;
+use crate::ics_info::IcsInfo;
+use crate::ms_stereo::MsMaskPresent;
+use crate::pcm::interleave_s16;
+use crate::raw_data_block::{Element, IdSynEle, Walker};
+use crate::spectral_data::SpectralData;
+use crate::{Error, Result};
+
+/// The §4.6.11 per-frame sample count for the 1024-line transform
+/// family (the only family this crate's `swb_offset` layout covers).
+pub const FRAME_LEN: usize = 1024;
+
+/// One decoded ADTS frame: the interleaved 16-bit PCM plus the geometry
+/// needed to interpret it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrame {
+    /// Interleaved 16-bit PCM, `channels` samples per time index, in the
+    /// `raw_data_block` element order (an SCE/LFE contributes one
+    /// channel, a CPE two). Length is `FRAME_LEN * channels`.
+    pub pcm: Vec<i16>,
+    /// Number of interleaved channels this frame produced.
+    pub channels: usize,
+    /// The frame's sampling rate in Hz (from the ADTS header).
+    pub sample_rate: u32,
+}
+
+/// Stateful whole-stream ADTS decoder.
+///
+/// Holds one [`ElementDecoder`] per `(element-id, instance-tag)` slot so
+/// every channel element's §4.6.11 overlap-add tail, §4.6.7 LTP history,
+/// and §4.6.6 predictor state persist across the frames of the stream.
+/// Construct one [`StreamDecoder`] per stream and feed it ADTS frames in
+/// order via [`Self::decode_frame`], or hand it the whole byte buffer
+/// via [`Self::decode_all`].
+#[derive(Debug, Default)]
+pub struct StreamDecoder {
+    decoders: HashMap<(u8, u8), ElementDecoder>,
+}
+
+impl StreamDecoder {
+    /// A fresh stream decoder with no element state.
+    #[must_use]
+    pub fn new() -> Self {
+        StreamDecoder {
+            decoders: HashMap::new(),
+        }
+    }
+
+    /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
+    /// 16-bit PCM.
+    ///
+    /// `header` is the parsed [`AdtsHeader`]; `payload` is the
+    /// `raw_data_block()` bytes (the frame body *after* the
+    /// fixed/variable header and the optional CRC — i.e. starting at the
+    /// header's `payload_offset`). The channel elements update this
+    /// decoder's per-slot state, so frames must be fed in stream order.
+    ///
+    /// A frame that yields no channel element (e.g. fill-only) returns a
+    /// [`DecodedFrame`] with `channels == 0` and an empty `pcm`.
+    pub fn decode_frame(&mut self, header: &AdtsHeader, payload: &[u8]) -> Result<DecodedFrame> {
+        let aot = header.audio_object_type();
+        let fs = header.sampling_frequency_index;
+        let mut reader = BitReader::new(payload);
+
+        // Channel time signals in element order; an SCE/LFE pushes one,
+        // a CPE pushes two.
+        let mut channels: Vec<Vec<f64>> = Vec::new();
+
+        // `number_of_raw_data_blocks_in_frame` is the resolved count `N`
+        // (the ADTS wire field is `N - 1`; [`AdtsHeader::parse`] adds the
+        // one back). The walker returns `None` when the payload is
+        // exhausted before an explicit END (the FFmpeg-native and
+        // reference encoders pad the frame but do not always round-trip a
+        // trailing END marker after the last element); treat that as
+        // end-of-block, the same as an `Element::End`.
+        'blocks: for _ in 0..header.number_of_raw_data_blocks_in_frame {
+            while let Some(elem) = Walker::new(&mut reader).next_element()? {
+                match elem {
+                    Element::ChannelElement {
+                        kind: kind @ (IdSynEle::Sce | IdSynEle::Lfe),
+                        element_instance_tag,
+                    } => {
+                        let body = IcsBody::parse(&mut reader, aot, fs, false)?;
+                        let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
+                        let spectral =
+                            SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
+                        let ch = ChannelInput {
+                            body: &body,
+                            ics_info: &ics,
+                            spectral: &spectral,
+                        };
+                        let key = (kind_id(kind), element_instance_tag);
+                        let dec = self.decoders.entry(key).or_default();
+                        channels.push(dec.decode_sce(&ch, aot, fs)?);
+                    }
+                    Element::ChannelElement {
+                        kind: IdSynEle::Cpe,
+                        element_instance_tag,
+                    } => {
+                        let (l, r) = self.decode_cpe(&mut reader, aot, fs, element_instance_tag)?;
+                        channels.push(l);
+                        channels.push(r);
+                    }
+                    Element::ChannelElement { kind, .. } => {
+                        // CCE and other channel elements have no decode
+                        // path here yet.
+                        return Err(unsupported_element(kind));
+                    }
+                    Element::Fill { .. } | Element::Data { .. } | Element::ProgramConfig(_) => {}
+                    Element::End => continue 'blocks,
+                }
+            }
+        }
+
+        let pcm = interleave_s16(&channels)?;
+        Ok(DecodedFrame {
+            pcm,
+            channels: channels.len(),
+            sample_rate: header.sample_rate(),
+        })
+    }
+
+    /// Decode a whole raw-ADTS byte buffer to a vector of per-frame
+    /// interleaved PCM.
+    ///
+    /// Skips a leading ID3v2 tag if present, then walks consecutive ADTS
+    /// frames (`aac_frame_length`-delimited) to exhaustion. A truncated
+    /// trailing frame (fewer bytes than its `aac_frame_length`) is
+    /// rejected with [`Error::UnexpectedEnd`].
+    pub fn decode_all(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
+        let data = skip_id3v2(data);
+        let mut frames = Vec::new();
+        let mut pos = 0usize;
+        while pos + crate::adts::ADTS_HEADER_BYTES_NO_CRC <= data.len() {
+            let (header, payload_offset) = AdtsHeader::parse(&data[pos..])?;
+            let frame_len = header.aac_frame_length as usize;
+            if frame_len < payload_offset || pos + frame_len > data.len() {
+                return Err(Error::UnexpectedEnd);
+            }
+            let payload = &data[pos + payload_offset..pos + frame_len];
+            frames.push(self.decode_frame(&header, payload)?);
+            pos += frame_len;
+        }
+        Ok(frames)
+    }
+
+    /// Parse one CPE body (after the walker consumed its element-instance
+    /// tag) and run it through the per-slot element decoder, returning
+    /// the `(left, right)` channel time signals.
+    fn decode_cpe(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        aot: u8,
+        fs: u8,
+        element_instance_tag: u8,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
+        let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+        if common_window {
+            // §4.4.2.3: shared ics_info, then the Table 4.4 ms_mask.
+            let ics = IcsInfo::parse(reader, aot, fs, true)?;
+            let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
+            let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
+            let mut ms_used: Vec<Vec<bool>> = Vec::new();
+            if ms_mask_present == MsMaskPresent::Mask {
+                for _g in 0..usize::from(ics.num_window_groups) {
+                    let mut row = Vec::with_capacity(usize::from(ics.max_sfb));
+                    for _sfb in 0..usize::from(ics.max_sfb) {
+                        row.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
+                    }
+                    ms_used.push(row);
+                }
+            }
+            let left_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
+            let left_spectral = SpectralData::parse(reader, &ics, &left_body.section_data, fs)?;
+            let right_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
+            let right_spectral = SpectralData::parse(reader, &ics, &right_body.section_data, fs)?;
+            let left = ChannelInput {
+                body: &left_body,
+                ics_info: &ics,
+                spectral: &left_spectral,
+            };
+            let right = ChannelInput {
+                body: &right_body,
+                ics_info: &ics,
+                spectral: &right_spectral,
+            };
+            let joint = CpeJointStereo {
+                ms_mask_present,
+                ms_used,
+            };
+            let dec = self.decoders.entry(key).or_default();
+            dec.decode_cpe(&left, &right, &joint, aot, fs)
+        } else {
+            // Non-shared CPE: each channel carries its own ics_info; no
+            // M/S mask, so the joint-stereo tools do not run.
+            let left_body = IcsBody::parse(reader, aot, fs, false)?;
+            let left_ics = left_body
+                .ics_info
+                .clone()
+                .ok_or(Error::ElementDecodeInvalid)?;
+            let left_spectral =
+                SpectralData::parse(reader, &left_ics, &left_body.section_data, fs)?;
+            let right_body = IcsBody::parse(reader, aot, fs, false)?;
+            let right_ics = right_body
+                .ics_info
+                .clone()
+                .ok_or(Error::ElementDecodeInvalid)?;
+            let right_spectral =
+                SpectralData::parse(reader, &right_ics, &right_body.section_data, fs)?;
+            let left = ChannelInput {
+                body: &left_body,
+                ics_info: &left_ics,
+                spectral: &left_spectral,
+            };
+            let right = ChannelInput {
+                body: &right_body,
+                ics_info: &right_ics,
+                spectral: &right_spectral,
+            };
+            let dec = self.decoders.entry(key).or_default();
+            dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)
+        }
+    }
+}
+
+/// Map a channel-element `id_syn_ele` to the slot key's first component
+/// (the element decoders are keyed independently per syntactic-element
+/// id so an SCE tag 0 and a CPE tag 0 never collide).
+fn kind_id(kind: IdSynEle) -> u8 {
+    match kind {
+        IdSynEle::Sce => 0,
+        IdSynEle::Cpe => 1,
+        IdSynEle::Lfe => 3,
+        _ => 9,
+    }
+}
+
+fn unsupported_element(kind: IdSynEle) -> Error {
+    // CCE (coupling) has no decode path; surface the element-decode
+    // failure mode rather than a parse error so the caller can tell a
+    // structural-OK-but-unsupported element apart from a malformed one.
+    let _ = kind;
+    Error::ElementDecodeInvalid
+}
+
+/// Skip a leading ID3v2 tag (`"ID3"` + 6-byte header + syncsafe size +
+/// optional footer) if present; otherwise return the input unchanged.
+fn skip_id3v2(data: &[u8]) -> &[u8] {
+    if data.len() < 10 || &data[..3] != b"ID3" {
+        return data;
+    }
+    let size = data[6..10]
+        .iter()
+        .fold(0usize, |acc, &b| (acc << 7) | usize::from(b & 0x7f));
+    let footer = if data[5] & 0x10 != 0 { 10 } else { 0 };
+    let total = 10 + size + footer;
+    if total >= data.len() {
+        data
+    } else {
+        &data[total..]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_id3v2_passes_through_non_id3() {
+        let data = [0xFFu8, 0xF1, 0x00, 0x00];
+        assert_eq!(skip_id3v2(&data), &data);
+    }
+
+    #[test]
+    fn skip_id3v2_strips_a_tag() {
+        // "ID3", ver 4.0, no flags, syncsafe size = 4 → 10 + 4 = 14
+        // bytes of tag, then a sentinel payload byte.
+        let mut data = vec![b'I', b'D', b'3', 4, 0, 0, 0, 0, 0, 4];
+        data.extend_from_slice(&[0; 4]);
+        data.push(0xAB);
+        assert_eq!(skip_id3v2(&data), &[0xABu8]);
+    }
+
+    #[test]
+    fn skip_id3v2_keeps_tag_when_size_overruns() {
+        // A declared size larger than the buffer leaves the data as-is
+        // rather than panicking.
+        let data = vec![b'I', b'D', b'3', 4, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f];
+        assert_eq!(skip_id3v2(&data), &data[..]);
+    }
+
+    #[test]
+    fn kind_id_separates_sce_and_cpe() {
+        assert_ne!(kind_id(IdSynEle::Sce), kind_id(IdSynEle::Cpe));
+        assert_ne!(kind_id(IdSynEle::Lfe), kind_id(IdSynEle::Cpe));
+    }
+}
