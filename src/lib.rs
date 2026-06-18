@@ -406,6 +406,7 @@ pub mod intensity_stereo;
 pub mod ltp;
 pub mod ms_stereo;
 pub mod pce;
+pub mod pcm;
 pub mod pns;
 pub mod predictor;
 pub mod pulse_data;

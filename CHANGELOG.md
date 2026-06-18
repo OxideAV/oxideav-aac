@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.6.11 integer-PCM rendering (`pcm` module) — the final output stage
+  that turns the §4.6.11 filterbank's `f64` time signal (already on the
+  `±32768` full-scale amplitude axis from the `2/N` IMDCT normalisation +
+  §4.6.2.3.3 scalefactor gain) into 16-bit signed PCM. `nint` is the
+  §1.3 `NINT()` nearest-integer operator (half-integers rounded away from
+  zero, per the spec arithmetic-operator definitions); `to_s16` applies
+  it then saturates to `-32768..=32767`; `channel_to_s16` maps a channel
+  and `interleave_s16` packs a frame's per-channel buffers into the
+  element-order interleaved layout. The conversion is the *only*
+  output-rendering step (no resampler, no dither, no channel remap), so
+  it is fully spec-determined. New `Error::PcmInvalid` for a channel
+  length disagreement on interleave. Pinned by 9 unit tests
+  (away-from-zero half rounding, non-finite-to-zero, saturation extremes,
+  interleave order / mismatch). This unblocks `expected.wav` byte-exact
+  comparison: the deterministic (non-PNS) decode path now matches the
+  reference s16 output to within ≤1 LSB (the residual is the difference
+  between this crate's f64 direct-sum IMDCT and a float32 fast transform;
+  PNS bands diverge by the §4.6.13.3 spec-undefined RNG phase, as
+  expected).
 - §1.8.4.5 error-protection CRC generator (`crc` module) — the full
   family of MPEG-4 Audio CRC generation polynomials (`CrcPoly::Crc4`
   through `Crc32`, including the `Crc8` used by the LATM

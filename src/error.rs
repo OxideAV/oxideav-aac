@@ -527,6 +527,13 @@ pub enum Error {
     /// The §4.6.18.3.2.1 master table and the §4.6.18.3.2.2 derived
     /// high / low / noise tables are undefined for such inputs.
     SbrFreqBandInvalid,
+    /// Integer-PCM rendering ([`crate::pcm`], §4.6.11 output →
+    /// §1.3 `NINT()`-rounded 16-bit word) was handed per-channel time
+    /// signals of disagreeing length. [`crate::pcm::interleave_s16`]
+    /// requires every channel buffer to carry the same per-frame sample
+    /// count (the §4.6.11 transform length) so the interleave is
+    /// well-defined.
+    PcmInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -797,6 +804,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "SBR frequency bands: bs_start_freq/bs_stop_freq/bs_freq_scale, FsSBR, or the derived k0/k2 geometry violate a §4.6.18.3.2 / §4.6.18.3.6 constraint"
+                )
+            }
+            Error::PcmInvalid => {
+                write!(
+                    f,
+                    "PCM interleave: per-channel time signals disagree in length"
                 )
             }
         }
