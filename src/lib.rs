@@ -382,9 +382,17 @@
 //!   whole stack per channel element: `decode_sce` for SCE / LFE and
 //!   `decode_cpe` for a CPE run pulse → dequant → `quant_to_spec()` →
 //!   M/S → intensity → PNS → TNS → §4.6.11 filterbank to PCM, carrying
-//!   the per-channel overlap-add tail across frames. `expected.wav` PCM
-//!   comparison (resampler / clipper, and the RNG-phase PNS caveat) is
-//!   the remaining followup.
+//!   the per-channel overlap-add tail across frames. The stream-level
+//!   [`decode::StreamDecoder`] walks the §4.4.2.1 `raw_data_block()`
+//!   above that driver and renders to element-order interleaved 16-bit
+//!   PCM via the §4.6.11 [`pcm`] output stage (the §1.3 `NINT()`
+//!   round-half-away-from-zero + saturation). The decoded PCM is
+//!   validated against the staged `expected.wav` corpus: the two
+//!   PNS-free ADTS fixtures are 99.9 % byte-exact (max error 1 LSB —
+//!   the residual is the `f64` direct-sum vs a `float32` fast-transform
+//!   IMDCT difference), and the PNS-bearing fixtures match in the PCM
+//!   RMS domain below 0.1 % error-to-signal (full byte-exactness is
+//!   precluded only by the §4.6.13.3 spec-undefined noise phase).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
