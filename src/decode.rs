@@ -15,8 +15,8 @@
 //!
 //! Scope: AAC-LC (and the other General-Audio object types the
 //! per-tool chain covers) carried in ADTS, single `raw_data_block` per
-//! frame, the channel elements the FFmpeg-native and reference encoders
-//! emit (SCE / LFE / CPE, plus the consumed-and-ignored FIL / DSE /
+//! frame, the channel elements the staged-fixture encoders emit
+//! (SCE / LFE / CPE, plus the consumed-and-ignored FIL / DSE /
 //! PCE). SBR / PS up-sampling, the coupling-channel (CCE) contribution,
 //! and multi-`raw_data_block` ADTS frames are out of scope (the same
 //! limits the element driver carries).
@@ -106,10 +106,10 @@ impl StreamDecoder {
         // `number_of_raw_data_blocks_in_frame` is the resolved count `N`
         // (the ADTS wire field is `N - 1`; [`AdtsHeader::parse`] adds the
         // one back). The walker returns `None` when the payload is
-        // exhausted before an explicit END (the FFmpeg-native and
-        // reference encoders pad the frame but do not always round-trip a
-        // trailing END marker after the last element); treat that as
-        // end-of-block, the same as an `Element::End`.
+        // exhausted before an explicit END (real-world encoders pad the
+        // frame but do not always round-trip a trailing END marker after
+        // the last element); treat that as end-of-block, the same as an
+        // `Element::End`.
         'blocks: for _ in 0..header.number_of_raw_data_blocks_in_frame {
             while let Some(elem) = Walker::new(&mut reader).next_element()? {
                 match elem {
