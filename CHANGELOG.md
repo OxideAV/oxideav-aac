@@ -22,13 +22,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   a raw ADTS stream end to end to comparable s16 PCM. CCE / multi-RDB /
   SBR remain out of scope (the element driver's limits). New
   `tests/pcm_byte_exact.rs` compares the decoded PCM against each
-  fixture's `expected.wav`: the two PNS-free fixtures
+  fixture's `expected.wav` in two regimes: the two PNS-free fixtures
   (`aac-lc-mono-8000-16kbps-adts`, `aac-lc-intensity-stereo`) match the
   reference s16 output at **99.9% byte-exact, max error 1 LSB** (the
   residual being the f64-direct-sum vs float32-fast-transform IMDCT
-  difference); the PNS-bearing fixtures are pinned at their
-  deterministic-sample-population fraction (§4.6.13.3 RNG-phase noise
-  precludes full byte-exactness, as the spec leaves the generator open).
+  difference); the six PNS-bearing fixtures are compared in the
+  §8-prescribed PCM RMS domain, where the error-to-signal RMS ratio
+  stays **below 0.1%** (the spec-undefined §4.6.13.3 noise phase carries
+  negligible energy in these tonal fixtures, so full byte-exactness is
+  precluded but the decode is energetically near-identical). A third
+  test pins that a `StreamDecoder` decodes a PNS-heavy stream
+  reproducibly across runs (the determinism the open §4.6.13.3 generator
+  still must provide).
 - §4.6.11 integer-PCM rendering (`pcm` module) — the final output stage
   that turns the §4.6.11 filterbank's `f64` time signal (already on the
   `±32768` full-scale amplitude axis from the `2/N` IMDCT normalisation +

@@ -87,6 +87,10 @@ struct Compare {
     exact: usize,
     off_by_one: usize,
     max_err: i32,
+    /// Sum of squared sample errors and of squared reference samples,
+    /// for the §8-recommended RMS-domain comparison.
+    err_sse: f64,
+    sig_sse: f64,
 }
 
 impl Compare {
@@ -95,6 +99,30 @@ impl Compare {
             return 0.0;
         }
         self.exact as f64 / self.n as f64
+    }
+
+    fn err_rms(&self) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        (self.err_sse / self.n as f64).sqrt()
+    }
+
+    fn sig_rms(&self) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        (self.sig_sse / self.n as f64).sqrt()
+    }
+
+    /// Error RMS as a fraction of the reference signal's own RMS — the
+    /// scale-free "how far off, energetically" figure §8 recommends.
+    fn err_to_signal(&self) -> f64 {
+        let s = self.sig_rms();
+        if s == 0.0 {
+            return 0.0;
+        }
+        self.err_rms() / s
     }
 }
 
@@ -112,6 +140,8 @@ fn compare(ours: &[i16], expected: &[i16]) -> Compare {
             c.off_by_one += 1;
         }
         c.max_err = c.max_err.max(d);
+        c.err_sse += (d as f64).powi(2);
+        c.sig_sse += (expected[i] as f64).powi(2);
     }
     c
 }
@@ -172,22 +202,25 @@ fn deterministic_fixtures_are_byte_exact_within_one_lsb() {
 }
 
 /// Fixtures that carry PNS bands: the noise *phase* is §4.6.13.3
-/// spec-undefined, so byte-exactness is impossible, but the
-/// deterministic (non-noise) sample population still matches a large
-/// fraction. The pair is `(fixture, min exact fraction)`.
+/// spec-undefined, so byte-exactness is impossible. The
+/// `aac-fixtures-and-traces.md` §8 prescribes a PCM-domain RMS-tolerance
+/// comparison for exactly this case; in these tonal fixtures the noise
+/// bands carry little energy, so the error RMS stays a small fraction of
+/// the reference signal's own RMS. The pair is `(fixture, max
+/// error-to-signal RMS ratio)`.
 const PNS_FIXTURES: &[(&str, f64)] = &[
-    ("aac-lc-mono-11025-32kbps-adts", 0.60),
-    ("aac-lc-mono-44100-64kbps-adts", 0.70),
-    ("aac-lc-stereo-22050-64kbps-adts", 0.70),
-    ("aac-lc-stereo-44100-128kbps-adts", 0.80),
-    ("aac-lc-ms-stereo", 0.80),
-    ("aac-lc-tns-active", 0.80),
+    ("aac-lc-mono-11025-32kbps-adts", 0.02),
+    ("aac-lc-mono-44100-64kbps-adts", 0.02),
+    ("aac-lc-stereo-22050-64kbps-adts", 0.02),
+    ("aac-lc-stereo-44100-128kbps-adts", 0.02),
+    ("aac-lc-ms-stereo", 0.02),
+    ("aac-lc-tns-active", 0.02),
 ];
 
 #[test]
-fn pns_fixtures_match_deterministic_population() {
+fn pns_fixtures_match_in_rms_domain() {
     let mut decoded_any = false;
-    for &(name, min_exact) in PNS_FIXTURES {
+    for &(name, max_ratio) in PNS_FIXTURES {
         let (Some(ours), Some(expected)) =
             (decode_fixture_pcm(name), read_wav_s16(&fixture_wav(name)))
         else {
@@ -204,24 +237,45 @@ fn pns_fixtures_match_deterministic_population() {
         );
         let c = compare(&ours, &expected);
         eprintln!(
-            "{name}: n={} exact={} ({:.3}%) off1={} max_err={}",
+            "{name}: n={} exact={} ({:.3}%) max_err={} err_rms={:.4} sig_rms={:.1} ratio={:.5}",
             c.n,
             c.exact,
             100.0 * c.exact_fraction(),
-            c.off_by_one,
-            c.max_err
+            c.max_err,
+            c.err_rms(),
+            c.sig_rms(),
+            c.err_to_signal()
         );
+        // §8: compare in the PCM domain with a small RMS tolerance. The
+        // residual is the energy of the spec-undefined PNS noise phase
+        // (plus the ≤1-LSB IMDCT rounding), which is a tiny fraction of
+        // the tonal signal energy here.
         assert!(
-            c.exact_fraction() >= min_exact,
-            "{name}: only {:.3}% byte-exact (expected ≥{:.0}% — the \
-             non-noise sample population)",
-            100.0 * c.exact_fraction(),
-            100.0 * min_exact
+            c.err_to_signal() <= max_ratio,
+            "{name}: error-to-signal RMS {:.5} exceeds the {:.3} tolerance",
+            c.err_to_signal(),
+            max_ratio
         );
     }
     if !decoded_any {
-        eprintln!("docs fixtures unavailable; PNS-population pass skipped");
+        eprintln!("docs fixtures unavailable; PNS RMS pass skipped");
     }
+}
+
+/// The §4.6.13.3 PNS generator phase is spec-undefined, but a given
+/// [`StreamDecoder`] must be *reproducible*: decoding the same stream
+/// twice yields bit-identical PCM (the determinism the milestone
+/// requires for a stable output, distinct from matching any one external
+/// reference). This pins it for a PNS-heavy fixture.
+#[test]
+fn pns_decode_is_reproducible_across_runs() {
+    let name = "aac-lc-pns-noise";
+    let (Some(a), Some(b)) = (decode_fixture_pcm(name), decode_fixture_pcm(name)) else {
+        eprintln!("skip {name}: fixtures unavailable");
+        return;
+    };
+    assert_eq!(a, b, "{name}: PNS decode is not reproducible across runs");
+    assert!(!a.is_empty(), "{name}: empty decode");
 }
 
 fn fixture_wav(name: &str) -> PathBuf {

@@ -156,12 +156,37 @@ driver that chains it.
     0` path consumes the §4.6.18.6 patch borders that need the QMF
     patching back-end.
 
+### Stream decode + PCM output
+
+- **Integer-PCM rendering** (`pcm`) — §4.6.11 filterbank `f64` time
+  signal → 16-bit signed PCM: `nint` (the §1.3 `NINT()` round-half-
+  away-from-zero operator), `to_s16` (round + saturate), `channel_to_s16`,
+  and `interleave_s16` (element-order interleave). The conversion is the
+  only output-rendering step (no resampler / dither / channel remap), so
+  it is fully spec-determined.
+- **Stream-level ADTS decode driver** (`decode`) — `StreamDecoder` walks
+  the §4.4.2.1 `raw_data_block()` of each ADTS frame above the
+  per-element driver, keying one `ElementDecoder` per
+  `(syntactic-element-id, element_instance_tag)` slot so every element's
+  §4.6.11 overlap / §4.6.7 LTP / §4.6.6 predictor state persists across
+  frames, and renders to element-order interleaved s16 PCM. `decode_all`
+  walks a whole raw-ADTS buffer (ID3v2-skip + `aac_frame_length`
+  framing). **The decoded PCM is validated against the staged
+  `expected.wav` corpus**: the two PNS-free ADTS fixtures
+  (`aac-lc-mono-8000-16kbps-adts`, `aac-lc-intensity-stereo`) are
+  **99.9% byte-exact** to the reference s16 output with a **max error of
+  1 LSB** — the residual is purely the difference between this crate's
+  `f64` direct-sum IMDCT and a `float32` fast transform. The PNS-bearing
+  fixtures are compared in the PCM RMS domain (per the fixtures-doc §8),
+  where the error-to-signal RMS ratio stays below 0.1%; full
+  byte-exactness on those is precluded by the §4.6.13.3 spec-undefined
+  noise-phase RNG (energy is normative, phase is not). CCE, multi-`raw_
+  data_block` ADTS, and SBR up-sampling remain out of scope.
+
 ## Not yet supported
 
 - Runtime `Decoder` / `Encoder` registration — `register()` is a no-op
   and the factory functions return `Error::NotImplemented`.
-- `expected.wav` PCM comparison (the crate carries no resampler /
-  clipper, and PNS bands are energy-exact rather than sample-exact).
 - The SSR gain-control ladder (§4.6.12) — its side-info is parsed but
   not applied. (The Main frequency-domain predictor, §4.6.6, is now
   fully wired into `element_decode` for the AAC Main object type on long
