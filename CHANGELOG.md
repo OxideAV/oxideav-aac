@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.6.18.3.2 SBR frequency band tables (`sbr_freq_bands` module) — the
+  static, header-only half of the Spectral Band Replication band setup,
+  computed from the closed-form ISO/IEC 14496-3 algorithm with no QMF
+  back-end. `k0` / `k2` derive the §4.6.18.3.2.1 low / high QMF subband
+  boundaries (the per-`FsSBR` `offset` table, the
+  `startMin`/`stopMin = NINT(c·128/FsSBR)` thresholds, the
+  `stopDkSort` accumulation for `bs_stop_freq < 14`, and the
+  `bs_stop_freq == 14/15` `min(64, 2·k0)` / `min(64, 3·k0)`
+  shortcuts). `master_table` builds `fMaster` for both the Figure 4.39
+  linear path (`bs_freq_scale == 0`) and the Figure 4.40 warped path
+  (`bs_freq_scale > 0`, single-/two-region split at `k2/k0 > 2.2449`
+  with the `min(vDk1) < max(vDk0)` smoothing). `HiLoTables::derive`
+  produces the §4.6.18.3.2.2 `fTableHigh` / `fTableLow` / `fTableNoise`
+  plus the `M` and `k_x` outputs. The §4.6.18.3.6 requirements
+  (`k2 > k0`, `numBands > 0`, `vDk > 0`, `bs_xover_band < NMaster`) are
+  enforced via the new `Error::SbrFreqBandInvalid`. The §4.6.18.3.2.3
+  limiter band table is deferred (needs the §4.6.18.6 patch borders).
 - §4.6.6 MPEG-2 frequency-domain prediction (`predictor` module) — the
   backward-adaptive intra-channel predictor of the AAC Main object type
   (AOT 1). A `PredictorBank` of second-order lattice `Predictor`s (one

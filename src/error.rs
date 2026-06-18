@@ -510,6 +510,23 @@ pub enum Error {
     /// §4.6.6.3.3 reset are undefined without a full predictor bank and a
     /// valid reset group.
     PredictorInvalid,
+    /// SBR frequency-band-table derivation
+    /// ([`crate::sbr_freq_bands`], §4.6.18.3.2) was handed parameters
+    /// that violate a normative constraint:
+    ///
+    /// * `bs_start_freq` / `bs_stop_freq` outside their 4-bit ranges
+    ///   (`0 ..= 15` each), an unsupported `FsSBR` (no offset /
+    ///   `startMin` / `stopMin` row in §4.6.18.3.2.1), or
+    ///   `bs_freq_scale` / `bs_alter_scale` / `bs_noise_bands`
+    ///   outside their signalled ranges.
+    /// * A derived geometry that breaks a §4.6.18.3.6 requirement:
+    ///   `k2 <= k0` (`fMaster` undefined), `numBands <= 0`,
+    ///   `k2 - k0` over the per-rate subband-count cap, `k_x > 32`,
+    ///   `k_x + M > 64`, or `bs_xover_band >= NMaster`.
+    ///
+    /// The §4.6.18.3.2.1 master table and the §4.6.18.3.2.2 derived
+    /// high / low / noise tables are undefined for such inputs.
+    SbrFreqBandInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -774,6 +791,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "predictor: long-window offset table, spectrum length, or reset-group number disagree with the §4.6.6 frequency-domain prediction process"
+                )
+            }
+            Error::SbrFreqBandInvalid => {
+                write!(
+                    f,
+                    "SBR frequency bands: bs_start_freq/bs_stop_freq/bs_freq_scale, FsSBR, or the derived k0/k2 geometry violate a §4.6.18.3.2 / §4.6.18.3.6 constraint"
                 )
             }
         }

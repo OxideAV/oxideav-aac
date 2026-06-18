@@ -113,6 +113,36 @@ driver that chains it.
   so the single synthesis pass shapes the residual while undoing the
   analysis on the LTP contribution.
 
+### SBR frequency band setup (HE-AAC)
+
+- **SBR frequency band tables** (`sbr_freq_bands`) — §4.6.18.3.2 the
+  static, header-only half of the Spectral Band Replication band setup,
+  computed directly from the closed-form spec algorithm (no QMF back-end
+  required):
+  - `k0` / `k2` — §4.6.18.3.2.1 the low and high QMF subband
+    boundaries. `k0 = startMin + offset(bs_start_freq)` with the
+    per-`FsSBR` `offset` table and the `startMin = NINT(c·128/FsSBR)`
+    thresholds; `k2` covers the `bs_stop_freq < 14` `stopDkSort`
+    accumulation path and the `bs_stop_freq == 14 / 15`
+    `min(64, 2·k0)` / `min(64, 3·k0)` shortcuts.
+  - `master_table` — §4.6.18.3.2.1 `fMaster`, both the Figure 4.39
+    linear path (`bs_freq_scale == 0`, the `dk`/`vDk`/`k2Diff`
+    away-from-zero correction walk) and the Figure 4.40 warped path
+    (`bs_freq_scale > 0`, the `bands`/`warp` log-spaced regions with
+    the single-/two-region split at `k2/k0 > 2.2449` and the
+    `min(vDk1) < max(vDk0)` smoothing step).
+  - `HiLoTables::derive` — §4.6.18.3.2.2 the derived `fTableHigh`,
+    `fTableLow` (the `i(k) = 2k − (1−(−1)^NHigh)/2` decimation), and
+    `fTableNoise` (the `NQ = max(1, NINT(bs_noise_bands·log2(k2/kx)))`
+    band count plus its `i(k)` recursion), along with the `M` and
+    `k_x` outputs every later SBR stage keys off.
+  - The §4.6.18.3.6 requirements are enforced (`k2 > k0`,
+    `numBands > 0`, `vDk > 0`, `bs_xover_band < NMaster`), surfacing
+    `Error::SbrFreqBandInvalid` on violation. The §4.6.18.3.2.3
+    limiter band table is out of scope here — its `bs_limiter_bands >
+    0` path consumes the §4.6.18.6 patch borders that need the QMF
+    patching back-end.
+
 ## Not yet supported
 
 - Runtime `Decoder` / `Encoder` registration — `register()` is a no-op
@@ -126,9 +156,13 @@ driver that chains it.
   with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
   Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
   scope per the §4.6.7.1 long-window restriction.)
-- SBR / PS synthesis (needs a QMF / patching back-end), the
+- SBR / PS synthesis (needs a QMF analysis / synthesis filterbank and
+  the §4.6.18.6 patching back-end) — the §4.6.18.3.2.1/.2 frequency
+  band tables (`fMaster` / `fTableHigh` / `fTableLow` / `fTableNoise`)
+  are in place (see `sbr_freq_bands` above), but the envelope / noise
+  decode, the limiter table, and the QMF filterbanks are not. PS, the
   coupling-channel (CCE) contribution, and the ER AAC LD 480/512
-  transform variants.
+  transform variants likewise remain out of scope.
 - The `scale_factor_data()` error-resilient (RVLC) branch.
 - LATM/LOAS transport (§1.7.3) and ADTS CRC-16 validation.
 
