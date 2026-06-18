@@ -45,6 +45,19 @@ driver that chains it.
   parser + encoder for the `EXT_FILL`, `EXT_FILL_DATA`, and
   `EXT_DYNAMIC_RANGE` branches. The two SBR-data extension types are
   rejected (`Error::UnsupportedExtensionSbr`) pending an SBR back-end.
+- **Error-protection CRC generator** (`crc`) — §1.8.4.5: the full
+  family of MPEG-4 Audio CRC generation polynomials (`CRC4`..`CRC32`,
+  including the `CRC8` LATM `StreamMuxConfig()` `crcCheckSum` and the
+  16-bit `x¹⁶+x¹⁵+x²+1`), a zero-init MSB-first shift-register
+  (`crc_bits` / `crc_bytes`) implementing the §1.8.4.5
+  `M(x)·xᵏ = Q(x)·G(x) + R(x)` remainder with the normative
+  output-bit inversion ("written in a reversed manner, i.e. each bit
+  is inverted"), and the [`crc::stream_mux_config_crc`] LATM helper.
+  Cross-checked against an independent GF(2) long-division reference
+  and the codeword-divisibility property. The ADTS
+  `adts_error_check()` region-selection CRC is *not* covered here —
+  ISO/IEC 13818-7 cites it to a different normative reference
+  (ISO/IEC 11172-3 §2.4.3.1).
 
 ### Numeric reconstruction (AAC-LC tool chain)
 
@@ -164,7 +177,14 @@ driver that chains it.
   coupling-channel (CCE) contribution, and the ER AAC LD 480/512
   transform variants likewise remain out of scope.
 - The `scale_factor_data()` error-resilient (RVLC) branch.
-- LATM/LOAS transport (§1.7.3) and ADTS CRC-16 validation.
+- LATM/LOAS transport framing (§1.7.3) — the `StreamMuxConfig()`
+  `crcCheckSum` generator polynomial (`CRC8`) is now available in the
+  `crc` module (§1.8.4.5), but the `AudioMuxElement()` /
+  `StreamMuxConfig()` bitstream walkers that feed it are not yet
+  wired. ADTS `adts_error_check()` CRC validation is likewise still
+  open: its region selection (192/128-bit element protection with the
+  double-protection edge cases) plus its ISO/IEC 11172-3 §2.4.3.1 CRC
+  reference are out of scope for the §1.8.4.5 `crc` module.
 
 ## License
 

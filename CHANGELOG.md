@@ -8,6 +8,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §1.8.4.5 error-protection CRC generator (`crc` module) — the full
+  family of MPEG-4 Audio CRC generation polynomials (`CrcPoly::Crc4`
+  through `Crc32`, including the `Crc8` used by the LATM
+  `StreamMuxConfig()` `crcCheckSum` and the 16-bit `x¹⁶+x¹⁵+x²+1`),
+  with `width()` / `generator()` accessors derived directly from the
+  §1.8.4.5 polynomial listing. `crc_bits` / `crc_bytes` implement the
+  zero-init, MSB-first, no-input-reflection shift register computing
+  the §1.8.4.5 `M(x)·xᵏ = Q(x)·G(x) + R(x)` remainder and apply the
+  normative output-bit inversion ("the CRC bits are written in a
+  reversed manner, i.e. each bit is inverted"). `stream_mux_config_crc`
+  is the LATM `crcCheckSum` (§1.7.3.1 / Table 1.42) helper. Validated
+  against an independent GF(2) long-division reference across six
+  widths and the `M(x)·xᵏ + R(x)` codeword-divisibility property. The
+  §1.8.4.6 SRCPC FEC stage and the ADTS `adts_error_check()`
+  region-selection CRC (ISO/IEC 13818-7 → ISO/IEC 11172-3 §2.4.3.1)
+  are out of scope.
 - §4.6.18.3.2 SBR frequency band tables (`sbr_freq_bands` module) — the
   static, header-only half of the Spectral Band Replication band setup,
   computed from the closed-form ISO/IEC 14496-3 algorithm with no QMF
