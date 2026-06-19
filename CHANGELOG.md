@@ -24,7 +24,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   tags. A `trait_decode_matches_stream_decoder_pcm` test pins the trait
   output as byte-identical to the underlying `StreamDecoder`. No encoder
   is wired (the crate has the bit-exact wire writers but no rate-control
-  back-end).
+  back-end). New `tests/codec_decoder_pcm.rs` re-runs the
+  `expected.wav` corpus comparison through the framework trait surface
+  (packet-in / `AudioFrame`-out, the exact path a container drives):
+  the two PNS-free fixtures stay **≥99.9% byte-exact, max error 1 LSB**,
+  and the PNS fixtures stay below the §8 PCM-RMS tolerance — proving the
+  packetisation / `AudioFrame` byte-layout / across-packet state
+  threading preserve the underlying decode.
 
 - Stream-level ADTS decode driver (`decode` module) — the §4.4.2.1
   `raw_data_block()` walk above the per-element driver. `StreamDecoder`
