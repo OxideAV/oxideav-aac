@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `sbr_header()` parser (`sbr_header` module) — ISO/IEC 14496-3
+  §4.4.2.8 Table 4.63. `SbrHeader::parse` reads the fixed-width header
+  (`bs_amp_res` / `bs_start_freq` / `bs_stop_freq` / `bs_xover_band` /
+  `bs_reserved` / the two `bs_header_extra_*` flags) and the optional
+  extra blocks, filling in the Table 4.63 Note 3 default values
+  (Tables 4.105–4.111: `bs_freq_scale=2`, `bs_alter_scale=1`,
+  `bs_noise_bands=2`, `bs_limiter_bands=2`, `bs_limiter_gains=2`,
+  `bs_interpol_freq=1`, `bs_smoothing_mode=1`) when an extra-header
+  flag is clear. `band_geometry_changed()` reports whether the
+  §4.6.18.3.3 band-reset parameters differ between two headers, and
+  `derive_bands()` chains the header into the existing
+  `sbr_freq_bands` k0/k2/master/HiLoTables pipeline.
 - SBR Huffman codebooks + `sbr_huff_dec()` (`sbr_huffman` module) —
   ISO/IEC 14496-3 Annex 4.A.6.1. All ten normative SBR envelope /
   noise codebooks (Tables 4.A.79–4.A.88) are transcribed directly from
