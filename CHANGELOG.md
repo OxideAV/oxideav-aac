@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Runtime `oxideav_core::Decoder` wiring (`codec_decoder` module) — the
+  no-op `register()` now installs a real AAC decoder under id `"aac"`.
+  `AacDecoder` adapts the persistent `decode::StreamDecoder` into the
+  framework's packet-in / frame-out trait: `send_packet` decodes every
+  ADTS frame in a packet (ID3v2-skip + `aac_frame_length` framing, one
+  or more frames per packet) against the carried-across-packets element
+  state, `receive_frame` returns one interleaved-S16 `AudioFrame` (1024
+  samples/channel) per decoded frame, `flush` drives to `Eof`, and
+  `reset` drops the whole `StreamDecoder` (and with it the §4.6.11
+  overlap / §4.6.7 LTP / §4.6.6 predictor memory) for a clean post-seek
+  restart. `register_codecs` claims the MP4 object-type `0x40`,
+  WAVEFORMATEX `0x00FF` / `0x1601`, the `mp4a` / `aac ` FourCCs, and the
+  Matroska `A_AAC` CodecID, with an ADTS-syncword probe to win shared
+  tags. A `trait_decode_matches_stream_decoder_pcm` test pins the trait
+  output as byte-identical to the underlying `StreamDecoder`. No encoder
+  is wired (the crate has the bit-exact wire writers but no rate-control
+  back-end).
+
 - Stream-level ADTS decode driver (`decode` module) — the §4.4.2.1
   `raw_data_block()` walk above the per-element driver. `StreamDecoder`
   holds one `ElementDecoder` per `(syntactic-element-id,

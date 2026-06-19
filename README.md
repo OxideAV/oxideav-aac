@@ -9,13 +9,14 @@ the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 specifications under
 
 ## Status
 
-The crate implements the full per-tool AAC-LC decode chain as a set of
-composable primitives, from bitstream parse all the way to PCM-domain
-samples for a single channel element. The runtime `Decoder` / `Encoder`
-registration is **not yet wired** — `register()` installs nothing and
-the high-level factory entry points return `Error::NotImplemented`.
-What is in place is the spec-faithful tool set plus an element-level
-driver that chains it.
+The crate implements the full AAC-LC decode chain end to end — from
+ADTS bitstream parse through the per-tool reconstruction to interleaved
+16-bit PCM — and **wires it into the framework's runtime `Decoder`
+trait** (`register()` installs an AAC decoder under id `"aac"`; see
+`codec_decoder` below). The PCM is validated byte-exactly (within the
+1-LSB IMDCT-rounding bound) against the staged `expected.wav` corpus.
+The `Encoder` side is **not yet wired** — the bit-exact wire writers are
+in place but there is no rate-control / psychoacoustic encoder back-end.
 
 ### Bitstream parsing
 
@@ -182,11 +183,28 @@ driver that chains it.
   byte-exactness on those is precluded by the §4.6.13.3 spec-undefined
   noise-phase RNG (energy is normative, phase is not). CCE, multi-`raw_
   data_block` ADTS, and SBR up-sampling remain out of scope.
+- **Runtime `Decoder` registration** (`codec_decoder`) — `AacDecoder`
+  adapts the persistent `StreamDecoder` into the framework's
+  packet-in / frame-out `oxideav_core::Decoder` trait. `send_packet`
+  decodes every ADTS frame in a packet (ID3v2-skip + `aac_frame_length`
+  framing; one or many frames per packet) against the across-packets
+  element state, `receive_frame` returns one interleaved-S16
+  `AudioFrame` (1024 samples/channel) per decoded frame, `flush` drains
+  to `Eof`, and `reset` drops the whole `StreamDecoder` (and its
+  §4.6.11 overlap / §4.6.7 LTP / §4.6.6 predictor memory) for a clean
+  post-seek restart. `register()` installs it under id `"aac"`, claiming
+  the MP4 object-type `0x40`, WAVEFORMATEX `0x00FF` / `0x1601`, the
+  `mp4a` / `aac ` FourCCs, and the Matroska `A_AAC` CodecID, with an
+  ADTS-syncword probe to win shared tags. The trait output is pinned
+  byte-identical to the underlying `StreamDecoder`.
 
 ## Not yet supported
 
-- Runtime `Decoder` / `Encoder` registration — `register()` is a no-op
-  and the factory functions return `Error::NotImplemented`.
+- Runtime `Encoder` registration — `register()` installs the AAC
+  **decoder** (id `"aac"`) but no encoder; the bit-exact wire writers
+  exist (`raw_data_block::FrameAssembler` and the per-tool `write`
+  primitives) but there is no rate-control / psychoacoustic encoder
+  back-end to drive them.
 - The SSR gain-control ladder (§4.6.12) — its side-info is parsed but
   not applied. (The Main frequency-domain predictor, §4.6.6, is now
   fully wired into `element_decode` for the AAC Main object type on long

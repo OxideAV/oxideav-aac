@@ -325,9 +325,12 @@
 //!   performed; the raw `(dyn_rng_sgn, dyn_rng_ctl)` records are
 //!   surfaced verbatim for a later round.
 //!
-//! Public API surface that requires a decoder or encoder body still
-//! returns [`Error::NotImplemented`]; the syntactic skeleton lives
-//! entirely in the modules above.
+//! The decode path is fully wired: [`register`] installs an AAC
+//! [`Decoder`](oxideav_core::Decoder) (id `"aac"`) via the
+//! [`codec_decoder`] module, adapting the [`decode::StreamDecoder`] into
+//! the framework's packet-in / frame-out trait. The encode path still
+//! has no rate-control back-end — the bit-exact wire writers exist but
+//! no `Encoder` is registered.
 //!
 //! ## Provenance
 //!
@@ -401,6 +404,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod adts;
 pub mod asc;
+pub mod codec_decoder;
 pub mod crc;
 pub mod decode;
 pub mod decoded_spectrum;
@@ -439,10 +443,15 @@ pub use error::Error;
 /// Result alias used throughout the crate.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Codec-registry entry point. The Phase 1 skeleton does **not** wire
-/// a [`Decoder`](oxideav_core::Decoder) or
-/// [`Encoder`](oxideav_core::Encoder) into the runtime context — those
-/// arrive in subsequent rounds once decode / encode bodies land.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Codec-registry entry point. Installs the AAC
+/// [`Decoder`](oxideav_core::Decoder) (id `"aac"`) — the ADTS-framed
+/// AAC-LC decode chain wired through [`codec_decoder::register_codecs`],
+/// claiming the MP4 object-type / WAVEFORMATEX / FourCC / Matroska tags
+/// an AAC elementary stream is routed under. No encoder is wired yet
+/// (the crate has the bit-exact wire writers but no rate-control
+/// encoder back-end).
+pub fn register(ctx: &mut RuntimeContext) {
+    codec_decoder::register_codecs(&mut ctx.codecs);
+}
 
 oxideav_core::register!("aac", register);
