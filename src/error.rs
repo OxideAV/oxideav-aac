@@ -527,6 +527,12 @@ pub enum Error {
     /// The §4.6.18.3.2.1 master table and the §4.6.18.3.2.2 derived
     /// high / low / noise tables are undefined for such inputs.
     SbrFreqBandInvalid,
+    /// SBR envelope / noise Huffman decode ([`crate::sbr_huffman`],
+    /// §4.A.6.1 `sbr_huff_dec()`) could not match a codeword: either no
+    /// table entry matched within the maximum SBR codeword length, or
+    /// the bitstream ran out before a codeword completed. Both signal a
+    /// corrupt or truncated SBR extension payload.
+    SbrHuffInvalid,
     /// Integer-PCM rendering ([`crate::pcm`], §4.6.11 output →
     /// §1.3 `NINT()`-rounded 16-bit word) was handed per-channel time
     /// signals of disagreeing length. [`crate::pcm::interleave_s16`]
@@ -804,6 +810,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "SBR frequency bands: bs_start_freq/bs_stop_freq/bs_freq_scale, FsSBR, or the derived k0/k2 geometry violate a §4.6.18.3.2 / §4.6.18.3.6 constraint"
+                )
+            }
+            Error::SbrHuffInvalid => {
+                write!(
+                    f,
+                    "SBR Huffman decode: no §4.A.6.1 codeword matched (corrupt or truncated SBR envelope/noise payload)"
                 )
             }
             Error::PcmInvalid => {

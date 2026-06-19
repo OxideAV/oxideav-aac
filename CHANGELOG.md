@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- SBR Huffman codebooks + `sbr_huff_dec()` (`sbr_huffman` module) —
+  ISO/IEC 14496-3 Annex 4.A.6.1. All ten normative SBR envelope /
+  noise codebooks (Tables 4.A.79–4.A.88) are transcribed directly from
+  the spec codeword grids: `t/f_huffman_env_1_5dB` (LAV 60),
+  `t/f_huffman_env_bal_1_5dB` (LAV 24), `t/f_huffman_env_3_0dB` (LAV
+  31), `t/f_huffman_env_bal_3_0dB` (LAV 12), `t_huffman_noise_3_0dB`
+  (LAV 31), `t_huffman_noise_bal_3_0dB` (LAV 12). The
+  frequency-direction noise codebooks alias the 3.0 dB envelope freq
+  tables per Table 4.A.78 Note 2. `sbr_huff_dec()` reads MSB-first one
+  bit at a time and returns `index - LAV` (the signed DPCM delta);
+  `env_tables()` / `noise_tables()` pick the `(t_huff, f_huff)` pair
+  from an `SbrHuffContext` (`bs_coupling` / channel / `bs_amp_res`) per
+  the §4.6.18.3 `sbr_envelope()` / `sbr_noise()` selection. Every table
+  is validated complete + prefix-free, and a codeword round-trip test
+  exercises all entries. New `Error::SbrHuffInvalid` for an unmatched
+  or truncated codeword.
+
 - Runtime `oxideav_core::Decoder` wiring (`codec_decoder` module) — the
   no-op `register()` now installs a real AAC decoder under id `"aac"`.
   `AacDecoder` adapts the persistent `decode::StreamDecoder` into the
