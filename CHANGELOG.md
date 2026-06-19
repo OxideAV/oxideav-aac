@@ -30,7 +30,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the two PNS-free fixtures stay **≥99.9% byte-exact, max error 1 LSB**,
   and the PNS fixtures stay below the §8 PCM-RMS tolerance — proving the
   packetisation / `AudioFrame` byte-layout / across-packet state
-  threading preserve the underlying decode.
+  threading preserve the underlying decode. A
+  `he_aac_base_layer_decodes_through_trait` test pins that an HE-AAC v1
+  ADTS stream (AAC-LC base layer + an `EXT_SBR_DATA` extension this
+  crate has no back-end for) still decodes its base layer to PCM through
+  the trait rather than erroring — the §4.4.2.1 walk consumes the FIL
+  element and the SBR high band is simply absent.
 
 - Stream-level ADTS decode driver (`decode` module) — the §4.4.2.1
   `raw_data_block()` walk above the per-element driver. `StreamDecoder`

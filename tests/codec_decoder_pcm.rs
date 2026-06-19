@@ -251,3 +251,33 @@ fn pns_fixtures_match_in_rms_through_trait() {
         eprintln!("docs fixtures unavailable; trait-path PNS RMS pass skipped");
     }
 }
+
+/// An HE-AAC v1 ADTS stream carries an AAC-LC base layer plus an
+/// `EXT_SBR_DATA` Spectral Band Replication extension inside a FIL
+/// element. This crate has no SBR back-end, but the §4.4.2.1
+/// `raw_data_block()` walk consumes the FIL element and the trait
+/// decoder must still decode the **base layer** to PCM rather than
+/// erroring out. (The result is the half-rate AAC-LC band without the
+/// SBR-reconstructed high band — energy-plausible, not byte-exact, so
+/// this pins decode success + frame shape, not a sample comparison.)
+#[test]
+fn he_aac_base_layer_decodes_through_trait() {
+    let name = "he-aac-v1-stereo-44100-32kbps-adts";
+    let Some(pcm) = decode_via_trait(name) else {
+        eprintln!("skip {name}: fixtures unavailable");
+        return;
+    };
+    assert!(!pcm.is_empty(), "{name}: empty base-layer decode");
+    // Stereo base layer → an integer number of (FRAME_LEN * 2) blocks.
+    assert_eq!(
+        pcm.len() % (1024 * 2),
+        0,
+        "{name}: PCM length {} not a whole number of stereo frames",
+        pcm.len()
+    );
+    // The base layer carries real audio: at least some non-zero samples.
+    assert!(
+        pcm.iter().any(|&s| s != 0),
+        "{name}: all-silent base-layer decode"
+    );
+}
