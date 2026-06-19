@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- SBR time-frequency grid parsers (`sbr_grid` module) — ISO/IEC
+  14496-3 §4.4.2.8 Tables 4.69–4.71. `SbrGrid::parse` decodes all four
+  `bs_frame_class` cases (FIXFIX / FIXVAR / VARFIX / VARVAR): the
+  envelope count (`2^raw` for FIXFIX, `bs_num_rel_*`-derived otherwise,
+  bounded by the §4.6.18.3.6 `SBR_MAX_NUM_ENV`), the variable /
+  relative borders, the `ptr_bits = ceil(log2(num_env + 1))`
+  `bs_pointer`, the per-envelope frequency-resolution flags (reversed
+  for FIXVAR), the single-envelope FIXFIX `bs_amp_res` override, and
+  `bs_num_noise = (num_env > 1) ? 2 : 1`. `SbrDtdf::parse` reads the
+  per-envelope / per-noise delta-direction flags (Table 4.70), and
+  `SbrInvf::parse` the 2-bit inverse-filtering mode per noise band
+  (Table 4.71). New `Error::SbrGridInvalid` for a truncated or
+  out-of-range grid.
 - `sbr_header()` parser (`sbr_header` module) — ISO/IEC 14496-3
   §4.4.2.8 Table 4.63. `SbrHeader::parse` reads the fixed-width header
   (`bs_amp_res` / `bs_start_freq` / `bs_stop_freq` / `bs_xover_band` /

@@ -533,6 +533,12 @@ pub enum Error {
     /// the bitstream ran out before a codeword completed. Both signal a
     /// corrupt or truncated SBR extension payload.
     SbrHuffInvalid,
+    /// SBR time-frequency grid parse ([`crate::sbr_grid`], §4.4.2.8
+    /// Tables 4.69–4.71) failed: the bitstream ran out mid-grid, or a
+    /// frame class signalled an envelope count outside the
+    /// §4.6.18.3.6 limit ([`crate::sbr_grid::SBR_MAX_NUM_ENV`]). Both
+    /// signal a corrupt SBR data element.
+    SbrGridInvalid,
     /// Integer-PCM rendering ([`crate::pcm`], §4.6.11 output →
     /// §1.3 `NINT()`-rounded 16-bit word) was handed per-channel time
     /// signals of disagreeing length. [`crate::pcm::interleave_s16`]
@@ -816,6 +822,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "SBR Huffman decode: no §4.A.6.1 codeword matched (corrupt or truncated SBR envelope/noise payload)"
+                )
+            }
+            Error::SbrGridInvalid => {
+                write!(
+                    f,
+                    "SBR grid: §4.4.2.8 sbr_grid/sbr_dtdf/sbr_invf ran out of bits or signalled an out-of-range envelope count"
                 )
             }
             Error::PcmInvalid => {

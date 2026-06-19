@@ -425,6 +425,7 @@ pub mod predictor;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod sbr_freq_bands;
+pub mod sbr_grid;
 pub mod sbr_header;
 pub mod sbr_huffman;
 pub mod scale_factor_data;
