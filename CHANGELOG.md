@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `sbr_envelope()` / `sbr_noise()` raw decode (`sbr_envelope` module) —
+  ISO/IEC 14496-3 §4.4.2.8 Tables 4.72–4.73. `SbrEnvelopeData::parse`
+  and `SbrNoiseData::parse` read the per-envelope / per-noise-floor
+  delta arrays driven by the grid, the `sbr_dtdf()` delta directions,
+  and the derived band counts: a fixed-width absolute start value at
+  band 0 of a frequency-coded envelope (5/6/7-bit per the coupling /
+  channel / `bs_amp_res` context; noise always 5-bit) followed by
+  frequency-direction Huffman deltas, or all-band time-direction
+  Huffman deltas. Per-envelope band counts come from `NHigh` / `NLow`,
+  noise floors from `NQ`. This produces the raw `bs_data_*` values;
+  the §4.6.18.3.5 DPCM accumulation and dequantization are downstream.
 - SBR time-frequency grid parsers (`sbr_grid` module) — ISO/IEC
   14496-3 §4.4.2.8 Tables 4.69–4.71. `SbrGrid::parse` decodes all four
   `bs_frame_class` cases (FIXFIX / FIXVAR / VARFIX / VARVAR): the
