@@ -416,6 +416,7 @@ pub mod gain_control_data;
 pub mod ics_body;
 pub mod ics_info;
 pub mod intensity_stereo;
+pub mod latm;
 pub mod ltp;
 pub mod ms_stereo;
 pub mod pce;

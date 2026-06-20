@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- LATM `StreamMuxConfig()` decode (`latm` module) — ISO/IEC 14496-3
+  §1.7.3.1 Table 1.42 plus `LatmGetValue()` (Table 1.43).
+  `StreamMuxConfig::parse` decodes the whole multiplex configuration:
+  the `audioMuxVersion` / `audioMuxVersionA` version flags (with the
+  `audioMuxVersion == 1` `taraBufferFullness` and per-ASC
+  length-prefix + `fillBits` extensions), `allStreamsSameTimeFraming`,
+  `numSubFrames` / `numProgram` / per-program `numLayer`, the
+  per-`streamID[prog][lay]` `LayerConfig` table (each carrying its
+  inline `AudioSpecificConfig()` or the resolved `useSameConfig`
+  inheritance, the `frameLengthType`, and the type-0
+  `latmBufferFullness` / CELP-core `coreFrameOffset` or type-1
+  `frameLength`), the `otherDataPresent` / `otherDataLenBits` escape
+  loop, and the `crcCheckPresent` / `crcCheckSum`. The `crcCheckSum` is
+  recomputed against the configuration prefix via the §1.8.4.5 `CRC8`
+  generator (`crc::stream_mux_config_crc`) and a mismatch surfaces
+  `Error::LatmCrcMismatch`. The reserved `audioMuxVersionA == 1` branch
+  and the CELP/HVXC `frameLengthType` values (`2`..`7`) are rejected
+  with dedicated errors.
 - SBR element framing (`sbr_element` module) — ISO/IEC 14496-3
   §4.4.2.8 Tables 4.65 / 4.66 / 4.74. `SbrElement::parse_single` and
   `SbrElement::parse_pair` decode a whole SBR data element in spec

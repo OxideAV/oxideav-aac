@@ -581,6 +581,43 @@ pub enum Error {
     /// count (the §4.6.11 transform length) so the interleave is
     /// well-defined.
     PcmInvalid,
+    /// LATM `StreamMuxConfig()` ([`crate::latm`], ISO/IEC 14496-3
+    /// §1.7.3 Table 1.42) signalled `audioMuxVersion == 1` with
+    /// `audioMuxVersionA == 1`, which the spec marks reserved-for-
+    /// future-extensions (`/* tbd */`). No syntax is defined for that
+    /// branch, so the multiplex cannot be parsed.
+    LatmAudioMuxVersionAReserved,
+    /// LATM `StreamMuxConfig()` ([`crate::latm`], §1.7.3 Table 1.42)
+    /// signalled a per-layer `frameLengthType` this decoder does not
+    /// carry payload framing for. Only `0` (variable-length, byte
+    /// count in `PayloadLengthInfo()`) and `1` (fixed `frameLength`
+    /// bits) are supported; the CELP (`3`/`4`/`5`) and HVXC
+    /// (`6`/`7`) types index frame-length tables this AAC-focused
+    /// decoder does not implement. Carries the offending value.
+    LatmUnsupportedFrameLengthType(u8),
+    /// LATM multiplex configuration ([`crate::latm`], §1.7.3) exceeded
+    /// one of the spec signalling caps: `numProgram > 15`,
+    /// `numLayer > 7`, `numChunk > 15`, `streamCnt > 15`, or
+    /// `numSubFrames` produced more PayloadMux frames than the bound.
+    /// The fields are bit-limited on the wire so this only fires on a
+    /// derived-count overflow or an internal inconsistency.
+    LatmConfigOutOfRange,
+    /// LATM `AudioMuxElement()` ([`crate::latm`], §1.7.3 Table 1.41)
+    /// with `muxConfigPresent == 1` set `useSameStreamMux == 1` (apply
+    /// previous configuration) but no `StreamMuxConfig()` had been
+    /// decoded yet on this stream. The first in-band element must
+    /// carry the configuration.
+    LatmNoPreviousMuxConfig,
+    /// LATM transport ([`crate::latm`], §1.7.3 Table 1.42) carried a
+    /// `crcCheckSum` whose recomputed §1.8.4.5 `CRC8` value did not
+    /// match the transmitted byte, indicating a corrupt
+    /// `StreamMuxConfig()`.
+    LatmCrcMismatch,
+    /// LOAS `AudioSyncStream()` / `EPAudioSyncStream()`
+    /// ([`crate::latm`], §1.7.2 Tables 1.36 / 1.37) sync search failed:
+    /// the `0x2B7` / `0x4DE1` syncword was not found, or the
+    /// `audioMuxLengthBytes` payload ran past the end of the buffer.
+    LoasSyncInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -893,6 +930,42 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "PCM interleave: per-channel time signals disagree in length"
+                )
+            }
+            Error::LatmAudioMuxVersionAReserved => {
+                write!(
+                    f,
+                    "LATM StreamMuxConfig: audioMuxVersionA == 1 is reserved (§1.7.3 Table 1.42 /* tbd */ branch)"
+                )
+            }
+            Error::LatmUnsupportedFrameLengthType(t) => {
+                write!(
+                    f,
+                    "LATM StreamMuxConfig: frameLengthType {t} (CELP/HVXC table-indexed framing) is unsupported; only 0 and 1 are carried"
+                )
+            }
+            Error::LatmConfigOutOfRange => {
+                write!(
+                    f,
+                    "LATM StreamMuxConfig: a multiplex count (numProgram/numLayer/numChunk/streamCnt/numSubFrames) exceeded the §1.7.3 signalling cap"
+                )
+            }
+            Error::LatmNoPreviousMuxConfig => {
+                write!(
+                    f,
+                    "LATM AudioMuxElement: useSameStreamMux == 1 but no previous StreamMuxConfig() has been decoded"
+                )
+            }
+            Error::LatmCrcMismatch => {
+                write!(
+                    f,
+                    "LATM StreamMuxConfig: recomputed §1.8.4.5 CRC8 does not match the transmitted crcCheckSum"
+                )
+            }
+            Error::LoasSyncInvalid => {
+                write!(
+                    f,
+                    "LOAS AudioSyncStream: §1.7.2 0x2B7/0x4DE1 syncword not found or audioMuxLengthBytes overruns the buffer"
                 )
             }
         }
