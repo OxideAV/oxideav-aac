@@ -1023,7 +1023,16 @@ impl ErScaleFactorData {
         }
 
         // ---- PNS backward seed.
-        let dpcm_noise_last_position = if noise_used {
+        //
+        // Table 4.53 resets `noise_used = 0` immediately before
+        // `sf_escapes_present` and re-derives it inside the escape
+        // loop's `if (!noise_used)` arm. The terminal
+        // `if (noise_used) dpcm_noise_last_position` therefore fires
+        // *only* when both a PNS band is present **and**
+        // `sf_escapes_present == 1` (the escape loop — and its
+        // `noise_used = 1` — is wholly inside `if (sf_escapes_present)`).
+        // A PNS frame with no escapes carries no `dpcm_noise_last_position`.
+        let dpcm_noise_last_position = if noise_used && sf_escapes_present {
             Some(
                 reader
                     .read_u32(NOISE_PCM_BITS)
@@ -1170,7 +1179,16 @@ impl ErScaleFactorData {
         }
 
         // ---- PNS backward seed.
-        match (noise_used, self.dpcm_noise_last_position) {
+        //
+        // Per Table 4.53 the terminal `dpcm_noise_last_position` is
+        // present only when a PNS band exists **and**
+        // `sf_escapes_present == 1` (the spec re-derives `noise_used`
+        // inside the escape loop, which only runs when escapes are
+        // present). So the seed must be `Some` exactly when
+        // `noise_used && any_escape`, and `None` otherwise — any other
+        // combination cannot be represented on the wire.
+        let expect_noise_seed = noise_used && any_escape;
+        match (expect_noise_seed, self.dpcm_noise_last_position) {
             (true, Some(pcm)) => {
                 if u32::from(pcm) >= (1u32 << NOISE_PCM_BITS) {
                     return Err(Error::RvlcScaleFactorDataInvalid);
@@ -1386,6 +1404,9 @@ mod tests {
     /// An ER block with both intensity and PNS bands round-trips,
     /// exercising `dpcm_is_last_position`, the first-PNS 9-bit PCM
     /// seed, a subsequent PNS RVLC delta, and `dpcm_noise_last_position`.
+    /// The Table 4.53 terminal `dpcm_noise_last_position` is present
+    /// only when `sf_escapes_present == 1`, so this block carries an
+    /// escape (`NoiseDpcm(10)` → base +7 + magnitude 3).
     #[test]
     fn er_roundtrip_intensity_and_pns() {
         // band codebooks: spectrum(2), intensity(15), pns(13), pns(13).
@@ -1398,7 +1419,7 @@ mod tests {
                     ScaleFactorEntry::Dpcm(2),
                     ScaleFactorEntry::Intensity(-3),
                     ScaleFactorEntry::NoisePcm(0x1a5), // 9-bit PCM seed
-                    ScaleFactorEntry::NoiseDpcm(4),
+                    ScaleFactorEntry::NoiseDpcm(10),   // escape → sf_escapes_present
                 ]],
             },
             dpcm_is_last_position: Some(5),
@@ -1412,6 +1433,48 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let parsed = ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::OnlyLong).unwrap();
         assert_eq!(parsed, block);
+    }
+
+    /// A PNS frame whose deltas all fit the RVLC ±6 range emits no
+    /// escapes (`sf_escapes_present == 0`), so per Table 4.53 the
+    /// terminal `dpcm_noise_last_position` is **absent** — the parser
+    /// recovers `None` for it. The writer rejects a `Some` seed in
+    /// that escapeless case as unrepresentable.
+    #[test]
+    fn er_pns_without_escapes_has_no_noise_seed() {
+        let sfb_cb = vec![vec![NOISE_HCB, NOISE_HCB]];
+        let block = ErScaleFactorData {
+            sf_concealment: false,
+            rev_global_gain: 80,
+            data: ScaleFactorData {
+                entries: vec![vec![
+                    ScaleFactorEntry::NoisePcm(0x010),
+                    ScaleFactorEntry::NoiseDpcm(3), // within ±6 → no escape
+                ]],
+            },
+            dpcm_is_last_position: None,
+            dpcm_noise_last_position: None,
+        };
+        let mut w = BitWriter::new();
+        block
+            .write(&mut w, &sfb_cb, WindowSequence::OnlyLong)
+            .unwrap();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let parsed = ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::OnlyLong).unwrap();
+        assert_eq!(parsed, block);
+        assert_eq!(parsed.dpcm_noise_last_position, None);
+
+        // A Some seed in the escapeless case is unrepresentable.
+        let bad = ErScaleFactorData {
+            dpcm_noise_last_position: Some(0x0aa),
+            ..block
+        };
+        let mut bw = BitWriter::new();
+        assert!(matches!(
+            bad.write(&mut bw, &sfb_cb, WindowSequence::OnlyLong),
+            Err(Error::RvlcScaleFactorDataInvalid)
+        ));
     }
 
     /// The headline §4.6.2.3.2 equivalence: an RVLC-coded scalefactor
