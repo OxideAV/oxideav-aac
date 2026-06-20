@@ -123,6 +123,7 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
+use crate::ics_info::WindowSequence;
 use crate::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
 use crate::{Error, Result};
 
@@ -787,6 +788,448 @@ pub fn differentiate(
     Ok(ScaleFactorData { entries: out })
 }
 
+// =============================================================================
+// Error-resilient `scale_factor_data()` — Table 4.53 RVLC branch (§4.6.16.2)
+// =============================================================================
+//
+// When the GASpecificConfig sets `aacScalefactorDataResilienceFlag == 1`,
+// `scale_factor_data()` takes the RVLC branch: the Table 4.A.1 Huffman
+// codebook is replaced by the Table 4.166 symmetric RVLC codebook (see
+// [`crate::rvlc`]) and three extra wire fields wrap the band loop so a
+// decoder can recover from bit errors by decoding backwards:
+//
+//   * `sf_concealment` (1 bit) — concealment hint, decode-irrelevant
+//     for an error-free stream (§4.6.16.2.2).
+//   * `rev_global_gain` (8 bits) — the *last* scalefactor, the start
+//     value for backward DPCM decoding.
+//   * `length_of_rvlc_sf` (11 bits if `EIGHT_SHORT_SEQUENCE` else 9) —
+//     the bit length of the RVLC part (the band loop + the optional
+//     `dpcm_is_last_position`), used to seek to the backward start.
+//   * `sf_escapes_present` (1 bit) + `length_of_rvlc_escapes` (8 bits)
+//     — the optional escape sub-stream, present iff any band's RVLC
+//     delta reached the ESC_FLAG (`±7`).
+//   * `dpcm_is_last_position` (RVLC, present iff intensity used) — the
+//     symmetric backward seed for the intensity-position track.
+//   * `dpcm_noise_last_position` (9 bits, present iff PNS used) — the
+//     symmetric backward seed for the PNS-energy track.
+//
+// Forward decoding is the focus here. Per §4.6.2.3.2, "the decoding
+// process of the RVLC words is the same as for the Huffman
+// codewords" — so once the RVLC deltas are recovered (and folded with
+// their escapes), the *same* [`accumulate`] three-track DPCM forward
+// pass reconstructs the absolute scalefactors. The `rev_global_gain`
+// / `dpcm_*_last_position` seeds and the `length_of_*` fields are the
+// backward-recovery scaffolding; this module surfaces them verbatim
+// (and validates the two length fields against the bits actually
+// consumed, an in-band conformance check) so a future recovery path
+// can use them, but forward decode keys off `global_gain` exactly as
+// the non-resilient branch does.
+//
+// Escape folding (§4.6.16.2.1): a base RVLC delta of `+7` means the
+// true delta is `+7 + esc`; a base delta of `-7` means `-7 - esc`,
+// where `esc` is the Table 4.168 escape magnitude. The escapes are a
+// *separate pass* over the same band walk, after the whole RVLC part.
+
+/// A parsed error-resilient `scale_factor_data()` block — Table 4.53
+/// RVLC branch (`aacScalefactorDataResilienceFlag == 1`).
+///
+/// `data` carries the *reconstructed* per-band DPCM records (RVLC base
+/// delta with any escape already folded in), so it feeds [`accumulate`]
+/// unchanged. The remaining fields are the §4.6.16.2 backward-decoding
+/// scaffolding, surfaced verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErScaleFactorData {
+    /// `sf_concealment` (1 bit) — concealment hint; not needed to
+    /// decode an error-free stream.
+    pub sf_concealment: bool,
+    /// `rev_global_gain` (8 bits) — last scalefactor, the backward
+    /// DPCM start value.
+    pub rev_global_gain: u8,
+    /// The reconstructed per-band records (escapes folded in),
+    /// identical in shape to the non-resilient
+    /// [`ScaleFactorData`] so [`accumulate`] consumes it directly.
+    pub data: ScaleFactorData,
+    /// `dpcm_is_last_position` — backward seed for the intensity
+    /// track. `Some` iff at least one intensity band was present.
+    pub dpcm_is_last_position: Option<i16>,
+    /// `dpcm_noise_last_position` (9-bit `uimsbf`) — backward seed
+    /// for the PNS track. `Some` iff at least one PNS band was
+    /// present.
+    pub dpcm_noise_last_position: Option<u16>,
+}
+
+/// `length_of_rvlc_sf` field width — 11 bits for
+/// `EIGHT_SHORT_SEQUENCE`, 9 bits otherwise (§4.6.16.2.2).
+fn length_of_rvlc_sf_bits(window_sequence: WindowSequence) -> u32 {
+    if window_sequence.is_eight_short() {
+        11
+    } else {
+        9
+    }
+}
+
+/// `length_of_rvlc_escapes` field width — always 8 bits
+/// (§4.6.16.2.2).
+const LENGTH_OF_RVLC_ESCAPES_BITS: u32 = 8;
+
+/// Fold a Table 4.168 escape magnitude into a base RVLC `±ESC_FLAG`
+/// delta (§4.6.16.2.1): a positive base recovers `+7 + esc`, a
+/// negative base recovers `-7 - esc`. Both extremes stay within the
+/// `-60..=+60` DPCM range, so the result fits `i8`.
+fn fold_escape(base: i8, esc_magnitude: u8) -> i8 {
+    if base >= 0 {
+        crate::rvlc::RVLC_ESC_FLAG + esc_magnitude as i8
+    } else {
+        -crate::rvlc::RVLC_ESC_FLAG - esc_magnitude as i8
+    }
+}
+
+impl ErScaleFactorData {
+    /// Parse an error-resilient `scale_factor_data()` from `reader`
+    /// (Table 4.53, RVLC branch).
+    ///
+    /// * `reader` — positioned at the first bit of the block (the
+    ///   `sf_concealment` flag).
+    /// * `sfb_cb` — the per-`(g, sfb)` codebook map from
+    ///   [`section_data`](crate::section_data).
+    /// * `window_sequence` — selects the `length_of_rvlc_sf` field
+    ///   width (11 vs 9 bits).
+    ///
+    /// The two `length_of_*` fields are validated against the bits
+    /// actually consumed; a mismatch surfaces
+    /// [`Error::RvlcScaleFactorDataInvalid`] (an in-band conformance
+    /// check). A forbidden RVLC codeword surfaces
+    /// [`Error::RvlcForbiddenCodeword`]; reader underflow surfaces
+    /// [`Error::UnexpectedEnd`].
+    pub fn parse(
+        reader: &mut BitReader<'_>,
+        sfb_cb: &[Vec<u8>],
+        window_sequence: WindowSequence,
+    ) -> Result<Self> {
+        let sf_concealment = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)? != 0;
+        let rev_global_gain = reader.read_u32(8).map_err(|_| Error::UnexpectedEnd)? as u8;
+        let len_rvlc_sf = u64::from(
+            reader
+                .read_u32(length_of_rvlc_sf_bits(window_sequence))
+                .map_err(|_| Error::UnexpectedEnd)?,
+        );
+
+        // ---- RVLC part (Table 4.53): base deltas + ESC bookkeeping.
+        let rvlc_start = reader.bit_position();
+        let mut intensity_used = false;
+        let mut noise_used = false;
+        // base[g] mirrors entries[g]; esc_band flags which records
+        // need an escape fold in the second pass.
+        let mut base: Vec<Vec<ScaleFactorEntry>> = Vec::with_capacity(sfb_cb.len());
+        // `(group, index_within_group)` of each record that is at
+        // ESC_FLAG and must read an escape (in band-walk order). The
+        // first-PNS-PCM record is never escaped.
+        let mut esc_records: Vec<(usize, usize)> = Vec::new();
+        for (g, group) in sfb_cb.iter().enumerate() {
+            let mut group_entries: Vec<ScaleFactorEntry> = Vec::new();
+            for &cb in group {
+                if cb == ZERO_HCB {
+                    continue;
+                }
+                let idx_in_group = group_entries.len();
+                let entry = if is_intensity(cb) {
+                    intensity_used = true;
+                    let d = crate::rvlc::rvlc_decode(reader)?;
+                    if d.abs() == crate::rvlc::RVLC_ESC_FLAG {
+                        esc_records.push((g, idx_in_group));
+                    }
+                    ScaleFactorEntry::Intensity(d)
+                } else if is_noise(cb) {
+                    if !noise_used {
+                        noise_used = true;
+                        let pcm = reader
+                            .read_u32(NOISE_PCM_BITS)
+                            .map_err(|_| Error::UnexpectedEnd)?
+                            as u16;
+                        ScaleFactorEntry::NoisePcm(pcm)
+                    } else {
+                        let d = crate::rvlc::rvlc_decode(reader)?;
+                        if d.abs() == crate::rvlc::RVLC_ESC_FLAG {
+                            esc_records.push((g, idx_in_group));
+                        }
+                        ScaleFactorEntry::NoiseDpcm(d)
+                    }
+                } else {
+                    let d = crate::rvlc::rvlc_decode(reader)?;
+                    if d.abs() == crate::rvlc::RVLC_ESC_FLAG {
+                        esc_records.push((g, idx_in_group));
+                    }
+                    ScaleFactorEntry::Dpcm(d)
+                };
+                group_entries.push(entry);
+            }
+            base.push(group_entries);
+        }
+
+        // `dpcm_is_last_position` (RVLC) closes the RVLC part if any
+        // intensity band was present.
+        let mut is_last_base: Option<i8> = None;
+        if intensity_used {
+            let d = crate::rvlc::rvlc_decode(reader)?;
+            is_last_base = Some(d);
+        }
+
+        // The RVLC part length must match the transmitted field.
+        let rvlc_consumed = reader.bit_position() - rvlc_start;
+        if rvlc_consumed != len_rvlc_sf {
+            return Err(Error::RvlcScaleFactorDataInvalid);
+        }
+
+        // ---- Escape part (Table 4.53): optional second pass.
+        let sf_escapes_present = reader.read_u32(1).map_err(|_| Error::UnexpectedEnd)? != 0;
+        let mut is_last_esc: Option<u8> = None;
+        if sf_escapes_present {
+            let len_escapes = u64::from(
+                reader
+                    .read_u32(LENGTH_OF_RVLC_ESCAPES_BITS)
+                    .map_err(|_| Error::UnexpectedEnd)?,
+            );
+            let esc_start = reader.bit_position();
+            // Read one escape per recorded ESC_FLAG band, in walk order,
+            // and fold it into the base delta.
+            for &(g, i) in &esc_records {
+                let mag = crate::rvlc::rvlc_esc_decode(reader)?;
+                let folded = match base[g][i] {
+                    ScaleFactorEntry::Dpcm(d) => ScaleFactorEntry::Dpcm(fold_escape(d, mag)),
+                    ScaleFactorEntry::Intensity(d) => {
+                        ScaleFactorEntry::Intensity(fold_escape(d, mag))
+                    }
+                    ScaleFactorEntry::NoiseDpcm(d) => {
+                        ScaleFactorEntry::NoiseDpcm(fold_escape(d, mag))
+                    }
+                    // A NoisePcm record is never recorded as an escape.
+                    ScaleFactorEntry::NoisePcm(_) => {
+                        return Err(Error::RvlcScaleFactorDataInvalid);
+                    }
+                };
+                base[g][i] = folded;
+            }
+            // `dpcm_is_last_position` escape closes the escape part.
+            if let Some(d) = is_last_base {
+                if d.abs() == crate::rvlc::RVLC_ESC_FLAG {
+                    let mag = crate::rvlc::rvlc_esc_decode(reader)?;
+                    is_last_esc = Some(mag);
+                }
+            }
+            let esc_consumed = reader.bit_position() - esc_start;
+            if esc_consumed != len_escapes {
+                return Err(Error::RvlcScaleFactorDataInvalid);
+            }
+        }
+
+        // ---- PNS backward seed.
+        let dpcm_noise_last_position = if noise_used {
+            Some(
+                reader
+                    .read_u32(NOISE_PCM_BITS)
+                    .map_err(|_| Error::UnexpectedEnd)? as u16,
+            )
+        } else {
+            None
+        };
+
+        // Fold the intensity-last backward seed (with its escape).
+        let dpcm_is_last_position = is_last_base.map(|d| {
+            let folded = match is_last_esc {
+                Some(mag) => fold_escape(d, mag),
+                None => d,
+            };
+            i16::from(folded)
+        });
+
+        Ok(ErScaleFactorData {
+            sf_concealment,
+            rev_global_gain,
+            data: ScaleFactorData { entries: base },
+            dpcm_is_last_position,
+            dpcm_noise_last_position,
+        })
+    }
+
+    /// Encode an error-resilient `scale_factor_data()` onto `writer`,
+    /// the inverse of [`ErScaleFactorData::parse`].
+    ///
+    /// The records in `self.data` carry the *final* DPCM deltas
+    /// (escapes already folded). The writer re-splits each delta whose
+    /// magnitude exceeds `±6` into a base `±7` RVLC codeword plus a
+    /// Table 4.168 escape magnitude, regenerates the `length_of_*`
+    /// fields from the bits emitted, and sets `sf_escapes_present`
+    /// when any escape is needed.
+    ///
+    /// Returns [`Error::RvlcScaleFactorDataInvalid`] on a structural
+    /// mismatch (record/codebook shape, escape magnitude out of the
+    /// Table 4.168 domain, or a backward-seed field overflow).
+    pub fn write(
+        &self,
+        writer: &mut BitWriter,
+        sfb_cb: &[Vec<u8>],
+        window_sequence: WindowSequence,
+    ) -> Result<()> {
+        if self.data.entries.len() != sfb_cb.len() {
+            return Err(Error::RvlcScaleFactorDataInvalid);
+        }
+
+        writer.write_u32(u32::from(self.sf_concealment), 1);
+        writer.write_u32(u32::from(self.rev_global_gain), 8);
+
+        // Build the RVLC part into a scratch writer first so its bit
+        // length is known for `length_of_rvlc_sf`. Collect the escape
+        // magnitudes (in walk order) for the second pass.
+        let mut rvlc_part = BitWriter::new();
+        let mut escapes: Vec<u8> = Vec::new();
+        let mut intensity_used = false;
+        let mut noise_used = false;
+
+        for (group_entries, group_cb) in self.data.entries.iter().zip(sfb_cb.iter()) {
+            let mut entry_iter = group_entries.iter();
+            for &cb in group_cb {
+                if cb == ZERO_HCB {
+                    continue;
+                }
+                let entry = entry_iter.next().ok_or(Error::RvlcScaleFactorDataInvalid)?;
+                match (entry, cb) {
+                    (ScaleFactorEntry::Intensity(d), cb) if is_intensity(cb) => {
+                        intensity_used = true;
+                        write_rvlc_delta(&mut rvlc_part, *d, &mut escapes)?;
+                    }
+                    (ScaleFactorEntry::NoisePcm(pcm), cb) if is_noise(cb) => {
+                        if noise_used {
+                            return Err(Error::RvlcScaleFactorDataInvalid);
+                        }
+                        if u32::from(*pcm) >= (1u32 << NOISE_PCM_BITS) {
+                            return Err(Error::RvlcScaleFactorDataInvalid);
+                        }
+                        noise_used = true;
+                        rvlc_part.write_u32(u32::from(*pcm), NOISE_PCM_BITS);
+                    }
+                    (ScaleFactorEntry::NoiseDpcm(d), cb) if is_noise(cb) => {
+                        if !noise_used {
+                            return Err(Error::RvlcScaleFactorDataInvalid);
+                        }
+                        write_rvlc_delta(&mut rvlc_part, *d, &mut escapes)?;
+                    }
+                    (ScaleFactorEntry::Dpcm(d), cb) if !is_intensity(cb) && !is_noise(cb) => {
+                        write_rvlc_delta(&mut rvlc_part, *d, &mut escapes)?;
+                    }
+                    _ => return Err(Error::RvlcScaleFactorDataInvalid),
+                }
+            }
+            if entry_iter.next().is_some() {
+                return Err(Error::RvlcScaleFactorDataInvalid);
+            }
+        }
+
+        // `dpcm_is_last_position` (RVLC) closes the RVLC part.
+        let mut is_last_escape: Option<u8> = None;
+        match (intensity_used, self.dpcm_is_last_position) {
+            (true, Some(d)) => {
+                let d8 = i8::try_from(d).map_err(|_| Error::RvlcScaleFactorDataInvalid)?;
+                let mut tail: Vec<u8> = Vec::new();
+                write_rvlc_delta(&mut rvlc_part, d8, &mut tail)?;
+                is_last_escape = tail.into_iter().next();
+            }
+            (true, None) | (false, Some(_)) => {
+                // Intensity presence must agree with the seed presence.
+                return Err(Error::RvlcScaleFactorDataInvalid);
+            }
+            (false, None) => {}
+        }
+
+        let len_rvlc_sf = rvlc_part.bit_position();
+        let field_bits = length_of_rvlc_sf_bits(window_sequence);
+        if len_rvlc_sf >= (1u64 << field_bits) {
+            return Err(Error::RvlcScaleFactorDataInvalid);
+        }
+        writer.write_u32(len_rvlc_sf as u32, field_bits);
+        append_bits(writer, len_rvlc_sf, &rvlc_part.finish());
+
+        // ---- Escape part.
+        let any_escape = !escapes.is_empty() || is_last_escape.is_some();
+        writer.write_u32(u32::from(any_escape), 1);
+        if any_escape {
+            let mut esc_part = BitWriter::new();
+            for &mag in &escapes {
+                let (len, cw) = crate::rvlc::rvlc_esc_encode(mag)?;
+                esc_part.write_u32(cw, u32::from(len));
+            }
+            if let Some(mag) = is_last_escape {
+                let (len, cw) = crate::rvlc::rvlc_esc_encode(mag)?;
+                esc_part.write_u32(cw, u32::from(len));
+            }
+            let len_escapes = esc_part.bit_position();
+            if len_escapes >= (1u64 << LENGTH_OF_RVLC_ESCAPES_BITS) {
+                return Err(Error::RvlcScaleFactorDataInvalid);
+            }
+            writer.write_u32(len_escapes as u32, LENGTH_OF_RVLC_ESCAPES_BITS);
+            append_bits(writer, len_escapes, &esc_part.finish());
+        }
+
+        // ---- PNS backward seed.
+        match (noise_used, self.dpcm_noise_last_position) {
+            (true, Some(pcm)) => {
+                if u32::from(pcm) >= (1u32 << NOISE_PCM_BITS) {
+                    return Err(Error::RvlcScaleFactorDataInvalid);
+                }
+                writer.write_u32(u32::from(pcm), NOISE_PCM_BITS);
+            }
+            (false, None) => {}
+            _ => return Err(Error::RvlcScaleFactorDataInvalid),
+        }
+        Ok(())
+    }
+}
+
+/// Split a final DPCM delta into an RVLC base codeword plus (if the
+/// magnitude exceeds `±6`) an escape magnitude pushed onto `escapes`.
+/// The base RVLC codeword is emitted onto `part`.
+fn write_rvlc_delta(part: &mut BitWriter, delta: i8, escapes: &mut Vec<u8>) -> Result<()> {
+    let flag = crate::rvlc::RVLC_ESC_FLAG; // 7
+    if delta.abs() < flag {
+        // Fits the RVLC codebook directly (no escape, magnitude ≤ 6).
+        let (len, cw) = crate::rvlc::rvlc_encode(delta)?;
+        part.write_u32(cw, u32::from(len));
+    } else {
+        // Magnitude ≥ 7: base codeword is the signed ESC_FLAG, the
+        // remainder is the escape magnitude.
+        let (base, mag) = if delta >= 0 {
+            (flag, (delta - flag) as u8)
+        } else {
+            (-flag, (-delta - flag) as u8)
+        };
+        let (len, cw) = crate::rvlc::rvlc_encode(base)?;
+        part.write_u32(cw, u32::from(len));
+        if mag as usize >= crate::rvlc::RVLC_ESC_NUM_ENTRIES {
+            return Err(Error::RvlcScaleFactorDataInvalid);
+        }
+        escapes.push(mag);
+    }
+    Ok(())
+}
+
+/// Append the first `total` bits of `bytes` (a zero-padded
+/// `BitWriter::finish()` output) to `dst`, MSB-first, preserving bit
+/// position. The trailing zero pad bits past `total` are ignored.
+fn append_bits(dst: &mut BitWriter, total: u64, bytes: &[u8]) {
+    let mut remaining = total;
+    let mut byte_idx = 0usize;
+    while remaining >= 8 {
+        dst.write_u32(u32::from(bytes[byte_idx]), 8);
+        byte_idx += 1;
+        remaining -= 8;
+    }
+    if remaining > 0 {
+        // The final partial byte is MSB-aligned in the finished buffer.
+        let last = bytes[byte_idx];
+        let value = u32::from(last) >> (8 - remaining);
+        dst.write_u32(value, remaining as u32);
+    }
+}
+
 /// Internal: `cb` is an intensity codebook (14 or 15).
 fn is_intensity(cb: u8) -> bool {
     cb == INTENSITY_HCB || cb == INTENSITY_HCB2
@@ -872,5 +1315,202 @@ mod tests {
             // Reader must consume exactly `len` bits.
             assert_eq!(br.bit_position(), bits_written);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Error-resilient (RVLC) `scale_factor_data()` — Table 4.53 / §4.6.16.2
+    // -------------------------------------------------------------------------
+
+    /// Round-trip an ER block (no intensity / no PNS, all spectrum
+    /// bands within the RVLC ±6 range — no escapes) and confirm the
+    /// writer regenerates exactly what the parser read back.
+    #[test]
+    fn er_roundtrip_spectrum_only_no_escapes() {
+        // Two groups, codebook 2 (spectrum) on every band.
+        let sfb_cb = vec![vec![2u8, 2, 2], vec![2u8, 2]];
+        let block = ErScaleFactorData {
+            sf_concealment: true,
+            rev_global_gain: 137,
+            data: ScaleFactorData {
+                entries: vec![
+                    vec![
+                        ScaleFactorEntry::Dpcm(0),
+                        ScaleFactorEntry::Dpcm(3),
+                        ScaleFactorEntry::Dpcm(-5),
+                    ],
+                    vec![ScaleFactorEntry::Dpcm(6), ScaleFactorEntry::Dpcm(-6)],
+                ],
+            },
+            dpcm_is_last_position: None,
+            dpcm_noise_last_position: None,
+        };
+        let mut w = BitWriter::new();
+        block
+            .write(&mut w, &sfb_cb, WindowSequence::OnlyLong)
+            .unwrap();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let parsed = ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::OnlyLong).unwrap();
+        assert_eq!(parsed, block);
+    }
+
+    /// A delta whose magnitude exceeds ±6 must round-trip through the
+    /// base-`±7` + escape split (§4.6.16.2.1) and set
+    /// `sf_escapes_present`.
+    #[test]
+    fn er_roundtrip_with_escapes() {
+        let sfb_cb = vec![vec![3u8, 3, 3]];
+        let block = ErScaleFactorData {
+            sf_concealment: false,
+            rev_global_gain: 200,
+            data: ScaleFactorData {
+                entries: vec![vec![
+                    ScaleFactorEntry::Dpcm(7),   // +7 + 0 escape
+                    ScaleFactorEntry::Dpcm(-20), // -7 - 13 escape
+                    ScaleFactorEntry::Dpcm(60),  // +7 + 53 escape (max)
+                ]],
+            },
+            dpcm_is_last_position: None,
+            dpcm_noise_last_position: None,
+        };
+        let mut w = BitWriter::new();
+        block
+            .write(&mut w, &sfb_cb, WindowSequence::EightShort)
+            .unwrap();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let parsed = ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::EightShort).unwrap();
+        assert_eq!(parsed, block);
+    }
+
+    /// An ER block with both intensity and PNS bands round-trips,
+    /// exercising `dpcm_is_last_position`, the first-PNS 9-bit PCM
+    /// seed, a subsequent PNS RVLC delta, and `dpcm_noise_last_position`.
+    #[test]
+    fn er_roundtrip_intensity_and_pns() {
+        // band codebooks: spectrum(2), intensity(15), pns(13), pns(13).
+        let sfb_cb = vec![vec![2u8, INTENSITY_HCB2, NOISE_HCB, NOISE_HCB]];
+        let block = ErScaleFactorData {
+            sf_concealment: true,
+            rev_global_gain: 100,
+            data: ScaleFactorData {
+                entries: vec![vec![
+                    ScaleFactorEntry::Dpcm(2),
+                    ScaleFactorEntry::Intensity(-3),
+                    ScaleFactorEntry::NoisePcm(0x1a5), // 9-bit PCM seed
+                    ScaleFactorEntry::NoiseDpcm(4),
+                ]],
+            },
+            dpcm_is_last_position: Some(5),
+            dpcm_noise_last_position: Some(0x0c2),
+        };
+        let mut w = BitWriter::new();
+        block
+            .write(&mut w, &sfb_cb, WindowSequence::OnlyLong)
+            .unwrap();
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let parsed = ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::OnlyLong).unwrap();
+        assert_eq!(parsed, block);
+    }
+
+    /// The headline §4.6.2.3.2 equivalence: an RVLC-coded scalefactor
+    /// stream and the Huffman-coded stream carrying the *same* DPCM
+    /// deltas accumulate to identical absolute scalefactors. This is
+    /// what "the decoding process of the RVLC words is the same as
+    /// for the Huffman codewords" means in practice.
+    #[test]
+    fn er_forward_decode_matches_huffman_path() {
+        let sfb_cb = vec![vec![2u8, 2, 2, 2]];
+        let global_gain = 120u8;
+        // Identical DPCM records for both paths.
+        let entries = vec![vec![
+            ScaleFactorEntry::Dpcm(0),
+            ScaleFactorEntry::Dpcm(5),
+            ScaleFactorEntry::Dpcm(-30), // forces an escape on the RVLC side
+            ScaleFactorEntry::Dpcm(2),
+        ]];
+        let sfd = ScaleFactorData {
+            entries: entries.clone(),
+        };
+
+        // Huffman path: write + parse + accumulate.
+        let mut hw = BitWriter::new();
+        sfd.write(&mut hw, &sfb_cb).unwrap();
+        let hbytes = hw.finish();
+        let mut hr = BitReader::new(&hbytes);
+        let hsfd = ScaleFactorData::parse(&mut hr, &sfb_cb).unwrap();
+        let habs = accumulate(&hsfd, &sfb_cb, global_gain).unwrap();
+
+        // RVLC path: write + parse the ER block, then accumulate the
+        // reconstructed records with the SAME global_gain.
+        let er = ErScaleFactorData {
+            sf_concealment: false,
+            rev_global_gain: 0,
+            data: ScaleFactorData { entries },
+            dpcm_is_last_position: None,
+            dpcm_noise_last_position: None,
+        };
+        let mut ew = BitWriter::new();
+        er.write(&mut ew, &sfb_cb, WindowSequence::OnlyLong)
+            .unwrap();
+        let ebytes = ew.finish();
+        let mut er_reader = BitReader::new(&ebytes);
+        let parsed_er =
+            ErScaleFactorData::parse(&mut er_reader, &sfb_cb, WindowSequence::OnlyLong).unwrap();
+        let eabs = accumulate(&parsed_er.data, &sfb_cb, global_gain).unwrap();
+
+        assert_eq!(habs, eabs, "RVLC forward decode must equal Huffman path");
+    }
+
+    /// A corrupted RVLC bit pattern that lands on a Table 4.167
+    /// forbidden codeword surfaces the in-band error-detection event.
+    #[test]
+    fn er_forbidden_codeword_is_detected() {
+        // Forbidden codeword (6 bits, 0b110010) followed by padding.
+        let mut w = BitWriter::new();
+        w.write_u32(0, 1); // sf_concealment
+        w.write_u32(0, 8); // rev_global_gain
+        w.write_u32(6, 9); // length_of_rvlc_sf == 6 bits
+        w.write_u32(0b110010, 6); // the forbidden codeword
+        let bytes = w.finish();
+        let sfb_cb = vec![vec![2u8]];
+        let mut r = BitReader::new(&bytes);
+        assert!(matches!(
+            ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::OnlyLong),
+            Err(Error::RvlcForbiddenCodeword)
+        ));
+    }
+
+    /// A `length_of_rvlc_sf` that disagrees with the bits actually
+    /// consumed is an in-band conformance failure.
+    #[test]
+    fn er_length_mismatch_rejected() {
+        // Build a valid block then corrupt the length field.
+        let sfb_cb = vec![vec![2u8, 2]];
+        let block = ErScaleFactorData {
+            sf_concealment: false,
+            rev_global_gain: 50,
+            data: ScaleFactorData {
+                entries: vec![vec![ScaleFactorEntry::Dpcm(1), ScaleFactorEntry::Dpcm(-1)]],
+            },
+            dpcm_is_last_position: None,
+            dpcm_noise_last_position: None,
+        };
+        let mut w = BitWriter::new();
+        block
+            .write(&mut w, &sfb_cb, WindowSequence::OnlyLong)
+            .unwrap();
+        let mut bytes = w.finish();
+        // The length_of_rvlc_sf field sits at bit offset 9 (after the
+        // 1-bit sf_concealment + 8-bit rev_global_gain), 9 bits wide.
+        // Flip its low bit to desync the consumed-bit check.
+        // bits 9..18 → spans bytes 1 (bits 1..8) and 2 (bits 0..1).
+        bytes[2] ^= 0x40; // flip a bit inside the length field region
+        let mut r = BitReader::new(&bytes);
+        // Either a length mismatch or a forbidden codeword — both are
+        // valid in-band rejections of the corrupted stream.
+        let res = ErScaleFactorData::parse(&mut r, &sfb_cb, WindowSequence::OnlyLong);
+        assert!(res.is_err(), "corrupted length field must be rejected");
     }
 }
