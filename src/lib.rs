@@ -429,6 +429,7 @@ pub mod sbr_freq_bands;
 pub mod sbr_grid;
 pub mod sbr_header;
 pub mod sbr_huffman;
+pub mod sbr_reconstruct;
 pub mod scale_factor_data;
 pub mod section_data;
 pub mod spectral_codebook;

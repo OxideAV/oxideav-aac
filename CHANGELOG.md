@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- SBR envelope / noise DPCM reconstruction (`sbr_reconstruct` module) —
+  ISO/IEC 14496-3 §4.6.18.3.5. `EnvelopeScalefactors::reconstruct` and
+  `NoiseScalefactors::reconstruct` invert the delta coding to recover
+  the quantized scalefactors `E_Q(k,l)` / `Q(k,l)` from the raw
+  `bs_data_*`: frequency-direction deltas accumulate across bands from
+  the absolute start value; time-direction deltas add to the reference
+  envelope (the previous envelope in-frame, or the last envelope of the
+  prior frame for `l == 0`), including the `i(k)` high↔low band remap
+  when the reference resolution differs (`r(l) ≠ g(l)`). The coupled
+  second channel's `δ = 0.5` is applied as an integer ×2 on the
+  transmitted (even) values. Cross-frame state is threaded via an
+  optional previous-frame `prev` argument.
 - `sbr_envelope()` / `sbr_noise()` raw decode (`sbr_envelope` module) —
   ISO/IEC 14496-3 §4.4.2.8 Tables 4.72–4.73. `SbrEnvelopeData::parse`
   and `SbrNoiseData::parse` read the per-envelope / per-noise-floor
