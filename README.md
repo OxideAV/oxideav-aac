@@ -59,6 +59,35 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   `adts_error_check()` region-selection CRC is *not* covered here —
   ISO/IEC 13818-7 cites it to a different normative reference
   (ISO/IEC 11172-3 §2.4.3.1).
+- **RVLC error-resilient scalefactor coding** (`rvlc`,
+  `scale_factor_data::ErScaleFactorData`) — §4.6.16.2 the
+  reversible-variable-length-coding replacement for the §4.6.3
+  noiseless coding of scalefactors, used when
+  `aacScalefactorDataResilienceFlag == 1`. The `rvlc` module
+  transcribes the symmetric (bit-palindrome) RVLC codebook
+  (Table 4.166, deltas `-7..=+7` with `±7` the `ESC_FLAG`), the eight
+  asymmetric *forbidden* codewords (Table 4.167) whose appearance is
+  surfaced as the §4.6.16.2.1 in-band error-detection event, and the
+  54-entry RVLC-ESC Huffman codebook (Table 4.168) — every codebook
+  proven prefix-free and round-tripping, and independently
+  cross-validated against the staged packed binary-tree node tables.
+  `ErScaleFactorData::parse` / `::write` decode and re-encode the whole
+  Table 4.53 RVLC branch: the `sf_concealment` / `rev_global_gain` /
+  `length_of_rvlc_sf` (11 bits for `EIGHT_SHORT_SEQUENCE`, else 9)
+  header, the RVLC base-delta band loop (first PNS band keeping the
+  9-bit PCM seed), the optional `sf_escapes_present` /
+  `length_of_rvlc_escapes` second pass folding each escape into its
+  `±ESC_FLAG` base (`+7 + esc` / `-7 - esc` per §4.6.16.2.1), and the
+  `dpcm_is_last_position` / `dpcm_noise_last_position` backward seeds.
+  Both `length_of_*` fields are validated against the bits actually
+  consumed. The reconstructed records share the non-resilient
+  `ScaleFactorData` shape, so the §4.6.2.3.2 forward DPCM
+  `accumulate()` pass consumes them unchanged — pinned by a test that
+  an RVLC stream and the Huffman stream carrying the same deltas
+  accumulate to identical absolute scalefactors. The
+  resilience-flag dispatch from `ics_body` (which today always takes
+  the non-resilient branch) is the remaining wiring step; the RVLC
+  bitstream path itself is decoded end to end.
 
 ### Numeric reconstruction (AAC-LC tool chain)
 
@@ -286,7 +315,13 @@ wired; those stages key off the band tables and scalefactors above.
   PS (parametric stereo) — whose `sbr_extension` payload bytes are now
   captured — the coupling-channel (CCE) contribution, and the ER AAC LD
   480/512 transform variants likewise remain out of scope.
-- The `scale_factor_data()` error-resilient (RVLC) branch.
+- The `aacScalefactorDataResilienceFlag` dispatch from `ics_body` to
+  the error-resilient (RVLC) `scale_factor_data()` branch — the RVLC
+  codebooks (`rvlc`) and the whole Table 4.53 RVLC parse / write path
+  (`scale_factor_data::ErScaleFactorData`) are now implemented and
+  tested (see the error-resilience section above); what remains is
+  plumbing the resilience flag from `GASpecificConfig` through
+  `ics_body` so the channel-element body selects the RVLC branch.
 - LATM/LOAS transport framing (§1.7.3) — the `StreamMuxConfig()`
   `crcCheckSum` generator polynomial (`CRC8`) is now available in the
   `crc` module (§1.8.4.5), but the `AudioMuxElement()` /
