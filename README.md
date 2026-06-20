@@ -127,6 +127,54 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   so the single synthesis pass shapes the residual while undoing the
   analysis on the LTP contribution.
 
+### SBR bitstream decode (HE-AAC)
+
+The full SBR side-info path is now decoded from the `extension_payload`
+SBR element down to the reconstructed quantized envelope / noise-floor
+scalefactors — every numeric table sourced from the ISO/IEC 14496-3
+spec PDF (the §4.A normative Huffman grids and the §4.4.2.8 syntax
+tables), independent of any external SBR table extraction.
+
+- **SBR Huffman codebooks** (`sbr_huffman`) — §4.A.6.1, all ten
+  normative envelope / noise codebooks (Tables 4.A.79–4.A.88)
+  transcribed from the spec codeword grids and validated complete +
+  prefix-free. `sbr_huff_dec()` reads MSB-first and returns the signed
+  DPCM delta (`index − LAV`); `env_tables()` / `noise_tables()` pick the
+  `(t_huff, f_huff)` pair from the §4.6.18.3 coupling / channel /
+  `bs_amp_res` selection (the freq-direction noise tables alias the
+  3.0 dB envelope freq tables per Table 4.A.78 Note 2).
+- **`sbr_header()`** (`sbr_header`) — §4.4.2.8 Table 4.63: the
+  fixed-width header plus the two optional extra blocks, with the
+  Table 4.63 Note 3 defaults (Tables 4.105–4.111) applied when an extra
+  flag is clear. `band_geometry_changed()` flags a §4.6.18.3.3 reset,
+  and `derive_bands()` chains into the band-setup pipeline below.
+- **`sbr_grid()` / `sbr_dtdf()` / `sbr_invf()`** (`sbr_grid`) —
+  §4.4.2.8 Tables 4.69–4.71: all four `bs_frame_class` layouts (FIXFIX
+  / FIXVAR / VARFIX / VARVAR) with the envelope count, variable /
+  relative borders, `ptr_bits = ceil(log2(num_env + 1))` pointer,
+  reversed FIXVAR freq-res order, single-envelope FIXFIX `bs_amp_res`
+  override, and `bs_num_noise` derivation; the delta-direction flags;
+  and the per-noise-band 2-bit inverse-filtering modes.
+- **`sbr_envelope()` / `sbr_noise()`** (`sbr_envelope`) — §4.4.2.8
+  Tables 4.72–4.73: the raw `bs_data_*` delta arrays, with the
+  fixed-width absolute start value (5/6/7-bit per the coupling /
+  channel / `bs_amp_res` context; noise always 5-bit) and the
+  frequency- vs time-direction Huffman deltas, over `NHigh` / `NLow`
+  envelope bands and `NQ` noise bands.
+- **Envelope / noise DPCM reconstruction** (`sbr_reconstruct`) —
+  §4.6.18.3.5: inverts the delta coding to the quantized scalefactors
+  `E_Q(k,l)` / `Q(k,l)`. Frequency deltas accumulate from the start
+  value; time deltas add to the reference envelope (previous in-frame,
+  or the prior frame's last envelope for `l == 0`) with the `i(k)`
+  high↔low band remap when the reference resolution differs; the
+  coupled second channel's `δ = 0.5` is applied as an integer ×2 on the
+  even transmitted values, threading cross-frame state.
+
+The remaining SBR back-end (dequantization to linear energies, the QMF
+analysis / synthesis filterbanks, HF generation / patching, the limiter
+and the envelope-adjustment that produce up-sampled PCM) is not yet
+wired; those stages key off the band tables and scalefactors above.
+
 ### SBR frequency band setup (HE-AAC)
 
 - **SBR frequency band tables** (`sbr_freq_bands`) — §4.6.18.3.2 the
@@ -212,13 +260,21 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
   Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
   scope per the §4.6.7.1 long-window restriction.)
-- SBR / PS synthesis (needs a QMF analysis / synthesis filterbank and
-  the §4.6.18.6 patching back-end) — the §4.6.18.3.2.1/.2 frequency
-  band tables (`fMaster` / `fTableHigh` / `fTableLow` / `fTableNoise`)
-  are in place (see `sbr_freq_bands` above), but the envelope / noise
-  decode, the limiter table, and the QMF filterbanks are not. PS, the
-  coupling-channel (CCE) contribution, and the ER AAC LD 480/512
-  transform variants likewise remain out of scope.
+- SBR synthesis (needs a QMF analysis / synthesis filterbank and the
+  §4.6.18.6 HF-generation / patching back-end) — the SBR *bitstream*
+  path is now decoded end to end: the §4.A.6.1 Huffman codebooks, the
+  §4.4.2.8 `sbr_header` / `sbr_grid` / `sbr_dtdf` / `sbr_invf` /
+  `sbr_envelope` / `sbr_noise` syntax, the §4.6.18.3.2 frequency band
+  tables, and the §4.6.18.3.5 envelope / noise DPCM reconstruction to
+  quantized scalefactors (see the SBR sections above). What remains is
+  the back-end DSP: dequantization to linear energies, the limiter
+  table, the QMF analysis / synthesis filterbanks, HF generation /
+  patching, and the envelope adjustment that produces up-sampled PCM.
+  The `sbr_single_channel_element()` / `sbr_channel_pair_element()`
+  framing wrapper (Tables 4.65–4.66) is not yet wired into
+  `extension_payload`. PS (parametric stereo), the coupling-channel
+  (CCE) contribution, and the ER AAC LD 480/512 transform variants
+  likewise remain out of scope.
 - The `scale_factor_data()` error-resilient (RVLC) branch.
 - LATM/LOAS transport framing (§1.7.3) — the `StreamMuxConfig()`
   `crcCheckSum` generator polynomial (`CRC8`) is now available in the
