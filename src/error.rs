@@ -157,6 +157,41 @@ pub enum Error {
     /// scalefactor-quantisation stage and bitstream emission.
     ScaleFactorDataEncodeInvalid,
 
+    /// An RVLC encode primitive ([`crate::rvlc::rvlc_encode`] /
+    /// [`crate::rvlc::rvlc_esc_encode`]) was handed a value outside
+    /// its codebook domain: a Table 4.166 RVLC delta outside
+    /// `-7..=+7`, or a Table 4.168 escape magnitude index outside
+    /// `0..=53` (ISO/IEC 14496-3 §4.6.16.2). A conforming
+    /// error-resilient encoder never builds such a value; this
+    /// surfaces caller bugs at the scalefactor-quantisation /
+    /// emission boundary.
+    RvlcEncodeInvalid,
+
+    /// [`crate::rvlc::rvlc_decode`] read a Table 4.167 *asymmetric*
+    /// (forbidden) codeword from the error-resilient
+    /// `scale_factor_data()` RVLC part (ISO/IEC 14496-3 §4.6.16.2.1).
+    /// Because the RVLC code tree leaves some nodes unused, hitting
+    /// one is an in-band *error-detection* event — the stream's RVLC
+    /// scalefactor data is corrupt.
+    RvlcForbiddenCodeword,
+
+    /// [`crate::rvlc::rvlc_esc_decode`] walked the full 20-bit
+    /// Table 4.168 RVLC-ESC depth without matching any codeword
+    /// (ISO/IEC 14496-3 §4.6.16.2). The escape part of the
+    /// error-resilient `scale_factor_data()` is corrupt.
+    RvlcEscInvalid,
+
+    /// The error-resilient `scale_factor_data()` RVLC branch
+    /// (ISO/IEC 14496-3 Table 4.53 / §4.6.16.2) violated a
+    /// structural invariant: the decoded RVLC part did not consume
+    /// exactly `length_of_rvlc_sf` bits, the escape part did not
+    /// consume exactly `length_of_rvlc_escapes` bits, an escape was
+    /// signalled for a non-`ESC_FLAG` band, or an in-memory record
+    /// set handed to the writer cannot be represented (variant /
+    /// codebook mismatch, escape magnitude out of range, or the
+    /// `rev_global_gain` / DPCM-last seeds out of their field caps).
+    RvlcScaleFactorDataInvalid,
+
     /// [`crate::pce::Pce::write`] was handed an in-memory
     /// [`crate::pce::Pce`] whose field combination cannot be
     /// represented on the wire under ISO/IEC 14496-3 §4.4.1.1 /
@@ -627,6 +662,30 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "scale_factor_data encode: in-memory record set violates a Table 4.53 / 4.150 wire-field invariant"
+                )
+            }
+            Error::RvlcEncodeInvalid => {
+                write!(
+                    f,
+                    "rvlc encode: value outside the Table 4.166 (-7..=+7) / Table 4.168 (0..=53) codebook domain"
+                )
+            }
+            Error::RvlcForbiddenCodeword => {
+                write!(
+                    f,
+                    "rvlc decode: read a Table 4.167 asymmetric (forbidden) codeword — RVLC scalefactor data is corrupt (§4.6.16.2.1)"
+                )
+            }
+            Error::RvlcEscInvalid => {
+                write!(
+                    f,
+                    "rvlc-esc decode: 20-bit Table 4.168 walk matched no codeword — RVLC escape data is corrupt (§4.6.16.2)"
+                )
+            }
+            Error::RvlcScaleFactorDataInvalid => {
+                write!(
+                    f,
+                    "error-resilient scale_factor_data: RVLC branch violates a Table 4.53 / §4.6.16.2 structural invariant"
                 )
             }
             Error::PceEncodeInvalid => {
