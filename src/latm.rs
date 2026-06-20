@@ -639,6 +639,197 @@ pub fn latm_get_value(reader: &mut BitReader<'_>) -> Result<u32> {
     Ok(value)
 }
 
+/// One decoded LOAS sync frame — ISO/IEC 14496-3 §1.7.2.1.
+///
+/// Carries the framed `audioMuxLengthBytes` length, the recovered
+/// [`AudioMuxElement`], and (for `EPAudioSyncStream`) the FEC header
+/// fields. The byte offset of the frame within the LOAS buffer is also
+/// recorded so callers can resume the sync search.
+#[derive(Debug, Clone)]
+pub struct LoasFrame {
+    /// `audioMuxLengthBytes` (13 bits) — the byte length of the framed
+    /// multiplexed element.
+    pub audio_mux_length_bytes: u16,
+    /// The recovered multiplexed element.
+    pub element: AudioMuxElement,
+    /// `frameCounter` (5 bits) — present only for `EPAudioSyncStream`.
+    pub frame_counter: Option<u8>,
+    /// Byte offset of the syncword within the LOAS buffer.
+    pub offset: usize,
+    /// Byte offset of the first byte after this sync frame.
+    pub next_offset: usize,
+}
+
+/// LOAS `AudioSyncStream()` walker — ISO/IEC 14496-3 §1.7.2.1
+/// Table 1.36.
+///
+/// Scans `data` for the 11-bit `0x2B7` syncword, then for each frame
+/// reads the 13-bit `audioMuxLengthBytes` and decodes the byte-aligned
+/// `AudioMuxElement(1)` over the next `audioMuxLengthBytes` bytes. The
+/// syncword is searched on byte boundaries (AudioSyncStream frames are
+/// byte-aligned per §1.7.2.2.1).
+#[derive(Debug)]
+pub struct AudioSyncStream<'a> {
+    data: &'a [u8],
+    pos: usize,
+    /// The most recently decoded [`StreamMuxConfig`], threaded across
+    /// frames for `useSameStreamMux` inheritance.
+    prev_config: Option<StreamMuxConfig>,
+}
+
+impl<'a> AudioSyncStream<'a> {
+    /// Create a walker over a LOAS `AudioSyncStream()` byte buffer.
+    pub fn new(data: &'a [u8]) -> Self {
+        AudioSyncStream {
+            data,
+            pos: 0,
+            prev_config: None,
+        }
+    }
+
+    /// Decode the next `AudioSyncStream()` sync frame, advancing past
+    /// it. Returns `Ok(None)` at end of stream (no further syncword).
+    ///
+    /// On a successful decode the frame's [`StreamMuxConfig`] is
+    /// retained so a subsequent frame carrying `useSameStreamMux` can
+    /// inherit it.
+    pub fn next_frame(&mut self) -> Result<Option<LoasFrame>> {
+        let Some(sync_off) = self.find_syncword(AUDIO_SYNC_STREAM_SYNCWORD, 11) else {
+            self.pos = self.data.len();
+            return Ok(None);
+        };
+
+        // Read audioMuxLengthBytes (13 bits) starting after the 11-bit
+        // syncword.
+        let mut reader = BitReader::new(&self.data[sync_off..]);
+        reader.skip(11).map_err(|_| Error::LoasSyncInvalid)?;
+        let audio_mux_length_bytes =
+            reader.read_u32(13).map_err(|_| Error::LoasSyncInvalid)? as u16;
+
+        // The AudioMuxElement(1) follows; it is byte-aligned because
+        // 11 + 13 = 24 bits = 3 whole bytes.
+        debug_assert_eq!(reader.bit_position(), 24);
+        let element_byte_start = sync_off + 3;
+        let element_byte_end = element_byte_start + usize::from(audio_mux_length_bytes);
+        if element_byte_end > self.data.len() {
+            return Err(Error::LoasSyncInvalid);
+        }
+        let element_bytes = &self.data[element_byte_start..element_byte_end];
+        let mut elem_reader = BitReader::new(element_bytes);
+        let element = AudioMuxElement::parse(
+            &mut elem_reader,
+            element_bytes,
+            true,
+            self.prev_config.as_ref(),
+        )?;
+
+        self.prev_config = Some(element.config.clone());
+        self.pos = element_byte_end;
+
+        Ok(Some(LoasFrame {
+            audio_mux_length_bytes,
+            element,
+            frame_counter: None,
+            offset: sync_off,
+            next_offset: element_byte_end,
+        }))
+    }
+
+    /// Search for an `n`-bit syncword on byte boundaries from the
+    /// current position. Returns the byte offset of the syncword's
+    /// first byte, or `None` if not found before end of buffer. The
+    /// 11-bit `0x2B7` and 16-bit `0x4DE1` syncwords both begin on a
+    /// byte boundary in their respective frame layouts.
+    fn find_syncword(&self, syncword: u32, n: u32) -> Option<usize> {
+        let bytes_needed = n.div_ceil(8) as usize;
+        let mut off = self.pos;
+        while off + bytes_needed <= self.data.len() {
+            let mut r = BitReader::new(&self.data[off..]);
+            if let Ok(v) = r.read_u32(n) {
+                if v == syncword {
+                    return Some(off);
+                }
+            }
+            off += 1;
+        }
+        None
+    }
+}
+
+impl Iterator for AudioSyncStream<'_> {
+    type Item = Result<LoasFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_frame() {
+            Ok(Some(frame)) => Some(Ok(frame)),
+            Ok(None) => None,
+            Err(e) => {
+                // Stop iterating after surfacing the error.
+                self.pos = self.data.len();
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// Decoded `EPAudioSyncStream()` FEC header — ISO/IEC 14496-3 §1.7.2.1
+/// Table 1.37.
+///
+/// Parses the 16-bit `0x4DE1` syncword, the 4-bit `futureUse`, the
+/// 13-bit `audioMuxLengthBytes`, the 5-bit `frameCounter`, and the
+/// 18-bit `headerParity`. The body is an `EPMuxElement(1, 1)` whose
+/// EP-tool de-interleave is out of scope; this struct captures the
+/// header so callers can frame the stream and recover the (byte-aligned)
+/// element body bounds.
+#[derive(Debug, Clone)]
+pub struct EpAudioSyncHeader {
+    /// `futureUse` (4 bits).
+    pub future_use: u8,
+    /// `audioMuxLengthBytes` (13 bits).
+    pub audio_mux_length_bytes: u16,
+    /// `frameCounter` (5 bits).
+    pub frame_counter: u8,
+    /// `headerParity` (18 bits).
+    pub header_parity: u32,
+    /// Byte offset of the syncword.
+    pub offset: usize,
+    /// Byte offset of the first byte of the `EPMuxElement(1, 1)` body
+    /// (the header is `16 + 4 + 13 + 5 + 18 = 56` bits = 7 bytes, so the
+    /// body is byte-aligned).
+    pub body_offset: usize,
+}
+
+impl EpAudioSyncHeader {
+    /// Parse one `EPAudioSyncStream()` FEC header from `data` starting
+    /// at `pos`, scanning for the `0x4DE1` syncword on byte boundaries.
+    /// Returns `Ok(None)` if no syncword is found.
+    pub fn parse(data: &[u8], pos: usize) -> Result<Option<Self>> {
+        let walker = AudioSyncStream {
+            data,
+            pos,
+            prev_config: None,
+        };
+        let Some(sync_off) = walker.find_syncword(EP_AUDIO_SYNC_STREAM_SYNCWORD, 16) else {
+            return Ok(None);
+        };
+        let mut reader = BitReader::new(&data[sync_off..]);
+        reader.skip(16).map_err(|_| Error::LoasSyncInvalid)?; // syncword
+        let future_use = read_u8(&mut reader, 4)?;
+        let audio_mux_length_bytes = read_u16(&mut reader, 13)?;
+        let frame_counter = read_u8(&mut reader, 5)?;
+        let header_parity = reader.read_u32(18).map_err(|_| Error::UnexpectedEnd)?;
+        debug_assert_eq!(reader.bit_position(), 56);
+        Ok(Some(EpAudioSyncHeader {
+            future_use,
+            audio_mux_length_bytes,
+            frame_counter,
+            header_parity,
+            offset: sync_off,
+            body_offset: sync_off + 7,
+        }))
+    }
+}
+
 // ---- bit helpers -----------------------------------------------------
 
 fn read_u8(reader: &mut BitReader<'_>, n: u32) -> Result<u8> {
@@ -1057,5 +1248,153 @@ mod tests {
         assert_eq!(ame.payloads[0].data, vec![0x01, 0x02]);
         assert_eq!(ame.payloads[1].sub_frame, 1);
         assert_eq!(ame.payloads[1].data, vec![0x03]);
+    }
+
+    /// Build the byte body of a minimal in-band AudioMuxElement(1)
+    /// carrying `payload` (one subframe, frameLengthType 0). The
+    /// returned bytes are exactly the `audioMuxLengthBytes` body that a
+    /// LOAS frame wraps.
+    fn build_min_audio_mux_element(payload: &[u8]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bit(false); // useSameStreamMux = 0
+        write_min_smc_into(&mut w);
+        // MuxSlotLengthBytes for payload.len() (< 255).
+        assert!(payload.len() < 255);
+        w.write_u32(payload.len() as u32, 8);
+        for &b in payload {
+            w.write_byte(b);
+        }
+        w.finish()
+    }
+
+    #[test]
+    fn audio_sync_stream_single_frame() {
+        let payload: [u8; 5] = [0x21, 0x00, 0x03, 0x40, 0x80];
+        let body = build_min_audio_mux_element(&payload);
+
+        // AudioSyncStream frame: 0x2B7 (11 bits) + audioMuxLengthBytes
+        // (13 bits) + body. 11 + 13 = 24 bits = 3 bytes, so the body is
+        // byte-aligned.
+        let mut w = BitWriter::new();
+        w.write_u32(AUDIO_SYNC_STREAM_SYNCWORD, 11);
+        w.write_u32(body.len() as u32, 13);
+        w.write_bytes(&body);
+        let stream = w.finish();
+
+        let mut walker = AudioSyncStream::new(&stream);
+        let frame = walker.next_frame().unwrap().unwrap();
+        assert_eq!(frame.offset, 0);
+        assert_eq!(usize::from(frame.audio_mux_length_bytes), body.len());
+        assert_eq!(frame.element.payloads.len(), 1);
+        assert_eq!(frame.element.payloads[0].data, payload.to_vec());
+        // No more frames.
+        assert!(walker.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn audio_sync_stream_skips_leading_garbage() {
+        let payload: [u8; 2] = [0xAB, 0xCD];
+        let body = build_min_audio_mux_element(&payload);
+        let mut w = BitWriter::new();
+        w.write_u32(AUDIO_SYNC_STREAM_SYNCWORD, 11);
+        w.write_u32(body.len() as u32, 13);
+        w.write_bytes(&body);
+        let frame_bytes = w.finish();
+
+        // Prepend non-syncword garbage bytes.
+        let mut stream = vec![0x00, 0xAA, 0x55];
+        stream.extend_from_slice(&frame_bytes);
+
+        let mut walker = AudioSyncStream::new(&stream);
+        let frame = walker.next_frame().unwrap().unwrap();
+        assert_eq!(frame.offset, 3);
+        assert_eq!(frame.element.payloads[0].data, payload.to_vec());
+    }
+
+    #[test]
+    fn audio_sync_stream_two_frames_via_iterator() {
+        let p0: [u8; 2] = [0x10, 0x20];
+        let p1: [u8; 3] = [0x30, 0x40, 0x50];
+
+        let build = |payload: &[u8]| {
+            // First frame carries config inline; second uses
+            // useSameStreamMux to inherit it.
+            let body = build_min_audio_mux_element(payload);
+            let mut w = BitWriter::new();
+            w.write_u32(AUDIO_SYNC_STREAM_SYNCWORD, 11);
+            w.write_u32(body.len() as u32, 13);
+            w.write_bytes(&body);
+            w.finish()
+        };
+
+        let mut stream = build(&p0);
+        // Second frame: useSameStreamMux = 1 body.
+        let body1 = {
+            let mut w = BitWriter::new();
+            w.write_bit(true); // useSameStreamMux = 1
+            w.write_u32(p1.len() as u32, 8); // MuxSlotLengthBytes
+            for &b in &p1 {
+                w.write_byte(b);
+            }
+            w.finish()
+        };
+        let mut w1 = BitWriter::new();
+        w1.write_u32(AUDIO_SYNC_STREAM_SYNCWORD, 11);
+        w1.write_u32(body1.len() as u32, 13);
+        w1.write_bytes(&body1);
+        stream.extend_from_slice(&w1.finish());
+
+        let frames: Vec<_> = AudioSyncStream::new(&stream)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].element.payloads[0].data, p0.to_vec());
+        assert_eq!(frames[1].element.payloads[0].data, p1.to_vec());
+        // The second frame inherited the first frame's config.
+        assert!(frames[1].element.use_same_stream_mux);
+    }
+
+    #[test]
+    fn audio_sync_stream_truncated_body_rejected() {
+        let payload: [u8; 4] = [0x01, 0x02, 0x03, 0x04];
+        let body = build_min_audio_mux_element(&payload);
+        let mut w = BitWriter::new();
+        w.write_u32(AUDIO_SYNC_STREAM_SYNCWORD, 11);
+        // Claim a longer body than is present.
+        w.write_u32((body.len() + 10) as u32, 13);
+        w.write_bytes(&body);
+        let stream = w.finish();
+
+        let mut walker = AudioSyncStream::new(&stream);
+        assert!(matches!(walker.next_frame(), Err(Error::LoasSyncInvalid)));
+    }
+
+    #[test]
+    fn ep_audio_sync_header_parse() {
+        // 0x4DE1 (16) + futureUse(4)=0x5 + audioMuxLengthBytes(13)=100
+        // + frameCounter(5)=7 + headerParity(18)=0x12345.
+        let mut w = BitWriter::new();
+        w.write_u32(EP_AUDIO_SYNC_STREAM_SYNCWORD, 16);
+        w.write_u32(0x5, 4);
+        w.write_u32(100, 13);
+        w.write_u32(7, 5);
+        w.write_u32(0x12345, 18);
+        // A few body bytes (not parsed).
+        w.write_bytes(&[0xAA, 0xBB]);
+        let stream = w.finish();
+
+        let hdr = EpAudioSyncHeader::parse(&stream, 0).unwrap().unwrap();
+        assert_eq!(hdr.offset, 0);
+        assert_eq!(hdr.future_use, 0x5);
+        assert_eq!(hdr.audio_mux_length_bytes, 100);
+        assert_eq!(hdr.frame_counter, 7);
+        assert_eq!(hdr.header_parity, 0x12345);
+        assert_eq!(hdr.body_offset, 7);
+    }
+
+    #[test]
+    fn ep_audio_sync_header_not_found() {
+        let stream = [0x00u8, 0x11, 0x22, 0x33];
+        assert!(EpAudioSyncHeader::parse(&stream, 0).unwrap().is_none());
     }
 }
