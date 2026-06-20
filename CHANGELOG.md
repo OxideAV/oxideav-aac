@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- SBR element framing (`sbr_element` module) — ISO/IEC 14496-3
+  §4.4.2.8 Tables 4.65 / 4.66 / 4.74. `SbrElement::parse_single` and
+  `SbrElement::parse_pair` decode a whole SBR data element in spec
+  order: the optional `bs_data_extra` reserved field, the per-channel
+  grid / dtdf / invf / envelope / noise blocks (the coupled-pair
+  shared-grid layout vs. the independent-grid layout, with the second
+  coupled channel decoded in balance mode), `sbr_sinusoidal_coding()`'s
+  `NHigh` add-harmonic flags, and the `bs_extended_data` block (id +
+  raw body bytes captured for a later PS pass; `EXTENSION_ID_PS`
+  defined). The single-envelope FIXFIX `bs_amp_res` override is applied
+  before envelope decode so start-value widths and codebook selection
+  match the spec's in-order `bs_amp_res` mutation.
 - SBR envelope / noise DPCM reconstruction (`sbr_reconstruct` module) —
   ISO/IEC 14496-3 §4.6.18.3.5. `EnvelopeScalefactors::reconstruct` and
   `NoiseScalefactors::reconstruct` invert the delta coding to recover

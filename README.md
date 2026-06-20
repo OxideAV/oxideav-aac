@@ -169,6 +169,15 @@ tables), independent of any external SBR table extraction.
   high↔low band remap when the reference resolution differs; the
   coupled second channel's `δ = 0.5` is applied as an integer ×2 on the
   even transmitted values, threading cross-frame state.
+- **Element framing** (`sbr_element`) — §4.4.2.8 Tables 4.65 / 4.66 /
+  4.74: `SbrElement::parse_single` / `parse_pair` decode a whole SBR
+  data element in spec order — the optional `bs_data_extra` field, the
+  per-channel grid / dtdf / invf / envelope / noise blocks (coupled
+  shared-grid vs. independent-grid layouts, second coupled channel in
+  balance mode), the `sbr_sinusoidal_coding()` add-harmonic flags, and
+  the `bs_extended_data` block (id + raw body captured for a later PS
+  pass). The single-envelope FIXFIX `bs_amp_res` override is applied
+  before envelope decode.
 
 The remaining SBR back-end (dequantization to linear energies, the QMF
 analysis / synthesis filterbanks, HF generation / patching, the limiter
@@ -271,10 +280,12 @@ wired; those stages key off the band tables and scalefactors above.
   table, the QMF analysis / synthesis filterbanks, HF generation /
   patching, and the envelope adjustment that produces up-sampled PCM.
   The `sbr_single_channel_element()` / `sbr_channel_pair_element()`
-  framing wrapper (Tables 4.65–4.66) is not yet wired into
-  `extension_payload`. PS (parametric stereo), the coupling-channel
-  (CCE) contribution, and the ER AAC LD 480/512 transform variants
-  likewise remain out of scope.
+  framing (Tables 4.65–4.66) is decoded by `sbr_element` but not yet
+  dispatched from `extension_payload`'s `EXT_SBR_DATA` branch (which
+  still surfaces `Error::UnsupportedExtensionSbr` pending the back-end).
+  PS (parametric stereo) — whose `sbr_extension` payload bytes are now
+  captured — the coupling-channel (CCE) contribution, and the ER AAC LD
+  480/512 transform variants likewise remain out of scope.
 - The `scale_factor_data()` error-resilient (RVLC) branch.
 - LATM/LOAS transport framing (§1.7.3) — the `StreamMuxConfig()`
   `crcCheckSum` generator polynomial (`CRC8`) is now available in the

@@ -424,6 +424,7 @@ pub mod pns;
 pub mod predictor;
 pub mod pulse_data;
 pub mod raw_data_block;
+pub mod sbr_element;
 pub mod sbr_envelope;
 pub mod sbr_freq_bands;
 pub mod sbr_grid;
