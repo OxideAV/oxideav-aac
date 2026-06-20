@@ -380,6 +380,251 @@ impl StreamMuxConfig {
     }
 }
 
+/// §1.7.3 signalling cap: `numChunk` is 4-bit (max chunk index 15).
+const MAX_NUM_CHUNK_INDEX: u32 = 15;
+
+/// One recovered MPEG-4 Audio payload from a [`PayloadMux`] — the raw
+/// access-unit bytes for a single `(subframe, prog, lay)` slot. For an
+/// AAC layer these bytes are the §4.4.2.1 `raw_data_block()` that the
+/// [`crate::decode::StreamDecoder`] / [`crate::raw_data_block`] layer
+/// consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxPayload {
+    /// Subframe index (`0 ..= numSubFrames`).
+    pub sub_frame: u8,
+    /// `prog` — the program this payload belongs to.
+    pub prog: u8,
+    /// `lay` — the layer within the program.
+    pub lay: u8,
+    /// `streamID[prog][lay]`.
+    pub stream_id: u8,
+    /// The raw payload bytes (one complete access unit for
+    /// `frameLengthType == 0`).
+    pub data: Vec<u8>,
+}
+
+/// `MuxSlotLengthBytes[streamID]` decoded for one payload slot of a
+/// [`PayloadLengthInfo`] (Table 1.44). For `frameLengthType == 0` this
+/// is the running 8-bit-escape byte count; the bit length for
+/// `frameLengthType == 1` comes from the layer's fixed `frameLength`.
+#[derive(Debug, Clone, Copy)]
+struct SlotLength {
+    prog: u8,
+    lay: u8,
+    stream_id: u8,
+    /// Payload length in **bits**. For type-0 this is `bytes * 8`; for
+    /// type-1 it is `(frameLength + 20) * 8`.
+    bits: u32,
+}
+
+/// Decoded `AudioMuxElement()` — ISO/IEC 14496-3 §1.7.3.1 Table 1.41.
+///
+/// Holds the (possibly inherited) [`StreamMuxConfig`] and the recovered
+/// per-subframe payloads. Parsing supports `audioMuxVersionA == 0`
+/// (the only defined branch) and `allStreamsSameTimeFraming` in both
+/// states; non-same-time-framing uses the `numChunk` chunk layout of
+/// Tables 1.44 / 1.45.
+#[derive(Debug, Clone)]
+pub struct AudioMuxElement {
+    /// `useSameStreamMux` (only present when `muxConfigPresent`). When
+    /// `true`, [`AudioMuxElement::config`] was inherited from the
+    /// previous element rather than parsed here.
+    pub use_same_stream_mux: bool,
+    /// The active multiplex configuration for this element.
+    pub config: StreamMuxConfig,
+    /// The recovered payloads in transmission order.
+    pub payloads: Vec<MuxPayload>,
+}
+
+impl AudioMuxElement {
+    /// Parse an `AudioMuxElement()` (Table 1.41) from `reader`.
+    ///
+    /// `data` is the byte slice backing `reader` (forwarded to
+    /// [`StreamMuxConfig::parse`] for CRC recomputation).
+    /// `mux_config_present` is the `muxConfigPresent` flag the calling
+    /// layer supplies (LOAS [`AudioSyncStream`] passes `1`; an
+    /// out-of-band-configured transport passes `0`). `prev_config` is
+    /// the configuration decoded on the previous element, used when
+    /// `useSameStreamMux` is set or when `muxConfigPresent == 0`.
+    pub fn parse(
+        reader: &mut BitReader<'_>,
+        data: &[u8],
+        mux_config_present: bool,
+        prev_config: Option<&StreamMuxConfig>,
+    ) -> Result<Self> {
+        let (use_same_stream_mux, config) = if mux_config_present {
+            let use_same = read_bit(reader)?;
+            if use_same {
+                let cfg = prev_config.cloned().ok_or(Error::LatmNoPreviousMuxConfig)?;
+                (true, cfg)
+            } else {
+                (false, StreamMuxConfig::parse(reader, data)?)
+            }
+        } else {
+            // Out-of-band StreamMuxConfig(): apply the previous one.
+            let cfg = prev_config.cloned().ok_or(Error::LatmNoPreviousMuxConfig)?;
+            (false, cfg)
+        };
+
+        if config.audio_mux_version_a != 0 {
+            return Err(Error::LatmAudioMuxVersionAReserved);
+        }
+
+        let mut payloads = Vec::new();
+        for sub_frame in 0..=u32::from(config.num_sub_frames) {
+            let slots = payload_length_info(reader, &config)?;
+            payload_mux(reader, &config, sub_frame as u8, &slots, &mut payloads)?;
+        }
+
+        // otherData: skip otherDataLenBits bits.
+        if config.other_data_present {
+            skip_bits(reader, u64::from(config.other_data_len_bits))?;
+        }
+
+        // ByteAlign().
+        reader.align_to_byte();
+
+        Ok(AudioMuxElement {
+            use_same_stream_mux,
+            config,
+            payloads,
+        })
+    }
+}
+
+/// `PayloadLengthInfo()` — §1.7.3.1 Table 1.44. Returns the decoded
+/// per-slot payload bit-lengths in the order `PayloadMux()` will emit
+/// them.
+fn payload_length_info(
+    reader: &mut BitReader<'_>,
+    config: &StreamMuxConfig,
+) -> Result<Vec<SlotLength>> {
+    let mut slots = Vec::new();
+    if config.all_streams_same_time_framing {
+        for prog in 0..=u32::from(config.num_program) {
+            let n_layer = config.num_layer[prog as usize];
+            for lay in 0..=u32::from(n_layer) {
+                let stream_id = config
+                    .stream_id(prog as u8, lay as u8)
+                    .ok_or(Error::LatmConfigOutOfRange)?;
+                let layer = config.layer(stream_id).ok_or(Error::LatmConfigOutOfRange)?;
+                let bits = slot_bits(reader, layer)?;
+                slots.push(SlotLength {
+                    prog: prog as u8,
+                    lay: lay as u8,
+                    stream_id,
+                    bits,
+                });
+            }
+        }
+    } else {
+        let num_chunk = read_u8(reader, 4)?;
+        if u32::from(num_chunk) > MAX_NUM_CHUNK_INDEX {
+            return Err(Error::LatmConfigOutOfRange);
+        }
+        for _ in 0..=u32::from(num_chunk) {
+            let stream_indx = read_u8(reader, 4)?;
+            let layer = config
+                .layer(stream_indx)
+                .ok_or(Error::LatmConfigOutOfRange)?;
+            let prog = layer.prog;
+            let lay = layer.lay;
+            let stream_id = layer.stream_id;
+            let frame_length_type = layer.frame_length_type;
+            let bits = slot_bits(reader, layer)?;
+            // For frameLengthType == 0 in the chunk layout the spec
+            // appends an AuEndFlag bit after MuxSlotLengthBytes.
+            if frame_length_type == 0 {
+                let _au_end_flag = read_bit(reader)?;
+            }
+            slots.push(SlotLength {
+                prog,
+                lay,
+                stream_id,
+                bits,
+            });
+        }
+    }
+    Ok(slots)
+}
+
+/// Decode the payload bit-length for one slot per its
+/// `frameLengthType` (Table 1.44 inner body): the 8-bit-escape running
+/// `MuxSlotLengthBytes` for type 0, or the fixed `(frameLength+20)*8`
+/// for type 1. CELP/HVXC `MuxSlotLengthCoded` table indices are out of
+/// scope and were already rejected when the config was parsed.
+fn slot_bits(reader: &mut BitReader<'_>, layer: &LayerConfig) -> Result<u32> {
+    match layer.frame_length_type {
+        0 => {
+            let mut bytes: u32 = 0;
+            loop {
+                let tmp = read_u8(reader, 8)?;
+                bytes = bytes.wrapping_add(u32::from(tmp));
+                if tmp != 255 {
+                    break;
+                }
+            }
+            Ok(bytes.saturating_mul(8))
+        }
+        1 => layer
+            .fixed_payload_bits()
+            .ok_or(Error::LatmConfigOutOfRange),
+        other => Err(Error::LatmUnsupportedFrameLengthType(other)),
+    }
+}
+
+/// `PayloadMux()` — §1.7.3.1 Table 1.45. Reads each slot's payload
+/// bytes in the same order `PayloadLengthInfo()` emitted them, pushing
+/// one [`MuxPayload`] per slot. Payloads are byte-extracted; the spec
+/// guarantees `frameLengthType == 0` payloads are an integer number of
+/// bytes, and `AudioMuxElement()` byte-aligns the reader at each
+/// subframe boundary in the common AAC case.
+fn payload_mux(
+    reader: &mut BitReader<'_>,
+    config: &StreamMuxConfig,
+    sub_frame: u8,
+    slots: &[SlotLength],
+    out: &mut Vec<MuxPayload>,
+) -> Result<()> {
+    // Walk in the order PayloadLengthInfo built the slots, which is the
+    // same program/layer (or chunk) order PayloadMux uses.
+    let _ = config;
+    for slot in slots {
+        let data = read_payload_bytes(reader, slot.bits)?;
+        out.push(MuxPayload {
+            sub_frame,
+            prog: slot.prog,
+            lay: slot.lay,
+            stream_id: slot.stream_id,
+            data,
+        });
+    }
+    Ok(())
+}
+
+/// Read `bits` bits of payload as a byte vector. The common AAC case
+/// (`frameLengthType == 0`, byte-aligned reader) is a fast `read_bytes`
+/// path; a non-byte-multiple length or non-aligned reader falls back to
+/// bit-by-bit assembly (MSB-first), with the trailing partial byte
+/// left-justified.
+fn read_payload_bytes(reader: &mut BitReader<'_>, bits: u32) -> Result<Vec<u8>> {
+    if bits % 8 == 0 && reader.is_byte_aligned() {
+        let n = (bits / 8) as usize;
+        return reader.read_bytes(n).map_err(|_| Error::UnexpectedEnd);
+    }
+    let full = bits / 8;
+    let rem = bits % 8;
+    let mut out = Vec::with_capacity((full + u32::from(rem != 0)) as usize);
+    for _ in 0..full {
+        out.push(read_u8(reader, 8)?);
+    }
+    if rem > 0 {
+        let v = read_u8(reader, rem)?;
+        out.push(v << (8 - rem));
+    }
+    Ok(out)
+}
+
 /// §1.7.3.1 Table 1.43 `LatmGetValue()`: a variable-length unsigned
 /// integer carried as `bytesForValue` (2 bits) followed by
 /// `bytesForValue + 1` bytes, big-endian.
@@ -671,5 +916,146 @@ mod tests {
         assert_eq!(lay.frame_length_type, 1);
         assert_eq!(lay.frame_length, Some(100));
         assert_eq!(lay.fixed_payload_bits(), Some((100 + 20) * 8));
+    }
+
+    /// Write the minimal `audioMuxVersion == 0` AAC-LC StreamMuxConfig
+    /// (one prog, one layer, frameLengthType 0, no CRC) into `w`
+    /// without finishing — for embedding inside an AudioMuxElement.
+    fn write_min_smc_into(w: &mut BitWriter) {
+        w.write_bit(false); // audioMuxVersion = 0
+        w.write_bit(true); // allStreamsSameTimeFraming
+        w.write_u32(0, 6); // numSubFrames = 0
+        w.write_u32(0, 4); // numProgram = 0
+        w.write_u32(0, 3); // numLayer = 0
+        write_aac_lc_asc(w);
+        w.write_u32(0, 3); // frameLengthType = 0
+        w.write_u32(0xFF, 8); // latmBufferFullness
+        w.write_bit(false); // otherDataPresent
+        w.write_bit(false); // crcCheckPresent
+    }
+
+    #[test]
+    fn audio_mux_element_in_band_single_payload() {
+        // muxConfigPresent=1, useSameStreamMux=0, inline minimal SMC,
+        // one subframe carrying a 4-byte payload.
+        let payload: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+        let mut w = BitWriter::new();
+        w.write_bit(false); // useSameStreamMux = 0
+        write_min_smc_into(&mut w);
+        // PayloadLengthInfo: MuxSlotLengthBytes = 4 (single byte, < 255).
+        w.write_u32(4, 8);
+        // PayloadMux: 4 payload bytes.
+        for &b in &payload {
+            w.write_byte(b);
+        }
+        // otherDataPresent was 0; ByteAlign() pads.
+        let bytes = w.finish();
+
+        let mut r = BitReader::new(&bytes);
+        let ame = AudioMuxElement::parse(&mut r, &bytes, true, None).unwrap();
+        assert!(!ame.use_same_stream_mux);
+        assert_eq!(ame.payloads.len(), 1);
+        let p = &ame.payloads[0];
+        assert_eq!(p.sub_frame, 0);
+        assert_eq!(p.prog, 0);
+        assert_eq!(p.lay, 0);
+        assert_eq!(p.stream_id, 0);
+        assert_eq!(p.data, payload.to_vec());
+    }
+
+    #[test]
+    fn audio_mux_element_escape_length() {
+        // MuxSlotLengthBytes with one 0xFF escape: 255 + 3 = 258 bytes.
+        let len = 258usize;
+        let payload: Vec<u8> = (0..len).map(|i| (i & 0xFF) as u8).collect();
+        let mut w = BitWriter::new();
+        w.write_bit(false); // useSameStreamMux
+        write_min_smc_into(&mut w);
+        w.write_u32(255, 8); // escape
+        w.write_u32(3, 8); // + 3 = 258
+        for &b in &payload {
+            w.write_byte(b);
+        }
+        let bytes = w.finish();
+
+        let mut r = BitReader::new(&bytes);
+        let ame = AudioMuxElement::parse(&mut r, &bytes, true, None).unwrap();
+        assert_eq!(ame.payloads.len(), 1);
+        assert_eq!(ame.payloads[0].data, payload);
+    }
+
+    #[test]
+    fn audio_mux_element_use_same_stream_mux_inherits() {
+        // First element carries the config; second sets
+        // useSameStreamMux and inherits it.
+        let mut w0 = BitWriter::new();
+        w0.write_bit(false); // useSameStreamMux = 0
+        write_min_smc_into(&mut w0);
+        w0.write_u32(2, 8); // 2-byte payload
+        w0.write_byte(0x11);
+        w0.write_byte(0x22);
+        let bytes0 = w0.finish();
+        let mut r0 = BitReader::new(&bytes0);
+        let first = AudioMuxElement::parse(&mut r0, &bytes0, true, None).unwrap();
+
+        let mut w1 = BitWriter::new();
+        w1.write_bit(true); // useSameStreamMux = 1
+        w1.write_u32(3, 8); // 3-byte payload
+        w1.write_byte(0xAA);
+        w1.write_byte(0xBB);
+        w1.write_byte(0xCC);
+        let bytes1 = w1.finish();
+        let mut r1 = BitReader::new(&bytes1);
+        let second = AudioMuxElement::parse(&mut r1, &bytes1, true, Some(&first.config)).unwrap();
+        assert!(second.use_same_stream_mux);
+        assert_eq!(second.payloads.len(), 1);
+        assert_eq!(second.payloads[0].data, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn audio_mux_element_use_same_without_prev_rejected() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // useSameStreamMux = 1, but no prev config
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        assert!(matches!(
+            AudioMuxElement::parse(&mut r, &bytes, true, None),
+            Err(Error::LatmNoPreviousMuxConfig)
+        ));
+    }
+
+    #[test]
+    fn audio_mux_element_multiple_subframes() {
+        // numSubFrames = 1 -> two PayloadMux frames, each a separate
+        // PayloadLengthInfo + payload.
+        let mut w = BitWriter::new();
+        w.write_bit(false); // useSameStreamMux
+                            // StreamMuxConfig with numSubFrames = 1.
+        w.write_bit(false); // audioMuxVersion = 0
+        w.write_bit(true); // allStreamsSameTimeFraming
+        w.write_u32(1, 6); // numSubFrames = 1
+        w.write_u32(0, 4); // numProgram = 0
+        w.write_u32(0, 3); // numLayer = 0
+        write_aac_lc_asc(&mut w);
+        w.write_u32(0, 3); // frameLengthType = 0
+        w.write_u32(0xFF, 8); // latmBufferFullness
+        w.write_bit(false); // otherDataPresent
+        w.write_bit(false); // crcCheckPresent
+                            // subframe 0: 2 bytes.
+        w.write_u32(2, 8);
+        w.write_byte(0x01);
+        w.write_byte(0x02);
+        // subframe 1: 1 byte.
+        w.write_u32(1, 8);
+        w.write_byte(0x03);
+        let bytes = w.finish();
+
+        let mut r = BitReader::new(&bytes);
+        let ame = AudioMuxElement::parse(&mut r, &bytes, true, None).unwrap();
+        assert_eq!(ame.payloads.len(), 2);
+        assert_eq!(ame.payloads[0].sub_frame, 0);
+        assert_eq!(ame.payloads[0].data, vec![0x01, 0x02]);
+        assert_eq!(ame.payloads[1].sub_frame, 1);
+        assert_eq!(ame.payloads[1].data, vec![0x03]);
     }
 }
