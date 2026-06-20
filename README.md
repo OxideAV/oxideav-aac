@@ -243,6 +243,59 @@ wired; those stages key off the band tables and scalefactors above.
     0` path consumes the §4.6.18.6 patch borders that need the QMF
     patching back-end.
 
+### LATM / LOAS transport framing
+
+The §1.7 low-overhead transport layer is now decoded from the LOAS
+sync frame down to the recovered MPEG-4 Audio access units — every
+field sourced from the ISO/IEC 14496-3 §1.7 syntax tables.
+
+- **`StreamMuxConfig()`** (`latm::StreamMuxConfig`) — §1.7.3.1
+  Table 1.42 plus `LatmGetValue()` (Table 1.43). Decodes the whole
+  multiplex configuration: the `audioMuxVersion` / `audioMuxVersionA`
+  version flags (with the `audioMuxVersion == 1` `taraBufferFullness`
+  and per-ASC length-prefix + `fillBits` extensions),
+  `allStreamsSameTimeFraming`, `numSubFrames` / `numProgram` /
+  per-program `numLayer`, and the per-`streamID[prog][lay]`
+  `LayerConfig` table — each layer carrying its inline
+  `AudioSpecificConfig()` (parsed via the `asc` module's
+  `parse_bits` / `parse_bits_bounded` entry points) or the resolved
+  `useSameConfig` inheritance, the `frameLengthType`, and the type-0
+  `latmBufferFullness` / CELP-core `coreFrameOffset` or type-1
+  `frameLength`. The `crcCheckSum` is recomputed against the
+  configuration prefix via the §1.8.4.5 `CRC8` generator and
+  validated. The reserved `audioMuxVersionA == 1` branch and the
+  CELP (`3`/`4`/`5`) / HVXC (`6`/`7`) `frameLengthType` values index
+  frame-length tables for object types this AAC-focused crate does not
+  decode, so they surface dedicated errors.
+- **`AudioMuxElement()`** (`latm::AudioMuxElement`) — §1.7.3.1
+  Tables 1.41 / 1.44 / 1.45. Recovers a whole multiplexed element: the
+  `muxConfigPresent` `useSameStreamMux` branch (inline
+  `StreamMuxConfig()` vs. inherited previous config), the per-subframe
+  `PayloadLengthInfo()` + `PayloadMux()` loop over `numSubFrames + 1`
+  frames (both the `allStreamsSameTimeFraming` program/layer walk and
+  the `numChunk` chunk layout with its `streamIndx` + `AuEndFlag`), the
+  `frameLengthType`-0 `MuxSlotLengthBytes` 8-bit-escape byte count and
+  the `frameLengthType`-1 fixed `(frameLength + 20) * 8` bits, the
+  `otherData` skip, and the trailing `ByteAlign()`. Each access unit is
+  returned as a `MuxPayload` carrying the raw §4.4.2.1
+  `raw_data_block()` bytes.
+- **`AudioSyncStream()` / `EPAudioSyncStream()`**
+  (`latm::AudioSyncStream`, `latm::EpAudioSyncHeader`) — §1.7.2.1
+  Tables 1.36 / 1.37. `AudioSyncStream` scans a LOAS byte buffer for
+  the 11-bit `0x2B7` syncword, reads the 13-bit `audioMuxLengthBytes`,
+  and decodes the byte-aligned `AudioMuxElement(1)` body, exposing an
+  `Iterator` of `LoasFrame`s with the `StreamMuxConfig` threaded across
+  frames for `useSameStreamMux` inheritance. `EpAudioSyncHeader`
+  decodes the `EPAudioSyncStream` FEC header (`0x4DE1` syncword,
+  `futureUse`, `audioMuxLengthBytes`, `frameCounter`, `headerParity`)
+  and reports the byte-aligned `EPMuxElement` body offset.
+
+The recovered `MuxPayload` raw-data-block bytes are not yet dispatched
+into the `StreamDecoder` from a runtime `Decoder` LOAS entry point;
+that wiring (auto-detecting an ADTS vs. LOAS carrier and routing AAC
+layers through the existing per-element state) is the remaining step.
+The `EPMuxElement()` EP-tool payload de-interleave is out of scope.
+
 ### Stream decode + PCM output
 
 - **Integer-PCM rendering** (`pcm`) — §4.6.11 filterbank `f64` time
@@ -322,12 +375,18 @@ wired; those stages key off the band tables and scalefactors above.
   tested (see the error-resilience section above); what remains is
   plumbing the resilience flag from `GASpecificConfig` through
   `ics_body` so the channel-element body selects the RVLC branch.
-- LATM/LOAS transport framing (§1.7.3) — the `StreamMuxConfig()`
-  `crcCheckSum` generator polynomial (`CRC8`) is now available in the
-  `crc` module (§1.8.4.5), but the `AudioMuxElement()` /
-  `StreamMuxConfig()` bitstream walkers that feed it are not yet
-  wired. ADTS `adts_error_check()` CRC validation is likewise still
-  open: its region selection (192/128-bit element protection with the
+- LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
+  `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
+  `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`
+  bitstream walkers are now implemented and tested (see the
+  LATM / LOAS transport section above), with the `crcCheckSum`
+  recomputed against the §1.8.4.5 `CRC8` generator in the `crc`
+  module. What remains is the runtime `Decoder` LOAS entry point that
+  routes the recovered `MuxPayload` raw-data-blocks into the existing
+  `StreamDecoder` (auto-detecting an ADTS vs. LOAS carrier), and the
+  `EPMuxElement()` EP-tool payload de-interleave. ADTS
+  `adts_error_check()` CRC validation is likewise still open: its
+  region selection (192/128-bit element protection with the
   double-protection edge cases) plus its ISO/IEC 11172-3 §2.4.3.1 CRC
   reference are out of scope for the §1.8.4.5 `crc` module.
 

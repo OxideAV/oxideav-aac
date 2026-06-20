@@ -26,6 +26,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `Error::LatmCrcMismatch`. The reserved `audioMuxVersionA == 1` branch
   and the CELP/HVXC `frameLengthType` values (`2`..`7`) are rejected
   with dedicated errors.
+- LATM `AudioMuxElement()` / `PayloadLengthInfo()` / `PayloadMux()`
+  decode (`latm` module) — ISO/IEC 14496-3 §1.7.3.1 Tables 1.41 / 1.44
+  / 1.45. `AudioMuxElement::parse` recovers a whole multiplexed
+  element: the `muxConfigPresent` `useSameStreamMux` branch (inline
+  `StreamMuxConfig()` vs. inherited previous config), the per-subframe
+  `PayloadLengthInfo()` + `PayloadMux()` loop over `numSubFrames + 1`
+  frames (both the `allStreamsSameTimeFraming` program/layer walk and
+  the `numChunk` chunk layout with its `streamIndx` + `AuEndFlag`), the
+  `frameLengthType`-0 `MuxSlotLengthBytes` 8-bit-escape byte count and
+  the `frameLengthType`-1 fixed `(frameLength + 20) * 8` bits, the
+  `otherData` skip, and the trailing `ByteAlign()`. Each recovered
+  access unit is returned as a `MuxPayload` carrying the raw bytes for
+  the §4.4.2.1 `raw_data_block()` layer.
+- LOAS `AudioSyncStream()` / `EPAudioSyncStream()` framing (`latm`
+  module) — ISO/IEC 14496-3 §1.7.2.1 Tables 1.36 / 1.37.
+  `AudioSyncStream` scans a LOAS byte buffer for the 11-bit `0x2B7`
+  syncword, reads the 13-bit `audioMuxLengthBytes`, and decodes the
+  byte-aligned `AudioMuxElement(1)` body, exposing an `Iterator` of
+  `LoasFrame`s with the `StreamMuxConfig` threaded across frames for
+  `useSameStreamMux` inheritance. A body length overrunning the buffer
+  is rejected with `Error::LoasSyncInvalid`. `EpAudioSyncHeader::parse`
+  decodes the `EPAudioSyncStream` FEC header (`0x4DE1` syncword,
+  `futureUse`, `audioMuxLengthBytes`, `frameCounter`, `headerParity`)
+  and reports the byte-aligned `EPMuxElement` body offset; the EP-tool
+  payload de-interleave is out of scope.
 - SBR element framing (`sbr_element` module) — ISO/IEC 14496-3
   §4.4.2.8 Tables 4.65 / 4.66 / 4.74. `SbrElement::parse_single` and
   `SbrElement::parse_pair` decode a whole SBR data element in spec
