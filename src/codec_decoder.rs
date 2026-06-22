@@ -72,6 +72,7 @@ use oxideav_core::{
 
 use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
 use crate::decode::{DecodedFrame, StreamDecoder, FRAME_LEN};
+use crate::latm::{LoasDecoder, AUDIO_SYNC_STREAM_SYNCWORD};
 
 /// Codec id under which [`register_codecs`] installs this decoder.
 pub const CODEC_ID_STR: &str = "aac";
@@ -127,14 +128,32 @@ pub struct AacDecoder {
     codec_id: CodecId,
     output: CodecParameters,
     stream: StreamDecoder,
+    loas: LoasDecoder,
+    /// The transport syntax detected from the first non-empty packet:
+    /// raw ADTS (`0xFFF` syncword) or LOAS `AudioSyncStream` (`0x2B7`
+    /// syncword). `None` until the first packet picks one; once set, every
+    /// later packet is routed the same way.
+    transport: Option<Transport>,
     pending: VecDeque<AudioFrame>,
     eof: bool,
+}
+
+/// The carrier syntax an [`AacDecoder`] auto-detects on its first packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// Raw ADTS frames (`0xFFF` 12-bit syncword), routed through
+    /// [`StreamDecoder::decode_frame`].
+    Adts,
+    /// LOAS `AudioSyncStream` (`0x2B7` 11-bit syncword), routed through
+    /// [`LoasDecoder::decode_all`].
+    Loas,
 }
 
 impl std::fmt::Debug for AacDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AacDecoder")
             .field("codec_id", &self.codec_id)
+            .field("transport", &self.transport)
             .field("pending", &self.pending.len())
             .field("eof", &self.eof)
             .finish()
@@ -147,6 +166,8 @@ impl AacDecoder {
             codec_id,
             output,
             stream: StreamDecoder::new(),
+            loas: LoasDecoder::new(),
+            transport: None,
             pending: VecDeque::new(),
             eof: false,
         }
@@ -180,19 +201,23 @@ impl AacDecoder {
             data: vec![bytes],
         }
     }
-}
 
-impl Decoder for AacDecoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
+    /// Queue a decoded frame's PCM and refresh the advertised output
+    /// params; a fill-only frame (`channels == 0`) produces no audio.
+    fn queue_decoded(&mut self, decoded: &DecodedFrame, pts: Option<i64>) -> bool {
+        if decoded.channels > 0 {
+            self.output.sample_rate = Some(decoded.sample_rate);
+            self.output.channels = Some(decoded.channels as u16);
+            self.pending.push_back(Self::decoded_to_audio(decoded, pts));
+            true
+        } else {
+            false
+        }
     }
 
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.eof {
-            return Err(Error::other("oxideav-aac: cannot send_packet after flush"));
-        }
-
-        let data = skip_id3v2(&packet.data);
+    /// Route an ADTS-framed packet (`data` already ID3-stripped) through
+    /// the [`StreamDecoder`], queuing one [`AudioFrame`] per ADTS frame.
+    fn send_adts(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
         let mut pos = 0usize;
         let mut produced_any = false;
         while pos + ADTS_HEADER_BYTES_NO_CRC <= data.len() {
@@ -209,17 +234,7 @@ impl Decoder for AacDecoder {
                 .stream
                 .decode_frame(&header, body)
                 .map_err(|e| Error::other(format!("oxideav-aac: decode_frame: {e}")))?;
-
-            // A channel-bearing frame updates the advertised output
-            // parameters from the wire and queues PCM; a fill-only frame
-            // (no channel element) produces no audio and is dropped.
-            if decoded.channels > 0 {
-                self.output.sample_rate = Some(decoded.sample_rate);
-                self.output.channels = Some(decoded.channels as u16);
-                self.pending
-                    .push_back(Self::decoded_to_audio(&decoded, packet.pts));
-                produced_any = true;
-            }
+            produced_any |= self.queue_decoded(&decoded, pts);
             pos += frame_len;
         }
 
@@ -229,6 +244,62 @@ impl Decoder for AacDecoder {
             ));
         }
         Ok(())
+    }
+
+    /// Route a LOAS `AudioSyncStream` packet (`data` already ID3-stripped)
+    /// through the [`LoasDecoder`], queuing one [`AudioFrame`] per
+    /// recovered access unit. A packet may carry one or several LOAS sync
+    /// frames; the persistent [`LoasDecoder`] threads the
+    /// `StreamMuxConfig` (and per-stream decode state) across packets.
+    fn send_loas(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
+        let decoded_frames = self
+            .loas
+            .decode_all(data)
+            .map_err(|e| Error::other(format!("oxideav-aac: loas decode: {e}")))?;
+        let mut produced_any = false;
+        for decoded in &decoded_frames {
+            produced_any |= self.queue_decoded(decoded, pts);
+        }
+        if !produced_any && decoded_frames.is_empty() {
+            return Err(Error::other(
+                "oxideav-aac: packet held no complete LOAS sync frame",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Decoder for AacDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.eof {
+            return Err(Error::other("oxideav-aac: cannot send_packet after flush"));
+        }
+
+        let data = skip_id3v2(&packet.data);
+
+        // Pick the carrier from the first non-empty packet, then route
+        // every later packet the same way.
+        let transport = match self.transport {
+            Some(t) => t,
+            None => {
+                let Some(t) = detect_transport(data) else {
+                    return Err(Error::other(
+                        "oxideav-aac: packet has neither an ADTS nor a LOAS syncword",
+                    ));
+                };
+                self.transport = Some(t);
+                t
+            }
+        };
+
+        match transport {
+            Transport::Adts => self.send_adts(data, packet.pts),
+            Transport::Loas => self.send_loas(data, packet.pts),
+        }
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -247,13 +318,41 @@ impl Decoder for AacDecoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        // Drop every per-element overlap / LTP / predictor slot so the
-        // next send_packet decodes from a clean state.
+        // Drop every per-element overlap / LTP / predictor slot (for both
+        // carriers) so the next send_packet decodes from a clean state,
+        // and re-arm transport auto-detection.
         self.stream = StreamDecoder::new();
+        self.loas = LoasDecoder::new();
+        self.transport = None;
         self.pending.clear();
         self.eof = false;
         Ok(())
     }
+}
+
+/// Detect the AAC carrier syntax from the first bytes of a packet
+/// (already ID3v2-stripped).
+///
+/// * ADTS — 12-bit `0xFFF` syncword: `byte0 == 0xFF` and the top four
+///   bits of `byte1` are set.
+/// * LOAS `AudioSyncStream` — 11-bit `0x2B7` syncword: the first 11 bits
+///   equal `0x2B7` (`byte0 == 0x56`, top three bits of `byte1` set).
+///
+/// Returns `None` when neither syncword matches.
+fn detect_transport(data: &[u8]) -> Option<Transport> {
+    if data.len() < 2 {
+        return None;
+    }
+    if data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
+        return Some(Transport::Adts);
+    }
+    // 0x2B7 = 0b010_1011_0111: byte0 = 0b0101_0110 = 0x56, byte1 top 3 =
+    // 0b111. Confirm via the 11-bit syncword constant.
+    let first11 = (u32::from(data[0]) << 3) | (u32::from(data[1]) >> 5);
+    if first11 == AUDIO_SYNC_STREAM_SYNCWORD {
+        return Some(Transport::Loas);
+    }
+    None
 }
 
 /// Skip a leading ID3v2 tag (`"ID3"` + 6-byte header + syncsafe size +
@@ -293,14 +392,21 @@ fn probe_aac(ctx: &ProbeContext) -> Confidence {
     if pkt.len() < 2 {
         return 0.2;
     }
-    // 12-bit syncword 0xFFF: byte 0 == 0xFF and the top 4 bits of byte 1
-    // are 1. `AdtsHeader::parse` confirms the rest of the fixed header is
-    // structurally valid before we commit to the definitive score.
+    // 12-bit ADTS syncword 0xFFF: byte 0 == 0xFF and the top 4 bits of
+    // byte 1 are 1. `AdtsHeader::parse` confirms the rest of the fixed
+    // header is structurally valid before we commit to the definitive
+    // score.
     if pkt[0] == 0xFF && (pkt[1] & 0xF0) == 0xF0 && AdtsHeader::parse(pkt).is_ok() {
-        1.0
-    } else {
-        0.2
+        return 1.0;
     }
+    // 11-bit LOAS AudioSyncStream syncword 0x2B7. A bare syncword match
+    // is a strong-but-not-definitive AAC signal (the AudioMuxElement
+    // body is validated on the first decode), so score it just below the
+    // structurally-confirmed ADTS hit.
+    if detect_transport(pkt) == Some(Transport::Loas) {
+        return 0.9;
+    }
+    0.2
 }
 
 /// Install the AAC decoder factory into `reg`.
@@ -392,6 +498,95 @@ mod tests {
             pos += fl;
         }
         packets
+    }
+
+    /// Read a fixture's whole `input.<ext>` byte buffer, or `None` when
+    /// the workspace `docs/` tree is absent.
+    fn fixture_bytes_ext(name: &str, ext: &str) -> Option<Vec<u8>> {
+        let path = format!(
+            "{}/../../docs/audio/aac/fixtures/{name}/input.{ext}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("skip: staged fixture not present at {path}");
+            return None;
+        }
+        Some(std::fs::read(&path).expect("read staged fixture"))
+    }
+
+    #[test]
+    fn detect_transport_recognises_adts_and_loas() {
+        // ADTS: 0xFFF syncword.
+        assert_eq!(detect_transport(&[0xFF, 0xF1, 0x00]), Some(Transport::Adts));
+        // LOAS AudioSyncStream: 0x2B7 in the first 11 bits → 0x56, top 3
+        // bits of byte 1 set.
+        assert_eq!(detect_transport(&[0x56, 0xE0, 0x00]), Some(Transport::Loas));
+        // Neither.
+        assert_eq!(detect_transport(&[0x00, 0x00]), None);
+        assert_eq!(detect_transport(&[0xFF]), None);
+    }
+
+    #[test]
+    fn loas_packet_decodes_through_trait() {
+        let Some(buf) = fixture_bytes_ext("aac-latm-stream", "latm") else {
+            return;
+        };
+        // Feed the whole LOAS buffer as one packet (a demuxer that hands
+        // the elementary stream in bulk).
+        let mut pkt = Packet::new(0, TimeBase::new(1, 44_100), buf.clone());
+        pkt.pts = Some(0);
+
+        let mut dec = make_decoder(&build_params(44_100, 2)).expect("decoder");
+        dec.send_packet(&pkt).expect("send_packet (loas)");
+
+        let mut frames = 0usize;
+        let mut samples_total = 0usize;
+        while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+            assert_eq!(a.samples as usize, FRAME_LEN);
+            // interleaved stereo → FRAME_LEN * 2 channels * 2 bytes.
+            assert_eq!(a.data[0].len(), FRAME_LEN * 2 * 2);
+            frames += 1;
+            samples_total += a.data[0].len() / 2;
+        }
+        assert!(frames > 0, "LOAS packet produced no frames");
+        // 32 access units × 1024 × 2 channels.
+        assert_eq!(samples_total, 65_536);
+    }
+
+    #[test]
+    fn loas_trait_matches_loas_decoder_pcm() {
+        let Some(buf) = fixture_bytes_ext("aac-latm-stream", "latm") else {
+            return;
+        };
+        // Reference: bare LoasDecoder.
+        let mut reference = LoasDecoder::new();
+        let ref_frames = reference.decode_all(&buf).expect("LoasDecoder");
+        let mut ref_pcm: Vec<i16> = Vec::new();
+        for f in &ref_frames {
+            ref_pcm.extend_from_slice(&f.pcm);
+        }
+
+        // Trait path: one bulk packet.
+        let mut pkt = Packet::new(0, TimeBase::new(1, 44_100), buf);
+        pkt.pts = Some(0);
+        let mut dec = make_decoder(&build_params(44_100, 2)).expect("decoder");
+        dec.send_packet(&pkt).expect("send_packet");
+        let mut trait_pcm: Vec<i16> = Vec::new();
+        while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+            for c in a.data[0].chunks_exact(2) {
+                trait_pcm.push(i16::from_le_bytes([c[0], c[1]]));
+            }
+        }
+        assert_eq!(trait_pcm, ref_pcm, "LOAS trait diverged from LoasDecoder");
+    }
+
+    #[test]
+    fn probe_scores_loas_sync() {
+        // 0x2B7 syncword (0x56, top 3 bits of next byte set).
+        let pkt = [0x56u8, 0xE0, 0x00, 0x00];
+        let tag = CodecTag::mp4_object_type(MP4_OBJECT_TYPE_AAC);
+        let ctx = ProbeContext::new(&tag).packet(&pkt);
+        assert!((probe_aac(&ctx) - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]

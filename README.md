@@ -304,10 +304,10 @@ field sourced from the ISO/IEC 14496-3 §1.7 syntax tables.
   ratio of 0.0004, and proven bit-identical to a hand-fed
   `decode_raw_data_block` pass.
 
-The runtime `Decoder` LOAS entry point (auto-detecting an ADTS vs. LOAS
-carrier in `codec_decoder`) is the remaining wiring step on top of
-`LoasDecoder`. The `EPMuxElement()` EP-tool payload de-interleave is out
-of scope.
+The runtime `Decoder` (`codec_decoder::AacDecoder`) auto-detects its
+carrier on the first packet and routes LOAS packets through `LoasDecoder`
+(see "Runtime `Decoder` registration" below). The `EPMuxElement()`
+EP-tool payload de-interleave is out of scope.
 
 ### Stream decode + PCM output
 
@@ -336,19 +336,25 @@ of scope.
   noise-phase RNG (energy is normative, phase is not). CCE, multi-`raw_
   data_block` ADTS, and SBR up-sampling remain out of scope.
 - **Runtime `Decoder` registration** (`codec_decoder`) — `AacDecoder`
-  adapts the persistent `StreamDecoder` into the framework's
-  packet-in / frame-out `oxideav_core::Decoder` trait. `send_packet`
-  decodes every ADTS frame in a packet (ID3v2-skip + `aac_frame_length`
-  framing; one or many frames per packet) against the across-packets
-  element state, `receive_frame` returns one interleaved-S16
-  `AudioFrame` (1024 samples/channel) per decoded frame, `flush` drains
-  to `Eof`, and `reset` drops the whole `StreamDecoder` (and its
-  §4.6.11 overlap / §4.6.7 LTP / §4.6.6 predictor memory) for a clean
-  post-seek restart. `register()` installs it under id `"aac"`, claiming
-  the MP4 object-type `0x40`, WAVEFORMATEX `0x00FF` / `0x1601`, the
-  `mp4a` / `aac ` FourCCs, and the Matroska `A_AAC` CodecID, with an
-  ADTS-syncword probe to win shared tags. The trait output is pinned
-  byte-identical to the underlying `StreamDecoder`.
+  adapts the persistent `StreamDecoder` / `LoasDecoder` into the
+  framework's packet-in / frame-out `oxideav_core::Decoder` trait. It
+  **auto-detects the carrier** on the first packet — the `0xFFF` ADTS
+  syncword vs. the `0x2B7` LOAS `AudioSyncStream` syncword — and then
+  routes every later packet the same way: ADTS frames through
+  `StreamDecoder::decode_frame` (ID3v2-skip + `aac_frame_length`
+  framing; one or many frames per packet), LOAS packets through
+  `LoasDecoder::decode_all` (one or many sync frames per packet, with
+  the `StreamMuxConfig` and per-stream state threaded across packets).
+  `receive_frame` returns one interleaved-S16 `AudioFrame` (1024
+  samples/channel) per decoded access unit, `flush` drains to `Eof`,
+  and `reset` drops both backends and re-arms carrier detection for a
+  clean post-seek restart. `register()` installs it under id `"aac"`,
+  claiming the MP4 object-type `0x40`, WAVEFORMATEX `0x00FF` / `0x1601`,
+  the `mp4a` / `aac ` FourCCs, and the Matroska `A_AAC` CodecID; the
+  probe scores a structurally-confirmed ADTS header at 1.0 and a bare
+  LOAS syncword at 0.9 to win shared tags. Both carrier outputs are
+  pinned byte-identical to their underlying `StreamDecoder` /
+  `LoasDecoder`.
 
 ## Not yet supported
 
@@ -394,10 +400,11 @@ of scope.
   bitstream walkers are now implemented and tested (see the
   LATM / LOAS transport section above), with the `crcCheckSum`
   recomputed against the §1.8.4.5 `CRC8` generator in the `crc`
-  module. What remains is the runtime `Decoder` LOAS entry point that
-  routes the recovered `MuxPayload` raw-data-blocks into the existing
-  `StreamDecoder` (auto-detecting an ADTS vs. LOAS carrier), and the
-  `EPMuxElement()` EP-tool payload de-interleave. ADTS
+  module. The runtime `Decoder` LOAS entry point that routes the
+  recovered `MuxPayload` raw-data-blocks into a `StreamDecoder` is now
+  wired (`latm::LoasDecoder` + the `codec_decoder` carrier
+  auto-detection above). What remains is the `EPMuxElement()` EP-tool
+  payload de-interleave. ADTS
   `adts_error_check()` CRC validation is likewise still open: its
   region selection (192/128-bit element protection with the
   double-protection edge cases) plus its ISO/IEC 11172-3 §2.4.3.1 CRC

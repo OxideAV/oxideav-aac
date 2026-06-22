@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Runtime `Decoder` LOAS routing** (`codec_decoder`) — the registered
+  `AacDecoder` now auto-detects its carrier on the first packet (the
+  `0xFFF` ADTS syncword vs. the `0x2B7` LOAS `AudioSyncStream`
+  syncword) and routes ADTS frames through `StreamDecoder` and LOAS
+  packets through the new `LoasDecoder`, threading per-carrier decode
+  state across packets. `reset()` re-arms detection; the probe scores a
+  bare LOAS syncword at 0.9 (just below a structurally-confirmed ADTS
+  hit). A container that hands AAC as a LOAS elementary stream now
+  decodes to PCM through the framework trait surface, validated
+  bit-identical to the bare `LoasDecoder`.
 - **LATM/LOAS → PCM decode driver** (`latm::LoasDecoder`) — ISO/IEC
   14496-3 §1.7.2 / §1.7.3. `LoasDecoder::decode_all` walks a LOAS
   `AudioSyncStream()` byte buffer via the existing
