@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **LATM/LOAS → PCM decode driver** (`latm::LoasDecoder`) — ISO/IEC
+  14496-3 §1.7.2 / §1.7.3. `LoasDecoder::decode_all` walks a LOAS
+  `AudioSyncStream()` byte buffer via the existing
+  [`latm::AudioSyncStream`] sync walker, recovers every
+  `AudioMuxElement` access unit (`MuxPayload`), and drives each
+  payload's §4.4.2.1 `raw_data_block()` through the shared
+  `decode::StreamDecoder` core, configuring the decode from the layer's
+  `AudioSpecificConfig` (`audioObjectType`, `samplingFrequencyIndex`,
+  resolved `sampleRate`). One `StreamDecoder` is held per
+  `streamID[prog][lay]` so each multiplexed stream's filterbank
+  overlap-add tail / LTP history / predictor state thread
+  independently. SBR/PS-configured ASCs are rejected with
+  `Error::LatmSbrUnsupported` (no SBR back-end). Validated end to end
+  against the `aac-latm-stream` fixture (32 frames, stereo, 44.1 kHz):
+  the reconstructed PCM matches the reference WAV to a §8 RMS-error
+  ratio of 0.0004 (the only divergence the §4.6.13.3 PNS phase of the
+  one NOISE band), and is bit-identical to a hand-fed
+  `StreamDecoder::decode_raw_data_block` pass.
+- **Transport-independent decode core** (`decode::StreamDecoder::
+  decode_raw_data_block`) — the §4.4.2.1 `raw_data_block()` →
+  interleaved-PCM walk, factored out of `decode_frame` so it can be
+  driven by an explicit `(aot, fs_index, sample_rate,
+  num_raw_data_blocks)` configuration. The ADTS path (`decode_frame`)
+  now delegates to it; the new LATM driver shares the exact same
+  per-element reconstruction chain.
 - LATM `StreamMuxConfig()` decode (`latm` module) — ISO/IEC 14496-3
   §1.7.3.1 Table 1.42 plus `LatmGetValue()` (Table 1.43).
   `StreamMuxConfig::parse` decodes the whole multiplex configuration:

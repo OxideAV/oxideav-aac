@@ -871,6 +871,99 @@ fn read_back_bits(data: &[u8], from_bit: u64, to_bit: u64) -> Result<Vec<bool>> 
     Ok(out)
 }
 
+// ---- LOAS → PCM decode driver ----------------------------------------
+
+use std::collections::HashMap;
+
+use crate::decode::{DecodedFrame, StreamDecoder};
+
+/// Whole-stream LATM/LOAS → PCM decoder.
+///
+/// Walks a LOAS `AudioSyncStream()` byte buffer ([`AudioSyncStream`]),
+/// and for every recovered access unit ([`MuxPayload`]) drives the
+/// payload's §4.4.2.1 `raw_data_block()` through the
+/// [`crate::decode::StreamDecoder`] core
+/// ([`StreamDecoder::decode_raw_data_block`]) using the configuration the
+/// LATM `StreamMuxConfig` carried in the layer's
+/// [`AudioSpecificConfig`].
+///
+/// The LATM multiplex can carry several streams (`streamID[prog][lay]`);
+/// each is given its own [`StreamDecoder`] so the per-stream filterbank
+/// overlap-add tail, LTP history, and predictor state thread across the
+/// frames of that stream independently. For the common single-program /
+/// single-layer AAC case there is exactly one stream.
+///
+/// ## Scope
+///
+/// Targets the core (AAC-LC / Main / LTP) tool chain the
+/// [`StreamDecoder`] covers. An `AudioSpecificConfig` that signals SBR or
+/// PS is rejected with [`Error::LatmSbrUnsupported`] (no SBR back-end
+/// yet). The `audioObjectType` carried by the ASC must be a General Audio
+/// type whose `raw_data_block()` the core driver understands; otherwise
+/// the underlying decode surfaces its own element-level error.
+#[derive(Debug, Default)]
+pub struct LoasDecoder {
+    /// One [`StreamDecoder`] per `streamID`, so each multiplexed stream's
+    /// inter-frame state stays independent.
+    streams: HashMap<u8, StreamDecoder>,
+}
+
+impl LoasDecoder {
+    /// A fresh LOAS decoder with no per-stream state.
+    #[must_use]
+    pub fn new() -> Self {
+        LoasDecoder {
+            streams: HashMap::new(),
+        }
+    }
+
+    /// Decode a whole LOAS `AudioSyncStream()` byte buffer to a vector of
+    /// per-access-unit interleaved PCM frames, in transmission order.
+    ///
+    /// Each [`LoasFrame`]'s `AudioMuxElement` may carry several
+    /// subframes / payloads; every payload is decoded and pushed in the
+    /// order [`AudioMuxElement::payloads`] presents them. A frame that
+    /// yields no channel element (fill-only) still contributes its
+    /// (empty) [`DecodedFrame`].
+    pub fn decode_all(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
+        let mut out = Vec::new();
+        let mut walker = AudioSyncStream::new(data);
+        while let Some(frame) = walker.next_frame()? {
+            for payload in &frame.element.payloads {
+                let decoded = self.decode_payload(&frame.element.config, payload)?;
+                out.push(decoded);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode one recovered [`MuxPayload`] to PCM, routing it to the
+    /// per-`streamID` [`StreamDecoder`] and configuring the decode from
+    /// the payload's layer [`AudioSpecificConfig`].
+    pub fn decode_payload(
+        &mut self,
+        config: &StreamMuxConfig,
+        payload: &MuxPayload,
+    ) -> Result<DecodedFrame> {
+        let layer = config
+            .layer(payload.stream_id)
+            .ok_or(Error::LatmConfigOutOfRange)?;
+        let asc = &layer.effective_asc;
+        if asc.sbr_present || asc.ps_present {
+            return Err(Error::LatmSbrUnsupported);
+        }
+        let dec = self.streams.entry(payload.stream_id).or_default();
+        // LATM carries exactly one raw_data_block() per payload.
+        dec.decode_raw_data_block(
+            asc.aot,
+            asc.sampling_frequency_index,
+            asc.sample_rate,
+            1,
+            &payload.data,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

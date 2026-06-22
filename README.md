@@ -290,11 +290,24 @@ field sourced from the ISO/IEC 14496-3 §1.7 syntax tables.
   `futureUse`, `audioMuxLengthBytes`, `frameCounter`, `headerParity`)
   and reports the byte-aligned `EPMuxElement` body offset.
 
-The recovered `MuxPayload` raw-data-block bytes are not yet dispatched
-into the `StreamDecoder` from a runtime `Decoder` LOAS entry point;
-that wiring (auto-detecting an ADTS vs. LOAS carrier and routing AAC
-layers through the existing per-element state) is the remaining step.
-The `EPMuxElement()` EP-tool payload de-interleave is out of scope.
+- **`LoasDecoder`** (`latm::LoasDecoder`) — the end-to-end LATM/LOAS →
+  PCM driver. `decode_all` walks the `AudioSyncStream`, and for every
+  recovered `MuxPayload` drives the payload's §4.4.2.1 `raw_data_block()`
+  through the shared `decode::StreamDecoder::decode_raw_data_block` core,
+  configuring the decode from the layer's `AudioSpecificConfig` (AOT /
+  `samplingFrequencyIndex` / resolved sample rate). One `StreamDecoder`
+  is held per `streamID[prog][lay]` so each multiplexed stream's
+  §4.6.11 overlap / §4.6.7 LTP / §4.6.6 predictor state threads
+  independently. An SBR/PS-configured ASC is rejected with
+  `Error::LatmSbrUnsupported` (no SBR back-end). Pinned against the
+  `aac-latm-stream` fixture (stereo, 44.1 kHz) to a §8 PCM-RMS error
+  ratio of 0.0004, and proven bit-identical to a hand-fed
+  `decode_raw_data_block` pass.
+
+The runtime `Decoder` LOAS entry point (auto-detecting an ADTS vs. LOAS
+carrier in `codec_decoder`) is the remaining wiring step on top of
+`LoasDecoder`. The `EPMuxElement()` EP-tool payload de-interleave is out
+of scope.
 
 ### Stream decode + PCM output
 

@@ -95,22 +95,52 @@ impl StreamDecoder {
     /// A frame that yields no channel element (e.g. fill-only) returns a
     /// [`DecodedFrame`] with `channels == 0` and an empty `pcm`.
     pub fn decode_frame(&mut self, header: &AdtsHeader, payload: &[u8]) -> Result<DecodedFrame> {
-        let aot = header.audio_object_type();
-        let fs = header.sampling_frequency_index;
+        self.decode_raw_data_block(
+            header.audio_object_type(),
+            header.sampling_frequency_index,
+            header.sample_rate(),
+            header.number_of_raw_data_blocks_in_frame,
+            payload,
+        )
+    }
+
+    /// Decode one `raw_data_block()` payload to interleaved 16-bit PCM,
+    /// driven by an explicit `(audioObjectType, samplingFrequencyIndex,
+    /// sampleRate)` configuration rather than an ADTS header.
+    ///
+    /// This is the transport-independent core that [`Self::decode_frame`]
+    /// (ADTS) and the LATM/LOAS driver
+    /// ([`crate::latm::LoasDecoder`]) both call: each recovers the AAC
+    /// configuration from its own framing (the ADTS fixed header, or the
+    /// LATM `AudioSpecificConfig`) and hands the same §4.4.2.1
+    /// `raw_data_block()` bytes here. `aot` is the §1.6.2.1
+    /// `audioObjectType` (already escaped past the ADTS `profile + 1`
+    /// adjustment), `fs_index` is the Table 1.18
+    /// `samplingFrequencyIndex`, `sample_rate` is the resolved rate the
+    /// returned [`DecodedFrame`] reports, and `num_raw_data_blocks` is
+    /// the resolved block count `N` (ADTS carries `N - 1`; LATM carries
+    /// one block per payload, i.e. `N == 1`).
+    pub fn decode_raw_data_block(
+        &mut self,
+        aot: u8,
+        fs_index: u8,
+        sample_rate: u32,
+        num_raw_data_blocks: u8,
+        payload: &[u8],
+    ) -> Result<DecodedFrame> {
+        let fs = fs_index;
         let mut reader = BitReader::new(payload);
 
         // Channel time signals in element order; an SCE/LFE pushes one,
         // a CPE pushes two.
         let mut channels: Vec<Vec<f64>> = Vec::new();
 
-        // `number_of_raw_data_blocks_in_frame` is the resolved count `N`
-        // (the ADTS wire field is `N - 1`; [`AdtsHeader::parse`] adds the
-        // one back). The walker returns `None` when the payload is
-        // exhausted before an explicit END (real-world encoders pad the
-        // frame but do not always round-trip a trailing END marker after
-        // the last element); treat that as end-of-block, the same as an
-        // `Element::End`.
-        'blocks: for _ in 0..header.number_of_raw_data_blocks_in_frame {
+        // `num_raw_data_blocks` is the resolved count `N`. The walker
+        // returns `None` when the payload is exhausted before an explicit
+        // END (real-world encoders pad the frame but do not always
+        // round-trip a trailing END marker after the last element); treat
+        // that as end-of-block, the same as an `Element::End`.
+        'blocks: for _ in 0..num_raw_data_blocks {
             while let Some(elem) = Walker::new(&mut reader).next_element()? {
                 match elem {
                     Element::ChannelElement {
@@ -153,7 +183,7 @@ impl StreamDecoder {
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),
-            sample_rate: header.sample_rate(),
+            sample_rate,
         })
     }
 

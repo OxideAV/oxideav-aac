@@ -618,6 +618,12 @@ pub enum Error {
     /// the `0x2B7` / `0x4DE1` syncword was not found, or the
     /// `audioMuxLengthBytes` payload ran past the end of the buffer.
     LoasSyncInvalid,
+    /// A LATM/LOAS `AudioSpecificConfig` signalled SBR or PS
+    /// ([`crate::latm::LoasDecoder`]). The LATM PCM driver targets the
+    /// core (AAC-LC / Main / LTP) tool chain; SBR / PS up-sampling has no
+    /// back-end yet, so an SBR/PS-configured LATM stream is rejected here
+    /// rather than silently decoded at the core rate.
+    LatmSbrUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -966,6 +972,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "LOAS AudioSyncStream: §1.7.2 0x2B7/0x4DE1 syncword not found or audioMuxLengthBytes overruns the buffer"
+                )
+            }
+            Error::LatmSbrUnsupported => {
+                write!(
+                    f,
+                    "LATM AudioSpecificConfig signalled SBR/PS, which the core LATM PCM driver does not decode"
                 )
             }
         }
