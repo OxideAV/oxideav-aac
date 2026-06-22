@@ -208,6 +208,15 @@ fn deterministic_fixtures_are_byte_exact_within_one_lsb() {
 /// bands carry little energy, so the error RMS stays a small fraction of
 /// the reference signal's own RMS. The pair is `(fixture, max
 /// error-to-signal RMS ratio)`.
+///
+/// `aac-lc-chirp-windows` carries a looser bound: it is a fast frequency
+/// *sweep* whose frames use `EIGHT_SHORT_SEQUENCE` short windows
+/// (exercising the §4.6.11 eight-short overlap path) with the upper
+/// spectrum filled by §4.6.13 PNS. Because the noise tracks the swept
+/// signal it holds a larger share of the per-frame energy than a steady
+/// tone, so the spec-undefined PNS phase shows up as a larger — but still
+/// small — RMS divergence. It is listed here to keep the short-window
+/// decode path under fixture-level validation.
 const PNS_FIXTURES: &[(&str, f64)] = &[
     ("aac-lc-mono-11025-32kbps-adts", 0.02),
     ("aac-lc-mono-44100-64kbps-adts", 0.02),
@@ -215,6 +224,7 @@ const PNS_FIXTURES: &[(&str, f64)] = &[
     ("aac-lc-stereo-44100-128kbps-adts", 0.02),
     ("aac-lc-ms-stereo", 0.02),
     ("aac-lc-tns-active", 0.02),
+    ("aac-lc-chirp-windows", 0.06),
 ];
 
 #[test]

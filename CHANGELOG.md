@@ -8,6 +8,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Short-window fixture validation** — the `aac-lc-chirp-windows`
+  fixture (a fast frequency sweep that drives `EIGHT_SHORT_SEQUENCE`
+  short-window frames through the §4.6.11 eight-short overlap path, with
+  §4.6.13 PNS in the upper spectrum) is now under `pcm_byte_exact`'s
+  §8 PCM-RMS comparison (error-to-signal ratio 0.046, within a 0.06
+  bound). This keeps the short-window decode path under fixture-level
+  validation alongside the long-window fixtures.
 - **Runtime `Decoder` LOAS routing** (`codec_decoder`) — the registered
   `AacDecoder` now auto-detects its carrier on the first packet (the
   `0xFFF` ADTS syncword vs. the `0x2B7` LOAS `AudioSyncStream`
