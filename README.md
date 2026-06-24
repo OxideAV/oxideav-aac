@@ -333,8 +333,26 @@ EP-tool payload de-interleave is out of scope.
   signal → 16-bit signed PCM: `nint` (the §1.3 `NINT()` round-half-
   away-from-zero operator), `to_s16` (round + saturate), `channel_to_s16`,
   and `interleave_s16` (element-order interleave). The conversion is the
-  only output-rendering step (no resampler / dither / channel remap), so
-  it is fully spec-determined.
+  only output-rendering step (no resampler / dither), so it is fully
+  spec-determined. The **canonical channel reorder** for default
+  `channelConfiguration` layouts (Table 1.19, see `channel_map` below) is
+  applied to the per-channel buffers *before* this interleave.
+- **Default-config channel reorder** (`channel_map`) — ISO/IEC 14496-3
+  §1.6.3.5 / Table 1.19. A `raw_data_block()` lists its channel elements
+  in bitstream order, so the decoder produces channels in element order
+  (e.g. a 5.1 stream as `C, L, R, Ls, Rs, LFE` for `SCE, CPE, CPE, LFE`);
+  `channel_map::reorder_channels` permutes them into the canonical
+  interleaved order that `oxideav_core::ChannelLayout` adopts (the
+  WAVE_FORMAT_EXTENSIBLE / BS.775 convention — 5.1 becomes
+  `L, R, C, LFE, Ls, Rs`). The driver threads the signalled
+  `channelConfiguration` through `decode_raw_data_block` and applies the
+  reorder for default configs **1–6**; mono / stereo are identity
+  permutations and configs **0** (PCE-defined) / **7** (the
+  amendment-specific 7.1 element→speaker mapping) are left in element
+  order pending a later pass. Multichannel byte-exact validation against
+  the staged 5.1 / 7.1 `expected.wav` fixtures awaits an in-crate MP4
+  demuxer (the fixtures are `.m4a`-wrapped); the reorder itself is pinned
+  by unit + end-to-end assembled-frame tests.
 - **Stream-level ADTS decode driver** (`decode`) — `StreamDecoder` walks
   the §4.4.2.1 `raw_data_block()` of each ADTS frame above the
   per-element driver, keying one `ElementDecoder` per

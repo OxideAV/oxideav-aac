@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Default-config channel reorder** (`channel_map`) — ISO/IEC 14496-3
+  §1.6.3.5 / Table 1.19. A new `channel_map` module maps each default
+  `channelConfiguration` (1–6) to its canonical
+  `oxideav_core::ChannelLayout` and computes the permutation from
+  `raw_data_block()` element order to the WAVE_FORMAT_EXTENSIBLE / BS.775
+  interleaved order (e.g. a 5.1 stream's `C, L, R, Ls, Rs, LFE` element
+  order becomes `L, R, C, LFE, Ls, Rs`).
+  `StreamDecoder::decode_raw_data_block` now takes the signalled
+  `channel_configuration` (from the ADTS fixed header and the LATM
+  effective ASC) and applies the reorder before interleaving; mono /
+  stereo are identity permutations and configs 0 (PCE-defined) / 7
+  (amendment-specific 7.1) stay in element order. The existing mono +
+  stereo PCM fixtures remain byte-exact (their reorder is a no-op); the
+  permutation is pinned by unit tests and end-to-end assembled-frame
+  integration tests (`tests/channel_map_reorder.rs`).
 - **`coupling_channel_element()` bitstream decode** (`cce`) — ISO/IEC
   14496-3 §4.6.8.3 / Table 4.8. The new `cce` module decodes the CCE
   coupling header (`CouplingHeader`: `ind_sw_cce_flag`,
