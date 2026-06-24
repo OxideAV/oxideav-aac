@@ -57,9 +57,13 @@ pub const FRAME_LEN: usize = 1024;
 /// needed to interpret it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
-    /// Interleaved 16-bit PCM, `channels` samples per time index, in the
-    /// `raw_data_block` element order (an SCE/LFE contributes one
-    /// channel, a CPE two). Length is `FRAME_LEN * channels`.
+    /// Interleaved 16-bit PCM, `channels` samples per time index. For a
+    /// default `channelConfiguration` (Table 1.19, values 1–6) the
+    /// channels are in the canonical [`crate::channel_map`] output order
+    /// (e.g. 5.1 is `L, R, C, LFE, Ls, Rs`); for the unmapped configs
+    /// (`0` PCE-defined, `7`) they stay in `raw_data_block` element order
+    /// (an SCE/LFE contributes one channel, a CPE two). Length is
+    /// `FRAME_LEN * channels`.
     pub pcm: Vec<i16>,
     /// Number of interleaved channels this frame produced.
     pub channels: usize,
@@ -105,6 +109,7 @@ impl StreamDecoder {
             header.audio_object_type(),
             header.sampling_frequency_index,
             header.sample_rate(),
+            header.channel_configuration,
             header.number_of_raw_data_blocks_in_frame,
             payload,
         )
@@ -123,14 +128,17 @@ impl StreamDecoder {
     /// `audioObjectType` (already escaped past the ADTS `profile + 1`
     /// adjustment), `fs_index` is the Table 1.18
     /// `samplingFrequencyIndex`, `sample_rate` is the resolved rate the
-    /// returned [`DecodedFrame`] reports, and `num_raw_data_blocks` is
-    /// the resolved block count `N` (ADTS carries `N - 1`; LATM carries
-    /// one block per payload, i.e. `N == 1`).
+    /// returned [`DecodedFrame`] reports, `channel_configuration` is the
+    /// Table 1.19 default-layout selector that drives the §1.6.3.5
+    /// element→speaker output reorder (see [`crate::channel_map`]), and
+    /// `num_raw_data_blocks` is the resolved block count `N` (ADTS carries
+    /// `N - 1`; LATM carries one block per payload, i.e. `N == 1`).
     pub fn decode_raw_data_block(
         &mut self,
         aot: u8,
         fs_index: u8,
         sample_rate: u32,
+        channel_configuration: u8,
         num_raw_data_blocks: u8,
         payload: &[u8],
     ) -> Result<DecodedFrame> {
@@ -205,6 +213,13 @@ impl StreamDecoder {
                 }
             }
         }
+
+        // §1.6.3.5 / Table 1.19: a default `channelConfiguration` fixes
+        // which loudspeaker each decoded element feeds. Reorder the
+        // element-order channel buffers into the canonical interleaved
+        // layout (a no-op for mono/stereo and for the configs this crate
+        // does not yet reorder — see `channel_map`).
+        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
 
         let pcm = interleave_s16(&channels)?;
         Ok(DecodedFrame {

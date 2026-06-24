@@ -152,6 +152,7 @@ fn latm_path_matches_manual_raw_data_block_decode() {
                     asc.aot,
                     asc.sampling_frequency_index,
                     asc.sample_rate,
+                    asc.channel_configuration,
                     1,
                     &payload.data,
                 )

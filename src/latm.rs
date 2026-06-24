@@ -958,6 +958,7 @@ impl LoasDecoder {
             asc.aot,
             asc.sampling_frequency_index,
             asc.sample_rate,
+            asc.channel_configuration,
             1,
             &payload.data,
         )

@@ -275,12 +275,12 @@ fn raw_data_block_with_cce_decodes_sce_and_skips_cce() {
     let sce_only = w2.into_bytes();
     let mut dec2 = StreamDecoder::new();
     let frame2 = dec2
-        .decode_raw_data_block(AOT_AAC_LC, FS, 44100, 1, &sce_only)
+        .decode_raw_data_block(AOT_AAC_LC, FS, 44100, 1, 1, &sce_only)
         .expect("SCE-only block decodes");
 
     let mut dec = StreamDecoder::new();
     let frame = dec
-        .decode_raw_data_block(AOT_AAC_LC, FS, 44100, 1, &payload)
+        .decode_raw_data_block(AOT_AAC_LC, FS, 44100, 1, 1, &payload)
         .expect("SCE+CCE block decodes");
     assert_eq!(frame.channels, 1, "the CCE contributes no output channel");
     assert_eq!(frame.pcm.len(), 1024);
