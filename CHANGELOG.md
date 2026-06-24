@@ -25,7 +25,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `cc_scale_table`, with the implicit list-0 natural-scaling target.
   Both `parse` and `write` round-trip; the embedded
   `individual_channel_stream(0,0)` is composed by the caller (as for
-  CPE).
+  CPE). `CouplingChannelElement::{parse,parse_after_tag}` tie the whole
+  Table 4.8 element together (header → embedded `IcsBody` +
+  `SpectralData` → gain lists).
+- **CCE consumed in the stream decode loop** (`decode`) — a
+  `raw_data_block()` carrying a `coupling_channel_element()` no longer
+  aborts the whole frame: `StreamDecoder::decode_raw_data_block` now
+  fully consumes the CCE via `CouplingChannelElement::parse_after_tag`,
+  keeping the walker bit-aligned so the frame's SCE / CPE channels still
+  decode. The §4.6.8.3.3 cross-element coupling (scaling the decoded CCE
+  spectrum onto the addressed targets) is decoded but not yet applied,
+  so the CCE contributes no output channel of its own. Pinned by a
+  SCE + CCE + END block test that decodes the SCE byte-identically to
+  the same SCE without the trailing CCE.
 - **Short-window fixture validation** — the `aac-lc-chirp-windows`
   fixture (a fast frequency sweep that drives `EIGHT_SHORT_SEQUENCE`
   short-window frames through the §4.6.11 eight-short overlap path, with

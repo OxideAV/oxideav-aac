@@ -115,6 +115,24 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   Perceptual Noise Substitution (`pns`, §4.6.13). PNS produces
   energy-exact bands; only the per-coefficient phase is RNG-defined per
   §4.6.13.3, so its output is not byte-exact against any one decoder.
+- **Coupling channel element** (`cce`) — §4.6.8.3 / Table 4.8. The CCE
+  coupling header (`CouplingHeader`: `ind_sw_cce_flag`,
+  `num_coupled_elements`, the per-target `cc_target_is_cpe` /
+  `cc_target_tag_select` / `cc_l` / `cc_r` list with the Table 4.153
+  shared-vs-split `num_gain_element_lists` derivation, `cc_domain` /
+  `gain_element_sign` / `gain_element_scale`) and the trailing gain-list
+  block (`CouplingGains`: per-target `common_gain_element` or per-`(g,
+  sfb)` `dpcm_gain_element` running-sum lists — the §4.6.8.3.3
+  `ind_sw_cce_flag ⇒ common-gain-only` constraint and the embedded-SCE
+  `sfb_cb` `ZERO_HCB` skip — reusing the §4.A.1 scalefactor Huffman
+  codebook `hcod_sf`). `CouplingChannelElement` ties the whole Table 4.8
+  element (header → embedded `individual_channel_stream(0,0)` body +
+  spectrum → gain lists) together, and `CouplingGains::cc_gain` computes
+  the §4.6.8.3.3 `couple_channel()` factor `cc_gain = cc_sign ·
+  cc_scale^gain` (Table 4.154 `cc_scale_table`, implicit list-0 natural
+  scaling). The stream decode loop fully consumes a CCE so a CCE-bearing
+  frame's SCE / CPE channels still decode; the cross-element coupling
+  *contribution* onto the targets is decoded but not yet applied.
 - **Frequency-domain prediction** (`predictor`) — §4.6.6 MPEG-2
   backward-adaptive intra-channel predictor for the AAC **Main** object
   type (AOT 1). A bank of second-order lattice predictors (one per MDCT
@@ -333,8 +351,12 @@ EP-tool payload de-interleave is out of scope.
   fixtures are compared in the PCM RMS domain (per the fixtures-doc §8),
   where the error-to-signal RMS ratio stays below 0.1%; full
   byte-exactness on those is precluded by the §4.6.13.3 spec-undefined
-  noise-phase RNG (energy is normative, phase is not). CCE, multi-`raw_
-  data_block` ADTS, and SBR up-sampling remain out of scope.
+  noise-phase RNG (energy is normative, phase is not). A
+  `coupling_channel_element()` (CCE) carried in the block is now fully
+  consumed (parsed via `cce::CouplingChannelElement`) so the frame's
+  SCE / CPE channels still decode; the §4.6.8.3.3 coupling *contribution*
+  onto the targets is decoded but not yet applied. Multi-`raw_data_block`
+  ADTS and SBR up-sampling remain out of scope.
 - **Runtime `Decoder` registration** (`codec_decoder`) — `AacDecoder`
   adapts the persistent `StreamDecoder` / `LoasDecoder` into the
   framework's packet-in / frame-out `oxideav_core::Decoder` trait. It
@@ -385,8 +407,12 @@ EP-tool payload de-interleave is out of scope.
   dispatched from `extension_payload`'s `EXT_SBR_DATA` branch (which
   still surfaces `Error::UnsupportedExtensionSbr` pending the back-end).
   PS (parametric stereo) — whose `sbr_extension` payload bytes are now
-  captured — the coupling-channel (CCE) contribution, and the ER AAC LD
-  480/512 transform variants likewise remain out of scope.
+  captured — and the ER AAC LD 480/512 transform variants likewise remain
+  out of scope. The coupling-channel (CCE) bitstream is now decoded end
+  to end (`cce`, see the tool-chain section above) and consumed by the
+  stream decode loop; the §4.6.8.3.3 cross-element coupling *application*
+  (scaling the decoded CCE spectrum onto the addressed SCE / CPE target
+  channels) is the remaining wiring step.
 - The `aacScalefactorDataResilienceFlag` dispatch from `ics_body` to
   the error-resilient (RVLC) `scale_factor_data()` branch — the RVLC
   codebooks (`rvlc`) and the whole Table 4.53 RVLC parse / write path

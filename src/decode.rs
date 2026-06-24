@@ -17,9 +17,14 @@
 //! per-tool chain covers) carried in ADTS, single `raw_data_block` per
 //! frame, the channel elements the staged-fixture encoders emit
 //! (SCE / LFE / CPE, plus the consumed-and-ignored FIL / DSE /
-//! PCE). SBR / PS up-sampling, the coupling-channel (CCE) contribution,
-//! and multi-`raw_data_block` ADTS frames are out of scope (the same
-//! limits the element driver carries).
+//! PCE). A `coupling_channel_element()` (CCE) is now **fully consumed**
+//! from the bitstream via [`crate::cce::CouplingChannelElement`] so a
+//! CCE-bearing frame stays bit-aligned and its SCE / CPE channels still
+//! decode; the §4.6.8.3.3 cross-element coupling (scaling the CCE
+//! spectrum onto the addressed targets) is decoded but not yet applied,
+//! so the CCE contributes no output channel of its own. SBR / PS
+//! up-sampling and multi-`raw_data_block` ADTS frames remain out of
+//! scope (the same limits the element driver carries).
 //!
 //! ## Provenance
 //!
@@ -34,6 +39,7 @@ use std::collections::HashMap;
 use oxideav_core::bits::BitReader;
 
 use crate::adts::AdtsHeader;
+use crate::cce::CouplingChannelElement;
 use crate::element_decode::{ChannelInput, CpeJointStereo, ElementDecoder};
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
@@ -168,9 +174,30 @@ impl StreamDecoder {
                         channels.push(l);
                         channels.push(r);
                     }
+                    Element::ChannelElement {
+                        kind: IdSynEle::Cce,
+                        element_instance_tag,
+                    } => {
+                        // §4.6.8.3 / Table 4.8: fully consume the coupling
+                        // channel element from the bitstream (header +
+                        // embedded single_channel_element + gain lists) so
+                        // the walker stays bit-aligned for the following
+                        // elements. The CCE contributes no output channel
+                        // of its own; the §4.6.8.3.3 cross-element coupling
+                        // (scale-and-add onto the addressed SCE/CPE
+                        // targets) is not yet wired, so the decoded
+                        // coupling spectrum is dropped — a stream that
+                        // carries a CCE still decodes its SCE/CPE channels
+                        // rather than aborting the whole frame.
+                        let _cce = CouplingChannelElement::parse_after_tag(
+                            &mut reader,
+                            element_instance_tag,
+                            aot,
+                            fs,
+                        )?;
+                    }
                     Element::ChannelElement { kind, .. } => {
-                        // CCE and other channel elements have no decode
-                        // path here yet.
+                        // Any other channel-element id has no decode path.
                         return Err(unsupported_element(kind));
                     }
                     Element::Fill { .. } | Element::Data { .. } | Element::ProgramConfig(_) => {}

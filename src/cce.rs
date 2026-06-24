@@ -74,8 +74,11 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
+use crate::ics_body::IcsBody;
+use crate::ics_info::IcsInfo;
 use crate::scale_factor_data::{hcod_sf_decode, hcod_sf_encode};
 use crate::section_data::ZERO_HCB;
+use crate::spectral_data::SpectralData;
 use crate::{Error, Result};
 
 /// Field width of `ind_sw_cce_flag` (Table 4.8).
@@ -432,6 +435,87 @@ impl CouplingGains {
             (1.0, raw)
         };
         Ok(cc_sign * self.cc_scale.powi(gain))
+    }
+}
+
+/// A fully-parsed `coupling_channel_element()` (Table 4.8): the coupling
+/// header, the embedded `individual_channel_stream(0,0)` (body +
+/// spectrum), and the trailing gain lists.
+///
+/// This is the single entry point a `raw_data_block()` walker uses to
+/// **consume a whole CCE** from the bitstream (advancing the reader past
+/// it). The decode loop can then either drop the element (a CCE
+/// contributes no output channel of its own) or, once the cross-element
+/// coupling is wired, scale [`Self::spectral`] by [`Self::gains`] and add
+/// it onto the addressed target channels (§4.6.8.3.3 `couple_channel()`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CouplingChannelElement {
+    /// `element_instance_tag` (4 bits) — the CCE's own instance tag.
+    pub element_instance_tag: u8,
+    /// The Table 4.8 coupling header.
+    pub header: CouplingHeader,
+    /// The embedded `individual_channel_stream(0,0)` body (Table 4.50),
+    /// up to but not including `spectral_data()`.
+    pub body: IcsBody,
+    /// `ics_info()` of the embedded SCE (cloned out of [`Self::body`] for
+    /// convenience; the embedded body always reads its own `ics_info`).
+    pub ics_info: IcsInfo,
+    /// The embedded SCE's `spectral_data()` (Table 4.56).
+    pub spectral: SpectralData,
+    /// The Table 4.8 trailing gain lists.
+    pub gains: CouplingGains,
+}
+
+impl CouplingChannelElement {
+    /// Parse a whole `coupling_channel_element()` (Table 4.8). `reader`
+    /// is positioned at `element_instance_tag` (i.e. immediately after
+    /// the `raw_data_block()` walker read the 3-bit `id_syn_ele == CCE`).
+    ///
+    /// * `aot` — the surrounding ASC's effective `audioObjectType`.
+    /// * `fs_index` — the `samplingFrequencyIndex`.
+    ///
+    /// Walks, in spec order: the 4-bit instance tag, the
+    /// [`CouplingHeader`], the embedded `individual_channel_stream(0,0)`
+    /// ([`IcsBody`] + [`SpectralData`]), and the [`CouplingGains`]
+    /// gain-list loop keyed off the embedded SCE's `sfb_cb`.
+    pub fn parse(reader: &mut BitReader<'_>, aot: u8, fs_index: u8) -> Result<Self> {
+        let element_instance_tag = read_u8(reader, 4)?;
+        Self::parse_after_tag(reader, element_instance_tag, aot, fs_index)
+    }
+
+    /// Parse a `coupling_channel_element()` whose 4-bit
+    /// `element_instance_tag` was already consumed by the surrounding
+    /// `raw_data_block()` walker (which returns the tag in its
+    /// `ChannelElement` event). `reader` is positioned at
+    /// `ind_sw_cce_flag`; `element_instance_tag` is the walker-supplied
+    /// tag. Otherwise identical to [`Self::parse`].
+    pub fn parse_after_tag(
+        reader: &mut BitReader<'_>,
+        element_instance_tag: u8,
+        aot: u8,
+        fs_index: u8,
+    ) -> Result<Self> {
+        let header = CouplingHeader::parse(reader)?;
+        // Embedded individual_channel_stream(0,0): common_window = 0 and
+        // scale_flag = 0 per Table 4.8.
+        let body = IcsBody::parse(reader, aot, fs_index, false)?;
+        let ics_info = body.ics_info.clone().ok_or(Error::CceInvalid)?;
+        let spectral = SpectralData::parse(reader, &ics_info, &body.section_data, fs_index)?;
+        let gains = CouplingGains::parse(
+            reader,
+            &header,
+            usize::from(ics_info.num_window_groups),
+            usize::from(ics_info.max_sfb),
+            &body.section_data.sfb_cb,
+        )?;
+        Ok(CouplingChannelElement {
+            element_instance_tag,
+            header,
+            body,
+            ics_info,
+            spectral,
+            gains,
+        })
     }
 }
 
