@@ -404,6 +404,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod adts;
 pub mod asc;
+pub mod cce;
 pub mod codec_decoder;
 pub mod crc;
 pub mod decode;

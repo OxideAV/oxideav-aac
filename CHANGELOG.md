@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`coupling_channel_element()` bitstream decode** (`cce`) — ISO/IEC
+  14496-3 §4.6.8.3 / Table 4.8. The new `cce` module decodes the CCE
+  coupling header (`CouplingHeader`: `ind_sw_cce_flag`,
+  `num_coupled_elements`, the per-target `cc_target_is_cpe` /
+  `cc_target_tag_select` / `cc_l` / `cc_r` list with the Table 4.153
+  shared-vs-split `num_gain_element_lists` derivation, `cc_domain`,
+  `gain_element_sign`, `gain_element_scale`) and the trailing gain-list
+  loop (`CouplingGains`: per-target `common_gain_element` or per-`(g,
+  sfb)` `dpcm_gain_element` running-sum lists, with the §4.6.8.3.3
+  `ind_sw_cce_flag ⇒ common-gain-only` constraint and the embedded-SCE
+  `sfb_cb` `ZERO_HCB` skip). The gains reuse the §4.A.1 scalefactor
+  Huffman codebook (`hcod_sf`) exactly as the spec directs.
+  `CouplingGains::cc_gain` applies the §4.6.8.3.3 `couple_channel()`
+  scaling `cc_gain = cc_sign · cc_scale^gain` from the Table 4.154
+  `cc_scale_table`, with the implicit list-0 natural-scaling target.
+  Both `parse` and `write` round-trip; the embedded
+  `individual_channel_stream(0,0)` is composed by the caller (as for
+  CPE).
 - **Short-window fixture validation** — the `aac-lc-chirp-windows`
   fixture (a fast frequency sweep that drives `EIGHT_SHORT_SEQUENCE`
   short-window frames through the §4.6.11 eight-short overlap path, with

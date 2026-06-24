@@ -624,6 +624,23 @@ pub enum Error {
     /// back-end yet, so an SBR/PS-configured LATM stream is rejected here
     /// rather than silently decoded at the core rate.
     LatmSbrUnsupported,
+    /// `coupling_channel_element()` parse / reconstruction
+    /// ([`crate::cce`], ISO/IEC 14496-3 §4.6.8.3 / Table 4.8) was handed
+    /// a structurally inconsistent CCE:
+    ///
+    /// * a `num_coupled_elements` / `cc_target_is_cpe` / `cc_l` / `cc_r`
+    ///   combination that derives a `num_gain_element_lists` other than
+    ///   the count of transmitted gain lists,
+    /// * an `ind_sw_cce_flag == 1` (independently switched) element that
+    ///   carries a per-band `dpcm_gain_element` list instead of the
+    ///   §4.6.8.3.3-required single `common_gain_element` per target, or
+    /// * a coupled-target geometry (`num_window_groups` / `max_sfb` /
+    ///   `swb_offset`) whose gain list does not cover the embedded
+    ///   `single_channel_element()`'s band layout.
+    ///
+    /// The §4.6.8.3.3 `couple_channel()` scaling-and-add is undefined for
+    /// such inputs.
+    CceInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -978,6 +995,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "LATM AudioSpecificConfig signalled SBR/PS, which the core LATM PCM driver does not decode"
+                )
+            }
+            Error::CceInvalid => {
+                write!(
+                    f,
+                    "coupling_channel_element() has an inconsistent gain-list / target geometry (§4.6.8.3)"
                 )
             }
         }
