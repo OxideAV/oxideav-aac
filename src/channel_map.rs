@@ -50,7 +50,7 @@
 //! The element list and speaker mapping are transcribed from ISO/IEC
 //! 14496-3:2009 §1.6.3.5 Table 1.19. The canonical interleaved order is
 //! the WAVE_FORMAT_EXTENSIBLE / ITU-R BS.775 convention already encoded
-//! in [`oxideav_core::ChannelLayout`]. No reference decoder was consulted.
+//! in [`oxideav_core::ChannelLayout`].
 
 use oxideav_core::{ChannelLayout, ChannelPosition};
 
