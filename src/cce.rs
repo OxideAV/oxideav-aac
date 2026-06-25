@@ -436,6 +436,113 @@ impl CouplingGains {
         };
         Ok(cc_sign * self.cc_scale.powi(gain))
     }
+
+    /// §4.6.8.3.3 `couple_channel(source_spectrum, dest_spectrum,
+    /// gain_list_index)` — scale the CCE's embedded-SCE spectrum by the
+    /// `gain_list_index` gain list and **add** it onto one target
+    /// channel's window-major spectrum in place.
+    ///
+    /// This is the per-band scale-and-add the spec pseudocode defines:
+    ///
+    /// ```text
+    /// for (g = 0; g < num_window_groups; g++)
+    ///   for (b = 0; b < window_group_length[g]; b++)
+    ///     for (sfb = 0; sfb < max_sfb; sfb++)
+    ///       if (sfb_cb[g][sfb] != ZERO_HCB)
+    ///         for (i = swb_offset[sfb]; i < swb_offset[sfb+1]; i++)
+    ///           dest[g][b][sfb][i] += cc_gain(idx,g,sfb) * source[g][b][sfb][i];
+    /// ```
+    ///
+    /// `cc_gain` per band is [`Self::cc_gain`] (`cc_sign · cc_scale^gain`);
+    /// the implicit list 0 (`list_index == 0`) couples in natural scaling
+    /// (`cc_gain == 1`) onto every non-`ZERO_HCB` band.
+    ///
+    /// * `source` / `dest` — window-major spectra
+    ///   (`num_windows × window_len`), identical geometry. `source` is the
+    ///   decoded embedded-SCE spectrum; `dest` is the addressed SCE / CPE
+    ///   channel's spectrum at the §4.6.8.3.3 `cc_domain` stage (before or
+    ///   after TNS).
+    /// * `list_index` — the §4.6.8.3.3 `couple_channel()` `gain_list_index`
+    ///   the [`CouplingHeader`] walk assigns to this target.
+    /// * `sfb_cb` — the **embedded SCE's** per-`(g, sfb)` section
+    ///   codebooks, per the §4.6.8.3.3 Note (`sfb_cb` is the CCE's own
+    ///   codebook data, not the coupled target's). Drives the `ZERO_HCB`
+    ///   band skip and, for a `GainList::Dpcm` list, the gain lookup.
+    /// * `window_group_length` / `max_sfb` — the embedded SCE's
+    ///   `ics_info()` group geometry.
+    /// * `offsets` — the `swb_offset` table for the embedded SCE's window
+    ///   length (`window_len + 1` entries; `offsets[sfb]..offsets[sfb+1]`
+    ///   is band `sfb`).
+    ///
+    /// Returns [`Error::CceInvalid`] on any geometry mismatch (source /
+    /// dest length, group / band shapes) so a malformed coupling does not
+    /// corrupt the target out of bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn couple_channel(
+        &self,
+        source: &[f64],
+        dest: &mut [f64],
+        list_index: usize,
+        sfb_cb: &[Vec<u8>],
+        window_group_length: &[u8],
+        max_sfb: usize,
+        offsets: &[u16],
+    ) -> Result<()> {
+        if source.len() != dest.len() {
+            return Err(Error::CceInvalid);
+        }
+        if offsets.is_empty() {
+            return Err(Error::CceInvalid);
+        }
+        // The last `swb_offset` entry is the window length (the first
+        // coefficient past the last band). The window-major spectrum is
+        // `num_windows * window_len` long.
+        let window_len = usize::from(*offsets.last().expect("non-empty checked above"));
+        if window_len == 0 || source.len() % window_len != 0 {
+            return Err(Error::CceInvalid);
+        }
+        let num_swb = offsets.len() - 1;
+        if max_sfb > num_swb {
+            return Err(Error::CceInvalid);
+        }
+        if sfb_cb.len() != window_group_length.len() {
+            return Err(Error::CceInvalid);
+        }
+
+        let mut window_base = 0usize;
+        for (g, &wgl) in window_group_length.iter().enumerate() {
+            let cb_row = sfb_cb.get(g).ok_or(Error::CceInvalid)?;
+            if cb_row.len() < max_sfb {
+                return Err(Error::CceInvalid);
+            }
+            let wgl = usize::from(wgl);
+            for sfb in 0..max_sfb {
+                if cb_row[sfb] == ZERO_HCB {
+                    // §4.6.8.3.3: ZERO_HCB bands carry no coupling
+                    // contribution (and, for a DPCM list, were not
+                    // transmitted — the accumulator simply skipped them).
+                    continue;
+                }
+                let start = usize::from(offsets[sfb]);
+                let end = usize::from(offsets[sfb + 1]);
+                let cc_gain = self.cc_gain(list_index, g, sfb)?;
+                for b in 0..wgl {
+                    let base = (window_base + b)
+                        .checked_mul(window_len)
+                        .ok_or(Error::CceInvalid)?;
+                    let dst_end = base + end;
+                    if dst_end > dest.len() {
+                        return Err(Error::CceInvalid);
+                    }
+                    for i in start..end {
+                        dest[base + i] += cc_gain * source[base + i];
+                    }
+                }
+            }
+            window_base += wgl;
+        }
+        Ok(())
+    }
 }
 
 /// A fully-parsed `coupling_channel_element()` (Table 4.8): the coupling
@@ -729,6 +836,115 @@ mod tests {
             GainList::Dpcm(g) => assert_eq!(g, &grid),
             other => panic!("expected Dpcm, got {other:?}"),
         }
+    }
+
+    /// `couple_channel` for the implicit list 0 (natural scaling) adds
+    /// the source spectrum onto the target unchanged on every
+    /// non-`ZERO_HCB` band, and skips the `ZERO_HCB` band entirely.
+    #[test]
+    fn couple_channel_list_zero_adds_natural_scaling() {
+        // One window group, one window of length 8; two bands of width 4.
+        // Band 0 is a spectrum book (couples), band 1 is ZERO_HCB (skip).
+        let offsets = [0u16, 4, 8];
+        let sfb_cb = vec![vec![2u8, ZERO_HCB]];
+        let wgl = [1u8];
+        let gains = CouplingGains {
+            cc_scale: CC_SCALE_TABLE[3],
+            gain_element_sign: false,
+            lists: vec![],
+        };
+        let source = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut dest = vec![10.0f64; 8];
+        gains
+            .couple_channel(&source, &mut dest, 0, &sfb_cb, &wgl, 2, &offsets)
+            .unwrap();
+        // Band 0 (indices 0..4): dest += 1*source.
+        assert_eq!(&dest[0..4], &[11.0, 12.0, 13.0, 14.0]);
+        // Band 1 (indices 4..8) is ZERO_HCB → untouched.
+        assert_eq!(&dest[4..8], &[10.0, 10.0, 10.0, 10.0]);
+    }
+
+    /// `couple_channel` applies a non-unity common gain (`cc_scale^gain`)
+    /// onto every coupled band.
+    #[test]
+    fn couple_channel_common_gain_scales() {
+        let offsets = [0u16, 4];
+        let sfb_cb = vec![vec![2u8]];
+        let wgl = [1u8];
+        // gain element +1, sign clear, scale index 3 (cc_scale = 2) ⇒
+        // cc_gain = 2^1 = 2.
+        let gains = CouplingGains {
+            cc_scale: 2.0,
+            gain_element_sign: false,
+            lists: vec![GainList::Common(1)],
+        };
+        let source = vec![1.0f64, 2.0, 3.0, 4.0];
+        let mut dest = vec![0.0f64; 4];
+        gains
+            .couple_channel(&source, &mut dest, 1, &sfb_cb, &wgl, 1, &offsets)
+            .unwrap();
+        assert_eq!(dest, vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    /// `couple_channel` walks the multi-window short-block grid: a window
+    /// group of length 2 applies the same per-sfb gain to both windows.
+    #[test]
+    fn couple_channel_multi_window_group() {
+        // num_windows = 2, window_len = 4, one group of length 2, one band.
+        let offsets = [0u16, 4];
+        let sfb_cb = vec![vec![2u8]];
+        let wgl = [2u8];
+        let gains = CouplingGains {
+            cc_scale: 2.0,
+            gain_element_sign: false,
+            lists: vec![GainList::Common(0)], // cc_gain = 2^0 = 1
+        };
+        let source = vec![1.0f64, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0];
+        let mut dest = vec![0.0f64; 8];
+        gains
+            .couple_channel(&source, &mut dest, 1, &sfb_cb, &wgl, 1, &offsets)
+            .unwrap();
+        // Both windows of the group are coupled at gain 1.
+        assert_eq!(dest, source);
+    }
+
+    /// `couple_channel` per-band DPCM gains scale each band independently.
+    #[test]
+    fn couple_channel_dpcm_per_band_gains() {
+        let offsets = [0u16, 2, 4];
+        let sfb_cb = vec![vec![2u8, 2u8]];
+        let wgl = [1u8];
+        // Absolute gains: band0 = 0 (cc_gain 1), band1 = 1 (cc_gain 2).
+        let gains = CouplingGains {
+            cc_scale: 2.0,
+            gain_element_sign: false,
+            lists: vec![GainList::Dpcm(vec![vec![0i32, 1i32]])],
+        };
+        let source = vec![3.0f64, 3.0, 3.0, 3.0];
+        let mut dest = vec![0.0f64; 4];
+        gains
+            .couple_channel(&source, &mut dest, 1, &sfb_cb, &wgl, 2, &offsets)
+            .unwrap();
+        // Band 0 (0..2): ×1; band 1 (2..4): ×2.
+        assert_eq!(dest, vec![3.0, 3.0, 6.0, 6.0]);
+    }
+
+    /// `couple_channel` rejects a source / dest length mismatch.
+    #[test]
+    fn couple_channel_rejects_length_mismatch() {
+        let offsets = [0u16, 4];
+        let sfb_cb = vec![vec![2u8]];
+        let gains = CouplingGains {
+            cc_scale: 2.0,
+            gain_element_sign: false,
+            lists: vec![],
+        };
+        let source = vec![0.0f64; 4];
+        let mut dest = vec![0.0f64; 8];
+        assert_eq!(
+            gains.couple_channel(&source, &mut dest, 0, &sfb_cb, &[1u8], 1, &offsets),
+            Err(Error::CceInvalid)
+        );
     }
 
     /// An independently switched CCE forces `cge == 1`: no
