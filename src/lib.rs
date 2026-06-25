@@ -430,6 +430,7 @@ pub mod raw_data_block;
 pub mod rvlc;
 pub mod sbr_element;
 pub mod sbr_envelope;
+pub mod sbr_extension;
 pub mod sbr_freq_bands;
 pub mod sbr_grid;
 pub mod sbr_header;
