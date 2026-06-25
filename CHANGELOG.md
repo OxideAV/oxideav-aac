@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **CCE per-band coupling math** (`cce::CouplingGains::couple_channel`) —
+  ISO/IEC 14496-3 §4.6.8.3.3. The `couple_channel(source, dest,
+  gain_list_index)` scale-and-add: walks the spec's group /
+  window-group / sfb / coefficient loop, multiplying the embedded-SCE
+  spectrum by the per-`(g, sfb)` `cc_gain` and adding it onto a target
+  channel's window-major spectrum in place (implicit list 0 in natural
+  scaling, `ZERO_HCB` bands skipped), geometry-checked against the
+  source / dest length and the embedded SCE's group + band shapes.
+  Unit-tested with synthetic spectra (natural scaling, common-gain
+  scaling, multi-window short blocks, per-band DPCM gains, geometry
+  guard). The decode-loop wiring that applies this onto the addressed
+  targets awaits a CCE fixture (docs-gap).
+- **`sbr_extension_data()` top-level walker** (`sbr_extension`) —
+  ISO/IEC 14496-3 §4.4.2.8 Table 4.62. Ties `sbr_header()` + the
+  `sbr_element` framing into a whole SBR extension payload: the
+  optional 10-bit `bs_sbr_crc_bits` (`EXT_SBR_DATA_CRC`),
+  `bs_header_flag` + `sbr_header()`, `sbr_data(id_aac, bs_amp_res)`
+  dispatching onto single / pair elements with band tables derived at
+  the SBR internal rate, the threaded previous-header reuse path, and
+  the trailing `bs_fill_bits` alignment. Reachable via the new
+  `extension_payload::ExtensionPayload::parse_with_sbr` (the default
+  `parse` still rejects SBR, so the byte-exact AAC-LC corpus path is
+  unchanged). This completes the SBR *bitstream* side-info decode end to
+  end; the back-end DSP (QMF / HF patching / envelope adjustment) is
+  still pending.
 - **Default-config channel reorder** (`channel_map`) — ISO/IEC 14496-3
   §1.6.3.5 / Table 1.19. A new `channel_map` module maps each default
   `channelConfiguration` (1–6) to its canonical

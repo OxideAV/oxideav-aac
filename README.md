@@ -130,9 +130,17 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   spectrum → gain lists) together, and `CouplingGains::cc_gain` computes
   the §4.6.8.3.3 `couple_channel()` factor `cc_gain = cc_sign ·
   cc_scale^gain` (Table 4.154 `cc_scale_table`, implicit list-0 natural
-  scaling). The stream decode loop fully consumes a CCE so a CCE-bearing
-  frame's SCE / CPE channels still decode; the cross-element coupling
-  *contribution* onto the targets is decoded but not yet applied.
+  scaling). `CouplingGains::couple_channel` applies the §4.6.8.3.3
+  per-band scale-and-add — the spec's group / window-group / sfb /
+  coefficient loop multiplying the embedded-SCE spectrum by the
+  per-`(g, sfb)` `cc_gain` and adding it onto a target channel's
+  window-major spectrum (implicit list 0 in natural scaling, `ZERO_HCB`
+  bands skipped). The stream decode loop fully consumes a CCE so a
+  CCE-bearing frame's SCE / CPE channels still decode; the per-band
+  coupling math is implemented and unit-tested, but the decode-loop
+  wiring that matches targets by `cc_target_tag_select` and intercepts
+  their spectra at the `cc_domain` stage awaits a CCE fixture for
+  end-to-end validation (docs-gap).
 - **Frequency-domain prediction** (`predictor`) — §4.6.6 MPEG-2
   backward-adaptive intra-channel predictor for the AAC **Main** object
   type (AOT 1). A bank of second-order lattice predictors (one per MDCT
@@ -225,11 +233,29 @@ tables), independent of any external SBR table extraction.
   the `bs_extended_data` block (id + raw body captured for a later PS
   pass). The single-envelope FIXFIX `bs_amp_res` override is applied
   before envelope decode.
+- **`sbr_extension_data()`** (`sbr_extension`) — §4.4.2.8 Table 4.62:
+  the top-level walker that ties the header + element framing into a
+  whole SBR extension payload, in spec order — the optional 10-bit
+  `bs_sbr_crc_bits` (for the `EXT_SBR_DATA_CRC` type), the
+  `bs_header_flag` + `sbr_header()`, then `sbr_data(id_aac, bs_amp_res)`
+  dispatching onto `parse_single` (ID_SCE) / `parse_pair` (ID_CPE) with
+  the band tables derived from the active header at the SBR internal
+  rate (`FsSBR = 2·core`), and the trailing `bs_fill_bits` alignment
+  (`num_align_bits = (8·cnt − 4 − num_sbr_bits) % 8`). A clear
+  `bs_header_flag` reuses the threaded previous header (the
+  non-scalable core fixes `sbr_layer == SBR_NOT_SCALABLE`, so the flag
+  is always present). Reachable from the natural FIL entry point via
+  `extension_payload::ExtensionPayload::parse_with_sbr`, which routes
+  the SBR extension types here (the default `parse` still rejects them,
+  keeping the byte-exact AAC-LC corpus path untouched).
 
 The remaining SBR back-end (dequantization to linear energies, the QMF
 analysis / synthesis filterbanks, HF generation / patching, the limiter
 and the envelope-adjustment that produce up-sampled PCM) is not yet
-wired; those stages key off the band tables and scalefactors above.
+wired; those stages key off the band tables and scalefactors above. The
+SBR *bitstream* side info is now decoded end to end — CRC field,
+header, element framing, band tables, and envelope / noise DPCM
+reconstruction.
 
 ### SBR frequency band setup (HE-AAC)
 
@@ -421,16 +447,22 @@ EP-tool payload de-interleave is out of scope.
   table, the QMF analysis / synthesis filterbanks, HF generation /
   patching, and the envelope adjustment that produces up-sampled PCM.
   The `sbr_single_channel_element()` / `sbr_channel_pair_element()`
-  framing (Tables 4.65–4.66) is decoded by `sbr_element` but not yet
-  dispatched from `extension_payload`'s `EXT_SBR_DATA` branch (which
-  still surfaces `Error::UnsupportedExtensionSbr` pending the back-end).
+  framing (Tables 4.65–4.66) is decoded by `sbr_element`, and the
+  §4.4.2.8 `sbr_extension_data()` (Table 4.62) top-level walker
+  (`sbr_extension`) now ties the CRC field + header + element framing
+  together — reachable from `extension_payload::parse_with_sbr` (the
+  default `parse` still surfaces `Error::UnsupportedExtensionSbr` so the
+  byte-exact AAC-LC corpus path is untouched, pending the back-end).
   PS (parametric stereo) — whose `sbr_extension` payload bytes are now
   captured — and the ER AAC LD 480/512 transform variants likewise remain
   out of scope. The coupling-channel (CCE) bitstream is now decoded end
   to end (`cce`, see the tool-chain section above) and consumed by the
-  stream decode loop; the §4.6.8.3.3 cross-element coupling *application*
-  (scaling the decoded CCE spectrum onto the addressed SCE / CPE target
-  channels) is the remaining wiring step.
+  stream decode loop; the §4.6.8.3.3 per-band coupling math
+  (`CouplingGains::couple_channel`) is implemented and unit-tested, but
+  the cross-element *application* (matching targets by
+  `cc_target_tag_select` and scaling the decoded CCE spectrum onto the
+  addressed SCE / CPE channels at the `cc_domain` stage) awaits a CCE
+  fixture for end-to-end validation.
 - The `aacScalefactorDataResilienceFlag` dispatch from `ics_body` to
   the error-resilient (RVLC) `scale_factor_data()` branch — the RVLC
   codebooks (`rvlc`) and the whole Table 4.53 RVLC parse / write path
