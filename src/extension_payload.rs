@@ -26,8 +26,12 @@
 //!   [`DynamicRangeInfo`]).
 //!
 //! The SBR-data extension types defined by ISO/IEC 13818-7 Table 40
-//! are surfaced as [`Error::UnsupportedExtensionSbr`] — they
-//! require the SBR back-end which is not yet present in this crate:
+//! are surfaced as [`Error::UnsupportedExtensionSbr`] by the default
+//! [`ExtensionPayload::parse`] (so the byte-exact AAC-LC decode path
+//! stays untouched). The dedicated [`ExtensionPayload::parse_with_sbr`]
+//! entry instead routes them into the §4.4.2.8
+//! [`crate::sbr_extension::SbrExtensionData`] side-info walker (the SBR
+//! back-end DSP is still not applied):
 //!
 //! * `EXT_SBR_DATA` (`0b1101`).
 //! * `EXT_SBR_DATA_CRC` (`0b1110`).
@@ -142,6 +146,21 @@ impl ExtensionType {
         }
     }
 
+    /// Like [`Self::from_bits`] but maps the two SBR wire values to
+    /// their [`ExtensionType`] variants instead of an error, so the
+    /// [`ExtensionPayload::parse_with_sbr`] entry can dispatch them into
+    /// the SBR side-info walker. Reserved values still error.
+    pub fn from_bits_allow_sbr(value: u8) -> Result<Self> {
+        match value {
+            0b0000 => Ok(ExtensionType::Fill),
+            0b0001 => Ok(ExtensionType::FillData),
+            0b1011 => Ok(ExtensionType::DynamicRange),
+            0b1101 => Ok(ExtensionType::SbrData),
+            0b1110 => Ok(ExtensionType::SbrDataCrc),
+            other => Err(Error::UnsupportedExtensionType(other)),
+        }
+    }
+
     /// Convert back to the 4-bit wire value used by Table 4.51.
     pub fn as_u8(self) -> u8 {
         match self {
@@ -191,6 +210,19 @@ pub enum ExtensionPayload {
     },
     /// `EXT_DYNAMIC_RANGE` — DRC metadata per Table 4.52.
     DynamicRange(DynamicRangeInfo),
+}
+
+/// The result of [`ExtensionPayload::parse_with_sbr`]: either a standard
+/// (non-SBR) extension payload, or a decoded SBR side-info element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionPayloadOrSbr {
+    /// A non-SBR extension payload (`EXT_FILL` / `EXT_FILL_DATA` /
+    /// `EXT_DYNAMIC_RANGE`).
+    Payload(ExtensionPayload),
+    /// A decoded `sbr_extension_data()` (`EXT_SBR_DATA` /
+    /// `EXT_SBR_DATA_CRC`). Boxed because the SBR side-info element is
+    /// much larger than the other variants.
+    Sbr(Box<crate::sbr_extension::SbrExtensionData>),
 }
 
 /// Parsed `dynamic_range_info()` body (Table 4.52). All fields are
@@ -304,6 +336,65 @@ impl ExtensionPayload {
             ExtensionType::DynamicRange => parse_dynamic_range(reader, cnt),
             // `from_bits` already converted these to errors.
             ExtensionType::SbrData | ExtensionType::SbrDataCrc => unreachable!(),
+        }
+    }
+
+    /// Parse an `extension_payload(cnt)`, routing the two SBR extension
+    /// types (`EXT_SBR_DATA` / `EXT_SBR_DATA_CRC`) into the
+    /// [`crate::sbr_extension::SbrExtensionData`] side-info walker rather
+    /// than rejecting them.
+    ///
+    /// Unlike [`Self::parse`] (which surfaces
+    /// [`Error::UnsupportedExtensionSbr`] for the SBR types so the
+    /// byte-exact AAC-LC decode path stays untouched), this entry decodes
+    /// the SBR bitstream side info: the §4.4.2.8 `sbr_extension_data()`
+    /// header + element framing keyed off the surrounding channel
+    /// element. The SBR back-end DSP (QMF / HF patching / envelope
+    /// adjustment) is still not applied — this only recovers the decoded
+    /// side info.
+    ///
+    /// * `id_aac` — the AAC core element this FIL follows
+    ///   ([`crate::raw_data_block::IdSynEle::Sce`] / `Cpe`); selects the
+    ///   single- vs pair-element `sbr_data()` dispatch.
+    /// * `fs_sbr` — the SBR internal sample rate (twice the core rate).
+    /// * `prev_header` — the threaded previous `sbr_header()` for the
+    ///   `bs_header_flag == 0` reuse path (`None` on the first payload).
+    ///
+    /// A non-SBR extension type returns
+    /// [`ExtensionPayloadOrSbr::Payload`] with the same body
+    /// [`Self::parse`] would produce.
+    pub fn parse_with_sbr(
+        reader: &mut BitReader<'_>,
+        cnt: u32,
+        id_aac: crate::raw_data_block::IdSynEle,
+        fs_sbr: u32,
+        prev_header: Option<crate::sbr_header::SbrHeader>,
+    ) -> Result<ExtensionPayloadOrSbr> {
+        if cnt == 0 {
+            return Err(Error::ExtensionPayloadInvalid);
+        }
+        let raw = read_u8(reader, EXTENSION_TYPE_BITS)?;
+        let ty = ExtensionType::from_bits_allow_sbr(raw)?;
+        match ty {
+            ExtensionType::Fill => Ok(ExtensionPayloadOrSbr::Payload(parse_fill(reader, cnt)?)),
+            ExtensionType::FillData => Ok(ExtensionPayloadOrSbr::Payload(parse_fill_data(
+                reader, cnt,
+            )?)),
+            ExtensionType::DynamicRange => Ok(ExtensionPayloadOrSbr::Payload(parse_dynamic_range(
+                reader, cnt,
+            )?)),
+            ExtensionType::SbrData | ExtensionType::SbrDataCrc => {
+                let crc_flag = ty == ExtensionType::SbrDataCrc;
+                let sbr = crate::sbr_extension::SbrExtensionData::parse(
+                    reader,
+                    id_aac,
+                    crc_flag,
+                    fs_sbr,
+                    Some(cnt),
+                    prev_header,
+                )?;
+                Ok(ExtensionPayloadOrSbr::Sbr(Box::new(sbr)))
+            }
         }
     }
 

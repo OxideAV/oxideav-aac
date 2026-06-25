@@ -837,3 +837,142 @@ fn parser_does_not_overread_past_drc_body() {
     let trailing = r.read_u32(8).unwrap() as u8;
     assert_eq!(trailing, 0xA5);
 }
+
+// ---------------------------------------------------------------
+// parse_with_sbr — §4.4.2.8 sbr_extension_data() routing
+// ---------------------------------------------------------------
+
+use oxideav_aac::extension_payload::ExtensionPayloadOrSbr;
+use oxideav_aac::raw_data_block::IdSynEle;
+use oxideav_aac::sbr_freq_bands::HiLoTables;
+use oxideav_aac::sbr_grid::FrameClass;
+use oxideav_aac::sbr_header::SbrHeader;
+use oxideav_aac::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+
+const FS_SBR: u32 = 88_200;
+
+/// Write an `sbr_header()` with explicit extra-1 params (deterministic
+/// band geometry); extra-2 absent.
+fn write_sbr_header(w: &mut BitWriter, amp_res: bool) {
+    w.write_bit(amp_res); // bs_amp_res
+    w.write_u32(5, 4); // bs_start_freq
+    w.write_u32(0, 4); // bs_stop_freq
+    w.write_u32(1, 3); // bs_xover_band
+    w.write_u32(0, 2); // bs_reserved
+    w.write_bit(true); // bs_header_extra_1
+    w.write_bit(false); // bs_header_extra_2
+    w.write_u32(0, 2); // bs_freq_scale
+    w.write_bit(false); // bs_alter_scale
+    w.write_u32(2, 2); // bs_noise_bands
+}
+
+fn header_bands() -> HiLoTables {
+    let mut w = BitWriter::new();
+    write_sbr_header(&mut w, false);
+    let bytes = w.finish();
+    let mut r = BitReader::new(&bytes);
+    SbrHeader::parse(&mut r)
+        .unwrap()
+        .derive_bands(FS_SBR)
+        .unwrap()
+}
+
+fn write_minimal_sce(w: &mut BitWriter, bands: &HiLoTables) {
+    let n_high = bands.n_high();
+    let n_q = bands.n_q();
+    w.write_bit(false); // bs_data_extra
+    w.write_u32(FrameClass::FixFix.to_bits(), 2);
+    w.write_u32(0, 2); // 1 env
+    w.write_bit(true); // freq_res high
+    w.write_bit(false); // df_env
+    w.write_bit(false); // df_noise
+    for _ in 0..n_q {
+        w.write_u32(1, 2);
+    }
+    let (_, (f_huff, f_lav)) = env_tables(SbrHuffContext {
+        coupling: false,
+        ch: false,
+        amp_res: false,
+    });
+    w.write_u32(33, 7);
+    for i in 1..n_high {
+        let (len, code) = f_huff[(i + f_lav as usize) % f_huff.len()];
+        w.write_u32(code, len as u32);
+    }
+    let (_, (nf, nfl)) = noise_tables(SbrHuffContext {
+        coupling: false,
+        ch: false,
+        amp_res: false,
+    });
+    w.write_u32(10, 5);
+    for i in 1..n_q {
+        let (len, code) = nf[(i + nfl as usize) % nf.len()];
+        w.write_u32(code, len as u32);
+    }
+    w.write_bit(false); // add_harmonic_flag
+    w.write_bit(false); // extended_data
+}
+
+#[test]
+fn parse_with_sbr_routes_ext_sbr_data() {
+    // FIL body: extension_type = EXT_SBR_DATA (0b1101), then
+    // bs_header_flag + sbr_header() + sbr_single_channel_element().
+    let bands = header_bands();
+    let mut w = BitWriter::new();
+    w.write_u32(0b1101, 4); // extension_type = EXT_SBR_DATA
+    w.write_bit(true); // bs_header_flag
+    write_sbr_header(&mut w, true);
+    write_minimal_sce(&mut w, &bands);
+    let mut bytes = w.finish();
+    let cnt = (bytes.len() + 1) as u32; // one trailing fill byte
+    bytes.push(0x00);
+
+    let mut r = BitReader::new(&bytes);
+    let out = ExtensionPayload::parse_with_sbr(&mut r, cnt, IdSynEle::Sce, FS_SBR, None).unwrap();
+    match out {
+        ExtensionPayloadOrSbr::Sbr(sbr) => {
+            assert!(sbr.header_present);
+            assert_eq!(sbr.header.start_freq, 5);
+            assert_eq!(sbr.element.channels.len(), 1);
+            assert_eq!(sbr.element.channels[0].envelope.data[0][0], 33);
+        }
+        other => panic!("expected Sbr, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_with_sbr_passes_through_fill() {
+    // A non-SBR extension type still produces a standard payload.
+    let mut w = BitWriter::new();
+    w.write_u32(0b0000, 4); // EXT_FILL
+    w.write_u32(0, 4); // 4 other_bits (cnt == 1)
+    let bytes = w.finish();
+    let mut r = BitReader::new(&bytes);
+    let out = ExtensionPayload::parse_with_sbr(&mut r, 1, IdSynEle::Sce, FS_SBR, None).unwrap();
+    match out {
+        ExtensionPayloadOrSbr::Payload(ExtensionPayload::Fill { cnt, .. }) => {
+            assert_eq!(cnt, 1);
+        }
+        other => panic!("expected Fill payload, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_with_sbr_crc_variant_reads_crc() {
+    let bands = header_bands();
+    let mut w = BitWriter::new();
+    w.write_u32(0b1110, 4); // EXT_SBR_DATA_CRC
+    w.write_u32(0x1B3, 10); // bs_sbr_crc_bits
+    w.write_bit(true);
+    write_sbr_header(&mut w, true);
+    write_minimal_sce(&mut w, &bands);
+    let mut bytes = w.finish();
+    let cnt = (bytes.len() + 1) as u32;
+    bytes.push(0x00);
+    let mut r = BitReader::new(&bytes);
+    let out = ExtensionPayload::parse_with_sbr(&mut r, cnt, IdSynEle::Sce, FS_SBR, None).unwrap();
+    match out {
+        ExtensionPayloadOrSbr::Sbr(sbr) => assert_eq!(sbr.crc, Some(0x1B3)),
+        other => panic!("expected Sbr, got {other:?}"),
+    }
+}
