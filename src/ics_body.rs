@@ -109,10 +109,11 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
+use crate::asc::AacResilienceFlags;
 use crate::gain_control_data::GainControlData;
 use crate::ics_info::{IcsInfo, WindowSequence};
 use crate::pulse_data::PulseData;
-use crate::scale_factor_data::ScaleFactorData;
+use crate::scale_factor_data::{ErScaleFactorData, ScaleFactorData};
 use crate::section_data::SectionData;
 use crate::tns_data::TnsData;
 use crate::{Error, Result};
@@ -170,6 +171,25 @@ pub struct IcsBody {
     /// the spectrum block out of a parent buffer or hand it to a
     /// spectral-data parser without re-walking the body.
     pub spectral_data_bit_offset: u64,
+    /// The error-resilient `scale_factor_data()` record (RVLC branch,
+    /// Table 4.53) when the body was parsed via [`IcsBody::parse_er`] /
+    /// [`IcsBody::parse_with_ics_info_er`] with
+    /// `aacScalefactorDataResilienceFlag == 1`. `None` on the
+    /// non-resilient path. The reconstructed absolute-delta records
+    /// are mirrored into [`Self::scale_factor_data`] so the shared
+    /// §4.6.2.3.2 accumulate pass consumes the body unchanged
+    /// regardless of which branch produced it; this field preserves
+    /// the extra RVLC backward seeds (`rev_global_gain`,
+    /// `dpcm_*_last_position`).
+    pub er_scale_factor_data: Option<ErScaleFactorData>,
+    /// The §4.4.2.7 Table 4.50 spectral-resilience length fields,
+    /// present only when the body was parsed via the ER path with
+    /// `aacSpectralDataResilienceFlag == 1`:
+    /// `(length_of_reordered_spectral_data, length_of_longest_codeword)`.
+    /// The `reordered_spectral_data()` (HCR) payload that follows is
+    /// the caller's responsibility (same contract as the non-resilient
+    /// `spectral_data()` block); these two counts size that payload.
+    pub reordered_spectral_lengths: Option<(u16, u8)>,
 }
 
 impl IcsBody {
@@ -257,6 +277,8 @@ impl IcsBody {
             gain_control_data_present: tools.gain_control_data_present,
             gain_control_data: tools.gain_control_data,
             spectral_data_bit_offset: tools.spectral_data_bit_offset,
+            er_scale_factor_data: None,
+            reordered_spectral_lengths: None,
         })
     }
 
@@ -303,6 +325,153 @@ impl IcsBody {
             gain_control_data_present: tools.gain_control_data_present,
             gain_control_data: tools.gain_control_data,
             spectral_data_bit_offset: tools.spectral_data_bit_offset,
+            er_scale_factor_data: None,
+            reordered_spectral_lengths: None,
+        })
+    }
+
+    /// Parse an **error-resilient** Table 4.50 channel-element body
+    /// (the ER General Audio object types — AOTs 17 / 19 / 20 / 23 —
+    /// whose ASC carries the [`AacResilienceFlags`] triplet).
+    ///
+    /// Differs from [`IcsBody::parse`] in three spec-driven ways
+    /// (Table 4.50 / Table 4.52 / Table 4.53):
+    ///
+    /// * `section_data()` takes the [`SectionData::parse_er`] branch
+    ///   when `resilience.section_data` is set (5-bit `sect_cb`).
+    /// * `scale_factor_data()` takes the RVLC
+    ///   [`ErScaleFactorData::parse`] branch when
+    ///   `resilience.scalefactor_data` is set; the reconstructed
+    ///   absolute-delta records are mirrored into
+    ///   [`Self::scale_factor_data`] and the RVLC seeds are retained
+    ///   in [`Self::er_scale_factor_data`].
+    /// * the trailing `spectral_data()` is replaced — when
+    ///   `resilience.spectral_data` is set — by the
+    ///   `length_of_reordered_spectral_data` (14-bit) +
+    ///   `length_of_longest_codeword` (6-bit) pair captured in
+    ///   [`Self::reordered_spectral_lengths`]; the
+    ///   `reordered_spectral_data()` (HCR) payload that follows is the
+    ///   caller's responsibility, exactly as `spectral_data()` is on
+    ///   the non-resilient path.
+    pub fn parse_er(
+        reader: &mut BitReader<'_>,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        scale_flag: bool,
+        resilience: AacResilienceFlags,
+    ) -> Result<Self> {
+        if scale_flag {
+            return Err(Error::NotImplemented);
+        }
+        let start = reader.bit_position();
+        let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
+        let ics_info = IcsInfo::parse(reader, audio_object_type, sampling_frequency_index, false)?;
+        let mut body = Self::finish_er_shared(
+            reader,
+            global_gain,
+            &ics_info,
+            audio_object_type,
+            resilience,
+            start,
+        )?;
+        body.ics_info = Some(ics_info);
+        Ok(body)
+    }
+
+    /// Parse an error-resilient Table 4.50 body whose `ics_info()` was
+    /// already consumed by the surrounding shared-info CPE form.
+    ///
+    /// ER analogue of [`IcsBody::parse_with_ics_info`]; the resilience
+    /// branch semantics match [`IcsBody::parse_er`]. The returned
+    /// `ics_info` is `None` (the caller holds the shared `IcsInfo`).
+    pub fn parse_with_ics_info_er(
+        reader: &mut BitReader<'_>,
+        ics_info: &IcsInfo,
+        audio_object_type: u8,
+        scale_flag: bool,
+        resilience: AacResilienceFlags,
+    ) -> Result<Self> {
+        if scale_flag {
+            return Err(Error::NotImplemented);
+        }
+        let start = reader.bit_position();
+        let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
+        Self::finish_er_shared(
+            reader,
+            global_gain,
+            ics_info,
+            audio_object_type,
+            resilience,
+            start,
+        )
+    }
+
+    /// Shared tail of the ER parse: `section_data()` (ER branch) →
+    /// `scale_factor_data()` (RVLC branch) → tool dispatch → spectral
+    /// resilience length fields. `ics_info` carries the geometry; the
+    /// returned `IcsBody::ics_info` is `None` (the inline caller sets
+    /// it afterwards from its owned value).
+    fn finish_er_shared(
+        reader: &mut BitReader<'_>,
+        global_gain: u8,
+        ics_info: &IcsInfo,
+        audio_object_type: u8,
+        resilience: AacResilienceFlags,
+        start: u64,
+    ) -> Result<Self> {
+        let section_data = if resilience.section_data {
+            SectionData::parse_er(
+                reader,
+                ics_info.window_sequence,
+                ics_info.num_window_groups,
+                ics_info.max_sfb,
+            )?
+        } else {
+            SectionData::parse(
+                reader,
+                ics_info.window_sequence,
+                ics_info.num_window_groups,
+                ics_info.max_sfb,
+            )?
+        };
+
+        let (scale_factor_data, er_scale_factor_data) = if resilience.scalefactor_data {
+            let er =
+                ErScaleFactorData::parse(reader, &section_data.sfb_cb, ics_info.window_sequence)?;
+            (er.data.clone(), Some(er))
+        } else {
+            (ScaleFactorData::parse(reader, &section_data.sfb_cb)?, None)
+        };
+
+        let tools = parse_tools(reader, ics_info, audio_object_type, start)?;
+
+        // Table 4.50 ER spectral branch: when
+        // aacSpectralDataResilienceFlag is set, the body carries the
+        // two HCR length fields in place of starting spectral_data().
+        let reordered_spectral_lengths = if resilience.spectral_data {
+            let len_reordered = reader.read_u32(14).map_err(|_| Error::UnexpectedEnd)? as u16;
+            let len_longest = reader.read_u32(6).map_err(|_| Error::UnexpectedEnd)? as u8;
+            Some((len_reordered, len_longest))
+        } else {
+            None
+        };
+
+        let spectral_data_bit_offset = reader.bit_position() - start;
+
+        Ok(IcsBody {
+            global_gain,
+            ics_info: None,
+            section_data,
+            scale_factor_data,
+            pulse_data_present: tools.pulse_data_present,
+            pulse_data: tools.pulse_data,
+            tns_data_present: tools.tns_data_present,
+            tns_data: tools.tns_data,
+            gain_control_data_present: tools.gain_control_data_present,
+            gain_control_data: tools.gain_control_data,
+            spectral_data_bit_offset,
+            er_scale_factor_data,
+            reordered_spectral_lengths,
         })
     }
 

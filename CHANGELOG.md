@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Error-resilient `individual_channel_stream()` branch**
+  (`ics_body::IcsBody::parse_er` / `::parse_with_ics_info_er`) — ISO/IEC
+  14496-3 §4.4.6 Table 4.50, the ER General-Audio object types (AOTs
+  17 / 19 / 20 / 23). Drives `section_data()` through the
+  [`SectionData::parse_er`] 5-bit branch when
+  `aacSectionDataResilienceFlag` is set, `scale_factor_data()` through
+  the RVLC [`ErScaleFactorData::parse`] branch when
+  `aacScalefactorDataResilienceFlag` is set (mirroring the reconstructed
+  records into the shared `scale_factor_data` field so the §4.6.2.3.2
+  accumulate pass is branch-agnostic, while the RVLC seeds are retained
+  in the new `er_scale_factor_data` field), and captures the
+  `length_of_reordered_spectral_data` (14-bit) +
+  `length_of_longest_codeword` (6-bit) pair in the new
+  `reordered_spectral_lengths` field when `aacSpectralDataResilienceFlag`
+  is set. The `reordered_spectral_data()` (HCR) payload that follows is
+  the caller's responsibility, exactly as `spectral_data()` is on the
+  non-resilient path.
 - **Error-resilient `section_data()` branch**
   (`section_data::SectionData::parse_er` / `::write_er`) — ISO/IEC
   14496-3 §4.4.6 Table 4.52, the `aacSectionDataResilienceFlag == 1`

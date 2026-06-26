@@ -213,6 +213,8 @@ fn minimal_lc_long_body_roundtrips() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0, // computed by parser
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     // Spectral-data bit offset is recomputed from the parsed stream;
     // build the expected by parsing first and then asserting the
@@ -261,6 +263,8 @@ fn lc_long_body_with_one_active_band_roundtrips() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     // Self-roundtrip via parser-derived spectral_data_bit_offset.
     let mut bw = BitWriter::new();
@@ -299,6 +303,8 @@ fn lc_long_body_with_pulse_data_roundtrips() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     roundtrip(&body, 2, 4);
 }
@@ -325,6 +331,8 @@ fn pulse_data_on_eight_short_rejected_by_writer() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let mut bw = BitWriter::new();
     let err = body
@@ -354,6 +362,8 @@ fn pulse_data_slot_populated_without_dispatch_bit_rejected() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let mut bw = BitWriter::new();
     let err = body
@@ -396,6 +406,8 @@ fn lc_long_body_with_tns_data_roundtrips() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     roundtrip(&body, 2, 4);
 }
@@ -427,6 +439,8 @@ fn lc_eight_short_body_with_tns_data_roundtrips() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     roundtrip(&body, 2, 4);
 }
@@ -465,6 +479,8 @@ fn ssr_long_body_with_gain_control_roundtrips() {
         gain_control_data_present: true,
         gain_control_data: Some(gc),
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     roundtrip(&body, 3, 4);
 }
@@ -490,6 +506,8 @@ fn gain_control_on_non_ssr_aot_rejected_by_writer() {
         gain_control_data_present: true,
         gain_control_data: Some(gc),
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let mut bw = BitWriter::new();
     // AOT 2 (LC) — not 3 (SSR) — must be rejected.
@@ -522,6 +540,8 @@ fn cpe_shared_ics_info_path_roundtrips() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     roundtrip_with_ics_info(&body, &ics, 2);
 }
@@ -543,6 +563,8 @@ fn write_inline_with_missing_ics_info_rejected() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let mut bw = BitWriter::new();
     let err = body
@@ -583,6 +605,8 @@ fn scale_flag_true_rejected_on_write() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let mut bw = BitWriter::new();
     let err = body
@@ -636,6 +660,8 @@ fn ssr_long_body_with_all_tools_roundtrips() {
         gain_control_data_present: true,
         gain_control_data: Some(gc),
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     roundtrip(&body, 3, 4);
 }
@@ -671,6 +697,8 @@ fn spectral_data_bit_offset_matches_writer_position() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let mut bw = BitWriter::new();
     body.write(&mut bw, 2, 4, false).expect("encode succeeds");
@@ -680,4 +708,162 @@ fn spectral_data_bit_offset_matches_writer_position() {
     let parsed = IcsBody::parse(&mut br, 2, 4, false).expect("parse succeeds");
     assert_eq!(parsed.spectral_data_bit_offset, bits);
     assert_eq!(br.bit_position(), bits);
+}
+
+// ===========================================================================
+// Error-resilient ICS body (Table 4.50 ER branch) — section_data() ER,
+// scale_factor_data() RVLC, and the spectral-resilience length fields.
+// ===========================================================================
+
+use oxideav_aac::asc::AacResilienceFlags;
+use oxideav_aac::scale_factor_data::ErScaleFactorData;
+
+/// ER AAC LC object type (AOTs 17/19/20/23 carry the resilience triplet).
+const AOT_ER_AAC_LC: u8 = 17;
+const FS_44100_IDX: u8 = 4;
+
+/// Build a one-section ER scale_factor_data() carrying a single DPCM
+/// scalefactor band so the body parses end to end.
+fn make_er_sf(global_gain: u8) -> ErScaleFactorData {
+    ErScaleFactorData {
+        sf_concealment: false,
+        rev_global_gain: global_gain,
+        data: ScaleFactorData {
+            entries: vec![vec![ScaleFactorEntry::Dpcm(0)]],
+        },
+        dpcm_is_last_position: None,
+        dpcm_noise_last_position: None,
+    }
+}
+
+#[test]
+fn er_ics_body_full_resilience_round_geometry() {
+    let ics = make_lc_long_ics_info(1, 1);
+    let resilience = AacResilienceFlags {
+        section_data: true,
+        scalefactor_data: true,
+        spectral_data: true,
+    };
+
+    // section_data: one ER section, cb 4 over the single band (escape
+    // coding for cb < 11).
+    let section = SectionData {
+        sections: vec![vec![Section {
+            codebook: 4,
+            start: 0,
+            end: 1,
+        }]],
+        sfb_cb: vec![vec![4]],
+    };
+    let er_sf = make_er_sf(0);
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 8); // global_gain
+    ics.write(&mut bw, AOT_ER_AAC_LC, FS_44100_IDX, false)
+        .unwrap();
+    section
+        .write_er(&mut bw, WindowSequence::OnlyLong, 1)
+        .unwrap();
+    er_sf
+        .write(&mut bw, &section.sfb_cb, WindowSequence::OnlyLong)
+        .unwrap();
+    bw.write_u32(0, 1); // pulse_data_present
+    bw.write_u32(0, 1); // tns_data_present
+    bw.write_u32(0, 1); // gain_control_data_present
+    bw.write_u32(123, 14); // length_of_reordered_spectral_data
+    bw.write_u32(17, 6); // length_of_longest_codeword
+    let buf = bw.finish();
+
+    let mut br = BitReader::new(&buf);
+    let body = IcsBody::parse_er(&mut br, AOT_ER_AAC_LC, FS_44100_IDX, false, resilience).unwrap();
+
+    assert!(body.er_scale_factor_data.is_some());
+    assert_eq!(body.reordered_spectral_lengths, Some((123, 17)));
+    // The ER section preserved the 5-bit codebook value.
+    assert_eq!(body.section_data.sections[0][0].codebook, 4);
+    // The RVLC reconstruction mirrors into the shared scale_factor_data.
+    assert_eq!(
+        body.scale_factor_data.entries,
+        body.er_scale_factor_data.as_ref().unwrap().data.entries
+    );
+}
+
+#[test]
+fn er_ics_body_scalefactor_only_no_spectral_lengths() {
+    // Only aacScalefactorDataResilienceFlag set: section_data is the
+    // ordinary 4-bit branch, no spectral length fields.
+    let ics = make_lc_long_ics_info(1, 1);
+    let resilience = AacResilienceFlags {
+        section_data: false,
+        scalefactor_data: true,
+        spectral_data: false,
+    };
+    let section = SectionData {
+        sections: vec![vec![Section {
+            codebook: 4,
+            start: 0,
+            end: 1,
+        }]],
+        sfb_cb: vec![vec![4]],
+    };
+    let er_sf = make_er_sf(0);
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 8);
+    ics.write(&mut bw, AOT_ER_AAC_LC, FS_44100_IDX, false)
+        .unwrap();
+    section.write(&mut bw, WindowSequence::OnlyLong, 1).unwrap(); // non-ER section
+    er_sf
+        .write(&mut bw, &section.sfb_cb, WindowSequence::OnlyLong)
+        .unwrap();
+    bw.write_u32(0, 1);
+    bw.write_u32(0, 1);
+    bw.write_u32(0, 1);
+    let buf = bw.finish();
+
+    let mut br = BitReader::new(&buf);
+    let body = IcsBody::parse_er(&mut br, AOT_ER_AAC_LC, FS_44100_IDX, false, resilience).unwrap();
+    assert!(body.er_scale_factor_data.is_some());
+    assert_eq!(body.reordered_spectral_lengths, None);
+}
+
+#[test]
+fn er_ics_body_shared_info_cpe_form() {
+    // parse_with_ics_info_er uses the caller's ics_info for geometry.
+    let ics = make_lc_long_ics_info(1, 1);
+    let resilience = AacResilienceFlags {
+        section_data: true,
+        scalefactor_data: true,
+        spectral_data: true,
+    };
+    let section = SectionData {
+        sections: vec![vec![Section {
+            codebook: 4,
+            start: 0,
+            end: 1,
+        }]],
+        sfb_cb: vec![vec![4]],
+    };
+    let er_sf = make_er_sf(0);
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 8); // global_gain (no inline ics_info on the shared form)
+    section
+        .write_er(&mut bw, WindowSequence::OnlyLong, 1)
+        .unwrap();
+    er_sf
+        .write(&mut bw, &section.sfb_cb, WindowSequence::OnlyLong)
+        .unwrap();
+    bw.write_u32(0, 1);
+    bw.write_u32(0, 1);
+    bw.write_u32(0, 1);
+    bw.write_u32(50, 14);
+    bw.write_u32(9, 6);
+    let buf = bw.finish();
+
+    let mut br = BitReader::new(&buf);
+    let body =
+        IcsBody::parse_with_ics_info_er(&mut br, &ics, AOT_ER_AAC_LC, false, resilience).unwrap();
+    assert!(body.ics_info.is_none());
+    assert_eq!(body.reordered_spectral_lengths, Some((50, 9)));
 }

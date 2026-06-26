@@ -302,6 +302,8 @@ fn ics_body_then_spectral_data_consumes_a_complete_channel_body() {
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     };
     let offsets = sect_sfb_offset(&ics_info, FS_INDEX).expect("offsets");
     let spectrum_end = offsets[0][max_sfb as usize] as usize;

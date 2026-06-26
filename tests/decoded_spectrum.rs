@@ -72,6 +72,8 @@ fn body(
         gain_control_data_present: false,
         gain_control_data: None,
         spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
     }
 }
 
