@@ -343,6 +343,170 @@ impl SectionData {
         Ok(SectionData { sections, sfb_cb })
     }
 
+    /// Parse the error-resilient `section_data()` branch
+    /// (`aacSectionDataResilienceFlag == 1`, Table 4.52).
+    ///
+    /// Two differences from the non-resilient [`SectionData::parse`]:
+    ///
+    /// * `sect_cb[g][i]` is read as a **5-bit** field (so it can carry
+    ///   the §4.6.16.4 virtual codebooks 16..=31, the per-band VCB11
+    ///   range derived from `ESC_HCB`) rather than 4 bits.
+    /// * The `sect_len_incr` escape loop only runs when
+    ///   `sect_cb < 11 || (sect_cb > 11 && sect_cb < 16)`; for
+    ///   `sect_cb == 11` (`ESC_HCB`) or `sect_cb >= 16` (a virtual
+    ///   codebook) the section length is fixed at `sect_len_incr = 1`
+    ///   (one band) with no field on the wire. This is the Table 4.52
+    ///   `else { sect_len_incr = 1; }` branch.
+    ///
+    /// The recovered `sfb_cb[g][sfb]` therefore carries the raw 5-bit
+    /// `sect_cb` value (which may exceed `0x0f`); downstream tools that
+    /// only understand the base §4.A.1 books must map a virtual `>= 16`
+    /// codebook back onto `ESC_HCB` before dispatching — the value is
+    /// preserved here so that mapping can stay one layer up.
+    ///
+    /// Returns [`Error::SectionDataOverrun`] on a run past `max_sfb`
+    /// and [`Error::UnexpectedEnd`] on bit-reader underflow.
+    pub fn parse_er(
+        reader: &mut BitReader<'_>,
+        window_sequence: WindowSequence,
+        num_window_groups: u8,
+        max_sfb: u8,
+    ) -> Result<Self> {
+        // Table 4.52: sect_esc_val / sect_len_incr field width are the
+        // same as the non-resilient branch; only sect_cb widens to 5
+        // bits and the escape loop is gated by the codebook value.
+        let (sect_esc_val, len_bits) = if window_sequence.is_eight_short() {
+            ((1u32 << 3) - 1, 3u32)
+        } else {
+            ((1u32 << 5) - 1, 5u32)
+        };
+
+        let mut sections: Vec<Vec<Section>> = Vec::with_capacity(num_window_groups as usize);
+        let mut sfb_cb: Vec<Vec<u8>> = Vec::with_capacity(num_window_groups as usize);
+
+        for _g in 0..num_window_groups {
+            let mut group_sections: Vec<Section> = Vec::new();
+            let mut group_sfb_cb: Vec<u8> = vec![ZERO_HCB; max_sfb as usize];
+
+            let mut k: u32 = 0;
+            let max = max_sfb as u32;
+            while k < max {
+                let sect_cb = read_u8(reader, 5)?;
+
+                let mut sect_len: u32 = 0;
+                if er_uses_escape_coding(sect_cb) {
+                    loop {
+                        let incr = reader
+                            .read_u32(len_bits)
+                            .map_err(|_| Error::UnexpectedEnd)?;
+                        if incr == sect_esc_val {
+                            sect_len += sect_esc_val;
+                            continue;
+                        }
+                        sect_len += incr;
+                        break;
+                    }
+                } else {
+                    // Table 4.52 `else { sect_len_incr = 1; }` — one band,
+                    // no field on the wire.
+                    sect_len = 1;
+                }
+
+                let start = k;
+                let end = k + sect_len;
+                if end > max {
+                    return Err(Error::SectionDataOverrun);
+                }
+                for sfb in start..end {
+                    group_sfb_cb[sfb as usize] = sect_cb;
+                }
+                group_sections.push(Section {
+                    codebook: sect_cb,
+                    start: start as u8,
+                    end: end as u8,
+                });
+                k = end;
+            }
+
+            sections.push(group_sections);
+            sfb_cb.push(group_sfb_cb);
+        }
+
+        Ok(SectionData { sections, sfb_cb })
+    }
+
+    /// Encode the error-resilient `section_data()` branch, the inverse
+    /// of [`SectionData::parse_er`].
+    ///
+    /// `sect_cb` is emitted as a 5-bit field; the `sect_len_incr`
+    /// escape sequence is emitted only for codebooks that use escape
+    /// coding (`< 11`, or `12..=15`). A `sect_cb == 11` / `>= 16`
+    /// section must span exactly one band (the Table 4.52 fixed
+    /// `sect_len_incr = 1`); a longer such section is rejected with
+    /// [`Error::SectionDataEncodeInvalid`].
+    pub fn write_er(
+        &self,
+        writer: &mut BitWriter,
+        window_sequence: WindowSequence,
+        max_sfb: u8,
+    ) -> Result<()> {
+        let (sect_esc_val, len_bits) = if window_sequence.is_eight_short() {
+            (7u32, 3u32)
+        } else {
+            (31u32, 5u32)
+        };
+
+        for group_sections in &self.sections {
+            if group_sections.is_empty() {
+                if max_sfb != 0 {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+                continue;
+            }
+            if group_sections[0].start != 0 {
+                return Err(Error::SectionDataEncodeInvalid);
+            }
+            for w in group_sections.windows(2) {
+                if w[0].end != w[1].start {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+            }
+            if group_sections.last().unwrap().end != max_sfb {
+                return Err(Error::SectionDataEncodeInvalid);
+            }
+
+            for section in group_sections {
+                // sect_cb is 5 bits in the ER branch.
+                if section.codebook > 0x1f {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+                let sect_len = section.len() as u32;
+                if sect_len == 0 {
+                    return Err(Error::SectionDataEncodeInvalid);
+                }
+
+                writer.write_u32(section.codebook as u32, 5);
+
+                if er_uses_escape_coding(section.codebook) {
+                    let mut remaining = sect_len;
+                    while remaining >= sect_esc_val {
+                        writer.write_u32(sect_esc_val, len_bits);
+                        remaining -= sect_esc_val;
+                    }
+                    writer.write_u32(remaining, len_bits);
+                } else {
+                    // Fixed sect_len_incr = 1 — the section must be a
+                    // single band and carries no length field.
+                    if sect_len != 1 {
+                        return Err(Error::SectionDataEncodeInvalid);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// `num_sec[g]` — number of sections in window group `g`.
     /// Returns `0` for an out-of-range group index.
     pub fn num_sec(&self, group: usize) -> usize {
@@ -452,4 +616,16 @@ impl SectionData {
 fn read_u8(reader: &mut BitReader<'_>, n: u32) -> Result<u8> {
     debug_assert!(n <= 8);
     Ok(reader.read_u32(n).map_err(|_| Error::UnexpectedEnd)? as u8)
+}
+
+/// Table 4.52 escape-coding gate for the error-resilient
+/// `section_data()` branch.
+///
+/// Escape coding (`sect_len_incr` loop) runs when
+/// `sect_cb < 11 || (sect_cb > 11 && sect_cb < 16)`. For
+/// `sect_cb == 11` (`ESC_HCB`) and `sect_cb >= 16` (the §4.6.16.4
+/// virtual codebooks) the spec fixes `sect_len_incr = 1` and emits no
+/// length field, so the section spans exactly one band.
+fn er_uses_escape_coding(sect_cb: u8) -> bool {
+    sect_cb < 11 || (sect_cb > 11 && sect_cb < 16)
 }

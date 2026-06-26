@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Error-resilient `section_data()` branch**
+  (`section_data::SectionData::parse_er` / `::write_er`) — ISO/IEC
+  14496-3 §4.4.6 Table 4.52, the `aacSectionDataResilienceFlag == 1`
+  path: `sect_cb` widens to a 5-bit field (carrying the §4.6.16.4
+  virtual codebooks 16..=31), and the `sect_len_incr` escape loop runs
+  only for codebooks that use escape coding (`< 11` or `12..=15`) —
+  `ESC_HCB` (11) and the virtual codebooks (`>= 16`) take the fixed
+  `sect_len_incr = 1` single-band branch with no length field on the
+  wire. The recovered `sfb_cb` preserves the raw 5-bit value so the
+  virtual→`ESC_HCB` remap can stay one layer up. Round-trips bit-exactly
+  through `write_er`; the write path rejects a multi-band fixed-length
+  section.
 - **CCE per-band coupling math** (`cce::CouplingGains::couple_channel`) —
   ISO/IEC 14496-3 §4.6.8.3.3. The `couple_channel(source, dest,
   gain_list_index)` scale-and-add: walks the spec's group /

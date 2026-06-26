@@ -344,3 +344,155 @@ fn fixtures_doc_section_trace_shape() {
     assert_eq!(sd.sections[0][1].codebook, 10);
     assert_eq!(sd.sections[0][2].codebook, 6);
 }
+
+// ---------------------------------------------------------------------
+// Error-resilient section_data() branch (aacSectionDataResilienceFlag,
+// Table 4.52): 5-bit sect_cb + value-gated escape coding.
+// ---------------------------------------------------------------------
+
+/// ER long-sequence escape-coded section: `sect_cb` (5 bits) +
+/// `sect_len_incr` (5 bits). Only valid for codebooks that use escape
+/// coding (`< 11` or `12..=15`).
+fn write_er_escape_section(bw: &mut BitWriter, cb: u8, len: u8) {
+    bw.write_u32(cb as u32, 5);
+    bw.write_u32(len as u32, 5);
+}
+
+/// ER fixed-length section: `sect_cb` (5 bits) and no length field —
+/// the parser fixes `sect_len = 1`. Valid for `cb == 11` and `cb >= 16`.
+fn write_er_fixed_section(bw: &mut BitWriter, cb: u8) {
+    bw.write_u32(cb as u32, 5);
+}
+
+#[test]
+fn er_section_5bit_codebook_escape_branch() {
+    // Two escape-coded sections (cb 4 over 5 bands, cb 6 over 3 bands).
+    let mut bw = BitWriter::new();
+    write_er_escape_section(&mut bw, 4, 5);
+    write_er_escape_section(&mut bw, 6, 3);
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+
+    let sd = SectionData::parse_er(&mut br, WindowSequence::OnlyLong, 1, 8).unwrap();
+    assert_eq!(sd.num_sec(0), 2);
+    assert_eq!(
+        sd.sections[0][0],
+        Section {
+            codebook: 4,
+            start: 0,
+            end: 5
+        }
+    );
+    assert_eq!(
+        sd.sections[0][1],
+        Section {
+            codebook: 6,
+            start: 5,
+            end: 8
+        }
+    );
+}
+
+#[test]
+fn er_section_fixed_length_for_esc_and_virtual_codebooks() {
+    // ESC_HCB (11) and a virtual codebook (>= 16) each span exactly one
+    // band with no sect_len_incr field on the wire; a normal book (5)
+    // in between is escape-coded.
+    let mut bw = BitWriter::new();
+    write_er_fixed_section(&mut bw, 11); // band 0
+    write_er_escape_section(&mut bw, 5, 2); // bands 1..3
+    write_er_fixed_section(&mut bw, 20); // band 3 (virtual codebook)
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+
+    let sd = SectionData::parse_er(&mut br, WindowSequence::OnlyLong, 1, 4).unwrap();
+    assert_eq!(sd.num_sec(0), 3);
+    assert_eq!(
+        sd.sections[0][0],
+        Section {
+            codebook: 11,
+            start: 0,
+            end: 1
+        }
+    );
+    assert_eq!(
+        sd.sections[0][1],
+        Section {
+            codebook: 5,
+            start: 1,
+            end: 3
+        }
+    );
+    assert_eq!(
+        sd.sections[0][2],
+        Section {
+            codebook: 20,
+            start: 3,
+            end: 4
+        }
+    );
+    // The 5-bit sect_cb preserves the virtual codebook value verbatim.
+    assert_eq!(sd.sfb_cb[0][3], 20);
+}
+
+#[test]
+fn er_section_roundtrips_through_write_er() {
+    let mut bw = BitWriter::new();
+    write_er_fixed_section(&mut bw, 11);
+    write_er_escape_section(&mut bw, 7, 4);
+    write_er_fixed_section(&mut bw, 16);
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let sd = SectionData::parse_er(&mut br, WindowSequence::OnlyLong, 1, 6).unwrap();
+
+    let mut wb = BitWriter::new();
+    sd.write_er(&mut wb, WindowSequence::OnlyLong, 6).unwrap();
+    let rebuilt = wb.finish();
+    assert_eq!(
+        rebuilt, buf,
+        "ER section_data() must round-trip bit-exactly"
+    );
+}
+
+#[test]
+fn er_section_write_rejects_multi_band_fixed_codebook() {
+    // A cb == 11 / >= 16 section spanning more than one band is illegal
+    // in the ER branch (the spec fixes sect_len_incr = 1).
+    let sd = SectionData {
+        sections: vec![vec![Section {
+            codebook: 11,
+            start: 0,
+            end: 3,
+        }]],
+        sfb_cb: vec![vec![11; 3]],
+    };
+    let mut wb = BitWriter::new();
+    let err = sd
+        .write_er(&mut wb, WindowSequence::OnlyLong, 3)
+        .unwrap_err();
+    assert_eq!(err, Error::SectionDataEncodeInvalid);
+}
+
+#[test]
+fn er_section_escape_long_run() {
+    // A run that needs an escape: 31 (sect_esc_val) + 4 = 35 bands of cb 9.
+    let mut bw = BitWriter::new();
+    bw.write_u32(9, 5); // sect_cb
+    bw.write_u32(31, 5); // sect_len_incr == sect_esc_val (escape)
+    bw.write_u32(4, 5); // residual
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let sd = SectionData::parse_er(&mut br, WindowSequence::OnlyLong, 1, 35).unwrap();
+    assert_eq!(
+        sd.sections[0][0],
+        Section {
+            codebook: 9,
+            start: 0,
+            end: 35
+        }
+    );
+
+    let mut wb = BitWriter::new();
+    sd.write_er(&mut wb, WindowSequence::OnlyLong, 35).unwrap();
+    assert_eq!(wb.finish(), buf);
+}
