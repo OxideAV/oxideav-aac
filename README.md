@@ -85,9 +85,42 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   `accumulate()` pass consumes them unchanged — pinned by a test that
   an RVLC stream and the Huffman stream carrying the same deltas
   accumulate to identical absolute scalefactors. The
-  resilience-flag dispatch from `ics_body` (which today always takes
-  the non-resilient branch) is the remaining wiring step; the RVLC
-  bitstream path itself is decoded end to end.
+  resilience-flag dispatch from `ics_body` is now wired (see the
+  error-resilient ICS body below); the RVLC bitstream path itself is
+  decoded end to end.
+- **Error-resilient channel-element body**
+  (`ics_body::IcsBody::parse_er` / `::parse_with_ics_info_er`,
+  `section_data::SectionData::parse_er` / `::write_er`) — ISO/IEC
+  14496-3 §4.4.6 Tables 4.50 / 4.52, the ER General-Audio object types
+  (AOTs 17 / 19 / 20 / 23). Drives all three resilience branches off
+  the `AacResilienceFlags` triplet: `section_data()` through the 5-bit
+  `sect_cb` branch (carrying the §4.6.16.4 virtual codebooks 16..=31,
+  whose `ESC_HCB` / `>= 16` runs take the fixed `sect_len_incr = 1`
+  single-band coding) when `aacSectionDataResilienceFlag` is set;
+  `scale_factor_data()` through the RVLC `ErScaleFactorData` branch
+  (its reconstruction mirrored into the shared `scale_factor_data`
+  field so the §4.6.2.3.2 accumulate pass is branch-agnostic, with the
+  RVLC seeds retained in `er_scale_factor_data`) when
+  `aacScalefactorDataResilienceFlag` is set; and the
+  `length_of_reordered_spectral_data` (14-bit) +
+  `length_of_longest_codeword` (6-bit) HCR length fields in
+  `reordered_spectral_lengths` when `aacSpectralDataResilienceFlag` is
+  set. The trailing `reordered_spectral_data()` (HCR) payload is the
+  caller's responsibility, exactly as `spectral_data()` is on the
+  non-resilient path.
+- **HCR segmentation / pre-sorting scaffold** (`hcr`) — ISO/IEC
+  14496-3 §4.6.16.3.3 / §4.6.16.3.5. The deterministic, header-only
+  half of Huffman codeword reordering: the Table 4.170 `maxCwLen`
+  table, the §4.6.16.3.3.1 `codebookPriority[32]` table + the
+  `assignedUnitNr` pre-sorting metric, the
+  `segmentWidth = min(maxCwLen, length_of_longest_codeword)`
+  derivation, the §4.6.16.3.2 length-field clamps, and the
+  `Segmentation` layout that instantiates PCW segments until the
+  `length_of_reordered_spectral_data` buffer is exhausted (folding the
+  trailing bits into the last segment). The full reordered-payload
+  decode (the §4.6.16.3.4 PCW / non-PCW trial loop inverted to recover
+  the codeword bit positions) keys off this scaffold and awaits an
+  HCR-bearing conformance stream for bit-exact validation.
 
 ### Numeric reconstruction (AAC-LC tool chain)
 
@@ -463,13 +496,22 @@ EP-tool payload de-interleave is out of scope.
   `cc_target_tag_select` and scaling the decoded CCE spectrum onto the
   addressed SCE / CPE channels at the `cc_domain` stage) awaits a CCE
   fixture for end-to-end validation.
-- The `aacScalefactorDataResilienceFlag` dispatch from `ics_body` to
-  the error-resilient (RVLC) `scale_factor_data()` branch — the RVLC
-  codebooks (`rvlc`) and the whole Table 4.53 RVLC parse / write path
-  (`scale_factor_data::ErScaleFactorData`) are now implemented and
-  tested (see the error-resilience section above); what remains is
-  plumbing the resilience flag from `GASpecificConfig` through
-  `ics_body` so the channel-element body selects the RVLC branch.
+- The full `reordered_spectral_data()` (HCR) payload decode — the
+  error-resilient channel-element body (`ics_body::IcsBody::parse_er`)
+  now selects all three §4.4.6 resilience branches off the
+  `AacResilienceFlags` triplet (ER `section_data()`, RVLC
+  `scale_factor_data()`, and the HCR `length_of_reordered_spectral_data`
+  / `length_of_longest_codeword` fields), and the `hcr` module supplies
+  the §4.6.16.3.3 segmentation / pre-sorting scaffold (`maxCwLen`,
+  `codebookPriority`, `assignedUnitNr`, `segmentWidth`, the
+  `Segmentation` PCW-segment layout). What remains is the
+  §4.6.16.3.4 reordered-payload decode itself — the PCW / non-PCW
+  `WriteCodewordToSegment` trial loop inverted to recover the codeword
+  bit positions — and threading `aacScalefactorDataResilienceFlag` /
+  the rest of the triplet from `GASpecificConfig` through the ADTS /
+  LATM decode drivers (today the ER body parse is reachable directly
+  but the drivers always take the non-resilient branch). Both await an
+  HCR-bearing conformance stream for bit-exact validation.
 - LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
   `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
   `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`

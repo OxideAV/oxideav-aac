@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HCR segmentation / pre-sorting scaffold** (`hcr`) — ISO/IEC
+  14496-3 §4.6.16.3.3, the deterministic header-only half of Huffman
+  codeword reordering: the Table 4.170 `maxCwLen` table (`MAX_CW_LEN`,
+  `max_cw_len`), the §4.6.16.3.3.1 `codebookPriority[32]` table
+  (`CODEBOOK_PRIORITY`, `codebook_priority`) + the `assignedUnitNr`
+  pre-sorting metric (`assigned_unit_nr`), the
+  `segmentWidth = min(maxCwLen, length_of_longest_codeword)` derivation
+  (`segment_width`), the §4.6.16.3.2 length-field clamps
+  (`clamp_longest_codeword`, `clamp_reordered_length` — `6144`
+  SCE/CCE/LFE, `12288` CPE), and the `Segmentation` layout that
+  instantiates PCW segments until the `length_of_reordered_spectral_data`
+  buffer is exhausted, folding the trailing bits into the last segment
+  per §4.6.16.3.3.2. The full reordered-payload decode (the PCW /
+  non-PCW trial loop) keys off this scaffold and is a later milestone
+  (needs an HCR-bearing conformance stream).
 - **Error-resilient `individual_channel_stream()` branch**
   (`ics_body::IcsBody::parse_er` / `::parse_with_ics_info_er`) — ISO/IEC
   14496-3 §4.4.6 Table 4.50, the ER General-Audio object types (AOTs
