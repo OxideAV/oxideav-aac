@@ -290,6 +290,176 @@ impl Segmentation {
     pub fn number_of_segments(&self) -> usize {
         self.segment_bits.len()
     }
+
+    /// The global bit offset of segment `i`'s first bit within the
+    /// reordered buffer (the running sum of preceding segment widths).
+    #[must_use]
+    fn segment_start(&self, i: usize) -> u32 {
+        self.segment_bits[..i].iter().sum()
+    }
+}
+
+/// Write direction within a segment (§4.6.16.3.3.3). PCWs and
+/// odd-numbered sets use [`Direction::Forward`] (left-to-right);
+/// the direction toggles from set to set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Left-to-right: fill from the leftmost remaining bit of the
+    /// segment's free region.
+    Forward,
+    /// Right-to-left: fill from the rightmost remaining bit.
+    Backward,
+}
+
+impl Direction {
+    /// Toggle the write direction (`ToggleWriteDirection()`).
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Direction::Forward => Direction::Backward,
+            Direction::Backward => Direction::Forward,
+        }
+    }
+}
+
+/// The fully-resolved bit placement of every codeword in a
+/// `reordered_spectral_data()` block — for each codeword, the ordered
+/// list of global bit positions (within the reordered buffer) that
+/// carry its bits, most-significant-bit first.
+///
+/// This is the inverse of the §4.6.16.3.3.4 `ReorderSpectralData()`
+/// writing scheme: it runs the same PCW-then-non-PCW set / trial loop
+/// to determine *where* each codeword's bits land, so a decoder that
+/// already knows each codeword's bit length (PCWs are decoded first
+/// from the segment starts, then the non-PCW lengths become known) can
+/// gather a codeword's scattered bits back into a contiguous codeword
+/// for Huffman decoding.
+///
+/// The bit lengths themselves come from Huffman-decoding the codewords
+/// in place (the §4.6.16.3.4 decode references the ordinary
+/// §4.6.3.3 spectral decode); this structure only resolves geometry
+/// once those lengths are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReorderPlan {
+    /// `codeword_bits[c]` — the global buffer bit positions of
+    /// codeword `c`, in codeword-MSB-first order.
+    pub codeword_bits: Vec<Vec<u32>>,
+}
+
+impl ReorderPlan {
+    /// Resolve the bit placement for `codeword_lengths` codewords over
+    /// `seg` segments, following the §4.6.16.3.3.4 writing scheme.
+    ///
+    /// * `codeword_lengths[c]` — the bit length of codeword `c`, in
+    ///   pre-sorted order (PCWs first). `codeword_lengths.len()` is
+    ///   `numberOfCodewords`.
+    /// * `seg` — the [`Segmentation`] giving `numberOfSegments` and the
+    ///   per-segment bit widths.
+    ///
+    /// `numberOfSets = ceil(numberOfCodewords / numberOfSegments)`. The
+    /// first `numberOfSegments` codewords are the PCWs (set 0), each
+    /// written forward from its own segment's start; the rest are
+    /// non-PCWs distributed by the set / trial loop with the per-set
+    /// direction toggle.
+    ///
+    /// Returns `None` if the codewords do not fit the buffer (the sum
+    /// of `codeword_lengths` exceeds `total_bits`, or a segment
+    /// overflows) — a conforming stream always fits by construction.
+    #[must_use]
+    pub fn build(codeword_lengths: &[u32], seg: &Segmentation) -> Option<Self> {
+        let num_segments = seg.number_of_segments();
+        let num_codewords = codeword_lengths.len();
+        if num_segments == 0 {
+            return if num_codewords == 0 {
+                Some(ReorderPlan {
+                    codeword_bits: Vec::new(),
+                })
+            } else {
+                None
+            };
+        }
+
+        // Per-segment free-region cursors. Segment `s` spans local bits
+        // `[0, width)`. `low[s]` counts bits consumed from the low end
+        // (forward writes), `high[s]` counts bits consumed from the high
+        // end (backward writes). The free region is the local-bit range
+        // `[low[s], width - high[s])`; free bit count is
+        // `width - low[s] - high[s]`.
+        let widths: Vec<u32> = seg.segment_bits.clone();
+        let mut low: Vec<u32> = vec![0; num_segments];
+        let mut high: Vec<u32> = vec![0; num_segments];
+        let seg_start: Vec<u32> = (0..num_segments).map(|s| seg.segment_start(s)).collect();
+
+        let mut codeword_bits: Vec<Vec<u32>> = vec![Vec::new(); num_codewords];
+        // remainingBitsInCodeword[]
+        let mut remaining: Vec<u32> = codeword_lengths.to_vec();
+
+        // Inlined `WriteCodewordToSegment(cw, sg, dir)`: write up to
+        // `remaining[cw]` bits of codeword `cw` into the free region of
+        // segment `sg` in `dir`, recording the global bit positions
+        // MSB-first. Returns bits written.
+        macro_rules! write_cw_to_seg {
+            ($cw:expr, $sg:expr, $dir:expr) => {{
+                let cw = $cw;
+                let sg = $sg;
+                let dir = $dir;
+                let free = widths[sg] - low[sg] - high[sg];
+                let n = remaining[cw].min(free);
+                for _ in 0..n {
+                    let local = match dir {
+                        Direction::Forward => {
+                            let l = low[sg];
+                            low[sg] += 1;
+                            l
+                        }
+                        Direction::Backward => {
+                            // Outermost free bit from the right.
+                            let l = widths[sg] - 1 - high[sg];
+                            high[sg] += 1;
+                            l
+                        }
+                    };
+                    codeword_bits[cw].push(seg_start[sg] + local);
+                }
+                remaining[cw] -= n;
+                n
+            }};
+        }
+
+        // First step: write PCWs (set 0). Codeword `i` → segment `i`,
+        // forward.
+        for codeword in 0..num_segments.min(num_codewords) {
+            write_cw_to_seg!(codeword, codeword, Direction::Forward);
+        }
+
+        // numberOfSets = ceil(numberOfCodewords / numberOfSegments).
+        let num_sets = num_codewords.div_ceil(num_segments);
+
+        // Second step: write non-PCWs (sets 1..num_sets).
+        let mut write_direction = Direction::Forward;
+        for set in 1..num_sets {
+            write_direction = write_direction.toggled();
+            for trial in 0..num_segments {
+                for codeword_base in 0..num_segments {
+                    let segment = (trial + codeword_base) % num_segments;
+                    let codeword = codeword_base + set * num_segments;
+                    if codeword >= num_codewords {
+                        continue;
+                    }
+                    if remaining[codeword] > 0 {
+                        write_cw_to_seg!(codeword, segment, write_direction);
+                    }
+                }
+            }
+        }
+
+        // Every codeword must be fully placed for a conforming stream.
+        if remaining.iter().any(|&r| r > 0) {
+            return None;
+        }
+
+        Some(ReorderPlan { codeword_bits })
+    }
 }
 
 #[cfg(test)]
@@ -405,5 +575,103 @@ mod tests {
         let seg = Segmentation::new(&[8, 8, 8], 24);
         assert_eq!(seg.segment_bits, vec![8, 8, 8]);
         assert_eq!(seg.segment_bits.iter().sum::<u32>(), 24);
+    }
+
+    // ---- ReorderPlan: bit-placement geometry ----
+
+    /// Assert the placement is a bijection over `[0, total_bits)`: every
+    /// codeword bit position is distinct and the union covers every
+    /// buffer bit exactly once (true whenever the codewords fully fill
+    /// the buffer).
+    fn assert_bijective(plan: &ReorderPlan, total_bits: u32) {
+        let mut seen = vec![false; total_bits as usize];
+        let mut count = 0u32;
+        for cw in &plan.codeword_bits {
+            for &p in cw {
+                assert!(p < total_bits, "position {p} out of range");
+                assert!(!seen[p as usize], "position {p} written twice");
+                seen[p as usize] = true;
+                count += 1;
+            }
+        }
+        assert_eq!(count, total_bits, "not every buffer bit was covered");
+    }
+
+    #[test]
+    fn reorder_pcws_start_at_segment_boundaries() {
+        // 3 segments of 8 bits, 3 PCWs each exactly 8 bits long → each
+        // codeword fills its own segment, forward, starting at the
+        // segment boundary.
+        let seg = Segmentation::new(&[8, 8, 8], 24);
+        let plan = ReorderPlan::build(&[8, 8, 8], &seg).unwrap();
+        assert_eq!(plan.codeword_bits[0], (0..8).collect::<Vec<_>>());
+        assert_eq!(plan.codeword_bits[1], (8..16).collect::<Vec<_>>());
+        assert_eq!(plan.codeword_bits[2], (16..24).collect::<Vec<_>>());
+        assert_bijective(&plan, 24);
+    }
+
+    #[test]
+    fn reorder_nonpcws_fill_gaps_with_direction_toggle() {
+        // 2 segments of 10 bits = 20-bit buffer. Codewords:
+        // PCWs (set 0): cw0=4 bits, cw1=4 bits (start of each segment).
+        // Set 1 (backward): cw2=6, cw3=6 — fill the remaining 6 bits of
+        // each segment from the right.
+        let seg = Segmentation::new(&[10, 10], 20);
+        let plan = ReorderPlan::build(&[4, 4, 6, 6], &seg).unwrap();
+        // cw0 forward at segment 0 start.
+        assert_eq!(plan.codeword_bits[0], vec![0, 1, 2, 3]);
+        // cw1 forward at segment 1 start (offset 10).
+        assert_eq!(plan.codeword_bits[1], vec![10, 11, 12, 13]);
+        // cw2 is the first non-PCW: set 1, trial 0, codeword_base 0 →
+        // segment 0, backward → bits 9,8,7,6,5,4.
+        assert_eq!(plan.codeword_bits[2], vec![9, 8, 7, 6, 5, 4]);
+        // cw3 → segment 1, backward → bits 19,18,17,16,15,14.
+        assert_eq!(plan.codeword_bits[3], vec![19, 18, 17, 16, 15, 14]);
+        assert_bijective(&plan, 20);
+    }
+
+    #[test]
+    fn reorder_codeword_spanning_multiple_segments() {
+        // 3 segments of 5 bits = 15-bit buffer. PCWs cw0,cw1,cw2 each 3
+        // bits (forward from each segment start, 2 free bits left each).
+        // Set 1 (backward): cw3=4, cw4=4, cw5=4 — each is longer than one
+        // segment's 2-bit remainder, so it spans into the next segment
+        // across trials (modulo shift).
+        let seg = Segmentation::new(&[5, 5, 5], 15);
+        let plan = ReorderPlan::build(&[3, 3, 3, 2, 2, 2], &seg).unwrap();
+        // Total bits placed equals buffer size, bijective.
+        assert_bijective(&plan, 15);
+        // PCWs at segment starts.
+        assert_eq!(plan.codeword_bits[0], vec![0, 1, 2]);
+        assert_eq!(plan.codeword_bits[1], vec![5, 6, 7]);
+        assert_eq!(plan.codeword_bits[2], vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn reorder_partial_codeword_continues_next_trial() {
+        // 2 segments of 6 bits = 12-bit buffer. PCWs cw0=2, cw1=2 leave
+        // 4 free bits per segment. Set 1 backward: cw2=6, cw3=2. cw2 (6
+        // bits) into segment 0's 4 free bits (trial 0) writes 4 bits;
+        // the remaining 2 spill into segment 1 on trial 1. cw3 (2 bits)
+        // goes into segment 1 trial 0.
+        let seg = Segmentation::new(&[6, 6], 12);
+        let plan = ReorderPlan::build(&[2, 2, 6, 2], &seg).unwrap();
+        assert_bijective(&plan, 12);
+        assert_eq!(plan.codeword_bits[2].len(), 6);
+        assert_eq!(plan.codeword_bits[3].len(), 2);
+    }
+
+    #[test]
+    fn reorder_rejects_overfull_buffer() {
+        // Codewords summing past the buffer don't fit.
+        let seg = Segmentation::new(&[8, 8], 16);
+        assert!(ReorderPlan::build(&[8, 8, 4], &seg).is_none());
+    }
+
+    #[test]
+    fn reorder_empty_block() {
+        let seg = Segmentation::new(&[], 0);
+        let plan = ReorderPlan::build(&[], &seg).unwrap();
+        assert!(plan.codeword_bits.is_empty());
     }
 }

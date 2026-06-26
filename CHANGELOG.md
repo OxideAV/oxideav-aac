@@ -23,6 +23,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   per §4.6.16.3.3.2. The full reordered-payload decode (the PCW /
   non-PCW trial loop) keys off this scaffold and is a later milestone
   (needs an HCR-bearing conformance stream).
+- **HCR codeword bit-placement engine** (`hcr::ReorderPlan`,
+  `hcr::Direction`) — ISO/IEC 14496-3 §4.6.16.3.3.3 / §4.6.16.3.3.4.
+  `ReorderPlan::build(codeword_lengths, segmentation)` runs the
+  `ReorderSpectralData()` writing scheme (PCWs written forward from each
+  segment start, then the non-PCW set / trial loop with the per-set
+  `ToggleWriteDirection()` and the modulo-shift `segment = (trial +
+  codewordBase) % numberOfSegments`) to resolve, for each codeword, the
+  ordered global buffer bit positions (MSB-first) that carry its bits —
+  the geometry a decoder needs to gather a codeword's scattered bits
+  back into a contiguous codeword once its length is known. Tested for
+  the PCW-at-segment-boundary placement, the backward-direction non-PCW
+  fill, multi-segment-spanning codewords, partial-codeword continuation
+  across trials, and the bijection invariant (every buffer bit covered
+  exactly once). The remaining step binds this geometry to the in-place
+  §4.6.3.3 Huffman decode (PCWs first to learn the non-PCW lengths),
+  which needs an HCR-bearing conformance stream.
 - **Error-resilient `individual_channel_stream()` branch**
   (`ics_body::IcsBody::parse_er` / `::parse_with_ics_info_er`) — ISO/IEC
   14496-3 §4.4.6 Table 4.50, the ER General-Audio object types (AOTs

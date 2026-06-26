@@ -117,10 +117,17 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   derivation, the §4.6.16.3.2 length-field clamps, and the
   `Segmentation` layout that instantiates PCW segments until the
   `length_of_reordered_spectral_data` buffer is exhausted (folding the
-  trailing bits into the last segment). The full reordered-payload
-  decode (the §4.6.16.3.4 PCW / non-PCW trial loop inverted to recover
-  the codeword bit positions) keys off this scaffold and awaits an
-  HCR-bearing conformance stream for bit-exact validation.
+  trailing bits into the last segment). `ReorderPlan::build` then runs
+  the §4.6.16.3.3.4 `ReorderSpectralData()` writing scheme (PCWs
+  forward from each segment start, then the non-PCW set / trial loop
+  with the per-set `ToggleWriteDirection()` and the modulo-shift
+  `segment = (trial + codewordBase) % numberOfSegments`) to resolve,
+  for each codeword, the ordered global buffer bit positions
+  (MSB-first) that carry its bits — pinned by a bijection invariant
+  (every buffer bit covered exactly once). The remaining step binds
+  this geometry to the in-place §4.6.3.3 Huffman decode (PCWs first to
+  learn the non-PCW lengths) and awaits an HCR-bearing conformance
+  stream for bit-exact validation.
 
 ### Numeric reconstruction (AAC-LC tool chain)
 
