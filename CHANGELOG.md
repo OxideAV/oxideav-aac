@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SSR gain-control `PFMD` length discipline + cross-frame robustness**
+  (`gain_control`) — split the §4.6.12.3.2 `PFMD_B` length into the
+  input-read length (`pfmd_len`: 256 for `ONLY_LONG` / `LONG_START`, 32
+  for `LONG_STOP` / `EIGHT_SHORT`) and the produced length
+  (`pfmd_produced_len`: 256 for `ONLY_LONG` / `LONG_STOP`, 32 for
+  `LONG_START` / `EIGHT_SHORT`), which differ because the left-half
+  `GMF` region size is sequence-dependent. `GainBandState` now writes
+  the produced prefix into a persistent 256-entry buffer so the carry
+  never shrinks across a `window_sequence` transition. New tests pin a
+  finite, strictly-positive `AD` for all four sequences, the exact
+  `AD(j)·GMF(j) == 1` inversion, and the step-3 `ALEV(0)·PFMD` left-half
+  scaling.
+
 - **SSR per-channel back-end driver** (`ssr`) — `SsrGainControl`
   composes the four-band gain-control state (`gain_control`) and the
   IPQF synthesizer (`ipqf`) into one persistent per-channel pipeline.

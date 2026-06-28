@@ -474,22 +474,32 @@ impl GainBandState {
         seq: WindowSequence,
     ) -> Vec<f64> {
         // (1) windowing: T = AD · U  (or T = U when gain control is off).
+        // The produced `pfmd_next` is the 32- or 256-entry prefix the
+        // next frame reads; write it into the persistent 256-buffer so
+        // the buffer never shrinks (any branch can read its prefix).
         let t = match band {
             Some(b) => {
                 let g = BandGainFunction::reconstruct(b, seq, &self.pfmd);
-                self.pfmd = g.pfmd_next;
+                self.store_pfmd(&g.pfmd_next);
                 apply_gain(&g.ad, u, seq)
             }
             None => {
                 // Band 0 / inactive: T = U, PFMD threads as the identity.
                 let g = BandGainFunction::identity(seq);
-                self.pfmd = g.pfmd_next;
+                self.store_pfmd(&g.pfmd_next);
                 u.to_vec()
             }
         };
 
         // (2) overlapping: produce V_B and update PT_B.
         self.overlap(&t, seq)
+    }
+
+    /// Write the produced `PFMD` prefix into the persistent 256-entry
+    /// buffer (the buffer never shrinks, so any following frame can read
+    /// the prefix it needs).
+    fn store_pfmd(&mut self, produced: &[f64]) {
+        self.pfmd[..produced.len()].copy_from_slice(produced);
     }
 
     /// The §4.6.12.3.3 step-(2) overlap for the gain-controlled block
@@ -571,13 +581,36 @@ fn apply_gain(ad: &[Vec<f64>], u: &[f64], seq: WindowSequence) -> Vec<f64> {
     }
 }
 
-/// The length of the per-frame `PFMD_B` state for a `window_sequence`:
-/// 256 for the long sequences, 32 for the short sequence.
+/// The §4.6.12.3.2 `PFMD_B` **input** length a frame of `seq` reads
+/// from the previous frame.
+///
+/// The step-3 `GMF` composition reads `PFMD_B(j)` over `0..256` for
+/// `ONLY_LONG` / `LONG_START` (their left half spans the full 256), but
+/// only `0..32` for `LONG_STOP` (the `112 ≤ j ≤ 143` region) and
+/// `EIGHT_SHORT` (the `W == 0`, `0 ≤ j ≤ 31` region). A
+/// [`GainBandState`] keeps the full 256-entry buffer, so any branch can
+/// always read the prefix it needs.
 #[must_use]
 pub fn pfmd_len(seq: WindowSequence) -> usize {
     match seq {
-        WindowSequence::EightShort => 32,
-        _ => 256,
+        WindowSequence::OnlyLong | WindowSequence::LongStart => 256,
+        WindowSequence::LongStop | WindowSequence::EightShort => 32,
+    }
+}
+
+/// The §4.6.12.3.2 `PFMD_B` **output** length a frame of `seq` produces
+/// for the next frame.
+///
+/// `ONLY_LONG` / `LONG_STOP` emit `FMD(0..256)` (256 entries);
+/// `LONG_START` / `EIGHT_SHORT` emit `FMD(0..32)` (32 entries). In a
+/// legal `window_sequence` chain the produced length always matches
+/// what the following frame's [`pfmd_len`] reads (`LONG_START` →
+/// `EIGHT_SHORT`, `EIGHT_SHORT` → `LONG_STOP`, etc.).
+#[must_use]
+pub fn pfmd_produced_len(seq: WindowSequence) -> usize {
+    match seq {
+        WindowSequence::OnlyLong | WindowSequence::LongStop => 256,
+        WindowSequence::LongStart | WindowSequence::EightShort => 32,
     }
 }
 
@@ -784,5 +817,92 @@ mod tests {
         // Beyond ALOC(NADW+1)=256 region: at j large, M=1 (ALOC(1)=16),
         // ALEV(1)=4, ALEV(2)=1, j-16 > 7 ⇒ FMD = ALEV(2) = 1 ⇒ AD=1.
         assert!((g.ad[0][511] - 1.0).abs() < 1e-9, "AD={}", g.ad[0][511]);
+    }
+
+    /// A band carrying a ladder reconstructs a finite, strictly-positive
+    /// `AD` over the full window for every `window_sequence` — the
+    /// `GMF`/`AD` reciprocal pair is well-defined (no zero or infinity).
+    #[test]
+    fn ad_is_finite_positive_all_sequences() {
+        use crate::gain_control_data::{GainAdjust, GainWindow};
+        for &seq in &[
+            WindowSequence::OnlyLong,
+            WindowSequence::LongStart,
+            WindowSequence::LongStop,
+            WindowSequence::EightShort,
+        ] {
+            let n_win = num_windows(seq);
+            // Each window carries one mid-range gain change.
+            let windows = (0..n_win)
+                .map(|_| GainWindow {
+                    adjustments: vec![GainAdjust {
+                        alevcode: 7, // AdjLev=3 ⇒ ALEV=8.
+                        aloccode: 1, // ALOC=8.
+                    }],
+                })
+                .collect();
+            let band = GainBand { windows };
+            let pfmd = vec![1.0f64; pfmd_len(seq)];
+            let g = BandGainFunction::reconstruct(&band, seq, &pfmd);
+            for win in &g.ad {
+                for &v in win {
+                    assert!(v.is_finite() && v > 0.0, "AD={v} for {seq:?}");
+                }
+            }
+            // PFMD threads with the right produced length.
+            assert_eq!(g.pfmd_next.len(), pfmd_produced_len(seq));
+        }
+    }
+
+    /// The §4.6.12.3.2 inversion is exact: `AD(j) · GMF(j) == 1`. We
+    /// recover `GMF` as `1/AD` and confirm it round-trips to `AD`.
+    #[test]
+    fn ad_times_gmf_is_one() {
+        use crate::gain_control_data::{GainAdjust, GainWindow};
+        let band = GainBand {
+            windows: vec![GainWindow {
+                adjustments: vec![
+                    GainAdjust {
+                        alevcode: 8,
+                        aloccode: 2,
+                    },
+                    GainAdjust {
+                        alevcode: 2,
+                        aloccode: 10,
+                    },
+                ],
+            }],
+        };
+        let pfmd = vec![1.0f64; 256];
+        let g = BandGainFunction::reconstruct(&band, WindowSequence::OnlyLong, &pfmd);
+        for &ad in &g.ad[0] {
+            let gmf = 1.0 / ad;
+            assert!((ad * gmf - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// Pre-stream defaults: a first frame with `PFMD ≡ 1.0` and a band
+    /// whose only gain change sits at `ALOC = 0` scales the left-half
+    /// `GMF` region by `ALEV(0)` (the §4.6.12.3.2 step-3 `ONLY_LONG`
+    /// branch `ALEV(0)·PFMD`).
+    #[test]
+    fn long_left_half_scaled_by_alev0() {
+        use crate::gain_control_data::{GainAdjust, GainWindow};
+        // alevcode=7 ⇒ AdjLev=3 ⇒ ALEV=8; aloccode=0 ⇒ ALOC=0.
+        // ALEV(0)=ALEV(1)=8. GMF(j) for j in 0..256 = ALEV(0)·PFMD(j)
+        // = 8·1 = 8 ⇒ AD = 1/8.
+        let band = GainBand {
+            windows: vec![GainWindow {
+                adjustments: vec![GainAdjust {
+                    alevcode: 7,
+                    aloccode: 0,
+                }],
+            }],
+        };
+        let pfmd = vec![1.0f64; 256];
+        let g = BandGainFunction::reconstruct(&band, WindowSequence::OnlyLong, &pfmd);
+        for &ad in &g.ad[0][..256] {
+            assert!((ad - 0.125).abs() < 1e-12, "AD={ad}");
+        }
     }
 }
