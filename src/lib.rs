@@ -414,6 +414,7 @@ pub mod dequant;
 pub mod element_decode;
 pub mod extension_payload;
 pub mod filterbank;
+pub mod gain_control;
 pub mod gain_control_data;
 pub mod hcr;
 pub mod ics_body;

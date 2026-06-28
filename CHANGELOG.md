@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SSR gain-control reconstruction back-end** (`gain_control`) —
+  ISO/IEC 14496-3 §4.6.12, the back-end counterpart to the
+  `gain_control_data` Table 4.12 wire parser. Implements §4.6.12.3.1
+  gain-control data decoding (the Table 4.108 `AdjLoc()` = `8·AC` and
+  Table 4.109 `AdjLev()` = `AV − 4` tables, the `NADW` / `ALOC` /
+  `ALEV` ladder with the step-(3) `ALOC(0)=0` / `ALEV(0)` and step-(4)
+  per-sequence endpoint), §4.6.12.3.2 gain-control function setting
+  (the `M_{W,B,j}` index, the `FMD` fragment-modification function with
+  the `Inter(a,b,j)` geometric-blend ramp, the per-sequence `GMF`
+  composition threading the cross-frame `PFMD`, and the inversion
+  `AD(j) = 1/GMF(j)`), and §4.6.12.3.3 gain-control windowing +
+  overlapping (`GainBandState::window_overlap`: `T = AD·U`, then the
+  per-`window_sequence` overlap-add into the band sample data `V_B`,
+  threading the cross-frame `PT_B` tail). All four `window_sequence`
+  shapes are covered; the `PFMD ≡ 1.0` / `PT ≡ 0.0` spec initial values
+  are honoured. Pinned by table spot-checks, the `Inter` endpoint /
+  geometric-midpoint identities, the identity-gain / empty-ladder unit
+  cases, and overlap-add property tests.
 - **HCR segmentation / pre-sorting scaffold** (`hcr`) — ISO/IEC
   14496-3 §4.6.16.3.3, the deterministic header-only half of Huffman
   codeword reordering: the Table 4.170 `maxCwLen` table (`MAX_CW_LEN`,
