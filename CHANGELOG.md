@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SSR per-channel back-end driver** (`ssr`) — `SsrGainControl`
+  composes the four-band gain-control state (`gain_control`) and the
+  IPQF synthesizer (`ipqf`) into one persistent per-channel pipeline.
+  `decode_frame` takes the four per-band IMDCT outputs `U_{W,B}` plus
+  the decoded `gain_control_data()` and runs the §4.6.12.3.3 per-band
+  windowing/overlap into `V_B` then the §4.6.12.3.4 IPQF synthesis into
+  the PCM `AS(n)` (1024 samples/frame for the steady `ONLY_LONG` /
+  `EIGHT_SHORT` case), threading the per-band `PFMD` / `PT` and IPQF
+  history across frames. PQF band 0 is never gain-controlled (the
+  §4.6.12.3.3 `B == 0` case). The §4.6.12.1 front half (spectrum →
+  PQF-band column de-interleave, even-band reversal, the per-band
+  IMDCTs) is the caller's responsibility and is tracked as a docs gap
+  (the staged §4.6.12 text does not give the spectrum-to-band
+  arrangement). Pinned by silence-in/out, the 1024-PCM frame invariant
+  for both long and short sequences, the cross-frame overlap carry, and
+  a `max_band == 0` ≡ no-gain equivalence.
+
 - **SSR IPQF synthesis filter** (`ipqf`) — ISO/IEC 14496-3 §4.6.12.3.4,
   the inverse polyphase quadrature filter that recombines the four
   per-band gain-controlled sample streams `V_B` into the full-rate PCM
