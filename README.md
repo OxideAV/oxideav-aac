@@ -222,6 +222,56 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   so the single synthesis pass shapes the residual while undoing the
   analysis on the LTP contribution.
 
+### SSR gain control back-end (§4.6.12)
+
+The §4.6.12 SSR (Scalable Sample Rate, AOT 3) gain-control **back-end**
+is now implemented — the reconstruction counterpart to the
+`gain_control_data` Table 4.12 wire parser, validated independent of any
+external SSR implementation:
+
+- **Gain-control reconstruction** (`gain_control`) — §4.6.12.3.1–3. The
+  §4.6.12.3.1 gain-control data decoding (the Table 4.108 `AdjLoc()` =
+  `8·AC` and Table 4.109 `AdjLev()` = `AV − 4` tables, the `NADW` /
+  `ALOC` / `ALEV` ladder with the step-(3) `ALOC(0)=0` / `ALEV(0)` rule
+  and the step-(4) per-window-sequence endpoint), the §4.6.12.3.2
+  gain-control function setting (the `M_{W,B,j}` index, the `FMD`
+  fragment-modification function with the `Inter(a,b,j)` geometric-blend
+  ramp, the per-sequence `GMF` composition threading the cross-frame
+  `PFMD`, and the inversion `AD(j) = 1/GMF(j)`), and the §4.6.12.3.3
+  windowing + overlapping (`GainBandState::window_overlap` applies
+  `T = AD·U` then overlap-adds per `window_sequence` into the band sample
+  data `V_B`, threading the cross-frame `PT_B` tail). All four
+  `window_sequence` shapes are covered; the spec initial values
+  `PFMD ≡ 1.0` / `PT ≡ 0.0` are honoured, and the input-read vs
+  produced `PFMD` lengths (which differ per sequence) are tracked
+  separately with a persistent 256-entry carry.
+- **IPQF synthesis filter** (`ipqf`) — §4.6.12.3.4. The Table 4.110
+  length-96 prototype `Q(j)` (the symmetric `Q(j) = Q(95 − j)` half
+  mirrored to 96), the cosine modulation
+  `Q_B(j) = Q(j)·cos((2B+1)(2j−3)π/16)`, the 4× upsampling
+  `Ṽ_B(j) = V_B(j/4)`, and the streaming convolution
+  `AS(n) = Σ_B Σ_j Q_B(j)·Ṽ_B(n−j)` as a polyphase bank (`Ipqf`) that
+  retains a 24-deep per-band history across frames — pinned by an
+  impulse-response test against the direct §4.6.12.3.4 convolution
+  (`AS(n) = Q_0(n)`).
+- **Per-channel driver** (`ssr`) — `SsrGainControl::decode_frame`
+  composes the four-band `GainBandState` and the `Ipqf` into one
+  persistent per-channel pipeline: the four per-band IMDCT outputs
+  `U_{W,B}` plus the decoded `gain_control_data()` → the §4.6.12.3.3
+  per-band windowing/overlap → the §4.6.12.3.4 IPQF synthesis → the PCM
+  `AS(n)` (1024 samples/frame for the steady `ONLY_LONG` / `EIGHT_SHORT`
+  case). PQF band 0 is never gain-controlled.
+
+The remaining §4.6.12.1 **front half** — splitting the transmitted
+spectrum into the four PQF-band coefficient columns, the even-band
+spectral reversal, and the per-band 256-coefficient (long) /
+32-coefficient (short) IMDCTs that feed `U_{W,B}` — is **not yet
+wired**: the staged §4.6.12 text does not specify the spectrum-to-band
+arrangement (contiguous-block vs interleaved split, the precise
+even-band reversal indexing), so the spectrum→band mapping is a
+documented docs gap. The back-end above is complete and validated; only
+this front-half de-interleave is pending the spec detail.
+
 ### SBR bitstream decode (HE-AAC)
 
 The full SBR side-info path is now decoded from the `extension_payload`
@@ -469,8 +519,16 @@ EP-tool payload de-interleave is out of scope.
   exist (`raw_data_block::FrameAssembler` and the per-tool `write`
   primitives) but there is no rate-control / psychoacoustic encoder
   back-end to drive them.
-- The SSR gain-control ladder (§4.6.12) — its side-info is parsed but
-  not applied. (The Main frequency-domain predictor, §4.6.6, is now
+- The SSR gain-control tool (§4.6.12) — the §4.6.12.3.1–4 **back end**
+  is now implemented and validated (gain-control function
+  reconstruction, the per-band windowing/overlap, and the IPQF synthesis
+  filter — see the "SSR gain control back-end" section above). What
+  remains is the §4.6.12.1 **front half**: the spectrum → PQF-band
+  coefficient-column de-interleave, the even-band spectral reversal, and
+  the per-band 256/32-coefficient IMDCTs that feed `U_{W,B}` — blocked on
+  a docs gap (the staged §4.6.12 text does not specify the
+  spectrum-to-band arrangement). (The Main frequency-domain predictor,
+  §4.6.6, is now
   fully wired into `element_decode` for the AAC Main object type on long
   windows — see `predictor` above. LTP, §4.6.7, is likewise wired in
   with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
