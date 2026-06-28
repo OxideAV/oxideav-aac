@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SSR IPQF synthesis filter** (`ipqf`) — ISO/IEC 14496-3 §4.6.12.3.4,
+  the inverse polyphase quadrature filter that recombines the four
+  per-band gain-controlled sample streams `V_B` into the full-rate PCM
+  signal `AS(n)`. Carries the Table 4.110 length-96 prototype `Q(j)`
+  (the symmetric `Q(j) = Q(95 − j)` half stored as `Q_HALF`, mirrored by
+  `prototype()`), the §4.6.12.3.4 cosine modulation
+  `Q_B(j) = Q(j)·cos((2B+1)(2j−3)π/16)`, the 4× upsampling
+  `Ṽ_B(j) = V_B(j/4)`, and the streaming convolution
+  `AS(n) = Σ_B Σ_j Q_B(j)·Ṽ_B(n−j)` as a polyphase bank (`Ipqf`) that
+  retains a 24-deep per-band history across frames. Pinned by the
+  prototype-symmetry check, silence-in/silence-out, the 4× output-length
+  invariant, and an impulse-response test that matches the streamed
+  output to the direct §4.6.12.3.4 convolution `AS(n) = Q_0(n)`.
 - **SSR gain-control reconstruction back-end** (`gain_control`) —
   ISO/IEC 14496-3 §4.6.12, the back-end counterpart to the
   `gain_control_data` Table 4.12 wire parser. Implements §4.6.12.3.1

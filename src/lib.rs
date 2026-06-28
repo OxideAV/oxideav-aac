@@ -420,6 +420,7 @@ pub mod hcr;
 pub mod ics_body;
 pub mod ics_info;
 pub mod intensity_stereo;
+pub mod ipqf;
 pub mod latm;
 pub mod ltp;
 pub mod ms_stereo;
