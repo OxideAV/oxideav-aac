@@ -550,3 +550,129 @@ fn fixture_transcode_preserves_the_signal() {
         );
     }
 }
+
+// ---- §4.6.13 PNS (encode side) ----
+
+/// Deterministic pseudo-noise on the ±`amp` axis (32-bit LCG).
+fn noise_pcm(n: usize, amp: f64, seed: u32) -> Vec<i16> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state as i32) as f64 / 2_147_483_648.0 * amp) as i16
+        })
+        .collect()
+}
+
+/// Count NOISE_HCB (13) bands across a mono SCE ADTS stream.
+fn count_noise_bands(stream: &[u8]) -> usize {
+    use oxideav_aac::ics_body::IcsBody;
+    use oxideav_core::bits::BitReader;
+
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    while pos < stream.len() {
+        let (hdr, off) = AdtsHeader::parse(&stream[pos..]).expect("frame parses");
+        let payload = &stream[pos + off..pos + hdr.aac_frame_length as usize];
+        let mut br = BitReader::new(payload);
+        let id = br.read_u32(3).unwrap();
+        assert_eq!(id, 0, "expected SCE");
+        let _tag = br.read_u32(4).unwrap();
+        let body = IcsBody::parse(&mut br, 2, hdr.sampling_frequency_index, false)
+            .expect("ics body parses");
+        for group in &body.section_data.sfb_cb {
+            count += group.iter().filter(|&&cb| cb == 13).count();
+        }
+        pos += hdr.aac_frame_length as usize;
+    }
+    count
+}
+
+#[test]
+fn noise_input_engages_pns_and_preserves_energy() {
+    let n = 6 * FRAME_LEN;
+    let pcm = noise_pcm(n, 8_000.0, 0x1234_5678);
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 64_000,
+    })
+    .unwrap();
+    enc.set_pns(true);
+    let stream = enc.encode_all(&pcm).unwrap();
+
+    // Dense noise must trigger PNS on a substantial number of bands.
+    let noise_bands = count_noise_bands(&stream);
+    eprintln!("PNS bands across the noise stream: {noise_bands}");
+    assert!(
+        noise_bands > 50,
+        "dense noise should engage PNS broadly, got {noise_bands} bands"
+    );
+
+    // The reconstruction is *different noise* (the §4.6.13 generator
+    // phase is the decoder's own), so compare energy, not samples:
+    // per-frame RMS must track the input RMS.
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let rms = |s: &[i16]| -> f64 {
+        (s.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / s.len() as f64).sqrt()
+    };
+    for f in 1..(n / FRAME_LEN) {
+        let in_rms = rms(&pcm[(f - 1) * FRAME_LEN..f * FRAME_LEN]);
+        let out_rms = rms(&out[f * FRAME_LEN..(f + 1) * FRAME_LEN]);
+        let rel = (out_rms - in_rms).abs() / in_rms;
+        assert!(
+            rel < 0.25,
+            "frame {f}: decoded RMS {out_rms:.0} vs input {in_rms:.0} ({rel:.3})"
+        );
+    }
+}
+
+#[test]
+fn default_config_never_emits_pns() {
+    // PNS emission is opt-in; the default encoder must never emit
+    // NOISE_HCB bands, even on noise content.
+    let n = 4 * FRAME_LEN;
+    for pcm in [multitone(n, 1), noise_pcm(n, 8_000.0, 0x0bad_cafe)] {
+        let mut enc = StreamEncoder::new(EncoderConfig {
+            sample_rate: 44_100,
+            channels: 1,
+            bitrate: 128_000,
+        })
+        .unwrap();
+        let stream = enc.encode_all(&pcm).unwrap();
+        assert_eq!(count_noise_bands(&stream), 0);
+    }
+}
+
+#[test]
+fn pns_shrinks_noise_frames() {
+    // The same noise content coded at generous bitrate: with PNS the
+    // stream should stay far below the budget ceiling (noise bands
+    // cost a handful of bits each instead of dozens of Huffman
+    // coefficients).
+    let n = 4 * FRAME_LEN;
+    let pcm = noise_pcm(n, 8_000.0, 0x9e37_79b9);
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 256_000,
+    })
+    .unwrap();
+    enc.set_pns(true);
+    let stream = enc.encode_all(&pcm).unwrap();
+    let budget = 256_000usize * 1024 / 44_100 / 8;
+    let per_frame = stream.len() / 5;
+    eprintln!(
+        "noise stream: {} bytes over 5 frames (avg {per_frame}/frame, budget {budget})",
+        stream.len()
+    );
+    assert!(
+        per_frame < budget / 2,
+        "PNS should leave noise frames well under budget: {per_frame} vs {budget}"
+    );
+}

@@ -649,13 +649,19 @@ EP-tool payload de-interleave is out of scope.
 ## Not yet supported
 
 - Encoder-side tool remainders — the end-to-end AAC-LC encoder (see
-  `encoder` below) covers block switching, M/S, and the
-  scalefactor/quantizer rate loop, but does not yet emit TNS, PNS,
-  intensity stereo, or pulse data, keeps M/S long-frame-only, codes
-  eight one-window groups per `EIGHT_SHORT` frame (no
-  `scale_factor_grouping` merging), and supports 1–2 channels (no
-  multichannel PCE-driven layouts). Codebook choice is
-  smallest-LAV-fits rather than measured-bit-cost.
+  `encoder` below) covers block switching, M/S, the
+  scalefactor/quantizer rate loop, and opt-in §4.6.13 PNS emission
+  (`StreamEncoder::set_pns` — off by default because a single-frame
+  spectral statistic cannot tell true noise from noise-shaped
+  deterministic content such as sweeps; default-on awaits a
+  cross-frame tonality measure), but does not yet emit TNS,
+  intensity stereo, or pulse data, keeps M/S and PNS
+  long-frame-only (PNS mono-only — the CPE `ms_used` noise
+  correlation is an encode-side follow-up), codes eight one-window
+  groups per `EIGHT_SHORT` frame (no `scale_factor_grouping`
+  merging), and supports 1–2 channels (no multichannel PCE-driven
+  layouts). Codebook choice is smallest-LAV-fits rather than
+  measured-bit-cost.
 - The SSR gain-control tool (§4.6.12) — the §4.6.12.3.1–4 **back end**
   is now implemented and validated (gain-control function
   reconstruction, the per-band windowing/overlap, and the IPQF synthesis

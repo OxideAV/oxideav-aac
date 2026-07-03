@@ -73,8 +73,21 @@
 //!   least ~9 dB lopsided, so the quiet one culls or codes cheaply).
 //!   The mask is emitted as `ms_mask_present = 2` when every band
 //!   flags (identical / phase-inverted channels), `1` + explicit
-//!   mask when mixed, `0` when no band benefits. No intensity, no
-//!   TNS, no PNS on the encode side yet.
+//!   mask when mixed, `0` when no band benefits. No intensity and no
+//!   TNS on the encode side yet.
+//! * **PNS (§4.6.13, opt-in)** — with [`StreamEncoder::set_pns`], a
+//!   mono long-frame band whose energy is spread across most of its
+//!   coefficients (density `(Σ|x|)²/(width·Σx²)` above 0.4 — dense
+//!   noise measures `≈2/π`, `k` spectral lines `≈k/width`) is
+//!   transmitted as a `NOISE_HCB` band carrying only its energy
+//!   (`noise_nrg = round(4·log2‖band‖₂)`, the `2^(0.25·nrg)` ladder)
+//!   on the §4.6.13 DPCM track; the decoder re-synthesises the band
+//!   from its own generator at exactly that L2 norm. Off by default:
+//!   a single-frame statistic cannot tell true noise from
+//!   noise-shaped deterministic content (sweeps, dense leakage
+//!   floors), which substitutes with the right energy but the wrong
+//!   waveform — the default-on decision awaits a cross-frame
+//!   tonality measure.
 //!
 //! ## Conformance envelope
 //!
@@ -94,8 +107,10 @@ use crate::ics_info::{
     IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
 };
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
-use crate::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
-use crate::section_data::{Section, SectionData, ZERO_HCB};
+use crate::scale_factor_data::{
+    differentiate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET,
+};
+use crate::section_data::{Section, SectionData, NOISE_HCB, ZERO_HCB};
 use crate::spectral_codebook::MAX_QUANT;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::{
@@ -147,6 +162,19 @@ const MAX_RATE_ITERATIONS: usize = 48;
 /// under budget: −32 scalefactors ≈ 24 dB of extra precision
 /// (magnitudes ×2^6 over the [`TARGET_PEAK_MAG`] baseline).
 const MAX_REFINE_OFFSET: i32 = 32;
+
+/// Minimum §4.5.4 band width (coefficients) for the §4.6.13 PNS
+/// noise-likeness statistic to be meaningful; narrower bands always
+/// code spectrally.
+const PNS_MIN_WIDTH: usize = 8;
+
+/// PNS density floor on the `(Σ|x|)² / (width·Σx²)` statistic: dense
+/// Gaussian-like noise measures `≈ 2/π ≈ 0.64` (`(E|x|)²/E[x²]`),
+/// while `k` dominant spectral lines measure `≈ k/width` — a band
+/// only counts as noise when its energy is spread across most of its
+/// coefficients, so leakage skirts and harmonic combs keep spectral
+/// coding.
+const PNS_DENSITY_MIN: f64 = 0.4;
 
 /// Configuration for [`StreamEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +241,8 @@ pub struct StreamEncoder {
     /// history hop, so this frame *must* be `EIGHT_SHORT_SEQUENCE`
     /// (the `LONG_START → EIGHT_SHORT` contract).
     short_pending: bool,
+    /// §4.6.13 PNS emission toggle — see [`StreamEncoder::set_pns`].
+    pns_enabled: bool,
 }
 
 impl StreamEncoder {
@@ -232,7 +262,24 @@ impl StreamEncoder {
             history: vec![vec![0.0; FRAME_LEN]; config.channels as usize],
             prev_seq: WindowSequence::OnlyLong,
             short_pending: false,
+            pns_enabled: false,
         })
+    }
+
+    /// Enable / disable §4.6.13 PNS emission (default **off**).
+    ///
+    /// When enabled, mono long frames transmit dense noise-like
+    /// bands (see the module docs) as `NOISE_HCB` energies instead
+    /// of spectra — a large bitrate win on noise content, validated
+    /// energy-exact through the decoder's §4.6.13.3 synthesis. It
+    /// stays opt-in because a *single-frame* spectral statistic
+    /// cannot distinguish true noise from noise-shaped deterministic
+    /// content (a frequency sweep, a dense leakage floor): those
+    /// substitute with the right energy but the wrong waveform.
+    /// Turning the default on awaits a cross-frame tonality /
+    /// predictability measure.
+    pub fn set_pns(&mut self, enabled: bool) {
+        self.pns_enabled = enabled;
     }
 
     /// The configuration this encoder was built with.
@@ -410,11 +457,16 @@ impl StreamEncoder {
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
         let mut body_bits = BitWriter::new();
+        // §4.6.13 PNS emission is opt-in (set_pns) and limited to
+        // mono long frames: in a CPE, PNS interacts with the ms_used
+        // mask (correlated vs independent noise, §4.6.13.3) — an
+        // encode-side follow-up.
+        let pns_allowed = self.pns_enabled && spectra.len() == 1;
         let quantize = |spec: &[f64], peak: f64| -> Result<QuantizedChannel> {
             if seq == WindowSequence::EightShort {
                 quantize_channel_short(spec, self.fs_index, sf_offset, peak)
             } else {
-                quantize_channel(spec, seq, self.fs_index, sf_offset, peak)
+                quantize_channel(spec, seq, self.fs_index, sf_offset, peak, pns_allowed)
             }
         };
         match spectra {
@@ -708,6 +760,9 @@ struct GroupQuant {
     x_quant: Vec<i32>,
     sfb_cb: Vec<u8>,
     sfs: Vec<Option<i32>>,
+    /// §4.6.13 noise energies for PNS bands (`sfb_cb == NOISE_HCB`):
+    /// the band's target L2 norm on the `2^(0.25·noise_nrg)` ladder.
+    noise: Vec<Option<i32>>,
 }
 
 /// Quantize the `num_swb` scalefactor bands of one window group.
@@ -729,10 +784,12 @@ fn quantize_group(
     sf_offset: i32,
     frame_peak: f64,
     prev_sf: &mut Option<i32>,
+    pns_allowed: bool,
 ) -> GroupQuant {
     let mut x_quant = vec![0i32; spec.len()];
     let mut sfb_cb = vec![ZERO_HCB; num_swb];
     let mut sfs: Vec<Option<i32>> = vec![None; num_swb];
+    let mut noise: Vec<Option<i32>> = vec![None; num_swb];
     for sfb in 0..num_swb {
         let start = offsets[sfb] as usize;
         let end = (offsets[sfb + 1] as usize).min(spec.len());
@@ -740,6 +797,16 @@ fn quantize_group(
         let Some(mut sf) = band_scalefactor(peak, frame_peak, sf_offset) else {
             continue; // culled: below the frame's masking floor
         };
+        // §4.6.13 PNS: a wide band with no dominant spectral line is
+        // transmitted as a noise energy instead of coefficients.
+        if pns_allowed && is_noise_like(&spec[start..end]) {
+            let nrg: f64 = spec[start..end].iter().map(|&x| x * x).sum();
+            // Target L2 norm 2^(0.25·noise_nrg) == sqrt(nrg).
+            let noise_nrg = (4.0 * nrg.sqrt().log2()).round() as i32;
+            sfb_cb[sfb] = NOISE_HCB;
+            noise[sfb] = Some(noise_nrg);
+            continue;
+        }
         if let Some(p) = *prev_sf {
             sf = sf.clamp(p - MAX_SF_DELTA, p + MAX_SF_DELTA).clamp(0, 255);
         }
@@ -770,37 +837,71 @@ fn quantize_group(
         x_quant,
         sfb_cb,
         sfs,
+        noise,
     }
 }
 
-/// Build the per-group scalefactor entry lists and the frame's
-/// `global_gain` from the chosen per-band scalefactors: the first
-/// coded band (in wire order across all groups) seeds the §4.6.2.3.2
-/// DPCM track at delta 0, every later coded band transmits its
-/// delta.
-fn scalefactor_entries(groups: &[GroupQuant]) -> (u8, Vec<Vec<ScaleFactorEntry>>) {
-    let mut all_entries = Vec::with_capacity(groups.len());
-    let mut global_gain: Option<i32> = None;
-    let mut last = 0i32;
-    for g in groups {
-        let mut entries = Vec::new();
-        for sf in g.sfs.iter().copied().flatten() {
-            match global_gain {
-                None => {
-                    global_gain = Some(sf);
-                    entries.push(ScaleFactorEntry::Dpcm(0));
-                }
-                Some(_) => {
-                    let delta = sf - last;
-                    debug_assert!((-MAX_SF_DELTA..=MAX_SF_DELTA).contains(&delta));
-                    entries.push(ScaleFactorEntry::Dpcm(delta as i8));
-                }
-            }
-            last = sf;
-        }
-        all_entries.push(entries);
+/// §4.6.13 noise-likeness test on the `(Σ|x|)² / (width·Σx²)`
+/// density statistic (see [`PNS_DENSITY_MIN`]): `true` only when the
+/// band's energy is spread across most of its coefficients the way a
+/// dense noise band's is. Bands narrower than [`PNS_MIN_WIDTH`]
+/// never qualify (the statistic is meaningless on a handful of
+/// coefficients).
+fn is_noise_like(band: &[f64]) -> bool {
+    let width = band.len();
+    if width < PNS_MIN_WIDTH {
+        return false;
     }
-    (global_gain.unwrap_or(SF_OFFSET) as u8, all_entries)
+    let l1: f64 = band.iter().map(|&v| v.abs()).sum();
+    let l2_sq: f64 = band.iter().map(|&v| v * v).sum();
+    if l2_sq <= 0.0 {
+        return false;
+    }
+    (l1 * l1) / (width as f64 * l2_sq) > PNS_DENSITY_MIN
+}
+
+/// Build the per-band absolute scalefactor / noise-energy records
+/// and the frame's `global_gain`, then run the §4.6.2.3.2 / §4.6.13
+/// inverse DPCM ([`differentiate`]) to obtain the transmitted entry
+/// set.
+///
+/// `global_gain` is the first coded spectrum band's scalefactor
+/// (making its delta 0). The §4.6.13 noise track is seeded at
+/// `global_gain − NOISE_OFFSET − 256` with the first PNS band's
+/// delta a 9-bit *unsigned* PCM (`0..=511`) and later noise deltas
+/// Huffman `±60`; each requested `noise_nrg` is clamped into the
+/// nearest feasible value on that track (a few 1.5 dB steps of
+/// clamp at worst — noise energy is far less sensitive than a
+/// spectral gain).
+fn scalefactor_track(groups: &[GroupQuant]) -> (u8, AbsoluteScaleFactors) {
+    let global_gain = groups
+        .iter()
+        .flat_map(|g| g.sfs.iter().copied().flatten())
+        .next()
+        .unwrap_or(SF_OFFSET) as u8;
+    let mut last_nrg = i32::from(global_gain) - NOISE_OFFSET - 256;
+    let mut first_noise = true;
+    let mut entries = Vec::with_capacity(groups.len());
+    for g in groups {
+        let mut group_out = Vec::new();
+        for sfb in 0..g.sfb_cb.len() {
+            if let Some(sf) = g.sfs[sfb] {
+                group_out.push(AbsoluteScaleFactorEntry::Sf(sf as u8));
+            } else if let Some(nrg) = g.noise[sfb] {
+                let delta = nrg - last_nrg;
+                let clamped = if first_noise {
+                    delta.clamp(0, 511)
+                } else {
+                    delta.clamp(-MAX_SF_DELTA, MAX_SF_DELTA)
+                };
+                first_noise = false;
+                last_nrg += clamped;
+                group_out.push(AbsoluteScaleFactorEntry::NoiseNrg(last_nrg));
+            }
+        }
+        entries.push(group_out);
+    }
+    (global_gain, AbsoluteScaleFactors { entries })
 }
 
 /// Merge one group's per-band codebooks into contiguous sections.
@@ -820,8 +921,8 @@ fn build_sections(sfb_cb: &[u8]) -> Vec<Section> {
 }
 
 /// Wrap quantized groups + an `ics_info` into the wire record set.
-fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> QuantizedChannel {
-    let (global_gain, entries) = scalefactor_entries(&groups);
+fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> Result<QuantizedChannel> {
+    let (global_gain, abs) = scalefactor_track(&groups);
     let mut sections = Vec::with_capacity(groups.len());
     let mut sfb_cb = Vec::with_capacity(groups.len());
     let mut x_quant = Vec::with_capacity(groups.len());
@@ -830,11 +931,12 @@ fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> QuantizedChannel {
         sfb_cb.push(g.sfb_cb);
         x_quant.push(g.x_quant);
     }
+    let scale_factor_data = differentiate(&abs, &sfb_cb, global_gain)?;
     let body = IcsBody {
         global_gain,
         ics_info: Some(info.clone()),
         section_data: SectionData { sections, sfb_cb },
-        scale_factor_data: ScaleFactorData { entries },
+        scale_factor_data,
         pulse_data_present: false,
         pulse_data: None,
         tns_data_present: false,
@@ -846,11 +948,11 @@ fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> QuantizedChannel {
         reordered_spectral_lengths: None,
     };
     let spectral = SpectralData { x_quant };
-    QuantizedChannel {
+    Ok(QuantizedChannel {
         info,
         body,
         spectral,
-    }
+    })
 }
 
 /// Quantize one channel's 1024-line long-sequence spectrum into a
@@ -865,13 +967,22 @@ fn quantize_channel(
     fs_index: u8,
     sf_offset: i32,
     frame_peak: f64,
+    pns_allowed: bool,
 ) -> Result<QuantizedChannel> {
     debug_assert_eq!(spec.len(), FRAME_LEN);
     debug_assert!(seq != WindowSequence::EightShort);
     let offsets = long_window_offsets(fs_index)?;
     let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
     let mut prev_sf: Option<i32> = None;
-    let group = quantize_group(spec, offsets, num_swb, sf_offset, frame_peak, &mut prev_sf);
+    let group = quantize_group(
+        spec,
+        offsets,
+        num_swb,
+        sf_offset,
+        frame_peak,
+        &mut prev_sf,
+        pns_allowed,
+    );
     let info = IcsInfo {
         ics_reserved_bit: false,
         window_sequence: seq,
@@ -889,7 +1000,7 @@ fn quantize_channel(
         window_group_length: vec![1],
         num_swb: num_swb as u8,
     };
-    Ok(finish_channel(info, vec![group]))
+    finish_channel(info, vec![group])
 }
 
 /// Quantize one channel's `EIGHT_SHORT_SEQUENCE` spectrum (8 x 128
@@ -918,6 +1029,7 @@ fn quantize_channel_short(
             sf_offset,
             frame_peak,
             &mut prev_sf,
+            false, // PNS stays long-frame-only for now
         ));
     }
     let info = IcsInfo {
@@ -937,7 +1049,7 @@ fn quantize_channel_short(
         window_group_length: vec![1; 8],
         num_swb: num_swb as u8,
     };
-    Ok(finish_channel(info, groups))
+    finish_channel(info, groups)
 }
 
 #[cfg(test)]
