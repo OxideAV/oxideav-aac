@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SBR high-frequency generation** (`sbr_hf_gen`) — ISO/IEC 14496-3
+  §4.6.18.6. The Figure 4.48 patch construction (`goalSb =
+  NINT(2.048e6/FsSBR)`, the `msb`/`usb` walk over `fMaster`, the `odd`
+  parity correction, the `fMaster(k) − sb < 3` end-game, the trailing
+  small-patch trim, and the §4.6.18.3.6 `numPatches ≤ 5` bound), the
+  §4.6.18.6.2 inverse filtering (covariance `φk(i,j)` over
+  `numTimeSlots·RATE + 6` samples, `d(k)` with `εInv = 1e-6`, the
+  `α0/α1` solution and the `|α| ≥ 4` reset), the Table 4.175 `newBw`
+  transition + `bwArray` chirp blend (attack `0.90625/0.09375`, decay
+  `0.75/0.25`, `< 0.015625` flush), and the §4.6.18.6.3 generator
+  `XHigh(k) = XLow(p) + bw·α0·XLow(p, l−1) + bw²·α1·XLow(p, l−2)` over
+  the patch mapping with the per-noise-band `g(k)` chirp selection.
+  `Patches::borders` exposes the §4.6.18.3.2.3 patch borders for the
+  limiter table. Pinned by a hand-walked Figure 4.48 case, the trim
+  case, invariants on a spec-derived 44.1 kHz master table, exact
+  AR(2) recovery (`α = −a` to the `O(εInv)` relaxation), the
+  `|α| ≥ 4` reset, and bw = 0 copy / bw = 1 whitening.
 - **SBR dequantization + stereo decoding** (`sbr_dequant`) — ISO/IEC
   14496-3 §4.6.18.3.5. Converts the reconstructed quantized
   scalefactors to linear energies: `EOrig = 64·2^(E/a)` (`a = 2` /

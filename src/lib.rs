@@ -438,6 +438,7 @@ pub mod sbr_extension;
 pub mod sbr_freq_bands;
 pub mod sbr_grid;
 pub mod sbr_header;
+pub mod sbr_hf_gen;
 pub mod sbr_huffman;
 pub mod sbr_qmf;
 pub mod sbr_reconstruct;
