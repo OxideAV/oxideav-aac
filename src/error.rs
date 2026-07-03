@@ -568,6 +568,14 @@ pub enum Error {
     /// the bitstream ran out before a codeword completed. Both signal a
     /// corrupt or truncated SBR extension payload.
     SbrHuffInvalid,
+    /// Parametric Stereo `ps_data()` parse ([`crate::ps_data`] /
+    /// [`crate::ps_huffman`], ISO/IEC 14496-3:2009 §8.4.2 Table 8.9):
+    /// a PS Huffman codeword failed to match within the Annex 8.B
+    /// maximum length, the bitstream ran out mid-element, a reserved
+    /// `iid_mode` / `icc_mode` was signalled, or a differentially
+    /// decoded IID/ICC index left its Table 8.24/8.27 range. All
+    /// signal a corrupt or truncated PS extension payload.
+    PsDataInvalid,
     /// SBR time-frequency grid parse ([`crate::sbr_grid`], §4.4.2.8
     /// Tables 4.69–4.71) failed: the bitstream ran out mid-grid, or a
     /// frame class signalled an envelope count outside the
@@ -946,6 +954,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "SBR Huffman decode: no §4.A.6.1 codeword matched (corrupt or truncated SBR envelope/noise payload)"
+                )
+            }
+            Error::PsDataInvalid => {
+                write!(
+                    f,
+                    "PS ps_data(): §8.4.2 Table 8.9 parse failed (unmatched Annex 8.B codeword, truncated payload, reserved iid/icc mode, or out-of-range index)"
                 )
             }
             Error::SbrGridInvalid => {

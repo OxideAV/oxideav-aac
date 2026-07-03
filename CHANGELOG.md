@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Parametric Stereo bitstream layer** (`ps_huffman`, `ps_data`) —
+  ISO/IEC 14496-3:2009 §8.4.2 Tables 8.9–8.14 + Annex 8.B. All ten PS
+  Huffman codebooks (IID coarse/fine × time/freq, ICC, IPD, OPD ×
+  time/freq; Tables 8.B.17–8.B.21) transcribed as `(length, codeword)`
+  pairs — every table verified a *complete* prefix code (Kraft sum
+  exactly 1) and the six IID/ICC books additionally cross-checked
+  leaf-for-leaf against the staged `ps-huffbook-*.csv` decode trees.
+  `PsData::parse` walks the full `ps_data()` element: the persistent
+  `enable_ps_header` configuration block (Tables 8.24/8.27 modes,
+  reserved modes rejected), FIX/VAR framing (Table 8.29 `num_env`,
+  5-bit border positions), per-envelope IID/ICC delta rows, and the
+  byte-counted extension layer (Table 8.10) carrying `enable_ipdopd` +
+  IPD/OPD rows; a headerless element with no prior configuration
+  resolves to the §8.6.5.1 "mono until a header arrives" signal.
+  `PsData::resolve` applies the §8.5.2 time/frequency DPCM
+  accumulation against a cross-frame `PsIndexState` (IID/ICC
+  range-checked to their Table 8.24/8.27 index ranges, IPD/OPD wrapped
+  modulo 8 on the Table 8.31 phase ladder) and handles the
+  `num_env == 0` parameter-hold. New `Error::PsDataInvalid` covers the
+  malformed cases.
 - **HE-AAC v1 over LATM/LOAS** (`latm`) — the `LoasDecoder` no longer
   pre-rejects an SBR-signalling `AudioSpecificConfig` with
   `Error::LatmSbrUnsupported`: both the explicit AOT-5 hierarchical
