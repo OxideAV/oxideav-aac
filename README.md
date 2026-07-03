@@ -21,8 +21,17 @@ SBR fixture, which decodes 99.98% sample-exact with a max error of
 1 LSB** at the doubled output rate, and the **HE-AAC v2 fixture, whose
 PS stereo reconstruction lands at a 5e-5 per-channel error-to-signal
 RMS** against the reference decode.
-The `Encoder` side is **not yet wired** — the bit-exact wire writers are
-in place but there is no rate-control / psychoacoustic encoder back-end.
+The crate also ships an **end-to-end AAC-LC encoder** (`encoder` /
+`codec_encoder`): PCM → §4.6.11.3.1 forward-MDCT analysis with
+§4.6.11.3.2 block switching (transient-driven
+`ONLY_LONG → LONG_START → EIGHT_SHORT → LONG_STOP`), the exact
+§4.6.2 inverse quantizer under a masking-spread psychoacoustics-lite
+model with a bidirectional rate loop, per-band §4.6.8.1 M/S joint
+stereo, and SCE / `common_window`-CPE ADTS assembly through the
+Phase-2 bit-exact wire writers. Every stream is round-tripped through
+the crate's own decoder (multitone 128 kbps at 0.016 err/sig RMS;
+staged-fixture transcodes at 0.0008–0.003); `register()` installs the
+encoder alongside the decoder under id `"aac"`.
 
 ### Bitstream parsing
 
@@ -604,13 +613,49 @@ EP-tool payload de-interleave is out of scope.
   pinned byte-identical to their underlying `StreamDecoder` /
   `LoasDecoder`.
 
+### AAC-LC encoder
+
+- **`encoder`** — the §4.5/§4.6-written-forward AAC-LC encode chain.
+  `StreamEncoder` consumes interleaved S16 PCM hop by hop
+  (`encode_frame` / `finish` / one-shot `encode_all`) and emits one
+  complete ADTS frame per 1024-sample hop with a 1024-sample encoder
+  delay. Per hop: an energy-jump transient detector over the
+  `[hist | cur]` subblock grid drives the §4.6.11.3.2
+  `ONLY_LONG → LONG_START → EIGHT_SHORT → LONG_STOP` state machine;
+  the §4.6.11.3.1 forward MDCT runs under the same composite windows
+  the decoder synthesizes with (one 2048-point transform for long
+  sequences, eight 256-point transforms at `448 + j·128` for short);
+  per-band scalefactors follow a masking-spread rule (band target
+  magnitude `42·(peak_b/peak_frame)^½`, sub-step bands culled to
+  `ZERO_HCB`) with the DPCM ±60 track threaded across window groups;
+  a bidirectional rate loop (±4 scalefactor ladder + ±1..3 fine pass)
+  fits each frame to the bitrate-derived byte budget; codebooks are
+  the smallest Table 4.95 LAV fit with adjacent-section merging.
+  Stereo pairs code per-band §4.6.8.1 M/S (`m=(l+r)/2`, `s=(l−r)/2`
+  where the transform concentrates band energy, emitted as
+  `ms_mask_present` 2 / 1+mask / 0) inside a `common_window` CPE.
+  Round-trips through the crate's own decoder: multitone 128 kbps at
+  0.016 err/sig RMS, staged-fixture transcodes at 0.0008–0.003,
+  identical-channel stereo at 1.02× the mono stream size, and the
+  wire-level window-sequence walk pins the exact
+  `LongStart → EightShort → LongStop` pattern around a percussive
+  burst.
+- **`codec_encoder`** — the frame-in / packet-out
+  `oxideav_core::Encoder` adaptor (`make_encoder`, honouring
+  `sample_rate` / `channels` / `bit_rate`, default 64 kbps/channel);
+  registered alongside the decoder under id `"aac"`, and re-exported
+  as `encoder::make_encoder` per the workspace dual-API convention.
+
 ## Not yet supported
 
-- Runtime `Encoder` registration — `register()` installs the AAC
-  **decoder** (id `"aac"`) but no encoder; the bit-exact wire writers
-  exist (`raw_data_block::FrameAssembler` and the per-tool `write`
-  primitives) but there is no rate-control / psychoacoustic encoder
-  back-end to drive them.
+- Encoder-side tool remainders — the end-to-end AAC-LC encoder (see
+  `encoder` below) covers block switching, M/S, and the
+  scalefactor/quantizer rate loop, but does not yet emit TNS, PNS,
+  intensity stereo, or pulse data, keeps M/S long-frame-only, codes
+  eight one-window groups per `EIGHT_SHORT` frame (no
+  `scale_factor_grouping` merging), and supports 1–2 channels (no
+  multichannel PCE-driven layouts). Codebook choice is
+  smallest-LAV-fits rather than measured-bit-cost.
 - The SSR gain-control tool (§4.6.12) — the §4.6.12.3.1–4 **back end**
   is now implemented and validated (gain-control function
   reconstruction, the per-band windowing/overlap, and the IPQF synthesis
@@ -624,8 +669,18 @@ EP-tool payload de-interleave is out of scope.
   fully wired into `element_decode` for the AAC Main object type on long
   windows — see `predictor` above. LTP, §4.6.7, is likewise wired in
   with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
-  Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
-  scope per the §4.6.7.1 long-window restriction.)
+  The ISO/IEC 14496-3:**2001** Table 4.55 short-window LTP *syntax* —
+  the per-short-window `ltp_short_used` / `ltp_short_lag_present` /
+  `ltp_short_lag` loop that the 2009 edition removed ("LTP is
+  restricted to long windows only", §4.6.7.1 2009) — is parsed and
+  re-encoded under the explicit `LtpEdition::Iso2001` selector
+  (`parse_ltp_data_edition` / `write_ltp_data_edition`; the two
+  editions are wire-incompatible there and nothing in-band signals
+  which one a stream follows). The short-window *synthesis* stays
+  unimplemented: the 2001 §4.6.7.3 text defines the `x_rec` buffer
+  arrangement once but never fixes the per-subframe index origin for
+  the eight windows, and no LTP fixture exists to disambiguate. The
+  ER AAC LD `M = N/2` lag offset likewise remains out of scope.)
 - SBR/PS remainders — the §4.6.18 SBR tool **and** the subpart-8 PS
   tool are **implemented end to end** (see the sections above) and
   wired into the ADTS / LATM `StreamDecoder` paths and the runtime

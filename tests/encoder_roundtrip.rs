@@ -494,3 +494,59 @@ fn stereo_transient_stream_roundtrips() {
     eprintln!("stereo transient err/sig RMS = {ratio:.5}");
     assert!(ratio < 0.08, "stereo transient ratio {ratio:.5}");
 }
+
+// ---- Transcode stability over the staged fixture corpus ----
+
+#[test]
+fn fixture_transcode_preserves_the_signal() {
+    // Decode a staged real-encoder fixture to PCM, re-encode it with
+    // our encoder, decode again, and compare the two PCM signals
+    // (accounting for the 1024-sample encoder delay). This exercises
+    // the encoder on dense real-world-like content — every §4.5.4
+    // band populated, window switching, both channels — rather than
+    // synthetic tones. Skipped when docs/ is absent.
+    let cases: [(&str, u32, u8, u32); 3] = [
+        ("aac-lc-stereo-44100-128kbps-adts", 44_100, 2, 128_000),
+        ("aac-lc-mono-44100-64kbps-adts", 44_100, 1, 96_000),
+        ("aac-lc-chirp-windows", 44_100, 1, 128_000),
+    ];
+    let root = std::path::PathBuf::from("../../docs/audio/aac/fixtures");
+    for (name, rate, channels, bitrate) in cases {
+        let input = root.join(name).join("input.aac");
+        let Ok(bytes) = std::fs::read(&input) else {
+            eprintln!("skip: fixture {name} not present");
+            continue;
+        };
+        let mut dec = StreamDecoder::new();
+        let Ok(frames) = dec.decode_all(&bytes) else {
+            panic!("{name}: fixture must decode");
+        };
+        let mut pcm = Vec::new();
+        for f in &frames {
+            pcm.extend_from_slice(&f.pcm);
+        }
+        assert_eq!(frames[0].sample_rate, rate, "{name}");
+
+        let mut enc = StreamEncoder::new(EncoderConfig {
+            sample_rate: rate,
+            channels,
+            bitrate,
+        })
+        .unwrap();
+        let stream = enc.encode_all(&pcm).unwrap();
+        let mut dec2 = StreamDecoder::new();
+        let frames2 = dec2.decode_all(&stream).expect("re-encoded stream decodes");
+        let mut pcm2 = Vec::new();
+        for f in &frames2 {
+            pcm2.extend_from_slice(&f.pcm);
+        }
+        let ch = channels as usize;
+        assert_eq!(pcm2.len(), pcm.len() + FRAME_LEN * ch);
+        let ratio = err_to_signal_rms(&pcm, &pcm2[FRAME_LEN * ch..]);
+        eprintln!("{name}: transcode err/sig RMS = {ratio:.5}");
+        assert!(
+            ratio < 0.02,
+            "{name}: transcode ratio {ratio:.5} exceeds tolerance"
+        );
+    }
+}
