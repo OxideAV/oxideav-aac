@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SBR dequantization + stereo decoding** (`sbr_dequant`) — ISO/IEC
+  14496-3 §4.6.18.3.5. Converts the reconstructed quantized
+  scalefactors to linear energies: `EOrig = 64·2^(E/a)` (`a = 2` /
+  `1` per `bs_amp_res`), `QOrig = 2^(NOISE_FLOOR_OFFSET − Q)`
+  (§4.6.18.2.5 `NOISE_FLOOR_OFFSET = 6`), and the coupled-pair split
+  with `panOffset = [24, 12]` (§4.6.18.2.6) dividing the doubled
+  average by `1 + 2^(±(panOffset − E1)/a)`. Pinned by exact
+  power-of-two vectors, the balanced-pan symmetry, and the
+  `ELeft + ERight = 2·EOrig` energy-sum identity across pan values
+  and both amplitude resolutions.
+- **SBR time / frequency grid** (`sbr_time_grid`) — ISO/IEC 14496-3
+  §4.6.18.3.3. `derive_time_grid` turns a parsed `sbr_grid()` into the
+  envelope / noise-floor border vectors `tE(l)` / `tQ(l)` and the
+  Table 4.176 `lA` transient-envelope index: the per-class
+  `absBordLead` / `absBordTrail`, the `nRelLead` / `nRelTrail` split,
+  FIXFIX's uniform `NINT(numTimeSlots/LE)` spacing, the variable-side
+  `2·bs_rel_bord + 2` reconstruction, and the Table 4.174
+  `middleBorder` noise-floor split — with strict border monotonicity /
+  range validation surfacing `Error::SbrGridInvalid`. Pinned across
+  all four frame classes plus the `lA` pointer branches.
 - **SBR QMF filterbanks** (`sbr_qmf`) — ISO/IEC 14496-3 §4.6.18.4, the
   first DSP stage of the SBR back-end. The Table 4.A.89 640-tap
   prototype window (transcribed digit-for-digit from the staged spec
