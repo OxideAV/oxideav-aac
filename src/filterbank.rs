@@ -134,6 +134,55 @@ pub(crate) fn long_only_window(left_shape: WindowShape, right_shape: WindowShape
     w
 }
 
+/// §4.6.11.3.2 — assemble the length-2048 window for any of the
+/// three long-transform sequences. The window is shared between the
+/// decoder's synthesis ([`Filterbank::long_window`] delegates here)
+/// and the encoder's analysis (the §4.6.11 filterbank is its own
+/// transpose up to the TDAC fold, so the same window applies on both
+/// sides). Returns [`Error::FilterbankInvalid`] for
+/// `EIGHT_SHORT_SEQUENCE` — use [`short_window_j`] per short window
+/// instead.
+pub(crate) fn long_sequence_window(
+    sequence: WindowSequence,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+) -> Result<Vec<f64>> {
+    let kind = match sequence {
+        WindowSequence::OnlyLong => LongKind::OnlyLong,
+        WindowSequence::LongStart => LongKind::Start,
+        WindowSequence::LongStop => LongKind::Stop,
+        WindowSequence::EightShort => return Err(Error::FilterbankInvalid),
+    };
+    Ok(build_long_window(left_shape, right_shape, kind))
+}
+
+/// §4.6.11.3.2 c) — the length-256 window of short window `j`
+/// (`0..8`) inside an `EIGHT_SHORT_SEQUENCE` frame: window 0's left
+/// half inherits the previous block's shape, all other halves use
+/// this block's shape.
+pub(crate) fn short_window_j(
+    j: usize,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+) -> Vec<f64> {
+    let this_left = if j == 0 { left_shape } else { right_shape };
+    let halves = window_halves(SHORT_TRANSFORM_LEN, this_left, right_shape);
+    let mut w = vec![0.0f64; N_S];
+    w[..N_S / 2].copy_from_slice(&halves.left);
+    for (m, &rv) in halves.right.iter().enumerate() {
+        w[N_S / 2 + m] = rv;
+    }
+    w
+}
+
+/// §4.6.11.3.2 c) — offset of short window 0 inside the 2048-sample
+/// frame window region: `(N_l − N_s)/4 = 448`.
+pub(crate) const SHORT_SEQ_START: usize = (N_L - N_S) / 4;
+
+/// §4.6.11.3.2 c) — hop between successive short windows:
+/// `N_s/2 = 128`.
+pub(crate) const SHORT_SEQ_HOP: usize = N_S / 2;
+
 /// Modified Bessel function of the first kind, order 0, via its power
 /// series `I0(x) = Σ_k ((x/2)^k / k!)^2` (§4.6.11.3.2). The series
 /// converges quickly for the `x = π·α` arguments the KBD window uses
@@ -409,58 +458,70 @@ impl Filterbank {
         right_shape: WindowShape,
         kind: LongKind,
     ) -> Vec<f64> {
-        let long = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
-        let short = window_halves(SHORT_TRANSFORM_LEN, left_shape, right_shape);
-        let half_l = N_L / 2; // 1024
-        let mut w = vec![0.0f64; N_L];
+        build_long_window(left_shape, right_shape, kind)
+    }
+}
 
-        // Left half is always the plain long left half for OnlyLong /
-        // Start; Stop replaces it with the start-transition mirror.
-        match kind {
-            LongKind::OnlyLong | LongKind::Start => {
-                w[..half_l].copy_from_slice(&long.left);
+/// §4.6.11.3.2 — the shared long-sequence window construction (see
+/// [`Filterbank::long_window`] for the per-kind geometry notes).
+fn build_long_window(
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+    kind: LongKind,
+) -> Vec<f64> {
+    let long = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
+    let short = window_halves(SHORT_TRANSFORM_LEN, left_shape, right_shape);
+    let half_l = N_L / 2; // 1024
+    let mut w = vec![0.0f64; N_L];
+
+    // Left half is always the plain long left half for OnlyLong /
+    // Start; Stop replaces it with the start-transition mirror.
+    match kind {
+        LongKind::OnlyLong | LongKind::Start => {
+            w[..half_l].copy_from_slice(&long.left);
+        }
+        LongKind::Stop => {
+            // 0.0 over [0, (N_l − N_s)/4); short left half over
+            // [(N_l − N_s)/4, (N_l + N_s)/4); 1.0 over
+            // [(N_l + N_s)/4, N_l/2).
+            let a = (N_L - N_S) / 4; // 448
+            for (m, &sv) in short.left.iter().enumerate() {
+                w[a + m] = sv;
             }
-            LongKind::Stop => {
-                // 0.0 over [0, (N_l − N_s)/4); short left half over
-                // [(N_l − N_s)/4, (N_l + N_s)/4); 1.0 over
-                // [(N_l + N_s)/4, N_l/2).
-                let a = (N_L - N_S) / 4; // 448
-                for (m, &sv) in short.left.iter().enumerate() {
-                    w[a + m] = sv;
-                }
-                for slot in w.iter_mut().take(half_l).skip(a + N_S / 2) {
-                    *slot = 1.0;
-                }
+            for slot in w.iter_mut().take(half_l).skip(a + N_S / 2) {
+                *slot = 1.0;
             }
         }
-
-        match kind {
-            LongKind::OnlyLong => {
-                for (m, &rv) in long.right.iter().enumerate() {
-                    w[half_l + m] = rv;
-                }
-            }
-            LongKind::Start => {
-                // 1.0 over [N_l/2, (3N_l − N_s)/4); short right half
-                // over [(3N_l − N_s)/4, (3N_l + N_s)/4); 0.0 after.
-                let b = (3 * N_L - N_S) / 4; // 1472
-                for slot in w.iter_mut().take(b).skip(half_l) {
-                    *slot = 1.0;
-                }
-                for (m, &rv) in short.right.iter().enumerate() {
-                    w[b + m] = rv;
-                }
-                // [(3N_l + N_s)/4, N_l) stays 0.0 from the vec init.
-            }
-            LongKind::Stop => {
-                for (m, &rv) in long.right.iter().enumerate() {
-                    w[half_l + m] = rv;
-                }
-            }
-        }
-        w
     }
 
+    match kind {
+        LongKind::OnlyLong => {
+            for (m, &rv) in long.right.iter().enumerate() {
+                w[half_l + m] = rv;
+            }
+        }
+        LongKind::Start => {
+            // 1.0 over [N_l/2, (3N_l − N_s)/4); short right half
+            // over [(3N_l − N_s)/4, (3N_l + N_s)/4); 0.0 after.
+            let b = (3 * N_L - N_S) / 4; // 1472
+            for slot in w.iter_mut().take(b).skip(half_l) {
+                *slot = 1.0;
+            }
+            for (m, &rv) in short.right.iter().enumerate() {
+                w[b + m] = rv;
+            }
+            // [(3N_l + N_s)/4, N_l) stays 0.0 from the vec init.
+        }
+        LongKind::Stop => {
+            for (m, &rv) in long.right.iter().enumerate() {
+                w[half_l + m] = rv;
+            }
+        }
+    }
+    w
+}
+
+impl Filterbank {
     /// §4.6.11.3.2 c) — the `EIGHT_SHORT` sequence: eight length-256
     /// IMDCTs, each windowed with a short window, then overlapped and
     /// added into the 2048-sample frame with leading/trailing zeros.

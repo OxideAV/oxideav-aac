@@ -22,14 +22,22 @@
 //! conforming encoder. The choices here are deliberately simple and
 //! fully derived from the normative decoder equations:
 //!
-//! * **Window decision** — every frame is `ONLY_LONG_SEQUENCE` with
-//!   the §4.6.11.3.2 sine shape. (Block switching is a quality
-//!   refinement, not a conformance requirement: a long-window-only
-//!   stream is valid AAC-LC.)
+//! * **Window decision (block switching, §4.6.11.3.2)** — an
+//!   energy-jump transient detector on each incoming hop drives the
+//!   `ONLY_LONG → LONG_START → EIGHT_SHORT → LONG_STOP` state
+//!   machine: a 128-sample subblock whose energy jumps ≥12× over the
+//!   running average of its predecessors (above an absolute floor)
+//!   marks the hop transient; the frame *before* the transient hop
+//!   becomes `LONG_START`, the transient hop's frame `EIGHT_SHORT`
+//!   (extended while transients continue), and the run exits through
+//!   `LONG_STOP`. All windows are the §4.6.11.3.2 sine shape.
 //! * **Analysis filterbank** — the §4.6.11.3.1 forward MDCT (the
 //!   transform whose windowed overlap-add against the decoder's IMDCT
 //!   is unity — the same [`crate::filterbank::forward_mdct`] the
-//!   §4.6.7 LTP loop uses). Frame `f` transforms input samples
+//!   §4.6.7 LTP loop uses). Long frames run one 2048-point transform
+//!   under the sequence's composite window; `EIGHT_SHORT` frames run
+//!   eight 256-point transforms at offsets `448 + j·128` within the
+//!   window region. Frame `f` covers input samples
 //!   `[f·1024 − 1024, f·1024 + 1024)`; the leading frame is primed
 //!   with zeros, giving the standard 1024-sample encoder delay.
 //! * **Quantizer** — the exact inverse of §4.6.2:
@@ -78,15 +86,21 @@
 //! ceiling), and `aac_frame_length` stays within its 13-bit field.
 
 use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ};
-use crate::filterbank::{forward_mdct, long_only_window};
+use crate::filterbank::{
+    forward_mdct, long_sequence_window, short_window_j, SHORT_SEQ_HOP, SHORT_SEQ_START,
+};
 use crate::ics_body::IcsBody;
-use crate::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use crate::ics_info::{
+    IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
+};
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
 use crate::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use crate::section_data::{Section, SectionData, ZERO_HCB};
 use crate::spectral_codebook::MAX_QUANT;
 use crate::spectral_data::SpectralData;
-use crate::swb_offset::{long_window_offsets, LONG_WINDOW_LEN};
+use crate::swb_offset::{
+    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
+};
 use crate::{Error, Result};
 
 use oxideav_core::bits::BitWriter;
@@ -192,8 +206,13 @@ pub struct StreamEncoder {
     /// analysis window), [`FRAME_LEN`] samples each. Starts all-zero
     /// (the priming frame).
     history: Vec<Vec<f64>>,
-    /// The 2048-sample sine `ONLY_LONG` analysis window.
-    window: Vec<f64>,
+    /// `window_sequence` of the previously emitted frame — drives
+    /// the §4.6.11.3.2 block-switching state machine.
+    prev_seq: WindowSequence,
+    /// The previous frame flagged a transient in what is now the
+    /// history hop, so this frame *must* be `EIGHT_SHORT_SEQUENCE`
+    /// (the `LONG_START → EIGHT_SHORT` contract).
+    short_pending: bool,
 }
 
 impl StreamEncoder {
@@ -211,7 +230,8 @@ impl StreamEncoder {
             config,
             fs_index,
             history: vec![vec![0.0; FRAME_LEN]; config.channels as usize],
-            window: long_only_window(WindowShape::Sine, WindowShape::Sine),
+            prev_seq: WindowSequence::OnlyLong,
+            short_pending: false,
         })
     }
 
@@ -280,16 +300,40 @@ impl StreamEncoder {
     /// loop, and wrap the raw data block in an ADTS header.
     fn encode_hop(&mut self, cur: &[Vec<f64>]) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
-        // Per-channel forward MDCT.
+
+        // §4.6.11.3.2 block-switching state machine. A transient in
+        // `cur` means the *next* frame (whose window's left half is
+        // `cur`) must be EIGHT_SHORT; this frame becomes the
+        // LONG_START lead-in (or stays short if a short run is
+        // already active). A pending short from the previous hop
+        // forces EIGHT_SHORT now; a short run with no continuation
+        // exits through LONG_STOP.
+        let transient = self
+            .history
+            .iter()
+            .zip(cur.iter())
+            .any(|(h, c)| detect_transient(h, c));
+        let seq = if self.short_pending {
+            WindowSequence::EightShort
+        } else if transient && self.prev_seq != WindowSequence::EightShort {
+            WindowSequence::LongStart
+        } else if self.prev_seq == WindowSequence::EightShort {
+            if transient {
+                WindowSequence::EightShort
+            } else {
+                WindowSequence::LongStop
+            }
+        } else {
+            WindowSequence::OnlyLong
+        };
+        self.short_pending = transient;
+
+        // Per-channel analysis transform for the chosen sequence.
         let mut spectra: Vec<Vec<f64>> = Vec::with_capacity(ch);
         for (hist, chan) in self.history.iter().zip(cur.iter()) {
-            let mut z = vec![0.0f64; LONG_TRANSFORM_LEN];
-            for m in 0..FRAME_LEN {
-                z[m] = hist[m] * self.window[m];
-                z[FRAME_LEN + m] = chan[m] * self.window[FRAME_LEN + m];
-            }
-            spectra.push(forward_mdct(&z, LONG_TRANSFORM_LEN));
+            spectra.push(analyze_channel(hist, chan, seq)?);
         }
+        self.prev_seq = seq;
 
         // Rate loop: uniform scalefactor offset in ±4 steps (3 dB
         // per step on the §4.6.2.3.3 quarter-step ladder). Coarsen
@@ -299,17 +343,17 @@ impl StreamEncoder {
         // `-MAX_REFINE_OFFSET`.
         let budget = self.config.frame_budget_bytes();
         let mut sf_offset = 0i32;
-        let mut raw_block = self.assemble_raw_block(&spectra, sf_offset)?;
+        let mut raw_block = self.assemble_raw_block(seq, &spectra, sf_offset)?;
         let mut iterations = 0usize;
         if raw_block.len() > budget {
             while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
                 sf_offset += 4;
-                raw_block = self.assemble_raw_block(&spectra, sf_offset)?;
+                raw_block = self.assemble_raw_block(seq, &spectra, sf_offset)?;
                 iterations += 1;
             }
         } else {
             while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer = self.assemble_raw_block(&spectra, sf_offset - 4)?;
+                let finer = self.assemble_raw_block(seq, &spectra, sf_offset - 4)?;
                 if finer.len() > budget {
                     break;
                 }
@@ -324,7 +368,7 @@ impl StreamEncoder {
         // once). Try the intermediate offsets, finest first.
         if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
             for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(&spectra, sf_offset - fine)?;
+                let cand = self.assemble_raw_block(seq, &spectra, sf_offset - fine)?;
                 if cand.len() <= budget {
                     raw_block = cand;
                     break;
@@ -358,13 +402,25 @@ impl StreamEncoder {
     /// Assemble one `raw_data_block()` (SCE for mono, one
     /// `common_window` CPE for stereo, then END) at the given
     /// rate-loop scalefactor offset.
-    fn assemble_raw_block(&self, spectra: &[Vec<f64>], sf_offset: i32) -> Result<Vec<u8>> {
+    fn assemble_raw_block(
+        &self,
+        seq: WindowSequence,
+        spectra: &[Vec<f64>],
+        sf_offset: i32,
+    ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
         let mut body_bits = BitWriter::new();
+        let quantize = |spec: &[f64], peak: f64| -> Result<QuantizedChannel> {
+            if seq == WindowSequence::EightShort {
+                quantize_channel_short(spec, self.fs_index, sf_offset, peak)
+            } else {
+                quantize_channel(spec, seq, self.fs_index, sf_offset, peak)
+            }
+        };
         match spectra {
             [mono] => {
                 let peak = mono.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-                let chan = quantize_channel(mono, self.fs_index, sf_offset, peak)?;
+                let chan = quantize(mono, peak)?;
                 asm.push_channel_header(IdSynEle::Sce, 0)?;
                 chan.body.write(&mut body_bits, 2, self.fs_index, false)?;
                 chan.spectral.write(
@@ -380,22 +436,31 @@ impl StreamEncoder {
                 // elsewhere). Both coding channels share the pair's
                 // loudest peak for the masking spread, so the side
                 // channel's noise floor is judged against the pair,
-                // not against its own (often tiny) peak.
-                let ms_used = ms_decide(l_spec, r_spec, self.fs_index)?;
-                let (code_l, code_r) = apply_ms(l_spec, r_spec, &ms_used, self.fs_index)?;
+                // not against its own (often tiny) peak. Short frames
+                // code the channels independently (mask 0) for now.
+                let ms_used = if seq == WindowSequence::EightShort {
+                    vec![]
+                } else {
+                    ms_decide(l_spec, r_spec, self.fs_index)?
+                };
+                let (code_l, code_r) = if ms_used.is_empty() {
+                    (l_spec.to_vec(), r_spec.to_vec())
+                } else {
+                    apply_ms(l_spec, r_spec, &ms_used, self.fs_index)?
+                };
                 let pair_peak = code_l
                     .iter()
                     .chain(code_r.iter())
                     .fold(0.0f64, |m, &v| m.max(v.abs()));
-                let left = quantize_channel(&code_l, self.fs_index, sf_offset, pair_peak)?;
-                let right = quantize_channel(&code_r, self.fs_index, sf_offset, pair_peak)?;
+                let left = quantize(&code_l, pair_peak)?;
+                let right = quantize(&code_r, pair_peak)?;
 
                 asm.push_channel_header(IdSynEle::Cpe, 0)?;
                 // §4.4.2.3: common_window = 1, one shared ics_info,
                 // then the two-bit ms_mask_present (+ mask when 1).
                 body_bits.write_bit(true);
                 left.info.write(&mut body_bits, 2, self.fs_index, true)?;
-                if ms_used.iter().all(|&b| b) {
+                if !ms_used.is_empty() && ms_used.iter().all(|&b| b) {
                     body_bits.write_u32(2, 2); // all ones, no mask bits
                 } else if ms_used.iter().any(|&b| b) {
                     body_bits.write_u32(1, 2);
@@ -422,6 +487,99 @@ impl StreamEncoder {
         let body = body_bits.finish();
         asm.push_channel_body_bits(&body, nbits)?;
         Ok(asm.push_end())
+    }
+}
+
+/// Subblock length of the transient detector — one short-window hop
+/// (128 samples), so a detected attack aligns with the short-window
+/// grid it triggers.
+const TRANSIENT_SUBBLOCK: usize = SHORT_SEQ_HOP;
+
+/// Energy jump (×) a subblock must show over the running average of
+/// the preceding subblocks to count as a transient attack.
+const TRANSIENT_RATIO: f64 = 12.0;
+
+/// Absolute per-subblock energy floor below which an attack is
+/// ignored (silence-to-quiet transitions don't warrant short
+/// windows): a 128-sample block at ~±180 amplitude.
+const TRANSIENT_FLOOR: f64 = 128.0 * 180.0 * 180.0;
+
+/// Minimum established (pre-attack) average subblock energy for the
+/// detector to arm. Below this the context is effectively silence
+/// and an onset codes acceptably with the long-window pair (its
+/// left flank is silence — there is no signal to smear pre-echo
+/// into), so the detector stays quiet rather than switching on
+/// every stream/passage onset.
+const TRANSIENT_ARM: f64 = TRANSIENT_FLOOR / TRANSIENT_RATIO;
+
+/// Detect a transient attack inside one channel's next hop.
+///
+/// The 2048-sample context `[hist | cur]` is split into sixteen
+/// 128-sample subblocks; an attack fires when a subblock **in the
+/// `cur` half** has energy that (a) clears the absolute
+/// [`TRANSIENT_FLOOR`], and (b) jumps [`TRANSIENT_RATIO`]× above the
+/// **maximum** energy of the preceding eight subblocks (one hop of
+/// context) — provided that maximum itself clears [`TRANSIENT_ARM`]
+/// (an established signal level to jump *from*). Using the recent
+/// max rather than a mean keeps beat nulls in steady multi-tone
+/// content from arming spurious triggers, and keeps zeroed history
+/// (stream start) from diluting the reference: an onset out of true
+/// digital silence codes acceptably with the long-window pair (its
+/// left flank is silence — there is nothing to smear pre-echo into),
+/// so the detector deliberately stays quiet there.
+fn detect_transient(hist: &[f64], cur: &[f64]) -> bool {
+    let energies: Vec<f64> = hist
+        .chunks(TRANSIENT_SUBBLOCK)
+        .chain(cur.chunks(TRANSIENT_SUBBLOCK))
+        .map(|b| b.iter().map(|&v| v * v).sum())
+        .collect();
+    let hist_blocks = hist.len() / TRANSIENT_SUBBLOCK;
+    for (j, &e) in energies.iter().enumerate().skip(hist_blocks) {
+        let ctx = &energies[j.saturating_sub(hist_blocks.max(1))..j];
+        let reference = ctx.iter().fold(0.0f64, |m, &v| m.max(v));
+        if e > TRANSIENT_FLOOR && reference > TRANSIENT_ARM && e > TRANSIENT_RATIO * reference {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the §4.6.11.3.1 analysis transform for one channel under the
+/// chosen `window_sequence`, over the 2048-sample region
+/// `[hist | cur]`.
+///
+/// * Long sequences: one 2048-point MDCT under the
+///   [`long_sequence_window`] (sine shape throughout — this encoder
+///   never switches shapes, so left/right inheritance is trivial).
+/// * `EIGHT_SHORT`: eight 256-point MDCTs at offsets
+///   `448 + j·128` inside the region ([`SHORT_SEQ_START`] /
+///   [`SHORT_SEQ_HOP`]), each under its [`short_window_j`];
+///   concatenated window-major (`8 × 128` coefficients).
+fn analyze_channel(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Result<Vec<f64>> {
+    debug_assert_eq!(hist.len(), FRAME_LEN);
+    debug_assert_eq!(cur.len(), FRAME_LEN);
+    let region = |i: usize| -> f64 {
+        if i < FRAME_LEN {
+            hist[i]
+        } else {
+            cur[i - FRAME_LEN]
+        }
+    };
+    if seq == WindowSequence::EightShort {
+        let short_len = SHORT_WINDOW_LEN as usize; // 128
+        let n_s = 2 * short_len; // 256
+        let mut out = Vec::with_capacity(8 * short_len);
+        for j in 0..8 {
+            let w = short_window_j(j, WindowShape::Sine, WindowShape::Sine);
+            let base = SHORT_SEQ_START + j * SHORT_SEQ_HOP;
+            let seg: Vec<f64> = (0..n_s).map(|m| region(base + m) * w[m]).collect();
+            out.extend_from_slice(&forward_mdct(&seg, n_s));
+        }
+        Ok(out)
+    } else {
+        let w = long_sequence_window(seq, WindowShape::Sine, WindowShape::Sine)?;
+        let z: Vec<f64> = (0..LONG_TRANSFORM_LEN).map(|m| region(m) * w[m]).collect();
+        Ok(forward_mdct(&z, LONG_TRANSFORM_LEN))
     }
 }
 
@@ -545,37 +703,44 @@ fn codebook_for(qmax: i32) -> u8 {
     }
 }
 
-/// Quantize one channel's 1024-line spectrum into a complete
-/// `individual_channel_stream()` record set. `frame_peak` anchors
-/// the masking spread and cull — the channel's own peak for mono,
-/// the pair's loudest peak for a jointly-coded CPE.
-fn quantize_channel(
+/// Per-band quantization result for one window group.
+struct GroupQuant {
+    x_quant: Vec<i32>,
+    sfb_cb: Vec<u8>,
+    sfs: Vec<Option<i32>>,
+}
+
+/// Quantize the `num_swb` scalefactor bands of one window group.
+///
+/// `spec` is the group's coefficient buffer (1024 lines for a long
+/// sequence, 128 for a one-window short group); `offsets` the
+/// matching §4.5.4 band-offset table. `prev_sf` threads the DPCM ±60
+/// clamp across groups in wire order — the §4.6.2.3.2 accumulator is
+/// a single track for the whole channel.
+///
+/// Pass 1 picks the masking-spread scalefactor per band; pass 2
+/// re-quantizes with the clamped value and derives the codebook. A
+/// band whose coefficients all quantize to zero (or whose target is
+/// culled) stays `ZERO_HCB` and transmits no scalefactor.
+fn quantize_group(
     spec: &[f64],
-    fs_index: u8,
+    offsets: &[u16],
+    num_swb: usize,
     sf_offset: i32,
     frame_peak: f64,
-) -> Result<QuantizedChannel> {
-    debug_assert_eq!(spec.len(), FRAME_LEN);
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
-
-    // Pass 1: per-band scalefactor from the constant-SNR rule, with
-    // the DPCM ±60 clamp applied against the previous *coded* band.
-    // Pass 2 below re-quantizes with the clamped sf and derives the
-    // codebook; a band whose coefficients all quantize to zero
-    // becomes ZERO_HCB and drops out of the scalefactor track.
-    let mut x_quant = vec![0i32; FRAME_LEN];
+    prev_sf: &mut Option<i32>,
+) -> GroupQuant {
+    let mut x_quant = vec![0i32; spec.len()];
     let mut sfb_cb = vec![ZERO_HCB; num_swb];
     let mut sfs: Vec<Option<i32>> = vec![None; num_swb];
-    let mut prev_sf: Option<i32> = None;
     for sfb in 0..num_swb {
         let start = offsets[sfb] as usize;
-        let end = offsets[sfb + 1] as usize;
+        let end = (offsets[sfb + 1] as usize).min(spec.len());
         let peak = spec[start..end].iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         let Some(mut sf) = band_scalefactor(peak, frame_peak, sf_offset) else {
             continue; // culled: below the frame's masking floor
         };
-        if let Some(p) = prev_sf {
+        if let Some(p) = *prev_sf {
             sf = sf.clamp(p - MAX_SF_DELTA, p + MAX_SF_DELTA).clamp(0, 255);
         }
         // Raise sf until the band's peak fits the ESC ceiling (a
@@ -586,7 +751,7 @@ fn quantize_channel(
             qmax = quantize_coef(peak, sf).abs();
         }
         if qmax == 0 {
-            continue; // all-zero band → ZERO_HCB, no scalefactor
+            continue; // all-zero band -> ZERO_HCB, no scalefactor
         }
         let mut band_max = 0i32;
         for k in start..end {
@@ -599,31 +764,47 @@ fn quantize_channel(
         }
         sfb_cb[sfb] = codebook_for(band_max);
         sfs[sfb] = Some(sf);
-        prev_sf = Some(sf);
+        *prev_sf = Some(sf);
     }
+    GroupQuant {
+        x_quant,
+        sfb_cb,
+        sfs,
+    }
+}
 
-    // Scalefactor track: global_gain seeds the DPCM at the first
-    // coded band; every subsequent coded band transmits its delta.
-    let mut entries: Vec<ScaleFactorEntry> = Vec::new();
+/// Build the per-group scalefactor entry lists and the frame's
+/// `global_gain` from the chosen per-band scalefactors: the first
+/// coded band (in wire order across all groups) seeds the §4.6.2.3.2
+/// DPCM track at delta 0, every later coded band transmits its
+/// delta.
+fn scalefactor_entries(groups: &[GroupQuant]) -> (u8, Vec<Vec<ScaleFactorEntry>>) {
+    let mut all_entries = Vec::with_capacity(groups.len());
     let mut global_gain: Option<i32> = None;
     let mut last = 0i32;
-    for sf in sfs.iter().copied().flatten() {
-        match global_gain {
-            None => {
-                global_gain = Some(sf);
-                entries.push(ScaleFactorEntry::Dpcm(0));
+    for g in groups {
+        let mut entries = Vec::new();
+        for sf in g.sfs.iter().copied().flatten() {
+            match global_gain {
+                None => {
+                    global_gain = Some(sf);
+                    entries.push(ScaleFactorEntry::Dpcm(0));
+                }
+                Some(_) => {
+                    let delta = sf - last;
+                    debug_assert!((-MAX_SF_DELTA..=MAX_SF_DELTA).contains(&delta));
+                    entries.push(ScaleFactorEntry::Dpcm(delta as i8));
+                }
             }
-            Some(_) => {
-                let delta = sf - last;
-                debug_assert!((-MAX_SF_DELTA..=MAX_SF_DELTA).contains(&delta));
-                entries.push(ScaleFactorEntry::Dpcm(delta as i8));
-            }
+            last = sf;
         }
-        last = sf;
+        all_entries.push(entries);
     }
-    let global_gain = global_gain.unwrap_or(SF_OFFSET) as u8;
+    (global_gain.unwrap_or(SF_OFFSET) as u8, all_entries)
+}
 
-    // Sections: merge adjacent equal codebooks.
+/// Merge one group's per-band codebooks into contiguous sections.
+fn build_sections(sfb_cb: &[u8]) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
     for (sfb, &cb) in sfb_cb.iter().enumerate() {
         match sections.last_mut() {
@@ -635,10 +816,65 @@ fn quantize_channel(
             }),
         }
     }
+    sections
+}
 
+/// Wrap quantized groups + an `ics_info` into the wire record set.
+fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> QuantizedChannel {
+    let (global_gain, entries) = scalefactor_entries(&groups);
+    let mut sections = Vec::with_capacity(groups.len());
+    let mut sfb_cb = Vec::with_capacity(groups.len());
+    let mut x_quant = Vec::with_capacity(groups.len());
+    for g in groups {
+        sections.push(build_sections(&g.sfb_cb));
+        sfb_cb.push(g.sfb_cb);
+        x_quant.push(g.x_quant);
+    }
+    let body = IcsBody {
+        global_gain,
+        ics_info: Some(info.clone()),
+        section_data: SectionData { sections, sfb_cb },
+        scale_factor_data: ScaleFactorData { entries },
+        pulse_data_present: false,
+        pulse_data: None,
+        tns_data_present: false,
+        tns_data: None,
+        gain_control_data_present: false,
+        gain_control_data: None,
+        spectral_data_bit_offset: 0,
+        er_scale_factor_data: None,
+        reordered_spectral_lengths: None,
+    };
+    let spectral = SpectralData { x_quant };
+    QuantizedChannel {
+        info,
+        body,
+        spectral,
+    }
+}
+
+/// Quantize one channel's 1024-line long-sequence spectrum into a
+/// complete `individual_channel_stream()` record set. `seq` must be
+/// one of the three long sequences (it lands in the `ics_info`);
+/// `frame_peak` anchors the masking spread and cull — the channel's
+/// own peak for mono, the pair's loudest peak for a jointly-coded
+/// CPE.
+fn quantize_channel(
+    spec: &[f64],
+    seq: WindowSequence,
+    fs_index: u8,
+    sf_offset: i32,
+    frame_peak: f64,
+) -> Result<QuantizedChannel> {
+    debug_assert_eq!(spec.len(), FRAME_LEN);
+    debug_assert!(seq != WindowSequence::EightShort);
+    let offsets = long_window_offsets(fs_index)?;
+    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let mut prev_sf: Option<i32> = None;
+    let group = quantize_group(spec, offsets, num_swb, sf_offset, frame_peak, &mut prev_sf);
     let info = IcsInfo {
         ics_reserved_bit: false,
-        window_sequence: WindowSequence::OnlyLong,
+        window_sequence: seq,
         window_shape: WindowShape::Sine,
         max_sfb: num_swb as u8,
         scale_factor_grouping: None,
@@ -653,36 +889,55 @@ fn quantize_channel(
         window_group_length: vec![1],
         num_swb: num_swb as u8,
     };
-    let section_data = SectionData {
-        sections: vec![sections],
-        sfb_cb: vec![sfb_cb],
+    Ok(finish_channel(info, vec![group]))
+}
+
+/// Quantize one channel's `EIGHT_SHORT_SEQUENCE` spectrum (8 x 128
+/// window-major coefficients) into a complete record set. Each short
+/// window forms its own window group (`scale_factor_grouping = 0`) —
+/// the simplest conforming grouping, at the cost of eight
+/// scalefactor/section tracks per frame.
+fn quantize_channel_short(
+    spec: &[f64],
+    fs_index: u8,
+    sf_offset: i32,
+    frame_peak: f64,
+) -> Result<QuantizedChannel> {
+    let short_len = SHORT_WINDOW_LEN as usize;
+    debug_assert_eq!(spec.len(), 8 * short_len);
+    let offsets = short_window_offsets(fs_index)?;
+    let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let mut prev_sf: Option<i32> = None;
+    let mut groups = Vec::with_capacity(8);
+    for j in 0..8 {
+        let win = &spec[j * short_len..(j + 1) * short_len];
+        groups.push(quantize_group(
+            win,
+            offsets,
+            num_swb,
+            sf_offset,
+            frame_peak,
+            &mut prev_sf,
+        ));
+    }
+    let info = IcsInfo {
+        ics_reserved_bit: false,
+        window_sequence: WindowSequence::EightShort,
+        window_shape: WindowShape::Sine,
+        max_sfb: num_swb as u8,
+        scale_factor_grouping: Some(0),
+        predictor_data_present: false,
+        predictor_data: None,
+        ltp_data_present: false,
+        ltp_data: None,
+        ltp_data_present_pair: None,
+        ltp_data_pair: None,
+        num_windows: 8,
+        num_window_groups: 8,
+        window_group_length: vec![1; 8],
+        num_swb: num_swb as u8,
     };
-    let scale_factor_data = ScaleFactorData {
-        entries: vec![entries],
-    };
-    let body = IcsBody {
-        global_gain,
-        ics_info: Some(info.clone()),
-        section_data,
-        scale_factor_data,
-        pulse_data_present: false,
-        pulse_data: None,
-        tns_data_present: false,
-        tns_data: None,
-        gain_control_data_present: false,
-        gain_control_data: None,
-        spectral_data_bit_offset: 0,
-        er_scale_factor_data: None,
-        reordered_spectral_lengths: None,
-    };
-    let spectral = SpectralData {
-        x_quant: vec![x_quant],
-    };
-    Ok(QuantizedChannel {
-        info,
-        body,
-        spectral,
-    })
+    Ok(finish_channel(info, groups))
 }
 
 #[cfg(test)]

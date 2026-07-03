@@ -363,3 +363,134 @@ fn uncorrelated_channels_still_roundtrip() {
     eprintln!("uncorrelated stereo err/sig RMS = {ratio:.5}");
     assert!(ratio < 0.03, "independent-channel ratio {ratio:.5}");
 }
+
+// ---- §4.6.11.3.2 block switching (encode side) ----
+
+/// Walk an ADTS stream of mono SCE frames and return each frame's
+/// `window_sequence` as parsed off the wire.
+fn window_sequences(stream: &[u8]) -> Vec<oxideav_aac::ics_info::WindowSequence> {
+    use oxideav_aac::ics_body::IcsBody;
+    use oxideav_core::bits::BitReader;
+
+    let mut seqs = Vec::new();
+    let mut pos = 0usize;
+    while pos < stream.len() {
+        let (hdr, off) = AdtsHeader::parse(&stream[pos..]).expect("frame parses");
+        let payload = &stream[pos + off..pos + hdr.aac_frame_length as usize];
+        let mut br = BitReader::new(payload);
+        // 3-bit id_syn_ele (SCE = 0) + 4-bit element_instance_tag.
+        let id = br.read_u32(3).unwrap();
+        assert_eq!(id, 0, "expected SCE");
+        let _tag = br.read_u32(4).unwrap();
+        let body = IcsBody::parse(&mut br, 2, hdr.sampling_frequency_index, false)
+            .expect("ics body parses");
+        seqs.push(body.ics_info.unwrap().window_sequence);
+        pos += hdr.aac_frame_length as usize;
+    }
+    seqs
+}
+
+#[test]
+fn transient_input_switches_to_short_windows() {
+    use oxideav_aac::ics_info::WindowSequence as Ws;
+
+    // Quiet tone for 3 hops, then a hard percussive attack in hop 3.
+    let n = 6 * FRAME_LEN;
+    let pcm: Vec<i16> = (0..n)
+        .map(|i| {
+            let quiet = (300.0 * (0.02 * i as f64).sin()) as i16;
+            if (3 * FRAME_LEN..3 * FRAME_LEN + 400).contains(&i) {
+                // Sharp burst.
+                if i % 2 == 0 {
+                    28_000
+                } else {
+                    -28_000
+                }
+            } else {
+                quiet
+            }
+        })
+        .collect();
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    let stream = enc.encode_all(&pcm).unwrap();
+    let seqs = window_sequences(&stream);
+    eprintln!("window sequences: {seqs:?}");
+
+    // Hop 3 carries the attack, so frame 3 must be the LONG_START
+    // lead-in and frame 4 EIGHT_SHORT, exiting through LONG_STOP.
+    assert_eq!(seqs[3], Ws::LongStart, "lead-in frame");
+    assert_eq!(seqs[4], Ws::EightShort, "transient frame");
+    assert_eq!(seqs[5], Ws::LongStop, "exit frame");
+    // Steady frames stay long.
+    assert_eq!(seqs[0], Ws::OnlyLong);
+    assert_eq!(seqs[1], Ws::OnlyLong);
+    // The whole stream still round-trips.
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN..]);
+    eprintln!("transient round-trip err/sig RMS = {ratio:.5}");
+    assert!(ratio < 0.08, "transient reconstruction ratio {ratio:.5}");
+}
+
+#[test]
+fn steady_tonal_input_never_switches() {
+    use oxideav_aac::ics_info::WindowSequence as Ws;
+
+    let n = 5 * FRAME_LEN;
+    let pcm = multitone(n, 1);
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    let stream = enc.encode_all(&pcm).unwrap();
+    let seqs = window_sequences(&stream);
+    assert!(
+        seqs.iter().all(|&s| s == Ws::OnlyLong),
+        "steady tone must stay ONLY_LONG: {seqs:?}"
+    );
+}
+
+#[test]
+fn stereo_transient_stream_roundtrips() {
+    // The same attack in a CPE stream (M/S disabled on short frames)
+    // must still decode end to end.
+    let n = 5 * FRAME_LEN;
+    let mut pcm = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let base = (400.0 * (0.025 * i as f64).sin()) as i16;
+        let burst = if (2 * FRAME_LEN..2 * FRAME_LEN + 300).contains(&i) {
+            if i % 2 == 0 {
+                24_000
+            } else {
+                -24_000
+            }
+        } else {
+            0
+        };
+        let v = base.saturating_add(burst);
+        pcm.push(v);
+        pcm.push(v);
+    }
+    let decoded = roundtrip(
+        &pcm,
+        EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 192_000,
+        },
+    );
+    let ratio = err_to_signal_rms(&pcm, &decoded[FRAME_LEN * 2..]);
+    eprintln!("stereo transient err/sig RMS = {ratio:.5}");
+    assert!(ratio < 0.08, "stereo transient ratio {ratio:.5}");
+}
