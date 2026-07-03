@@ -417,11 +417,10 @@ fn probe_aac(ctx: &ProbeContext) -> Confidence {
 ///   ADTS-AAC format tags used by AVI / WAVE carriage.
 /// * **FourCCs `mp4a` / `aac `** and the **Matroska `A_AAC`** CodecID.
 ///
-/// The encoder factory is **not** wired: this crate has the per-tool
-/// decode chain plus the bit-exact wire writers, but no rate-control /
-/// psychoacoustic encoder. The §4.4.2.1 `raw_data_block()` assembler
-/// (`raw_data_block::FrameAssembler`) is the encode-side surface that
-/// would feed a future `make_encoder`.
+/// The encoder factory is
+/// [`crate::codec_encoder::make_encoder`] — the frame-in /
+/// packet-out adaptor over the `encoder` module's PCM→ADTS
+/// [`crate::encoder::StreamEncoder`].
 ///
 /// The probe ([`probe_aac`]) scores the ADTS syncword so a genuine ADTS
 /// stream out-ranks a non-ADTS claimant on any shared tag.
@@ -430,9 +429,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .capabilities(
             CodecCapabilities::audio("aac")
                 .with_decode()
+                .with_encode()
                 .with_lossy(true),
         )
         .decoder(make_decoder)
+        .encoder(crate::codec_encoder::make_encoder)
         .probe(probe_aac)
         .tags([
             CodecTag::mp4_object_type(MP4_OBJECT_TYPE_AAC),

@@ -407,6 +407,7 @@ pub mod asc;
 pub mod cce;
 pub mod channel_map;
 pub mod codec_decoder;
+pub mod codec_encoder;
 pub mod crc;
 pub mod decode;
 pub mod decoded_spectrum;

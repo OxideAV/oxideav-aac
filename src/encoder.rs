@@ -83,6 +83,11 @@ use crate::{Error, Result};
 
 use oxideav_core::bits::BitWriter;
 
+/// Historical direct-factory endpoint (the crate convention's
+/// `<crate>::encoder::make_encoder` path) — re-exported from
+/// [`crate::codec_encoder`].
+pub use crate::codec_encoder::make_encoder;
+
 /// Samples per channel per AAC frame (the 1024-line transform
 /// family this crate implements).
 pub const FRAME_LEN: usize = LONG_WINDOW_LEN as usize;
