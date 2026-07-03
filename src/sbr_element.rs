@@ -294,21 +294,33 @@ fn parse_extended_data(reader: &mut BitReader<'_>) -> Result<Option<SbrExtension
     }
     let mut num_bits_left = (8 * cnt) as i64;
     // The while-loop in the spec reads one bs_extension_id then hands
-    // the rest to sbr_extension(); we capture the first id and the body
-    // bytes, then byte-align with the trailing fill.
+    // the rest to sbr_extension(); we capture the first id and then
+    // *every remaining bit* of the block. The extension payload (e.g.
+    // ps_data(), Table 8.A.1) is a bitstream that is NOT byte-aligned
+    // within the block — its final sub-byte shares a byte with the
+    // bs_fill_bits — so a whole-byte capture would truncate up to 7
+    // trailing payload bits. The re-packed buffer is zero-padded to a
+    // byte; the payload parser consumes exactly the bits it needs and
+    // ignores the rest as fill.
     let mut id = 0u8;
     let mut data: Vec<u8> = Vec::new();
     if num_bits_left > 7 {
         id = read(reader, 2)? as u8;
         num_bits_left -= 2;
-        // Capture the remaining whole bytes of the block as the body,
-        // leaving the sub-byte fill to be consumed below.
+        let mut w = oxideav_core::bits::BitWriter::new();
         while num_bits_left >= 8 {
-            data.push(read(reader, 8)? as u8);
+            w.write_u32(read(reader, 8)?, 8);
             num_bits_left -= 8;
         }
+        if num_bits_left > 0 {
+            let n = num_bits_left as u32;
+            w.write_u32(read(reader, n)?, n);
+            num_bits_left = 0;
+        }
+        data = w.finish();
     }
-    // bs_fill_bits: consume the remaining (< 8) bits.
+    // bs_fill_bits: consume the remaining (< 8) bits of a block too
+    // short to carry an id.
     if num_bits_left > 0 {
         read(reader, num_bits_left as u32)?;
     }

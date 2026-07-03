@@ -23,7 +23,10 @@
 //! Figure 4.47 of the staged spec. No part of this implementation is
 //! derived from any external decoder.
 
+use crate::ps_decoder::PsDecoder;
+use crate::ps_hybrid::LOOKAHEAD;
 use crate::sbr_dequant::{dequant_coupled, dequant_single, DequantizedSbr};
+use crate::sbr_element::EXTENSION_ID_PS;
 use crate::sbr_env_adjust::{adjust, EnvAdjustState, EnvParams};
 use crate::sbr_extension::SbrExtensionData;
 use crate::sbr_freq_bands::{k0 as derive_k0, k2 as derive_k2, master_table, HiLoTables};
@@ -114,6 +117,18 @@ pub struct SbrDecoder {
     patches: Option<Patches>,
     f_table_lim: Vec<i32>,
     channels: Vec<ChannelState>,
+    /// Annex 8.A parametric stereo state, created when a
+    /// single-channel element first carries a PS extension. Holds the
+    /// PS decoder plus the second (right-channel) synthesis bank; the
+    /// channel's own bank renders the left channel.
+    ps: Option<PsState>,
+}
+
+/// PS decoder + right-channel synthesis bank (Annex 8.A).
+#[derive(Debug)]
+struct PsState {
+    dec: PsDecoder,
+    synthesis_r: SynthesisQmf,
 }
 
 impl SbrDecoder {
@@ -130,6 +145,7 @@ impl SbrDecoder {
             patches: None,
             f_table_lim: Vec::new(),
             channels: (0..num_channels).map(|_| ChannelState::new()).collect(),
+            ps: None,
         })
     }
 
@@ -144,13 +160,42 @@ impl SbrDecoder {
             return Err(Error::SbrQmfInvalid);
         }
         let mut out = Vec::with_capacity(core.len());
+        let n_ch = self.channels.len();
         for (ch, core_ch) in self.channels.iter_mut().zip(core.iter()) {
             let x_low = ch.analyze(core_ch)?;
-            let mut pcm = Vec::with_capacity(LF * 64);
+            let mut x_cols: Vec<[Complex; 64]> = Vec::with_capacity(LF);
             for l in 0..LF {
                 let mut x = [Complex::default(); 64];
                 x[..32].copy_from_slice(&x_low[l + T_HF_ADJ]);
-                pcm.extend_from_slice(&ch.synthesis.push_slot(&x)?);
+                x_cols.push(x);
+            }
+            // A PS-active stream holds its stereo parameters over a
+            // frame without SBR/PS payload (Annex 8.A.3); the whole
+            // 32-band spectrum counts as SBR-covered for the partial
+            // reset.
+            let mut emitted = false;
+            if n_ch == 1 {
+                if let Some(ps) = self.ps.as_mut() {
+                    let x_input = build_x_input(&x_cols, &x_low);
+                    if let Some((lq, rq)) = ps.dec.process(None, &x_input, 32)? {
+                        let mut pcm_l = Vec::with_capacity(LF * 64);
+                        let mut pcm_r = Vec::with_capacity(LF * 64);
+                        for l in 0..LF {
+                            pcm_l.extend_from_slice(&ch.synthesis.push_slot(&lq[l])?);
+                            pcm_r.extend_from_slice(&ps.synthesis_r.push_slot(&rq[l])?);
+                        }
+                        out.push(pcm_l);
+                        out.push(pcm_r);
+                        emitted = true;
+                    }
+                }
+            }
+            if !emitted {
+                let mut pcm = Vec::with_capacity(LF * 64);
+                for x in &x_cols {
+                    pcm.extend_from_slice(&ch.synthesis.push_slot(x)?);
+                }
+                out.push(pcm);
             }
             // No Y for this frame; the next frame's lTemp splice sees
             // an empty previous envelope span.
@@ -158,7 +203,6 @@ impl SbrDecoder {
                 .iter_mut()
                 .for_each(|c| *c = [Complex::default(); 64]);
             ch.t_e_last_prev = NUM_TIME_SLOTS;
-            out.push(pcm);
         }
         Ok(out)
     }
@@ -294,9 +338,9 @@ impl SbrDecoder {
             };
             let y = adjust(&x_high, &params, &mut ch.env_state)?;
 
-            // §4.6.18.5 X assembly + synthesis.
+            // §4.6.18.5 X assembly.
             let l_temp = (RATE * ch.t_e_last_prev - NUM_TIME_SLOTS * RATE).max(0) as usize;
-            let mut pcm = Vec::with_capacity(LF * 64);
+            let mut x_cols: Vec<[Complex; 64]> = Vec::with_capacity(LF);
             for l in 0..LF {
                 let mut x = [Complex::default(); 64];
                 let (kx_cur, m_cur, y_col) = if l < l_temp {
@@ -313,9 +357,54 @@ impl SbrDecoder {
                 if kx_u < hi {
                     x[kx_u..hi].copy_from_slice(&y_col[kx_u..hi]);
                 }
-                pcm.extend_from_slice(&ch.synthesis.push_slot(&x)?);
+                x_cols.push(x);
             }
-            out.push(pcm);
+
+            // Annex 8.A: a single-channel element carrying an
+            // EXTENSION_ID_PS payload renders stereo through the PS
+            // tool (the element's own bank = left, the PS state's =
+            // right). Until the first decodable ps_data() the mono
+            // path below stays in effect.
+            let ps_payload = if n_ch == 1 {
+                ext.element
+                    .extension
+                    .as_ref()
+                    .filter(|e| e.id == EXTENSION_ID_PS)
+                    .map(|e| e.data.as_slice())
+            } else {
+                None
+            };
+            if ps_payload.is_some() && self.ps.is_none() {
+                self.ps = Some(PsState {
+                    dec: PsDecoder::new(),
+                    synthesis_r: SynthesisQmf::new(),
+                });
+            }
+            let mut emitted = false;
+            if n_ch == 1 {
+                if let Some(ps) = self.ps.as_mut() {
+                    let x_input = build_x_input(&x_cols, &x_low);
+                    let kx_plus_m = (bands.k_x + bands.m).max(0) as usize;
+                    if let Some((lq, rq)) = ps.dec.process(ps_payload, &x_input, kx_plus_m)? {
+                        let mut pcm_l = Vec::with_capacity(LF * 64);
+                        let mut pcm_r = Vec::with_capacity(LF * 64);
+                        for l in 0..LF {
+                            pcm_l.extend_from_slice(&ch.synthesis.push_slot(&lq[l])?);
+                            pcm_r.extend_from_slice(&ps.synthesis_r.push_slot(&rq[l])?);
+                        }
+                        out.push(pcm_l);
+                        out.push(pcm_r);
+                        emitted = true;
+                    }
+                }
+            }
+            if !emitted {
+                let mut pcm = Vec::with_capacity(LF * 64);
+                for x in &x_cols {
+                    pcm.extend_from_slice(&ch.synthesis.push_slot(x)?);
+                }
+                out.push(pcm);
+            }
 
             // Thread cross-frame state.
             ch.y_prev = y;
@@ -330,6 +419,21 @@ impl SbrDecoder {
         }
         Ok(out)
     }
+}
+
+/// Assemble the Annex 8.A.3 `Xinput` matrix: the 32 assembled `X`
+/// columns followed by `LOOKAHEAD` slots taken from `XLow` beyond the
+/// frame (`XLow(k, l + tHFAdj)`, `k < 5` — the split bands the hybrid
+/// filterbank consumes ahead of time).
+fn build_x_input(x_cols: &[[Complex; 64]], x_low: &[[Complex; 32]]) -> Vec<[Complex; 64]> {
+    let mut v = Vec::with_capacity(LF + LOOKAHEAD);
+    v.extend_from_slice(x_cols);
+    for l in LF..LF + LOOKAHEAD {
+        let mut col = [Complex::default(); 64];
+        col[..5].copy_from_slice(&x_low[l + T_HF_ADJ][..5]);
+        v.push(col);
+    }
+    v
 }
 
 /// The effective `bs_amp_res` after the single-envelope FIXFIX

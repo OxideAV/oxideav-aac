@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HE-AAC v2 decodes end-to-end — PS wired into the SBR decoder,
+  99.995% signal-accurate** (`ps_decoder`, `sbr_decoder`,
+  `sbr_element`) — the Annex 8.A frame driver composes the whole
+  §8.6.4 chain (ps_data parse with persistent header config →
+  differential resolution → hybrid analysis of the `Xinput` matrix
+  with the 6-slot `XLow` look-ahead → de-correlation with the
+  per-frame partial reset above `k_x + M` → stereo mixing → hybrid
+  synthesis), staying inactive (mono) until the first header'd
+  `ps_data()` per §8.6.5.1, holding parameters over payload-less
+  frames, and full-resetting the de-correlator after a missing
+  `ps_data()`. `SbrDecoder` renders a PS-carrying SCE as stereo: the
+  element's own synthesis bank becomes the left channel, a second
+  bank the right, in both the SBR-processed and pure-upsampling
+  paths. **Fixed** `sbr_element`'s extended-data capture, which
+  truncated the trailing sub-byte of the (non-byte-aligned)
+  `sbr_extension()` payload — up to 7 real `ps_data()` bits went lost
+  as "fill" (the HE-AAC v2 fixture's second element lost 2 bits and
+  failed to parse). Validated end-to-end against the staged HE-AAC v2
+  MP4 fixture (`tests/ps_he_aac_v2.rs`, with a minimal ISO 14496-12
+  `stsz`/`stco`/`stsc` walk): every access unit decodes to 2×2048
+  samples at 32 kHz, and after priming-lag alignment the per-channel
+  error-to-signal RMS against the reference decode is **5e-5 (L) /
+  4e-5 (R)** — filterbank-rounding level.
 - **PS stereo processing** (`ps_stereo`) — ISO/IEC 14496-3:2009
   §8.6.4.6. Dequantization on the Table 8.25/8.26 IID dB grids and
   the Table 8.28 ICC `ρ` grid — **cross-validated against the staged
