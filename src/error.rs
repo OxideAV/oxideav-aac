@@ -574,6 +574,11 @@ pub enum Error {
     /// §4.6.18.3.6 limit ([`crate::sbr_grid::SBR_MAX_NUM_ENV`]). Both
     /// signal a corrupt SBR data element.
     SbrGridInvalid,
+    /// SBR QMF filterbank ([`crate::sbr_qmf`], §4.6.18.4) was handed a
+    /// slot buffer of the wrong length: the analysis bank consumes
+    /// exactly 32 time samples per slot, the synthesis bank exactly 64
+    /// complex subband samples (32 for the downsampled variant).
+    SbrQmfInvalid,
     /// Integer-PCM rendering ([`crate::pcm`], §4.6.11 output →
     /// §1.3 `NINT()`-rounded 16-bit word) was handed per-channel time
     /// signals of disagreeing length. [`crate::pcm::interleave_s16`]
@@ -947,6 +952,12 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "SBR grid: §4.4.2.8 sbr_grid/sbr_dtdf/sbr_invf ran out of bits or signalled an out-of-range envelope count"
+                )
+            }
+            Error::SbrQmfInvalid => {
+                write!(
+                    f,
+                    "SBR QMF: §4.6.18.4 filterbank slot buffer has the wrong length (analysis takes 32 samples, synthesis 64 complex bands, downsampled 32)"
                 )
             }
             Error::PcmInvalid => {

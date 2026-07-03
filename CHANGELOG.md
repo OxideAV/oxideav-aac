@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SBR QMF filterbanks** (`sbr_qmf`) — ISO/IEC 14496-3 §4.6.18.4, the
+  first DSP stage of the SBR back-end. The Table 4.A.89 640-tap
+  prototype window (transcribed digit-for-digit from the staged spec
+  PDF; the table prints `c[639]` with nine decimals, every other entry
+  with ten, and the tests pin the `|c[i]| == |c[640-i]|` mirror
+  structure), the §4.6.18.4.1 / Figure 4.42 32-band complex analysis
+  bank (`AnalysisQmf`, 320-sample history, per-slot
+  `W[k] = Σ u[n]·2·exp(iπ/64·(k+0.5)(2n−0.5))`), the §4.6.18.4.2 /
+  Figure 4.43 64-band real-output synthesis bank (`SynthesisQmf`,
+  1280-sample `v` history, the `g`-extraction / window / ten-tap sum),
+  and the §4.6.18.4.3 / Figure 4.44 downsampled 32-channel synthesis
+  bank (`DownsampledSynthesisQmf`). A crate-local `Complex` type
+  carries the oversampled-by-two complex subband domain. Pinned by
+  window spot values + mirror structure, silence/shape guards,
+  linearity, a sine through analysis → 64-band synthesis reconstructing
+  the 2×-upsampled sine to an error ratio < 1e-4, and analysis →
+  downsampled synthesis being a delay-identity at the core rate
+  (< 1e-4). New `Error::SbrQmfInvalid` for wrong slot-buffer lengths.
+
 - **SSR gain-control `PFMD` length discipline + cross-frame robustness**
   (`gain_control`) — split the §4.6.12.3.2 `PFMD_B` length into the
   input-read length (`pfmd_len`: 256 for `ONLY_LONG` / `LONG_START`, 32
