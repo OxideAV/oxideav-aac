@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **PS de-correlator + parameter-band maps** (`ps_decorr`, `ps_map`) —
+  ISO/IEC 14496-3:2009 §8.6.4.5 / §8.6.4.6.1. The three-link complex
+  all-pass chain (Table 8.39 coefficients + delays, Table 8.42
+  fractional-delay rotations, `q_φ = 0.39`, the Table 8.40/8.41
+  centre-frequency ladders plus their closed-form tails, the
+  `DECAY_SLOPE` frequency taper) behind the z⁻²·φ_fract front, the
+  14-slot / 1-slot plain delays above `NR_ALLPASS_BANDS`, and the
+  §8.6.4.5.3–5.4 transient duck (peak-decay `α = 0.76592833836465`,
+  one-pole smoothing `a_smooth = 0.25`, impact `γ = 1.5`) applied per
+  Table 8.48/8.49 stereo band. State threads across frames; the Annex
+  8.A.3 partial (`k ≥ kmax`) and full resets are exposed. `ps_map`
+  carries the Table 8.48/8.49 `b(k)` hybrid→stereo-band maps (the
+  34-band table's deliberately non-monotonic split region matches the
+  Table 8.41 frequency ladder), the conjugate-flag rows, and the
+  Table 8.45/8.46 10↔20↔34 parameter re-mappings in ANSI-C integer
+  (and float, for the h hand-over) arithmetic. Pinned by per-band
+  energy conservation of the all-pass on stationary noise, the exact
+  14/1-slot delay identity with G ≡ 1 on constant level, the
+  deterministic post-burst duck profile, partial-reset scoping, and
+  the map tables' completeness/spot rows.
 - **PS hybrid filterbank** (`ps_hybrid`) — ISO/IEC 14496-3:2009
   §8.6.4.3 / Annex 8.A.3. Both configurations: 10/20 stereo bands (QMF
   band 0 split by 8 with the Figure 8.20 merge/reorder to 6 channels —
