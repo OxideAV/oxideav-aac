@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **PS stereo processing** (`ps_stereo`) — ISO/IEC 14496-3:2009
+  §8.6.4.6. Dequantization on the Table 8.25/8.26 IID dB grids and
+  the Table 8.28 ICC `ρ` grid — **cross-validated against the staged
+  fdk-extracted tables**: the `ps-iid-scale-factors.csv` Q30 values
+  are exactly the §8.6.4.6.2.1 `c1 = √(2/(1+c²))` over Table 8.25,
+  and `ps-icc-alphas.csv` exactly `½·arccos(ρ)` over Table 8.28 —
+  mixing procedures Ra (rotation `α = ½arccos ρ`, `β = α(c1−c2)/√2`)
+  and Rb (`ρ ≥ 0.05` floor, `arctan` α with the `c = 1` / modulo-π/2
+  corrections, `μ`/`γ`), the §8.6.4.6.3.2 IPD/OPD three-position
+  complex smoothing with per-band history and the `*`-channel
+  conjugation, and the §8.6.4.6.4 linear interpolation between
+  envelope borders (FIX `⌊32(e+1)/num_env⌋−1` / VAR positions, the
+  first region rising from the previous frame's coefficients, the
+  post-border hold, and the §8.6.4.6.5 `num_env == 0` full-frame
+  hold). Table 8.47 band-count switches re-map the retained
+  coefficients via Tables 8.45/8.46. Pinned by exact scale-factor
+  panning at ±25 dB, the ICC = −1 anti-phase decorrelated pair, the
+  first-region `n/n₀` ramp, the hold path, the Rb identity point, and
+  the Ra `Σh² = 2` energy invariant over the whole cue grid.
 - **PS de-correlator + parameter-band maps** (`ps_decorr`, `ps_map`) —
   ISO/IEC 14496-3:2009 §8.6.4.5 / §8.6.4.6.1. The three-link complex
   all-pass chain (Table 8.39 coefficients + delays, Table 8.42

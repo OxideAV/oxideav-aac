@@ -433,6 +433,7 @@ pub mod ps_decorr;
 pub mod ps_huffman;
 pub mod ps_hybrid;
 pub mod ps_map;
+pub mod ps_stereo;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod rvlc;
