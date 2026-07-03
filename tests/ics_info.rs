@@ -501,6 +501,7 @@ fn ltp_data_struct_can_be_constructed_externally() {
         lag: Some(42),
         coef: 0,
         long_used: vec![],
+        short: None,
     };
     assert_eq!(ltp.lag, Some(42));
 }

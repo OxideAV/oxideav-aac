@@ -165,8 +165,12 @@ pub struct PredictorData {
 /// (`ER_AAC_LD`), which carries a delta-coded `ltp_lag_update` /
 /// `ltp_lag` pair instead of an unconditional 11-bit `ltp_lag`.
 /// For `EIGHT_SHORT_SEQUENCE` in the non-LD branch,
-/// `ltp_long_used[]` is **absent** per the spec — the parser
-/// emits an empty `long_used` vec in that case.
+/// `ltp_long_used[]` is **absent** per the 2009 edition — the
+/// parser emits an empty `long_used` vec in that case. The 2001
+/// edition instead carries a per-short-window
+/// `ltp_short_used` / `ltp_short_lag_present` / `ltp_short_lag`
+/// loop there (see [`LtpEdition`] and [`LtpShortWindow`]); those
+/// records land in `short`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LtpData {
     /// `ltp_lag_update` bit. Only present for `audioObjectType ==
@@ -181,13 +185,79 @@ pub struct LtpData {
     pub coef: u8,
     /// `ltp_long_used[sfb]` for `sfb in 0..min(max_sfb,
     /// MAX_LTP_LONG_SFB)`. Empty when the non-LD AOT is using
-    /// `EIGHT_SHORT_SEQUENCE` (spec omits the loop in that case).
+    /// `EIGHT_SHORT_SEQUENCE` (both editions omit the long loop in
+    /// that case).
     pub long_used: Vec<bool>,
+    /// ISO/IEC 14496-3:2001 Table 4.55 per-short-window LTP
+    /// records — `Some(v)` (with `v.len() == num_windows == 8`)
+    /// only when the non-LD `EIGHT_SHORT_SEQUENCE` branch is
+    /// parsed / written under [`LtpEdition::Iso2001`]. Always
+    /// `None` for long window sequences, the LD branch, and the
+    /// 2009 edition (which removed short-window LTP — §4.6.7.1
+    /// "LTP is restricted to long windows only").
+    pub short: Option<Vec<LtpShortWindow>>,
+}
+
+/// One short window's LTP record from the ISO/IEC 14496-3:2001
+/// Table 4.55 `EIGHT_SHORT_SEQUENCE` branch.
+///
+/// Wire layout (2001 edition only): `ltp_short_used[w]` (1 bit);
+/// if set, `ltp_short_lag_present[w]` (1 bit); if *that* is set,
+/// `ltp_short_lag[w]` (4 bits). Per §4.6.7.2 (2001) the 4-bit
+/// field is "a 4-bit number specifying the relative delay for
+/// each short window to ltp_lag from −8 to 7" — this crate reads
+/// it as a 4-bit two's-complement integer (the standard MPEG
+/// reading of an n-bit field whose documented range is
+/// −2^(n−1)..2^(n−1)−1). When `ltp_short_lag_present == 0` the
+/// relative delay is 0 per §4.6.7.3 (2001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LtpShortWindow {
+    /// `ltp_short_used[w]` — whether LTP contributes to this short
+    /// window at all.
+    pub used: bool,
+    /// `ltp_short_lag_present[w]` — whether the 4-bit relative lag
+    /// was actually transmitted. Only meaningful when `used`;
+    /// always `false` otherwise. Kept distinct from `lag == 0` so a
+    /// re-encode reproduces the exact wire bits.
+    pub lag_present: bool,
+    /// The relative delay for this window, `−8..=7`, added to the
+    /// frame's `ltp_lag`. `0` when `lag_present == false`.
+    pub lag: i8,
+}
+
+/// Which edition of the ISO/IEC 14496-3 Table 4.55 `ltp_data()`
+/// syntax to apply for the non-LD `EIGHT_SHORT_SEQUENCE` branch.
+///
+/// The 2001 edition transmits a per-short-window
+/// `ltp_short_used` / `ltp_short_lag_present` / `ltp_short_lag`
+/// loop after `ltp_coef`; the 2009 edition removed short-window
+/// LTP entirely (§4.6.7.1: "LTP is restricted to long windows
+/// only") and transmits nothing there. The two forms are
+/// wire-incompatible for `EIGHT_SHORT_SEQUENCE` frames with
+/// `ltp_data_present == 1`, and the bitstream itself does not
+/// signal which edition the encoder followed, so the choice is an
+/// out-of-band caller decision. Long window sequences and the LD
+/// branch are identical in both editions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LtpEdition {
+    /// ISO/IEC 14496-3:2009 Table 4.55 — no short-window LTP
+    /// fields (the form every contemporary stream follows).
+    #[default]
+    Iso2009,
+    /// ISO/IEC 14496-3:2001 Table 4.55 — per-short-window
+    /// `ltp_short_used[w]` loop for `EIGHT_SHORT_SEQUENCE`.
+    Iso2001,
 }
 
 /// Per-Table 4.55 maximum number of scalefactor bands carrying
 /// `ltp_long_used[]`. ISO/IEC 14496-3 §4.6.7.2.
 pub const MAX_LTP_LONG_SFB: usize = 40;
+
+/// Number of short windows in an `EIGHT_SHORT_SEQUENCE` frame —
+/// `num_windows == 8` per ISO/IEC 14496-3 §4.5.2.3.4, and the
+/// iteration count of the 2001-edition Table 4.55 short-window
+/// LTP loop.
+pub const SHORT_WINDOWS_PER_FRAME: usize = 8;
 
 /// Per-Table 4.6 / Table 62 (ISO/IEC 13818-7 §13.3.1)
 /// sample-rate-dependent `PRED_SFB_MAX` constant. Indexed by
@@ -613,14 +683,42 @@ impl IcsInfo {
     }
 }
 
-/// `ltp_data()` per Table 4.55. Public to allow standalone unit
-/// tests; in normal use it is invoked indirectly via
-/// [`IcsInfo::parse`].
+/// `ltp_data()` per Table 4.55 (2009 edition). Public to allow
+/// standalone unit tests; in normal use it is invoked indirectly
+/// via [`IcsInfo::parse`]. Equivalent to
+/// [`parse_ltp_data_edition`] with [`LtpEdition::Iso2009`] and the
+/// spec's `num_windows == 8` for `EIGHT_SHORT_SEQUENCE`.
 pub fn parse_ltp_data(
     reader: &mut BitReader<'_>,
     audio_object_type: u8,
     window_sequence: WindowSequence,
     max_sfb: u8,
+) -> Result<LtpData> {
+    parse_ltp_data_edition(
+        reader,
+        audio_object_type,
+        window_sequence,
+        max_sfb,
+        LtpEdition::Iso2009,
+    )
+}
+
+/// `ltp_data()` per Table 4.55, edition-selectable.
+///
+/// [`LtpEdition::Iso2009`] behaves exactly like
+/// [`parse_ltp_data`]. [`LtpEdition::Iso2001`] additionally reads
+/// the per-short-window `ltp_short_used[w]` /
+/// `ltp_short_lag_present[w]` / `ltp_short_lag[w]` loop (8
+/// iterations — `num_windows` for `EIGHT_SHORT_SEQUENCE` is
+/// always 8, §4.5.2.3.4) when the non-LD branch sees a short
+/// window sequence; the records land in [`LtpData::short`]. The
+/// LD branch and all long window sequences are edition-invariant.
+pub fn parse_ltp_data_edition(
+    reader: &mut BitReader<'_>,
+    audio_object_type: u8,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+    edition: LtpEdition,
 ) -> Result<LtpData> {
     if audio_object_type == 23 {
         // ER_AAC_LD branch.
@@ -641,11 +739,43 @@ pub fn parse_ltp_data(
             lag,
             coef,
             long_used,
+            short: None,
         })
     } else {
         let lag = read_u16(reader, 11)?;
         let coef = read_u8(reader, 3)?;
+        let mut short = None;
         let long_used = if window_sequence.is_eight_short() {
+            if edition == LtpEdition::Iso2001 {
+                // 2001 Table 4.55: for (w = 0; w < num_windows; w++)
+                // { ltp_short_used[w]; if set →
+                // ltp_short_lag_present[w]; if set →
+                // ltp_short_lag[w] (4 bits). }
+                let mut v = Vec::with_capacity(SHORT_WINDOWS_PER_FRAME);
+                for _ in 0..SHORT_WINDOWS_PER_FRAME {
+                    let used = read_bit(reader)?;
+                    let (lag_present, lag) = if used {
+                        let lag_present = read_bit(reader)?;
+                        let lag = if lag_present {
+                            // 4-bit two's-complement −8..=7 (see
+                            // LtpShortWindow docs).
+                            let raw = read_u8(reader, 4)?;
+                            ((raw << 4) as i8) >> 4
+                        } else {
+                            0
+                        };
+                        (lag_present, lag)
+                    } else {
+                        (false, 0)
+                    };
+                    v.push(LtpShortWindow {
+                        used,
+                        lag_present,
+                        lag,
+                    });
+                }
+                short = Some(v);
+            }
             Vec::new()
         } else {
             let n = core::cmp::min(max_sfb as usize, MAX_LTP_LONG_SFB);
@@ -660,6 +790,7 @@ pub fn parse_ltp_data(
             lag: Some(lag),
             coef,
             long_used,
+            short,
         })
     }
 }
@@ -691,7 +822,44 @@ pub fn write_ltp_data(
     window_sequence: WindowSequence,
     max_sfb: u8,
 ) -> Result<()> {
+    write_ltp_data_edition(
+        writer,
+        ltp,
+        audio_object_type,
+        window_sequence,
+        max_sfb,
+        LtpEdition::Iso2009,
+    )
+}
+
+/// Encode an `ltp_data()` (Table 4.55) body, edition-selectable —
+/// the inverse of [`parse_ltp_data_edition`].
+///
+/// Under [`LtpEdition::Iso2001`] a non-LD `EIGHT_SHORT_SEQUENCE`
+/// body must carry `short == Some(v)` with `v.len() == 8`
+/// ([`SHORT_WINDOWS_PER_FRAME`]) and each [`LtpShortWindow`]
+/// internally consistent (`!used ⇒ !lag_present`,
+/// `!lag_present ⇒ lag == 0`, `lag ∈ −8..=7`); under
+/// [`LtpEdition::Iso2009`] `short` must be `None` everywhere.
+/// All other validation matches [`write_ltp_data`].
+pub fn write_ltp_data_edition(
+    writer: &mut BitWriter,
+    ltp: &LtpData,
+    audio_object_type: u8,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+    edition: LtpEdition,
+) -> Result<()> {
     if ltp.coef > 0x07 {
+        return Err(Error::IcsInfoEncodeInvalid);
+    }
+    // `short` is only representable on the wire in the 2001
+    // non-LD EIGHT_SHORT branch; reject it anywhere else so an
+    // in-memory record can't silently drop fields.
+    let short_branch = audio_object_type != 23
+        && window_sequence.is_eight_short()
+        && edition == LtpEdition::Iso2001;
+    if !short_branch && ltp.short.is_some() {
         return Err(Error::IcsInfoEncodeInvalid);
     }
     if audio_object_type == 23 {
@@ -727,6 +895,34 @@ pub fn write_ltp_data(
         if window_sequence.is_eight_short() {
             if !ltp.long_used.is_empty() {
                 return Err(Error::IcsInfoEncodeInvalid);
+            }
+            if edition == LtpEdition::Iso2001 {
+                // 2001 Table 4.55 per-short-window loop.
+                let short = ltp.short.as_ref().ok_or(Error::IcsInfoEncodeInvalid)?;
+                if short.len() != SHORT_WINDOWS_PER_FRAME {
+                    return Err(Error::IcsInfoEncodeInvalid);
+                }
+                for w in short {
+                    // Internal consistency: an unused window has no
+                    // further fields; an absent lag means rel 0.
+                    if !w.used && (w.lag_present || w.lag != 0) {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    if !w.lag_present && w.lag != 0 {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    if !(-8..=7).contains(&w.lag) {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
+                    writer.write_bit(w.used);
+                    if w.used {
+                        writer.write_bit(w.lag_present);
+                        if w.lag_present {
+                            // 4-bit two's complement.
+                            writer.write_u32((w.lag as u32) & 0x0f, 4);
+                        }
+                    }
+                }
             }
         } else {
             let expected = core::cmp::min(max_sfb as usize, MAX_LTP_LONG_SFB);

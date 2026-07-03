@@ -358,6 +358,7 @@ fn ltp_long_roundtrips() {
             lag: Some(1234),
             coef: 5,
             long_used: (0..20).map(|i| i % 3 == 0).collect(),
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -389,6 +390,7 @@ fn ltp_long_caps_at_max_ltp_long_sfb_roundtrips() {
             lag: Some(0x7ff),
             coef: 7,
             long_used: vec![true; 40],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -419,6 +421,7 @@ fn ltp_short_no_long_used_roundtrips() {
         lag: Some(0x123),
         coef: 2,
         long_used: vec![],
+        short: None,
     };
     let mut bw = BitWriter::new();
     write_ltp_data(&mut bw, &ltp, 4, WindowSequence::EightShort, 14).unwrap();
@@ -457,6 +460,7 @@ fn ltp_er_aac_ld_with_lag_update_roundtrips() {
                 false, true, false, true, false, true, false, true, false, true, false, true,
                 false, true, false,
             ],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -486,6 +490,7 @@ fn ltp_er_aac_ld_without_lag_update_roundtrips() {
             lag: None,
             coef: 0,
             long_used: vec![true; 8],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -507,12 +512,14 @@ fn ltp_common_window_paired_roundtrips() {
         lag: Some(0x010),
         coef: 1,
         long_used: vec![true; 5],
+        short: None,
     };
     let pair = LtpData {
         lag_update: None,
         lag: Some(0x020),
         coef: 2,
         long_used: vec![false; 5],
+        short: None,
     };
     let info = IcsInfo {
         ics_reserved_bit: false,
@@ -554,6 +561,7 @@ fn ltp_common_window_pair_absent_roundtrips() {
             lag: Some(0),
             coef: 0,
             long_used: vec![false; 5],
+            short: None,
         }),
         ltp_data_present_pair: Some(false),
         ltp_data_pair: None,
@@ -773,6 +781,7 @@ fn write_rejects_ltp_data_on_main_aot() {
             lag: Some(0),
             coef: 0,
             long_used: vec![false; 5],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -868,6 +877,7 @@ fn write_rejects_pair_slot_without_common_window() {
             lag: Some(0),
             coef: 0,
             long_used: vec![false; 5],
+            short: None,
         }),
         ltp_data_present_pair: Some(false),
         ltp_data_pair: None,
@@ -901,6 +911,7 @@ fn write_rejects_stale_data_on_no_predictor_branch() {
             lag: Some(0),
             coef: 0,
             long_used: vec![false; 5],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -932,6 +943,7 @@ fn write_rejects_ltp_coef_overflow() {
             lag: Some(0),
             coef: 8, // > 3-bit field
             long_used: vec![false; 5],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -964,6 +976,7 @@ fn write_rejects_ltp_long_used_wrong_length() {
             lag: Some(0),
             coef: 0,
             long_used: vec![false; 7],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -996,6 +1009,7 @@ fn write_rejects_ltp_ld_missing_lag_update() {
             lag: Some(0),
             coef: 0,
             long_used: vec![false; 5],
+            short: None,
         }),
         ltp_data_present_pair: None,
         ltp_data_pair: None,
@@ -1079,4 +1093,255 @@ fn long_lc_wire_layout_pin() {
     let parsed = IcsInfo::parse(&mut br, 2, 4, false).unwrap();
     assert_eq!(parsed, info);
     assert_eq!(br.bit_position(), 11);
+}
+
+// ---- ISO/IEC 14496-3:2001 short-window LTP branch ----
+
+#[test]
+fn ltp_2001_short_windows_roundtrip() {
+    use oxideav_aac::ics_info::{
+        parse_ltp_data_edition, write_ltp_data_edition, LtpEdition, LtpShortWindow,
+        SHORT_WINDOWS_PER_FRAME,
+    };
+
+    // A representative mix: unused windows, used-without-lag, and
+    // used-with-lag covering the signed extremes -8, -1, 0, 7.
+    let short: Vec<LtpShortWindow> = vec![
+        LtpShortWindow {
+            used: false,
+            lag_present: false,
+            lag: 0,
+        },
+        LtpShortWindow {
+            used: true,
+            lag_present: false,
+            lag: 0,
+        },
+        LtpShortWindow {
+            used: true,
+            lag_present: true,
+            lag: -8,
+        },
+        LtpShortWindow {
+            used: true,
+            lag_present: true,
+            lag: 7,
+        },
+        LtpShortWindow {
+            used: true,
+            lag_present: true,
+            lag: -1,
+        },
+        LtpShortWindow {
+            used: true,
+            lag_present: true,
+            lag: 0,
+        },
+        LtpShortWindow {
+            used: false,
+            lag_present: false,
+            lag: 0,
+        },
+        LtpShortWindow {
+            used: true,
+            lag_present: true,
+            lag: 3,
+        },
+    ];
+    assert_eq!(short.len(), SHORT_WINDOWS_PER_FRAME);
+    let ltp = LtpData {
+        lag_update: None,
+        lag: Some(700),
+        coef: 4,
+        long_used: vec![],
+        short: Some(short),
+    };
+    let mut bw = BitWriter::new();
+    write_ltp_data_edition(
+        &mut bw,
+        &ltp,
+        4,
+        WindowSequence::EightShort,
+        14,
+        LtpEdition::Iso2001,
+    )
+    .unwrap();
+    // Bits: lag 11 + coef 3 + per-window (1 / 2 / 6):
+    // w0: 1, w1: 2, w2..w5: 6 each, w6: 1, w7: 6 = 34; total 48.
+    assert_eq!(bw.bit_position(), 48);
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let parsed = parse_ltp_data_edition(
+        &mut br,
+        4,
+        WindowSequence::EightShort,
+        14,
+        LtpEdition::Iso2001,
+    )
+    .unwrap();
+    assert_eq!(parsed, ltp);
+    assert_eq!(br.bit_position(), 48);
+}
+
+#[test]
+fn ltp_2001_short_lag_is_twos_complement_on_the_wire() {
+    use oxideav_aac::ics_info::{parse_ltp_data_edition, LtpEdition};
+
+    // Hand-pack: lag = 0 (11 bits), coef = 0 (3 bits), then
+    // window 0: used=1, lag_present=1, lag bits 1111 (= -1 two's
+    // complement), then 7 unused windows (single 0 bits).
+    let mut bw = BitWriter::new();
+    bw.write_u32(0, 11);
+    bw.write_u32(0, 3);
+    bw.write_bit(true); // used
+    bw.write_bit(true); // lag_present
+    bw.write_u32(0b1111, 4); // -1
+    for _ in 0..7 {
+        bw.write_bit(false);
+    }
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let parsed = parse_ltp_data_edition(
+        &mut br,
+        2,
+        WindowSequence::EightShort,
+        10,
+        LtpEdition::Iso2001,
+    )
+    .unwrap();
+    let short = parsed.short.as_ref().unwrap();
+    assert_eq!(short[0].lag, -1);
+    assert!(short[0].used && short[0].lag_present);
+    assert!(short[1..].iter().all(|w| !w.used));
+}
+
+#[test]
+fn ltp_2009_short_branch_reads_nothing_after_coef() {
+    use oxideav_aac::ics_info::{parse_ltp_data_edition, LtpEdition};
+
+    let mut bw = BitWriter::new();
+    bw.write_u32(123, 11);
+    bw.write_u32(5, 3);
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let parsed = parse_ltp_data_edition(
+        &mut br,
+        2,
+        WindowSequence::EightShort,
+        10,
+        LtpEdition::Iso2009,
+    )
+    .unwrap();
+    assert_eq!(br.bit_position(), 14);
+    assert_eq!(parsed.short, None);
+    assert!(parsed.long_used.is_empty());
+}
+
+#[test]
+fn ltp_2001_write_rejects_inconsistent_short_records() {
+    use oxideav_aac::ics_info::{write_ltp_data_edition, LtpEdition, LtpShortWindow};
+
+    let base = |w: LtpShortWindow| {
+        let mut v = vec![
+            LtpShortWindow {
+                used: false,
+                lag_present: false,
+                lag: 0,
+            };
+            8
+        ];
+        v[0] = w;
+        LtpData {
+            lag_update: None,
+            lag: Some(1),
+            coef: 0,
+            long_used: vec![],
+            short: Some(v),
+        }
+    };
+    let bad = [
+        // unused window carrying a lag_present flag
+        LtpShortWindow {
+            used: false,
+            lag_present: true,
+            lag: 0,
+        },
+        // absent lag but nonzero value
+        LtpShortWindow {
+            used: true,
+            lag_present: false,
+            lag: 3,
+        },
+    ];
+    for w in bad {
+        let mut bw = BitWriter::new();
+        let err = write_ltp_data_edition(
+            &mut bw,
+            &base(w),
+            2,
+            WindowSequence::EightShort,
+            10,
+            LtpEdition::Iso2001,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::IcsInfoEncodeInvalid));
+    }
+
+    // Wrong vector length.
+    let mut short_7 = vec![
+        LtpShortWindow {
+            used: false,
+            lag_present: false,
+            lag: 0,
+        };
+        7
+    ];
+    short_7.truncate(7);
+    let ltp = LtpData {
+        lag_update: None,
+        lag: Some(1),
+        coef: 0,
+        long_used: vec![],
+        short: Some(short_7),
+    };
+    let mut bw = BitWriter::new();
+    assert!(matches!(
+        write_ltp_data_edition(
+            &mut bw,
+            &ltp,
+            2,
+            WindowSequence::EightShort,
+            10,
+            LtpEdition::Iso2001
+        ),
+        Err(Error::IcsInfoEncodeInvalid)
+    ));
+
+    // A 2009-edition write must reject any `short` payload.
+    let ltp_2009 = LtpData {
+        lag_update: None,
+        lag: Some(1),
+        coef: 0,
+        long_used: vec![],
+        short: Some(vec![
+            LtpShortWindow {
+                used: false,
+                lag_present: false,
+                lag: 0,
+            };
+            8
+        ]),
+    };
+    let mut bw = BitWriter::new();
+    assert!(matches!(
+        write_ltp_data_edition(
+            &mut bw,
+            &ltp_2009,
+            2,
+            WindowSequence::EightShort,
+            10,
+            LtpEdition::Iso2009
+        ),
+        Err(Error::IcsInfoEncodeInvalid)
+    ));
 }

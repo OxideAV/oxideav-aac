@@ -315,6 +315,7 @@ mod tests {
             lag: Some(lag),
             coef,
             long_used,
+            short: None,
         }
     }
 

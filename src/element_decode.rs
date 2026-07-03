@@ -938,6 +938,7 @@ mod tests {
             lag: Some(lag),
             coef,
             long_used,
+            short: None,
         });
         body.ics_info = Some(ics);
         body
