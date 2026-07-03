@@ -11,13 +11,16 @@ the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 specifications under
 
 The crate implements the full AAC-LC decode chain end to end — from
 ADTS bitstream parse through the per-tool reconstruction to interleaved
-16-bit PCM — **plus the complete §4.6.18 SBR back-end (HE-AAC v1)**,
-and **wires both into the framework's runtime `Decoder` trait**
-(`register()` installs an AAC decoder under id `"aac"`; see
-`codec_decoder` below). The PCM is validated byte-exactly (within the
-1-LSB IMDCT-rounding bound) against the staged `expected.wav` corpus —
-**including the HE-AAC v1 SBR fixture, which decodes 99.98%
-sample-exact with a max error of 1 LSB** at the doubled output rate.
+16-bit PCM — **plus the complete §4.6.18 SBR back-end (HE-AAC v1) and
+the subpart-8 Parametric Stereo tool (HE-AAC v2)**, and **wires them
+into the framework's runtime `Decoder` trait** (`register()` installs
+an AAC decoder under id `"aac"`; see `codec_decoder` below). The PCM
+is validated byte-exactly (within the 1-LSB IMDCT-rounding bound)
+against the staged `expected.wav` corpus — **including the HE-AAC v1
+SBR fixture, which decodes 99.98% sample-exact with a max error of
+1 LSB** at the doubled output rate, and the **HE-AAC v2 fixture, whose
+PS stereo reconstruction lands at a 5e-5 per-channel error-to-signal
+RMS** against the reference decode.
 The `Encoder` side is **not yet wired** — the bit-exact wire writers are
 in place but there is no rate-control / psychoacoustic encoder back-end.
 
@@ -47,8 +50,10 @@ in place but there is no rate-control / psychoacoustic encoder back-end.
   bit-exact writer, dispatching onto the Huffman codebooks.
 - **extension_payload()** (`extension_payload`) — §4.4.2.7 / Table 4.51
   parser + encoder for the `EXT_FILL`, `EXT_FILL_DATA`, and
-  `EXT_DYNAMIC_RANGE` branches. The two SBR-data extension types are
-  rejected (`Error::UnsupportedExtensionSbr`) pending an SBR back-end.
+  `EXT_DYNAMIC_RANGE` branches. The two SBR-data extension types
+  decode through the `parse_with_sbr` entry (feeding the §4.6.18
+  back-end); the plain `parse` entry without an SBR context rejects
+  them (`Error::UnsupportedExtensionSbr`).
 - **Error-protection CRC generator** (`crc`) — §1.8.4.5: the full
   family of MPEG-4 Audio CRC generation polynomials (`CRC4`..`CRC32`,
   including the `CRC8` LATM `StreamMuxConfig()` `crcCheckSum` and the
@@ -422,6 +427,44 @@ signal to dual-rate PCM, validated **99.98% sample-exact (max error
     0` path consumes the §4.6.18.6 patch borders that need the QMF
     patching back-end.
 
+### Parametric Stereo (HE-AAC v2) — subpart 8 / Annex 8.A
+
+The complete §8.6.4 PS tool, reconstructing a stereo image from the
+mono SBR signal, validated **5e-5 per-channel error-to-signal RMS**
+against the staged HE-AAC v2 MP4 fixture (filterbank-rounding level):
+
+- **Bitstream** (`ps_data`, `ps_huffman`) — §8.4.2 Tables 8.9–8.14:
+  the persistent `enable_ps_header` configuration, FIX/VAR framing
+  (Table 8.29), per-envelope IID/ICC/IPD/OPD delta rows on all ten
+  Annex 8.B codebooks (each verified a complete prefix code; the six
+  IID/ICC books cross-checked leaf-for-leaf against the staged
+  `ps-huffbook-*.csv` trees), and the §8.5.2 time/frequency DPCM
+  resolution with range checks and modulo-8 phase wrap.
+- **Hybrid filterbank** (`ps_hybrid`) — §8.6.4.3: both configurations
+  (71 / 91 sub-subbands) on the Table 8.37/8.38 13-tap prototypes,
+  with the Figure 8.20 merge/reorder, the odd-QMF-band inversion, and
+  the Annex 8.A.3 zero-delay alignment (6 look-ahead `XLow` slots + 6
+  history slots). Analysis→synthesis reconstructs exactly.
+- **De-correlation** (`ps_decorr`) — §8.6.4.5: the 3-link complex
+  all-pass chain behind `z⁻²·φ_fract`, the Table 8.40/8.41 centre
+  frequencies, the 14-/1-slot delays above `NR_ALLPASS_BANDS`, and
+  the transient duck (peak decay / smoothing / γ = 1.5) per stereo
+  band, with the Annex 8.A.3 partial + full resets.
+- **Stereo processing** (`ps_stereo`, `ps_map`) — §8.6.4.6: Table
+  8.25/8.26/8.28 dequantization (cross-validated against the staged
+  Q30 tables), mixing procedures Ra and Rb, IPD/OPD three-position
+  smoothing, the Table 8.48/8.49 `b(k)` maps + conjugate channels,
+  the Table 8.45/8.46 10↔20↔34 re-mappings, and the §8.6.4.6.4
+  border interpolation with hold semantics.
+- **Frame driver + wiring** (`ps_decoder`, `sbr_decoder`) — Annex
+  8.A: inactive (mono) until the first header'd `ps_data()`,
+  parameter hold over payload-less frames, band-count switches, and
+  the per-frame de-correlator reset above `k_x + M`. A PS-carrying
+  SCE renders stereo through two synthesis banks in both the
+  SBR-processed and pure-upsampling paths, end to end through the
+  ADTS / LATM / raw `StreamDecoder` entries and the runtime
+  `Decoder`.
+
 ### LATM / LOAS transport framing
 
 The §1.7 low-overhead transport layer is now decoded from the LOAS
@@ -479,8 +522,9 @@ field sourced from the ISO/IEC 14496-3 §1.7 syntax tables.
   §4.6.11 overlap / §4.6.7 LTP / §4.6.6 predictor state threads
   independently. An SBR-signalling ASC (explicit AOT-5 wrapper or
   implicit AAC-LC-only) rides the same §4.6.18 auto-detect the ADTS
-  path uses and emits dual-rate output; a PS-signalling stream decodes
-  its HE-AAC v1 layer. Pinned against the `aac-latm-stream` fixture
+  path uses and emits dual-rate output, and a PS payload synthesizes
+  stereo through the Annex 8.A tool. Pinned against the
+  `aac-latm-stream` fixture
   (stereo, 44.1 kHz) to a §8 PCM-RMS error ratio of 0.0004, proven
   bit-identical to a hand-fed `decode_raw_data_block` pass, and — for
   a re-multiplexed HE-AAC v1 stream (both signalling modes) —
@@ -582,13 +626,11 @@ EP-tool payload de-interleave is out of scope.
   with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
   Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
   scope per the §4.6.7.1 long-window restriction.)
-- SBR remainders — the §4.6.18 SBR tool is **implemented end to end**
-  (bitstream + back-end DSP, see the "SBR back-end" section above) and
-  wired into the ADTS `StreamDecoder` / runtime `Decoder`, validated
-  99.98% sample-exact against the HE-AAC v1 fixture. Still open: PS
-  (parametric stereo, HE-AAC v2) — whose `sbr_extension` payload bytes
-  are captured but not decoded — so an HE-AAC v2 stream decodes as
-  HE-AAC v1 (mono SBR without the stereo synthesis); the 10-bit
+- SBR/PS remainders — the §4.6.18 SBR tool **and** the subpart-8 PS
+  tool are **implemented end to end** (see the sections above) and
+  wired into the ADTS / LATM `StreamDecoder` paths and the runtime
+  `Decoder`, validated against the HE-AAC v1 (99.98% sample-exact)
+  and HE-AAC v2 (5e-5 RMS) fixtures. Still open: the 10-bit
   `bs_sbr_crc_bits` field is captured, not verified;
   the §4.6.18.4.3 downsampled-output mode and the §4.6.18.8 low-power
   variant are not selectable; and the ER AAC LD 480/512 transform
