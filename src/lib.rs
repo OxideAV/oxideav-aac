@@ -412,6 +412,7 @@ pub mod decode;
 pub mod decoded_spectrum;
 pub mod dequant;
 pub mod element_decode;
+pub mod encoder;
 pub mod extension_payload;
 pub mod filterbank;
 pub mod gain_control;

@@ -34,6 +34,17 @@ pub enum Error {
     /// count outside `1..=4`).
     AdtsEncodeInvalid,
 
+    /// [`crate::encoder::StreamEncoder`] configuration is invalid:
+    /// the sample rate is not a Table 1.18 ADTS rate, the channel
+    /// count is not 1 or 2, the bitrate is 0, or an input slice
+    /// exceeds the per-frame hop / is not a whole number of
+    /// interleaved sample tuples.
+    EncoderInvalidConfig,
+
+    /// The assembled encoder frame exceeds the 13-bit ADTS
+    /// `aac_frame_length` ceiling even after the rate loop.
+    EncoderFrameOverflow,
+
     /// The bit-reader hit end-of-stream while parsing.
     UnexpectedEnd,
 
@@ -688,6 +699,15 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "ADTS header field exceeds its wire width or violates a normative constraint"
+                )
+            }
+            Error::EncoderInvalidConfig => {
+                write!(f, "AAC encoder configuration or input slice is invalid")
+            }
+            Error::EncoderFrameOverflow => {
+                write!(
+                    f,
+                    "encoded AAC frame exceeds the 13-bit aac_frame_length ceiling"
                 )
             }
             Error::UnexpectedEnd => {
