@@ -181,3 +181,133 @@ fn mpeg2_id_bit_round_trips() {
     let (h, _) = AdtsHeader::parse(&header).unwrap();
     assert!(h.mpeg_version_mpeg2);
 }
+
+// -------------------------------------------------------------------
+// AdtsHeader::write — the byte-exact inverse of parse
+// -------------------------------------------------------------------
+
+#[test]
+fn write_then_parse_roundtrips_representative_headers() {
+    let cases = [
+        // (mpeg2, profile, fs_idx, ch_cfg, frame_len, fullness, blocks)
+        (false, 1u8, 4u8, 2u8, 144u16, 0x7FFu16, 1u8),
+        (false, 1, 11, 1, 7, 0, 1),
+        (true, 0, 0, 7, 8191, 0x123, 4),
+        (false, 3, 12, 0, 512, 0x400, 2),
+    ];
+    for (mpeg2, profile, fs, ch, len, full, blocks) in cases {
+        let hdr = AdtsHeader {
+            mpeg_version_mpeg2: mpeg2,
+            protection_absent: true,
+            profile,
+            sampling_frequency_index: fs,
+            channel_configuration: ch,
+            aac_frame_length: len,
+            adts_buffer_fullness: full,
+            number_of_raw_data_blocks_in_frame: blocks,
+        };
+        let bytes = hdr.write().expect("write succeeds");
+        assert_eq!(bytes.len(), ADTS_HEADER_BYTES_NO_CRC);
+        let (parsed, offset) = AdtsHeader::parse(&bytes).expect("parse of self-written header");
+        assert_eq!(parsed, hdr);
+        assert_eq!(offset, ADTS_HEADER_BYTES_NO_CRC);
+    }
+}
+
+#[test]
+fn write_matches_hand_packed_bits() {
+    // Independent packing via the test helper `build_header`.
+    let hdr = AdtsHeader {
+        mpeg_version_mpeg2: false,
+        protection_absent: true,
+        profile: 1,
+        sampling_frequency_index: 4,
+        channel_configuration: 2,
+        aac_frame_length: 144,
+        adts_buffer_fullness: 0x7FF,
+        number_of_raw_data_blocks_in_frame: 1,
+    };
+    let expected = build_header(false, true, 1, 4, 2, 144, 0x7FF, 0);
+    assert_eq!(hdr.write().unwrap().as_slice(), &expected[..7]);
+}
+
+#[test]
+fn write_rejects_out_of_range_fields() {
+    let good = AdtsHeader {
+        mpeg_version_mpeg2: false,
+        protection_absent: true,
+        profile: 1,
+        sampling_frequency_index: 4,
+        channel_configuration: 2,
+        aac_frame_length: 144,
+        adts_buffer_fullness: 0x7FF,
+        number_of_raw_data_blocks_in_frame: 1,
+    };
+    let mut c;
+
+    c = good;
+    c.sampling_frequency_index = 13;
+    assert!(matches!(c.write(), Err(Error::AdtsEncodeInvalid)));
+
+    c = good;
+    c.adts_buffer_fullness = 0x800;
+    assert!(matches!(c.write(), Err(Error::AdtsEncodeInvalid)));
+
+    c = good;
+    c.number_of_raw_data_blocks_in_frame = 0;
+    assert!(matches!(c.write(), Err(Error::AdtsEncodeInvalid)));
+    c.number_of_raw_data_blocks_in_frame = 5;
+    assert!(matches!(c.write(), Err(Error::AdtsEncodeInvalid)));
+
+    c = good;
+    c.aac_frame_length = 6; // below the 7-byte header itself
+    assert!(matches!(c.write(), Err(Error::AdtsEncodeInvalid)));
+
+    // With CRC the overhead is 9 bytes.
+    c = good;
+    c.protection_absent = false;
+    c.aac_frame_length = 8;
+    assert!(matches!(c.write(), Err(Error::AdtsEncodeInvalid)));
+}
+
+#[test]
+fn write_reemits_fixture_headers_byte_exactly() {
+    // Parse each staged fixture stream's ADTS headers and re-emit
+    // them; every protection_absent header must reproduce its 7
+    // wire bytes exactly. Skipped when docs/ is absent (standalone
+    // repo layout).
+    let root = std::path::PathBuf::from("../../docs/audio/aac/fixtures");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        eprintln!("docs fixtures unavailable; ADTS re-emit pass skipped");
+        return;
+    };
+    let mut frames_checked = 0usize;
+    for entry in entries.flatten() {
+        let input = entry.path().join("input.aac");
+        let Ok(data) = std::fs::read(&input) else {
+            continue;
+        };
+        // Only ADTS-framed fixtures (skip LATM / MP4 payloads).
+        if data.len() < 2 || data[0] != 0xFF || (data[1] & 0xF0) != 0xF0 {
+            continue;
+        }
+        let mut pos = 0usize;
+        while pos + ADTS_HEADER_BYTES_NO_CRC <= data.len() {
+            let Ok((hdr, _)) = AdtsHeader::parse(&data[pos..]) else {
+                break;
+            };
+            if hdr.protection_absent {
+                let reemitted = hdr.write().expect("fixture header re-emits");
+                assert_eq!(
+                    &data[pos..pos + ADTS_HEADER_BYTES_NO_CRC],
+                    reemitted.as_slice(),
+                    "fixture {:?} frame at byte {pos} did not re-emit byte-exactly",
+                    entry.file_name()
+                );
+                frames_checked += 1;
+            }
+            pos += hdr.aac_frame_length as usize;
+        }
+    }
+    eprintln!("re-emitted {frames_checked} fixture ADTS headers byte-exactly");
+}

@@ -36,7 +36,7 @@
 //! Table 1.18; this module exposes [`AdtsHeader::sample_rate`] which
 //! resolves the index to a frequency in Hz.
 
-use oxideav_core::bits::BitReader;
+use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::{Error, Result};
 
@@ -219,5 +219,71 @@ impl AdtsHeader {
             ADTS_HEADER_BYTES_WITH_CRC
         };
         (self.aac_frame_length as usize).saturating_sub(header)
+    }
+
+    /// Serialise the fixed + variable header pair (7 bytes) — the
+    /// byte-exact inverse of [`AdtsHeader::parse`] for a
+    /// `protection_absent == 1` header.
+    ///
+    /// The four fields [`AdtsHeader::parse`] discards (`private_bit`,
+    /// `original_copy`, `home`, `copyright_identification_bit` /
+    /// `_start`) are written as `0`, matching what every fixture
+    /// header in the staged corpus carries. Encoders needing a CRC
+    /// (`protection_absent == 0`) must append the §1.A.2.2.3 16-bit
+    /// `crc_check` themselves after the returned 7 bytes; this
+    /// routine intentionally emits only the header pair so it stays
+    /// a pure function of the struct.
+    ///
+    /// Returns [`Error::AdtsEncodeInvalid`] when a field exceeds its
+    /// wire width or violates a normative constraint:
+    ///
+    /// * `profile > 3` (2-bit field),
+    /// * `sampling_frequency_index >= 13` (Table 1.18 reserved),
+    /// * `channel_configuration > 7` (3-bit field),
+    /// * `aac_frame_length >= 8192` (13-bit field) or smaller than
+    ///   the header overhead itself,
+    /// * `adts_buffer_fullness > 0x7FF` (11-bit field),
+    /// * `number_of_raw_data_blocks_in_frame` outside `1..=4`
+    ///   (2-bit `N − 1` field).
+    pub fn write(&self) -> Result<[u8; ADTS_HEADER_BYTES_NO_CRC]> {
+        if self.profile > 3
+            || self.sampling_frequency_index >= 13
+            || self.channel_configuration > 7
+            || self.aac_frame_length >= (1 << 13)
+            || self.adts_buffer_fullness > 0x7FF
+            || !(1..=4).contains(&self.number_of_raw_data_blocks_in_frame)
+        {
+            return Err(Error::AdtsEncodeInvalid);
+        }
+        let overhead = if self.protection_absent {
+            ADTS_HEADER_BYTES_NO_CRC
+        } else {
+            ADTS_HEADER_BYTES_WITH_CRC
+        };
+        if (self.aac_frame_length as usize) < overhead {
+            return Err(Error::AdtsEncodeInvalid);
+        }
+
+        let mut bw = BitWriter::new();
+        bw.write_u32(ADTS_SYNCWORD as u32, 12);
+        bw.write_bit(self.mpeg_version_mpeg2);
+        bw.write_u32(0, 2); // layer — required 0b00
+        bw.write_bit(self.protection_absent);
+        bw.write_u32(self.profile as u32, 2);
+        bw.write_u32(self.sampling_frequency_index as u32, 4);
+        bw.write_bit(false); // private_bit
+        bw.write_u32(self.channel_configuration as u32, 3);
+        bw.write_bit(false); // original_copy
+        bw.write_bit(false); // home
+        bw.write_bit(false); // copyright_identification_bit
+        bw.write_bit(false); // copyright_identification_start
+        bw.write_u32(self.aac_frame_length as u32, 13);
+        bw.write_u32(self.adts_buffer_fullness as u32, 11);
+        bw.write_u32((self.number_of_raw_data_blocks_in_frame - 1) as u32, 2);
+        let bytes = bw.finish();
+        debug_assert_eq!(bytes.len(), ADTS_HEADER_BYTES_NO_CRC);
+        let mut out = [0u8; ADTS_HEADER_BYTES_NO_CRC];
+        out.copy_from_slice(&bytes);
+        Ok(out)
     }
 }

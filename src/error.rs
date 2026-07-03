@@ -27,6 +27,13 @@ pub enum Error {
     /// is malformed and cannot wrap any payload.
     AdtsFrameLengthTooSmall,
 
+    /// An in-memory [`crate::adts::AdtsHeader`] cannot be
+    /// serialised: a field exceeds its ADTS wire width or violates
+    /// a normative constraint (reserved sampling-frequency index,
+    /// `aac_frame_length` below the header overhead, raw-data-block
+    /// count outside `1..=4`).
+    AdtsEncodeInvalid,
+
     /// The bit-reader hit end-of-stream while parsing.
     UnexpectedEnd,
 
@@ -676,6 +683,12 @@ impl core::fmt::Display for Error {
             }
             Error::AdtsFrameLengthTooSmall => {
                 write!(f, "ADTS aac_frame_length is smaller than the header")
+            }
+            Error::AdtsEncodeInvalid => {
+                write!(
+                    f,
+                    "ADTS header field exceeds its wire width or violates a normative constraint"
+                )
             }
             Error::UnexpectedEnd => {
                 write!(f, "unexpected end of bitstream")
