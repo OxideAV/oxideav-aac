@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HE-AAC v1 over LATM/LOAS** (`latm`) — the `LoasDecoder` no longer
+  pre-rejects an SBR-signalling `AudioSpecificConfig` with
+  `Error::LatmSbrUnsupported`: both the explicit AOT-5 hierarchical
+  wrapper and implicit AAC-LC-only signalling route through the shared
+  `decode_raw_data_block` core, whose §4.6.18 `EXT_SBR_DATA` FIL
+  auto-detect doubles the output rate exactly as on the ADTS path (a
+  PS-signalling stream decodes its HE-AAC v1 layer). The error variant
+  is kept (documented as no longer emitted) so existing `match` arms
+  stay valid. Pinned by `tests/latm_sbr.rs`: the staged HE-AAC v1 ADTS
+  fixture is re-multiplexed access-unit-for-access-unit into a LOAS
+  `AudioSyncStream()` (inline `StreamMuxConfig` on the first element,
+  `useSameStreamMux` after, `frameLengthType 0` with 255-escape slot
+  lengths) and the LATM decode must be **byte-identical** to the ADTS
+  decode under both signalling modes.
 - **HE-AAC v1 SBR wired into the stream decoder — 99.98% sample-exact**
   (`decode`, `codec_decoder`, `raw_data_block`) — the ADTS
   `StreamDecoder` now walks FIL bodies via a new

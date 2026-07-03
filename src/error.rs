@@ -623,11 +623,11 @@ pub enum Error {
     /// the `0x2B7` / `0x4DE1` syncword was not found, or the
     /// `audioMuxLengthBytes` payload ran past the end of the buffer.
     LoasSyncInvalid,
-    /// A LATM/LOAS `AudioSpecificConfig` signalled SBR or PS
-    /// ([`crate::latm::LoasDecoder`]). The LATM PCM driver targets the
-    /// core (AAC-LC / Main / LTP) tool chain; SBR / PS up-sampling has no
-    /// back-end yet, so an SBR/PS-configured LATM stream is rejected here
-    /// rather than silently decoded at the core rate.
+    /// **No longer emitted.** A LATM/LOAS `AudioSpecificConfig` that
+    /// signals SBR ([`crate::latm::LoasDecoder`]) now decodes through
+    /// the shared §4.6.18 SBR back-end instead of being pre-rejected
+    /// (a PS-signalling stream decodes its HE-AAC v1 layer). The
+    /// variant is kept so existing `match` arms stay valid.
     LatmSbrUnsupported,
     /// `coupling_channel_element()` parse / reconstruction
     /// ([`crate::cce`], ISO/IEC 14496-3 §4.6.8.3 / Table 4.8) was handed

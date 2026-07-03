@@ -477,11 +477,14 @@ field sourced from the ISO/IEC 14496-3 §1.7 syntax tables.
   `samplingFrequencyIndex` / resolved sample rate). One `StreamDecoder`
   is held per `streamID[prog][lay]` so each multiplexed stream's
   §4.6.11 overlap / §4.6.7 LTP / §4.6.6 predictor state threads
-  independently. An SBR/PS-configured ASC is rejected with
-  `Error::LatmSbrUnsupported` (no SBR back-end). Pinned against the
-  `aac-latm-stream` fixture (stereo, 44.1 kHz) to a §8 PCM-RMS error
-  ratio of 0.0004, and proven bit-identical to a hand-fed
-  `decode_raw_data_block` pass.
+  independently. An SBR-signalling ASC (explicit AOT-5 wrapper or
+  implicit AAC-LC-only) rides the same §4.6.18 auto-detect the ADTS
+  path uses and emits dual-rate output; a PS-signalling stream decodes
+  its HE-AAC v1 layer. Pinned against the `aac-latm-stream` fixture
+  (stereo, 44.1 kHz) to a §8 PCM-RMS error ratio of 0.0004, proven
+  bit-identical to a hand-fed `decode_raw_data_block` pass, and — for
+  a re-multiplexed HE-AAC v1 stream (both signalling modes) —
+  byte-identical to the ADTS decode.
 
 The runtime `Decoder` (`codec_decoder::AacDecoder`) auto-detects its
 carrier on the first packet and routes LOAS packets through `LoasDecoder`
@@ -585,10 +588,8 @@ EP-tool payload de-interleave is out of scope.
   99.98% sample-exact against the HE-AAC v1 fixture. Still open: PS
   (parametric stereo, HE-AAC v2) — whose `sbr_extension` payload bytes
   are captured but not decoded — so an HE-AAC v2 stream decodes as
-  HE-AAC v1 (mono SBR without the stereo synthesis); the LATM/LOAS
-  driver still rejects an SBR-configured ASC
-  (`Error::LatmSbrUnsupported`, pending the same wiring the ADTS path
-  got); the 10-bit `bs_sbr_crc_bits` field is captured, not verified;
+  HE-AAC v1 (mono SBR without the stereo synthesis); the 10-bit
+  `bs_sbr_crc_bits` field is captured, not verified;
   the §4.6.18.4.3 downsampled-output mode and the §4.6.18.8 low-power
   variant are not selectable; and the ER AAC LD 480/512 transform
   variants remain out of scope. The coupling-channel (CCE) bitstream is

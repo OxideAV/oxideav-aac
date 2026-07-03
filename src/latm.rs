@@ -896,9 +896,12 @@ use crate::decode::{DecodedFrame, StreamDecoder};
 /// ## Scope
 ///
 /// Targets the core (AAC-LC / Main / LTP) tool chain the
-/// [`StreamDecoder`] covers. An `AudioSpecificConfig` that signals SBR or
-/// PS is rejected with [`Error::LatmSbrUnsupported`] (no SBR back-end
-/// yet). The `audioObjectType` carried by the ASC must be a General Audio
+/// [`StreamDecoder`] covers, **plus §4.6.18 SBR (HE-AAC v1)** — the
+/// shared `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`
+/// FIL payloads in-band and doubles the output rate, so an
+/// SBR-signalling ASC decodes rather than being rejected (PS synthesis
+/// is still absent; an HE-AAC v2 stream decodes its v1 layer). The
+/// `audioObjectType` carried by the ASC must be a General Audio
 /// type whose `raw_data_block()` the core driver understands; otherwise
 /// the underlying decode surfaces its own element-level error.
 #[derive(Debug, Default)]
@@ -949,9 +952,14 @@ impl LoasDecoder {
             .layer(payload.stream_id)
             .ok_or(Error::LatmConfigOutOfRange)?;
         let asc = &layer.effective_asc;
-        if asc.sbr_present || asc.ps_present {
-            return Err(Error::LatmSbrUnsupported);
-        }
+        // An SBR-signalling ASC (explicit AOT 5 wrapper or the implicit
+        // trailing probe) needs no pre-rejection: the shared
+        // `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`
+        // FIL payloads in-band and doubles the output rate (§4.6.18).
+        // The decode runs at the *core* configuration (`asc.aot` is the
+        // unwrapped core object type, `asc.sample_rate` the core rate).
+        // PS (HE-AAC v2) synthesis is not implemented, so a PS stream
+        // decodes its HE-AAC v1 layer.
         let dec = self.streams.entry(payload.stream_id).or_default();
         // LATM carries exactly one raw_data_block() per payload.
         dec.decode_raw_data_block(
