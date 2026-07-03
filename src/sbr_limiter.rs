@@ -48,8 +48,8 @@ pub fn limiter_table(
     // limTable = fTableLow ∪ interior patch borders, sorted.
     let num_patches = patch_borders.len().saturating_sub(1);
     let mut lim_table: Vec<i32> = f_low.clone();
-    for k in 1..num_patches {
-        lim_table.push(patch_borders[k]);
+    if num_patches > 1 {
+        lim_table.extend_from_slice(&patch_borders[1..num_patches]);
     }
     lim_table.sort_unstable();
 
