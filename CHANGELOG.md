@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SBR limiter frequency band table** (`sbr_limiter`) — ISO/IEC
+  14496-3 §4.6.18.3.2.3 / Figure 4.41, previously deferred for the
+  patch borders that `sbr_hf_gen::Patches::borders` now supplies.
+  `limiter_table` builds `fTableLim`: the `bs_limiter_bands == 0`
+  single-band case, the `limiterBandsPerOctave = {1.2, 2, 3}` selector,
+  the sorted `fTableLow ∪ interior-patch-borders` union, and the
+  Figure 4.41 merge walk (`nOctaves·limBands < 0.49`) that drops
+  duplicates and envelope borders while preserving patch borders.
+  Pinned by single-band / pass-through / duplicate / patch-preference /
+  coarseness-ordering cases.
 - **SBR high-frequency generation** (`sbr_hf_gen`) — ISO/IEC 14496-3
   §4.6.18.6. The Figure 4.48 patch construction (`goalSb =
   NINT(2.048e6/FsSBR)`, the `msb`/`usb` walk over `fMaster`, the `odd`
