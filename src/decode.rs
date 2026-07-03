@@ -41,11 +41,15 @@ use oxideav_core::bits::BitReader;
 use crate::adts::AdtsHeader;
 use crate::cce::CouplingChannelElement;
 use crate::element_decode::{ChannelInput, CpeJointStereo, ElementDecoder};
+use crate::extension_payload::{ExtensionPayload, ExtensionPayloadOrSbr};
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
 use crate::ms_stereo::MsMaskPresent;
 use crate::pcm::interleave_s16;
 use crate::raw_data_block::{Element, IdSynEle, Walker};
+use crate::sbr_decoder::SbrDecoder;
+use crate::sbr_extension::SbrExtensionData;
+use crate::sbr_header::SbrHeader;
 use crate::spectral_data::SpectralData;
 use crate::{Error, Result};
 
@@ -63,11 +67,14 @@ pub struct DecodedFrame {
     /// (e.g. 5.1 is `L, R, C, LFE, Ls, Rs`); for the unmapped configs
     /// (`0` PCE-defined, `7`) they stay in `raw_data_block` element order
     /// (an SCE/LFE contributes one channel, a CPE two). Length is
-    /// `FRAME_LEN * channels`.
+    /// `FRAME_LEN * channels` for the plain AAC path, or
+    /// `2 * FRAME_LEN * channels` once the stream is SBR-active
+    /// (HE-AAC dual-rate output).
     pub pcm: Vec<i16>,
     /// Number of interleaved channels this frame produced.
     pub channels: usize,
-    /// The frame's sampling rate in Hz (from the ADTS header).
+    /// The frame's sampling rate in Hz: the ADTS-signalled core rate,
+    /// doubled once the stream is SBR-active.
     pub sample_rate: u32,
 }
 
@@ -82,15 +89,23 @@ pub struct DecodedFrame {
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     decoders: HashMap<(u8, u8), ElementDecoder>,
+    /// One §4.6.18 SBR back-end per channel-element slot (HE-AAC).
+    sbr: HashMap<(u8, u8), SbrDecoder>,
+    /// The threaded previous `sbr_header()` per slot (the
+    /// `bs_header_flag == 0` reuse path).
+    sbr_prev_header: HashMap<(u8, u8), SbrHeader>,
+    /// Latched once any frame carries SBR data: from then on every
+    /// frame is emitted at the doubled (SBR) rate — SBR-less frames go
+    /// through the §4.6.18.5 pure-upsampling path so the output rate
+    /// never flaps.
+    sbr_active: bool,
 }
 
 impl StreamDecoder {
     /// A fresh stream decoder with no element state.
     #[must_use]
     pub fn new() -> Self {
-        StreamDecoder {
-            decoders: HashMap::new(),
-        }
+        StreamDecoder::default()
     }
 
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
@@ -145,9 +160,17 @@ impl StreamDecoder {
         let fs = fs_index;
         let mut reader = BitReader::new(payload);
 
-        // Channel time signals in element order; an SCE/LFE pushes one,
-        // a CPE pushes two.
-        let mut channels: Vec<Vec<f64>> = Vec::new();
+        // Per channel-element outputs in element order: the decoded
+        // core time signals plus any SBR extension payload that
+        // followed the element in a FIL.
+        struct ElementOut {
+            key: (u8, u8),
+            kind: IdSynEle,
+            channels: Vec<Vec<f64>>,
+            sbr: Option<Box<SbrExtensionData>>,
+        }
+        let mut elements: Vec<ElementOut> = Vec::new();
+        let fs_sbr = sample_rate.saturating_mul(2);
 
         // `num_raw_data_blocks` is the resolved count `N`. The walker
         // returns `None` when the payload is exhausted before an explicit
@@ -155,7 +178,7 @@ impl StreamDecoder {
         // round-trip a trailing END marker after the last element); treat
         // that as end-of-block, the same as an `Element::End`.
         'blocks: for _ in 0..num_raw_data_blocks {
-            while let Some(elem) = Walker::new(&mut reader).next_element()? {
+            while let Some(elem) = Walker::new(&mut reader).next_element_keep_fill()? {
                 match elem {
                     Element::ChannelElement {
                         kind: kind @ (IdSynEle::Sce | IdSynEle::Lfe),
@@ -172,15 +195,25 @@ impl StreamDecoder {
                         };
                         let key = (kind_id(kind), element_instance_tag);
                         let dec = self.decoders.entry(key).or_default();
-                        channels.push(dec.decode_sce(&ch, aot, fs)?);
+                        elements.push(ElementOut {
+                            key,
+                            kind,
+                            channels: vec![dec.decode_sce(&ch, aot, fs)?],
+                            sbr: None,
+                        });
                     }
                     Element::ChannelElement {
                         kind: IdSynEle::Cpe,
                         element_instance_tag,
                     } => {
+                        let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
                         let (l, r) = self.decode_cpe(&mut reader, aot, fs, element_instance_tag)?;
-                        channels.push(l);
-                        channels.push(r);
+                        elements.push(ElementOut {
+                            key,
+                            kind: IdSynEle::Cpe,
+                            channels: vec![l, r],
+                            sbr: None,
+                        });
                     }
                     Element::ChannelElement {
                         kind: IdSynEle::Cce,
@@ -208,9 +241,59 @@ impl StreamDecoder {
                         // Any other channel-element id has no decode path.
                         return Err(unsupported_element(kind));
                     }
-                    Element::Fill { .. } | Element::Data { .. } | Element::ProgramConfig(_) => {}
+                    Element::Fill { payload_bytes } => {
+                        // The FIL body was left unconsumed: walk the
+                        // Table 4.51 extension_payload() chain, routing
+                        // any SBR payload onto the preceding channel
+                        // element (§4.4.2.7: an SBR FIL directly follows
+                        // the SCE/CPE it extends).
+                        let target = elements
+                            .last()
+                            .filter(|el| matches!(el.kind, IdSynEle::Sce | IdSynEle::Cpe))
+                            .map(|el| (el.kind, el.key));
+                        if let Some(ext) =
+                            self.consume_fill(&mut reader, payload_bytes, fs_sbr, target)?
+                        {
+                            if let Some(el) = elements.last_mut() {
+                                el.sbr = Some(ext);
+                            }
+                        }
+                    }
+                    Element::Data { .. } | Element::ProgramConfig(_) => {}
                     Element::End => continue 'blocks,
                 }
+            }
+        }
+
+        // HE-AAC: once any frame carries SBR data the stream is emitted
+        // at the doubled rate; frames without SBR go through the pure
+        // upsampling path so the rate never flaps.
+        if elements.iter().any(|e| e.sbr.is_some()) {
+            self.sbr_active = true;
+        }
+
+        let mut channels: Vec<Vec<f64>> = Vec::new();
+        let mut out_rate = sample_rate;
+        if self.sbr_active {
+            out_rate = fs_sbr;
+            for el in &elements {
+                let n_ch = el.channels.len();
+                let dec = match self.sbr.entry(el.key) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(SbrDecoder::new(fs_sbr, n_ch)?)
+                    }
+                };
+                let core: Vec<&[f64]> = el.channels.iter().map(Vec::as_slice).collect();
+                let up = match &el.sbr {
+                    Some(ext) => dec.process_frame(ext, &core)?,
+                    None => dec.upsample_frame(&core)?,
+                };
+                channels.extend(up);
+            }
+        } else {
+            for el in elements {
+                channels.extend(el.channels);
             }
         }
 
@@ -225,8 +308,53 @@ impl StreamDecoder {
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),
-            sample_rate,
+            sample_rate: out_rate,
         })
+    }
+
+    /// Walk a FIL element's Table 4.51 `extension_payload()` chain
+    /// (the body was left unconsumed by
+    /// [`Walker::next_element_keep_fill`]). `target` is the preceding
+    /// SCE / CPE this FIL would extend (its `id_syn_ele` + slot key),
+    /// or `None` when the FIL follows no channel element. Returns the
+    /// decoded SBR payload, if any; the threaded `sbr_header()` reuse
+    /// state is updated per slot.
+    fn consume_fill(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        payload_bytes: u32,
+        fs_sbr: u32,
+        target: Option<(IdSynEle, (u8, u8))>,
+    ) -> Result<Option<Box<SbrExtensionData>>> {
+        let mut remaining = payload_bytes;
+        let mut result = None;
+        while remaining > 0 {
+            match target {
+                None => {
+                    // No preceding channel element: only the non-SBR
+                    // payload types are meaningful here.
+                    let p = ExtensionPayload::parse(reader, remaining)?;
+                    let n = p.byte_length().max(1);
+                    remaining = remaining.saturating_sub(n);
+                }
+                Some((id_aac, slot)) => {
+                    let prev = self.sbr_prev_header.get(&slot).copied();
+                    match ExtensionPayload::parse_with_sbr(reader, remaining, id_aac, fs_sbr, prev)?
+                    {
+                        ExtensionPayloadOrSbr::Payload(p) => {
+                            let n = p.byte_length().max(1);
+                            remaining = remaining.saturating_sub(n);
+                        }
+                        ExtensionPayloadOrSbr::Sbr(ext) => {
+                            self.sbr_prev_header.insert(slot, ext.header);
+                            result = Some(ext);
+                            remaining = 0;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Decode a whole raw-ADTS byte buffer to a vector of per-frame

@@ -214,6 +214,22 @@ impl<'a, 'b> Walker<'a, 'b> {
     /// body itself if more than one element is needed in a single
     /// `raw_data_block()`.
     pub fn next_element(&mut self) -> Result<Option<Element>> {
+        self.next_element_impl(true)
+    }
+
+    /// [`Self::next_element`], except a FIL element's
+    /// `extension_payload` body is **left unconsumed**: the returned
+    /// [`Element::Fill`] reports the byte count and the bit-reader
+    /// stays at the first extension-payload bit, so the caller can
+    /// parse the Table 4.51 `extension_payload()` chain itself (e.g.
+    /// to route an `EXT_SBR_DATA` payload into the SBR decoder). The
+    /// caller **must** consume exactly `payload_bytes` bytes worth of
+    /// bits before the next call.
+    pub fn next_element_keep_fill(&mut self) -> Result<Option<Element>> {
+        self.next_element_impl(false)
+    }
+
+    fn next_element_impl(&mut self, consume_fill: bool) -> Result<Option<Element>> {
         if self.finished {
             return Ok(None);
         }
@@ -232,7 +248,9 @@ impl<'a, 'b> Walker<'a, 'b> {
             }
             IdSynEle::Fil => {
                 let payload_bytes = self.read_fill_count()?;
-                self.skip_bytes(payload_bytes)?;
+                if consume_fill {
+                    self.skip_bytes(payload_bytes)?;
+                }
                 Ok(Some(Element::Fill { payload_bytes }))
             }
             IdSynEle::Dse => {

@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HE-AAC v1 SBR wired into the stream decoder — 99.98% sample-exact**
+  (`decode`, `codec_decoder`, `raw_data_block`) — the ADTS
+  `StreamDecoder` now walks FIL bodies via a new
+  `Walker::next_element_keep_fill` + `extension_payload::
+  parse_with_sbr`, attaches each `EXT_SBR_DATA` payload to the
+  preceding SCE / CPE, threads the `sbr_header()` reuse state per
+  element slot, and — once a stream shows SBR — emits every frame at
+  the doubled rate (2048 samples/channel), sending SBR-less frames
+  through the §4.6.18.5 pure-upsampling path so the output rate never
+  flaps. The coupled-pair `sbr_invf()` sharing (Table 4.66) is
+  honoured. The runtime `Decoder` trait derives the per-frame sample
+  count from the buffer (1024 core / 2048 dual-rate). **Validated
+  against the staged HE-AAC v1 fixture: identical sample count at
+  zero lag, ≥ 99.9% byte-exact (measured 99.98%), max per-sample
+  error 1 LSB, error-to-signal RMS 1e-5** (`tests/sbr_he_aac.rs`) —
+  the same bound the AAC-LC corpus holds — and the trait path is
+  pinned byte-identical to the raw `StreamDecoder`. The AAC-LC
+  corpus stays untouched (non-SBR streams take the exact old path).
 - **SBR frame driver** (`sbr_decoder`) — ISO/IEC 14496-3 §4.6.18.5 /
   Figure 4.47. `SbrDecoder` composes the whole back-end per channel
   element: the analysis QMF over the 1024-sample core frame, the

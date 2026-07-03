@@ -11,10 +11,13 @@ the staged ISO/IEC 13818-7 and ISO/IEC 14496-3 specifications under
 
 The crate implements the full AAC-LC decode chain end to end — from
 ADTS bitstream parse through the per-tool reconstruction to interleaved
-16-bit PCM — and **wires it into the framework's runtime `Decoder`
-trait** (`register()` installs an AAC decoder under id `"aac"`; see
+16-bit PCM — **plus the complete §4.6.18 SBR back-end (HE-AAC v1)**,
+and **wires both into the framework's runtime `Decoder` trait**
+(`register()` installs an AAC decoder under id `"aac"`; see
 `codec_decoder` below). The PCM is validated byte-exactly (within the
-1-LSB IMDCT-rounding bound) against the staged `expected.wav` corpus.
+1-LSB IMDCT-rounding bound) against the staged `expected.wav` corpus —
+**including the HE-AAC v1 SBR fixture, which decodes 99.98%
+sample-exact with a max error of 1 LSB** at the doubled output rate.
 The `Encoder` side is **not yet wired** — the bit-exact wire writers are
 in place but there is no rate-control / psychoacoustic encoder back-end.
 
@@ -339,13 +342,55 @@ tables), independent of any external SBR table extraction.
   the SBR extension types here (the default `parse` still rejects them,
   keeping the byte-exact AAC-LC corpus path untouched).
 
-The remaining SBR back-end (dequantization to linear energies, the QMF
-analysis / synthesis filterbanks, HF generation / patching, the limiter
-and the envelope-adjustment that produce up-sampled PCM) is not yet
-wired; those stages key off the band tables and scalefactors above. The
-SBR *bitstream* side info is now decoded end to end — CRC field,
+The SBR *bitstream* side info is decoded end to end — CRC field,
 header, element framing, band tables, and envelope / noise DPCM
-reconstruction.
+reconstruction — and the **back-end DSP is now implemented too** (see
+the next section).
+
+### SBR back-end (HE-AAC v1) — §4.6.18
+
+The complete SBR reconstruction chain, from the core decoder's time
+signal to dual-rate PCM, validated **99.98% sample-exact (max error
+1 LSB)** against the staged HE-AAC v1 `expected.wav`:
+
+- **QMF filterbanks** (`sbr_qmf`) — §4.6.18.4 / Figures 4.42–4.44: the
+  Table 4.A.89 640-tap prototype window (transcribed digit-for-digit
+  from the spec PDF), the 32-band complex analysis bank, the 64-band
+  real-output synthesis bank (dual-rate), and the downsampled
+  32-channel synthesis variant. Pinned by near-perfect-reconstruction
+  properties (< 1e-4 error ratios).
+- **Dequantization + stereo decoding** (`sbr_dequant`) — §4.6.18.3.5:
+  `EOrig = 64·2^(E/a)`, `QOrig = 2^(6 − Q)`, and the coupled-pair pan
+  split with `panOffset = [24, 12]` (energy-sum-preserving).
+- **Time / frequency grid** (`sbr_time_grid`) — §4.6.18.3.3: the
+  `tE` / `tQ` border vectors for all four frame classes, the
+  Table 4.174 `middleBorder` and the Table 4.176 `lA`.
+- **HF generation** (`sbr_hf_gen`) — §4.6.18.6: the Figure 4.48 patch
+  construction, the covariance-method second-order inverse filtering
+  (`εInv = 1e-6`, `|α| ≥ 4` reset), the Table 4.175 chirp-factor
+  blend, and the patched `XHigh` generator.
+- **Limiter band table** (`sbr_limiter`) — §4.6.18.3.2.3 /
+  Figure 4.41, fed by the patch borders (closing the previously
+  deferred limiter-table item).
+- **Envelope adjustment** (`sbr_env_adjust` + `sbr_noise_table`) —
+  §4.6.18.7: mapping, `ECurr` estimation (both `bs_interpol_freq`
+  regimes), amplitude-domain gains (the spec PDF's typeset equations
+  carry square roots the plain text layer drops), the limiter /
+  boost compensation, `hSmooth` smoothing with cross-frame tails, the
+  Table 4.A.91 noise table with the running `fIndexNoise`, and the
+  sinusoid injection with the `(−1)^(m+kx)` alternation.
+- **Frame driver** (`sbr_decoder`) — §4.6.18.5 / Figure 4.47: the
+  `tHFGen = 8`-slot `XLow` history, header-reset handling, the
+  `lTemp` splice of the previous frame's `Y'`, the coupled-pair invf
+  sharing, and the pure-upsampling path for SBR-less frames.
+- **Stream wiring** (`decode`) — the ADTS `StreamDecoder` walks FIL
+  extension payloads via `extension_payload::parse_with_sbr`, attaches
+  each SBR payload to its preceding SCE / CPE, threads the
+  `sbr_header()` reuse state per element slot, and (once SBR-active)
+  emits every frame at the doubled rate — 2048 samples/channel — with
+  SBR-less frames upsampled so the output rate never flaps. The
+  runtime `Decoder` trait surfaces the dual-rate frames unchanged
+  (pinned byte-identical to the raw `StreamDecoder`).
 
 ### SBR frequency band setup (HE-AAC)
 
@@ -534,26 +579,20 @@ EP-tool payload de-interleave is out of scope.
   with the §4.6.7.4.1 / Figure 4.30 TNS-analysis-in-loop ordering.
   Short-window LTP and the ER AAC LD `M = N/2` lag offset remain out of
   scope per the §4.6.7.1 long-window restriction.)
-- SBR synthesis (needs a QMF analysis / synthesis filterbank and the
-  §4.6.18.6 HF-generation / patching back-end) — the SBR *bitstream*
-  path is now decoded end to end: the §4.A.6.1 Huffman codebooks, the
-  §4.4.2.8 `sbr_header` / `sbr_grid` / `sbr_dtdf` / `sbr_invf` /
-  `sbr_envelope` / `sbr_noise` syntax, the §4.6.18.3.2 frequency band
-  tables, and the §4.6.18.3.5 envelope / noise DPCM reconstruction to
-  quantized scalefactors (see the SBR sections above). What remains is
-  the back-end DSP: dequantization to linear energies, the limiter
-  table, the QMF analysis / synthesis filterbanks, HF generation /
-  patching, and the envelope adjustment that produces up-sampled PCM.
-  The `sbr_single_channel_element()` / `sbr_channel_pair_element()`
-  framing (Tables 4.65–4.66) is decoded by `sbr_element`, and the
-  §4.4.2.8 `sbr_extension_data()` (Table 4.62) top-level walker
-  (`sbr_extension`) now ties the CRC field + header + element framing
-  together — reachable from `extension_payload::parse_with_sbr` (the
-  default `parse` still surfaces `Error::UnsupportedExtensionSbr` so the
-  byte-exact AAC-LC corpus path is untouched, pending the back-end).
-  PS (parametric stereo) — whose `sbr_extension` payload bytes are now
-  captured — and the ER AAC LD 480/512 transform variants likewise remain
-  out of scope. The coupling-channel (CCE) bitstream is now decoded end
+- SBR remainders — the §4.6.18 SBR tool is **implemented end to end**
+  (bitstream + back-end DSP, see the "SBR back-end" section above) and
+  wired into the ADTS `StreamDecoder` / runtime `Decoder`, validated
+  99.98% sample-exact against the HE-AAC v1 fixture. Still open: PS
+  (parametric stereo, HE-AAC v2) — whose `sbr_extension` payload bytes
+  are captured but not decoded — so an HE-AAC v2 stream decodes as
+  HE-AAC v1 (mono SBR without the stereo synthesis); the LATM/LOAS
+  driver still rejects an SBR-configured ASC
+  (`Error::LatmSbrUnsupported`, pending the same wiring the ADTS path
+  got); the 10-bit `bs_sbr_crc_bits` field is captured, not verified;
+  the §4.6.18.4.3 downsampled-output mode and the §4.6.18.8 low-power
+  variant are not selectable; and the ER AAC LD 480/512 transform
+  variants remain out of scope. The coupling-channel (CCE) bitstream is
+  decoded end
   to end (`cce`, see the tool-chain section above) and consumed by the
   stream decode loop; the §4.6.8.3.3 per-band coupling math
   (`CouplingGains::couple_channel`) is implemented and unit-tested, but

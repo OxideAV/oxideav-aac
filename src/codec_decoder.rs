@@ -71,7 +71,7 @@ use oxideav_core::{
 };
 
 use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
-use crate::decode::{DecodedFrame, StreamDecoder, FRAME_LEN};
+use crate::decode::{DecodedFrame, StreamDecoder};
 use crate::latm::{LoasDecoder, AUDIO_SYNC_STREAM_SYNCWORD};
 
 /// Codec id under which [`register_codecs`] installs this decoder.
@@ -189,14 +189,11 @@ impl AacDecoder {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         AudioFrame {
-            // A non-empty channel-bearing frame is always the 1024-line
-            // per-frame count; a fill-only frame (`channels == 0`) carries
-            // no samples.
-            samples: if decoded.channels == 0 {
-                0
-            } else {
-                FRAME_LEN as u32
-            },
+            // Per-channel sample count from the interleaved buffer:
+            // 1024 for the plain AAC path, 2048 for an SBR (HE-AAC)
+            // dual-rate frame. A fill-only frame (`channels == 0`)
+            // carries no samples.
+            samples: decoded.pcm.len().checked_div(decoded.channels).unwrap_or(0) as u32,
             pts,
             data: vec![bytes],
         }
@@ -451,6 +448,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::FRAME_LEN;
     use oxideav_core::TimeBase;
 
     fn build_params(sample_rate: u32, channels: u16) -> CodecParameters {

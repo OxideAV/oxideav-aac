@@ -253,10 +253,20 @@ impl SbrDecoder {
         for c in 0..n_ch {
             let sbr_ch = &ext.element.channels[c];
             let grid = derive_time_grid(&sbr_ch.grid, NUM_TIME_SLOTS)?;
+
+            // Coupling: the second channel transmits no sbr_invf()
+            // (Table 4.66) — it shares the first channel's
+            // inverse-filtering modes.
+            let invf_modes = if coupling && c == 1 {
+                &ext.element.channels[0].invf.invf_mode
+            } else {
+                &sbr_ch.invf.invf_mode
+            };
+
             let ch = &mut self.channels[c];
 
             // Chirp factors (per noise band).
-            let bw = chirp_factors(&sbr_ch.invf.invf_mode, &ch.prev_invf, &ch.prev_bw);
+            let bw = chirp_factors(invf_modes, &ch.prev_invf, &ch.prev_bw);
 
             // Analysis + XLow (with tHFGen history).
             let x_low = ch.analyze(core[c])?;
@@ -312,7 +322,7 @@ impl SbrDecoder {
             ch.t_e_last_prev = grid.t_e[grid.t_e.len() - 1];
             ch.k_x_prev = bands.k_x;
             ch.m_prev = bands.m;
-            ch.prev_invf = sbr_ch.invf.invf_mode.clone();
+            ch.prev_invf = invf_modes.clone();
             ch.prev_bw = bw;
             let (env, noise) = recon[c].clone();
             ch.prev_env = Some(env);

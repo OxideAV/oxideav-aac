@@ -254,30 +254,36 @@ fn pns_fixtures_match_in_rms_through_trait() {
 
 /// An HE-AAC v1 ADTS stream carries an AAC-LC base layer plus an
 /// `EXT_SBR_DATA` Spectral Band Replication extension inside a FIL
-/// element. This crate has no SBR back-end, but the §4.4.2.1
-/// `raw_data_block()` walk consumes the FIL element and the trait
-/// decoder must still decode the **base layer** to PCM rather than
-/// erroring out. (The result is the half-rate AAC-LC band without the
-/// SBR-reconstructed high band — energy-plausible, not byte-exact, so
-/// this pins decode success + frame shape, not a sample comparison.)
+/// element. The §4.6.18 SBR back-end is wired into the stream decoder,
+/// so the trait decoder must emit **dual-rate** frames — 2048 samples
+/// per channel at twice the ADTS-signalled core rate — and stay
+/// byte-identical to the raw `StreamDecoder` output (the ≤1-LSB
+/// `expected.wav` comparison itself lives in `tests/sbr_he_aac.rs`).
 #[test]
-fn he_aac_base_layer_decodes_through_trait() {
+fn he_aac_sbr_decodes_through_trait() {
     let name = "he-aac-v1-stereo-44100-32kbps-adts";
     let Some(pcm) = decode_via_trait(name) else {
         eprintln!("skip {name}: fixtures unavailable");
         return;
     };
-    assert!(!pcm.is_empty(), "{name}: empty base-layer decode");
-    // Stereo base layer → an integer number of (FRAME_LEN * 2) blocks.
+    assert!(!pcm.is_empty(), "{name}: empty SBR decode");
+    // Stereo dual-rate frames → an integer number of (2048 * 2) blocks.
     assert_eq!(
-        pcm.len() % (1024 * 2),
+        pcm.len() % (2048 * 2),
         0,
-        "{name}: PCM length {} not a whole number of stereo frames",
+        "{name}: PCM length {} not a whole number of stereo SBR frames",
         pcm.len()
     );
-    // The base layer carries real audio: at least some non-zero samples.
-    assert!(
-        pcm.iter().any(|&s| s != 0),
-        "{name}: all-silent base-layer decode"
-    );
+    assert!(pcm.iter().any(|&s| s != 0), "{name}: all-silent SBR decode");
+    // The trait path must match the raw StreamDecoder byte-for-byte.
+    let bytes = std::fs::read(
+        PathBuf::from("../../docs/audio/aac/fixtures")
+            .join(name)
+            .join("input.aac"),
+    )
+    .expect("fixture bytes");
+    let mut dec = oxideav_aac::decode::StreamDecoder::new();
+    let frames = dec.decode_all(&bytes).expect("decode_all");
+    let direct: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+    assert_eq!(pcm, direct, "{name}: trait path diverges from direct");
 }
