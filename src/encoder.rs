@@ -56,9 +56,17 @@
 //!   covers the band's max |q| (`1 / 3 / 5 / 7 / 9 / 11`); adjacent
 //!   bands with equal codebooks merge into one section.
 //! * **Stereo** — a CPE with `common_window == 1` (one shared
-//!   `ics_info()`), `ms_mask_present == 0`, and the two channels
-//!   coded independently. No M/S, no intensity, no TNS, no PNS on the
-//!   encode side yet.
+//!   `ics_info()`) and per-band §4.6.8.1 M/S coding: for each
+//!   scalefactor band the encoder forms `m = (l+r)/2`,
+//!   `s = (l−r)/2` (the exact forward matrix of the normative
+//!   `l = m+s` / `r = m−s` de-matrix) and selects M/S when it moves
+//!   the band's energy into one dominant channel — i.e. when
+//!   `min(e_m, e_s) ≤ (e_l + e_r) / 8` (the transformed pair is at
+//!   least ~9 dB lopsided, so the quiet one culls or codes cheaply).
+//!   The mask is emitted as `ms_mask_present = 2` when every band
+//!   flags (identical / phase-inverted channels), `1` + explicit
+//!   mask when mixed, `0` when no band benefits. No intensity, no
+//!   TNS, no PNS on the encode side yet.
 //!
 //! ## Conformance envelope
 //!
@@ -351,32 +359,53 @@ impl StreamEncoder {
     /// `common_window` CPE for stereo, then END) at the given
     /// rate-loop scalefactor offset.
     fn assemble_raw_block(&self, spectra: &[Vec<f64>], sf_offset: i32) -> Result<Vec<u8>> {
-        let mut channels = Vec::with_capacity(spectra.len());
-        for spec in spectra {
-            channels.push(quantize_channel(spec, self.fs_index, sf_offset)?);
-        }
-
         let mut asm = FrameAssembler::new();
         let mut body_bits = BitWriter::new();
-        match channels.as_slice() {
+        match spectra {
             [mono] => {
+                let peak = mono.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+                let chan = quantize_channel(mono, self.fs_index, sf_offset, peak)?;
                 asm.push_channel_header(IdSynEle::Sce, 0)?;
-                mono.body.write(&mut body_bits, 2, self.fs_index, false)?;
-                mono.spectral.write(
+                chan.body.write(&mut body_bits, 2, self.fs_index, false)?;
+                chan.spectral.write(
                     &mut body_bits,
-                    &mono.info,
-                    &mono.body.section_data,
+                    &chan.info,
+                    &chan.body.section_data,
                     self.fs_index,
                 )?;
             }
-            [left, right] => {
+            [l_spec, r_spec] => {
+                // §4.6.8.1: per-band M/S decision, then quantize the
+                // coding spectra (m/s on flagged bands, l/r
+                // elsewhere). Both coding channels share the pair's
+                // loudest peak for the masking spread, so the side
+                // channel's noise floor is judged against the pair,
+                // not against its own (often tiny) peak.
+                let ms_used = ms_decide(l_spec, r_spec, self.fs_index)?;
+                let (code_l, code_r) = apply_ms(l_spec, r_spec, &ms_used, self.fs_index)?;
+                let pair_peak = code_l
+                    .iter()
+                    .chain(code_r.iter())
+                    .fold(0.0f64, |m, &v| m.max(v.abs()));
+                let left = quantize_channel(&code_l, self.fs_index, sf_offset, pair_peak)?;
+                let right = quantize_channel(&code_r, self.fs_index, sf_offset, pair_peak)?;
+
                 asm.push_channel_header(IdSynEle::Cpe, 0)?;
                 // §4.4.2.3: common_window = 1, one shared ics_info,
-                // ms_mask_present = 0 (channels coded independently).
+                // then the two-bit ms_mask_present (+ mask when 1).
                 body_bits.write_bit(true);
                 left.info.write(&mut body_bits, 2, self.fs_index, true)?;
-                body_bits.write_u32(0, 2);
-                for chan in [left, right] {
+                if ms_used.iter().all(|&b| b) {
+                    body_bits.write_u32(2, 2); // all ones, no mask bits
+                } else if ms_used.iter().any(|&b| b) {
+                    body_bits.write_u32(1, 2);
+                    for &b in &ms_used {
+                        body_bits.write_bit(b);
+                    }
+                } else {
+                    body_bits.write_u32(0, 2);
+                }
+                for chan in [&left, &right] {
                     chan.body
                         .write_with_ics_info(&mut body_bits, &chan.info, 2, false)?;
                     chan.spectral.write(
@@ -401,6 +430,68 @@ struct QuantizedChannel {
     info: IcsInfo,
     body: IcsBody,
     spectral: SpectralData,
+}
+
+/// §4.6.8.1 per-band M/S decision for a channel pair.
+///
+/// A band selects M/S coding when the mid/side transform
+/// (`m = (l+r)/2`, `s = (l−r)/2`) concentrates its energy: with
+/// `e_m + e_s = (e_l + e_r)/2` (exact, by the transform's geometry),
+/// requiring `min(e_m, e_s) ≤ (e_l + e_r)/8` means the quieter
+/// transformed channel holds at most a quarter of the transformed
+/// energy (≥ ~5 dB below its partner) — it will cull or code
+/// cheaply while the dominant channel carries the band once instead
+/// of twice.
+fn ms_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<bool>> {
+    let offsets = long_window_offsets(fs_index)?;
+    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let mut used = Vec::with_capacity(num_swb);
+    for sfb in 0..num_swb {
+        let start = offsets[sfb] as usize;
+        let end = offsets[sfb + 1] as usize;
+        let mut e_lr = 0.0f64;
+        let mut e_m = 0.0f64;
+        let mut e_s = 0.0f64;
+        for k in start..end {
+            let (l, r) = (l_spec[k], r_spec[k]);
+            e_lr += l * l + r * r;
+            let m = 0.5 * (l + r);
+            let s = 0.5 * (l - r);
+            e_m += m * m;
+            e_s += s * s;
+        }
+        used.push(e_lr > 0.0 && e_m.min(e_s) <= e_lr / 8.0);
+    }
+    Ok(used)
+}
+
+/// Forward M/S matrix: on flagged bands the coding pair is
+/// `(m, s) = ((l+r)/2, (l−r)/2)` — the exact inverse of the
+/// decoder's §4.6.8.1.3 `l = m+s` / `r = m−s` de-matrix — and the
+/// identity elsewhere.
+fn apply_ms(
+    l_spec: &[f64],
+    r_spec: &[f64],
+    ms_used: &[bool],
+    fs_index: u8,
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    let offsets = long_window_offsets(fs_index)?;
+    let mut code_l = l_spec.to_vec();
+    let mut code_r = r_spec.to_vec();
+    for (sfb, &used) in ms_used.iter().enumerate() {
+        if !used {
+            continue;
+        }
+        let start = offsets[sfb] as usize;
+        let end = offsets[sfb + 1] as usize;
+        for k in start..end {
+            let m = 0.5 * (l_spec[k] + r_spec[k]);
+            let s = 0.5 * (l_spec[k] - r_spec[k]);
+            code_l[k] = m;
+            code_r[k] = s;
+        }
+    }
+    Ok((code_l, code_r))
 }
 
 /// §4.6.2 forward quantizer for one coefficient at scalefactor `sf`:
@@ -455,8 +546,15 @@ fn codebook_for(qmax: i32) -> u8 {
 }
 
 /// Quantize one channel's 1024-line spectrum into a complete
-/// `individual_channel_stream()` record set.
-fn quantize_channel(spec: &[f64], fs_index: u8, sf_offset: i32) -> Result<QuantizedChannel> {
+/// `individual_channel_stream()` record set. `frame_peak` anchors
+/// the masking spread and cull — the channel's own peak for mono,
+/// the pair's loudest peak for a jointly-coded CPE.
+fn quantize_channel(
+    spec: &[f64],
+    fs_index: u8,
+    sf_offset: i32,
+    frame_peak: f64,
+) -> Result<QuantizedChannel> {
     debug_assert_eq!(spec.len(), FRAME_LEN);
     let offsets = long_window_offsets(fs_index)?;
     let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
@@ -470,7 +568,6 @@ fn quantize_channel(spec: &[f64], fs_index: u8, sf_offset: i32) -> Result<Quanti
     let mut sfb_cb = vec![ZERO_HCB; num_swb];
     let mut sfs: Vec<Option<i32>> = vec![None; num_swb];
     let mut prev_sf: Option<i32> = None;
-    let frame_peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
     for sfb in 0..num_swb {
         let start = offsets[sfb] as usize;
         let end = offsets[sfb + 1] as usize;

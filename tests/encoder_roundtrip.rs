@@ -246,3 +246,120 @@ fn hop_by_hop_api_matches_encode_all() {
     manual.extend_from_slice(&b.finish().unwrap());
     assert_eq!(one_shot, manual);
 }
+
+// ---- §4.6.8.1 M/S joint stereo (encode side) ----
+
+#[test]
+fn identical_channels_engage_ms_and_shrink_the_stream() {
+    // L == R: every band's side channel is exactly zero, so the M/S
+    // decision must flag (ms_mask_present = 2) and the stereo stream
+    // should cost little more than the mono encode of the same
+    // signal (the side channel is all-ZERO_HCB sections).
+    let n = 6 * FRAME_LEN;
+    let mono = multitone(n, 1);
+    let mut stereo = Vec::with_capacity(n * 2);
+    for &s in &mono {
+        stereo.push(s);
+        stereo.push(s);
+    }
+
+    let mut enc_m = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    let mono_stream = enc_m.encode_all(&mono).unwrap();
+
+    let mut enc_s = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    let stereo_stream = enc_s.encode_all(&stereo).unwrap();
+
+    eprintln!(
+        "mono {} bytes, identical-channel stereo {} bytes",
+        mono_stream.len(),
+        stereo_stream.len()
+    );
+    assert!(
+        stereo_stream.len() < mono_stream.len() * 13 / 10,
+        "M/S should make identical-channel stereo cost <1.3x mono: {} vs {}",
+        stereo_stream.len(),
+        mono_stream.len()
+    );
+
+    // And the reconstruction must keep the channels (nearly)
+    // identical and close to the input.
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stereo_stream).unwrap();
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let ratio = err_to_signal_rms(&stereo, &out[FRAME_LEN * 2..]);
+    eprintln!("identical-channel stereo err/sig RMS = {ratio:.5}");
+    assert!(ratio < 0.03, "M/S round-trip ratio {ratio:.5}");
+    // Channel coherence: decoded L and R stay near-identical.
+    let steady = &out[FRAME_LEN * 2..];
+    let max_lr_diff = steady
+        .chunks_exact(2)
+        .map(|p| (i32::from(p[0]) - i32::from(p[1])).abs())
+        .max()
+        .unwrap();
+    assert!(
+        max_lr_diff <= 2,
+        "identical input channels decoded {max_lr_diff} LSB apart"
+    );
+}
+
+#[test]
+fn phase_inverted_channels_roundtrip_through_ms() {
+    // R == −L: the mid channel is exactly zero; M/S concentrates all
+    // energy in the side channel. Round-trip must preserve the
+    // inversion.
+    let n = 4 * FRAME_LEN;
+    let mono = multitone(n, 1);
+    let mut stereo = Vec::with_capacity(n * 2);
+    for &s in &mono {
+        stereo.push(s);
+        stereo.push(s.saturating_neg());
+    }
+    let decoded = roundtrip(
+        &stereo,
+        EncoderConfig {
+            sample_rate: 44_100,
+            channels: 2,
+            bitrate: 128_000,
+        },
+    );
+    let ratio = err_to_signal_rms(&stereo, &decoded[FRAME_LEN * 2..]);
+    eprintln!("phase-inverted stereo err/sig RMS = {ratio:.5}");
+    assert!(ratio < 0.03, "anti-correlated M/S ratio {ratio:.5}");
+}
+
+#[test]
+fn uncorrelated_channels_still_roundtrip() {
+    // Fully independent channels: the M/S decision should mostly
+    // stay off and quality must not regress against the joint path.
+    let n = 4 * FRAME_LEN;
+    let mut stereo = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64;
+        stereo.push((9000.0 * (0.033 * t).sin()) as i16);
+        stereo.push((9000.0 * (0.171 * t + 0.9).sin()) as i16);
+    }
+    let decoded = roundtrip(
+        &stereo,
+        EncoderConfig {
+            sample_rate: 44_100,
+            channels: 2,
+            bitrate: 160_000,
+        },
+    );
+    let ratio = err_to_signal_rms(&stereo, &decoded[FRAME_LEN * 2..]);
+    eprintln!("uncorrelated stereo err/sig RMS = {ratio:.5}");
+    assert!(ratio < 0.03, "independent-channel ratio {ratio:.5}");
+}
