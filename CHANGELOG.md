@@ -8,6 +8,35 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SBR HF adjustment (envelope adjuster)** (`sbr_env_adjust`) +
+  **noise table** (`sbr_noise_table`) — ISO/IEC 14496-3 §4.6.18.7,
+  the stage that turns `XHigh` into the output matrix `Y`: the
+  §4.6.18.7.2 mapping (`EOrigMapped` / `QMapped` to QMF resolution,
+  the `SIndexMapped` band-middle sinusoid placement with the `δStep`
+  start gate against `lA` and the previous frame's sinusoids, and the
+  `SMapped` band flags), the §4.6.18.7.3 `ECurr` estimation (both
+  `bs_interpol_freq` regimes), the §4.6.18.7.4 `QM` / `SM` levels and
+  §4.6.18.7.5 gain — **read from the spec PDF's typeset equations,
+  which carry square roots the plain text layer drops** (`G`, `QM`,
+  `SM`, `GMaxTemp`, `GBoostTemp` are all amplitude-domain) — the
+  limiter (`limGain = [0.70795, 1.0, 1.41254, 1e10]`, the `10^5` cap,
+  per-`fTableLim`-band ratios), the noise-level limit and the boost
+  compensation capped at `1.584893192`, and the §4.6.18.7.6 assembly
+  (the `hSmooth` 5-tap gain/noise smoothing with cross-frame `GTemp` /
+  `QTemp` tails, `W1 = GFilt·XHigh`, the Table 4.A.91 noise mix with
+  the running `fIndexNoise = (indexNoise + (i−i0)·M + m + 1) mod 512`,
+  and the `φsin` sinusoid injection with the `(−1)^(m+kx)` imaginary
+  alternation and the `indexSine` advance). `sbr_noise_table` is the
+  512-entry Table 4.A.91 transcribed from the spec PDF (the staged
+  `sbr-random-phase.csv` cross-checks every present value to 1e-9 but
+  is missing one scalar, so the spec grid is authoritative).
+  `EnvAdjustState` threads all cross-frame state and honours the
+  §4.6.18.3.3 reset. Pinned by flat-gain envelope reproduction,
+  per-envelope gain switching at `tE` borders, limiter clamping with
+  boost compensation, noise-floor synthesis with exact `fIndexNoise`
+  threading across frames, the sinusoid injection pattern (phase
+  ladder, odd-subband alternation, prev-frame ring-on), and the hSL=4
+  smoothing carry.
 - **SBR limiter frequency band table** (`sbr_limiter`) — ISO/IEC
   14496-3 §4.6.18.3.2.3 / Figure 4.41, previously deferred for the
   patch borders that `sbr_hf_gen::Patches::borders` now supplies.
