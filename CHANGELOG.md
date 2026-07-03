@@ -6,7 +6,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/OxideAV/oxideav-aac/compare/v0.1.5...v0.2.0) - 2026-07-03
+## [0.1.6](https://github.com/OxideAV/oxideav-aac/compare/v0.1.5...v0.1.6) - 2026-07-03
 
 ### Other
 
