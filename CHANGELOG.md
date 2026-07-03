@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SBR frame driver** (`sbr_decoder`) — ISO/IEC 14496-3 §4.6.18.5 /
+  Figure 4.47. `SbrDecoder` composes the whole back-end per channel
+  element: the analysis QMF over the 1024-sample core frame, the
+  `XLow` buffer with the `tHFGen = 8`-slot `W'` cross-frame history,
+  header-reset band/patch/limiter derivation (§4.6.18.3.3), quantized
+  scalefactor reconstruction (with cross-frame time-delta references)
+  → dequantization (coupled or single, with the single-envelope
+  FIXFIX `bs_amp_res` override), chirp factors, HF generation,
+  envelope adjustment, the §4.6.18.5 output-matrix `X` assembly (the
+  `lTemp` splice of the previous frame's `Y'` under the previous
+  `kx'/M'` against the current `XLow`/`Y`), and the 64-band synthesis
+  producing 2048 output samples per frame (dual-rate). The
+  `upsample_frame` path implements the spec's pure-upsampling mode
+  for frames without SBR payload, keeping QMF state continuous.
+  Pinned by cross-frame upsample continuity against an ideal
+  2×-upsampled sine (< 1e-4 error ratio), a synthetic single-envelope
+  SBR frame (finite, deterministic, high-band energy scaling with the
+  envelope scalefactor), and shape-mismatch rejections.
 - **SBR HF adjustment (envelope adjuster)** (`sbr_env_adjust`) +
   **noise table** (`sbr_noise_table`) — ISO/IEC 14496-3 §4.6.18.7,
   the stage that turns `XHigh` into the output matrix `Y`: the

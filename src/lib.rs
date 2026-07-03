@@ -431,6 +431,7 @@ pub mod predictor;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod rvlc;
+pub mod sbr_decoder;
 pub mod sbr_dequant;
 pub mod sbr_element;
 pub mod sbr_env_adjust;
