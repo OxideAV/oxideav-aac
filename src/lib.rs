@@ -430,6 +430,7 @@ pub mod pns;
 pub mod predictor;
 pub mod ps_data;
 pub mod ps_huffman;
+pub mod ps_hybrid;
 pub mod pulse_data;
 pub mod raw_data_block;
 pub mod rvlc;

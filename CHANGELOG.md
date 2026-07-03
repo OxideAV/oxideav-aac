@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **PS hybrid filterbank** (`ps_hybrid`) — ISO/IEC 14496-3:2009
+  §8.6.4.3 / Annex 8.A.3. Both configurations: 10/20 stereo bands (QMF
+  band 0 split by 8 with the Figure 8.20 merge/reorder to 6 channels —
+  `s0=q6, s1=q7, s2=q0, s3=q1, s4=q2+q5, s5=q3+q4` — bands 1–2 split
+  by 2 with the odd-band spectral inversion; 71 hybrid channels) and
+  34 bands (12/8/4/4/4 splits, filter order; 91 channels), using the
+  Table 8.37/8.38 13-tap prototypes with Type A complex / Type B
+  cosine modulation. Implements the Annex 8.A.3 zero-delay alignment:
+  6 look-ahead QMF slots feed the convolution, 6 history slots thread
+  across frames, unsplit bands pass straight through. `synthesize` is
+  the §8.6.4.7 sub-subband adder. Pinned by exact analysis→synthesis
+  reconstruction (both configs, across frame boundaries — each
+  prototype's sub-filters provably sum to a pure 6-slot delay), by
+  sub-subband selectivity tests fixing the positive/negative
+  low-frequency channel order, and by the zero-delay pass-through.
 - **Parametric Stereo bitstream layer** (`ps_huffman`, `ps_data`) —
   ISO/IEC 14496-3:2009 §8.4.2 Tables 8.9–8.14 + Annex 8.B. All ten PS
   Huffman codebooks (IID coarse/fine × time/freq, ICC, IPD, OPD ×
