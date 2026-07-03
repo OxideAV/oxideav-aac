@@ -6,6 +6,78 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-aac/compare/v0.1.5...v0.2.0) - 2026-07-03
+
+### Other
+
+- document the subpart-8 Parametric Stereo tool — HE-AAC v2 end-to-end
+- Annex 8.A PS frame driver wired into SbrDecoder — HE-AAC v2 end-to-end at 5e-5 RMS
+- §8.6.4.6 stereo processing — Ra/Rb mixing, IPD/OPD smoothing, envelope interpolation
+- ps_decorr + ps_map: §8.6.4.5 de-correlator and §8.6.4.6.1 parameter-band maps
+- §8.6.4.3 hybrid filterbank — 10/20 + 34 band configs, zero-delay Annex 8.A alignment
+- ps_huffman + ps_data: §8.4.2 Parametric Stereo bitstream layer
+- route SBR-signalling ASCs through the §4.6.18 back-end — LATM HE-AAC v1 byte-identical to ADTS
+- wire the §4.6.18 SBR back-end into the ADTS stream decoder — HE-AAC v1 99.98% sample-exact
+- §4.6.18.5 SBR frame driver — analysis to 2048-sample dual-rate output
+- sbr_env_adjust + sbr_noise_table: §4.6.18.7 HF adjustment to the output matrix Y
+- fix needless_range_loop clippy lint
+- §4.6.18.3.2.3 limiter frequency band table (Figure 4.41)
+- §4.6.18.6 HF generation — patches, chirp factors, LPC inverse filtering
+- sbr_dequant + sbr_time_grid: §4.6.18.3.5 dequantization and §4.6.18.3.3 time grid
+- §4.6.18.4 QMF filterbanks — Table 4.A.89 window + analysis/synthesis banks
+- README — document the SSR gain-control back-end (§4.6.12.3.1-4)
+- SSR gain-control PFMD length discipline + cross-frame robustness
+- SSR per-channel gain-control + IPQF back-end driver §4.6.12
+- SSR IPQF synthesis filter §4.6.12.3.4
+- SSR gain-control reconstruction back-end §4.6.12.3.1-3
+- HCR codeword bit-placement engine (§4.6.16.3.3.3 / .4)
+- HCR segmentation / pre-sorting scaffold (§4.6.16.3.3)
+- error-resilient individual_channel_stream() branch (§4.4.6 Table 4.50)
+- error-resilient section_data() branch (§4.4.6 Table 4.52)
+- README + CHANGELOG — couple_channel() + sbr_extension_data() walker
+- ExtensionPayload::parse_with_sbr routes EXT_SBR_DATA into sbr_extension_data()
+- sbr_extension_data() top-level SBR side-info walker (§4.4.2.8 Table 4.62)
+- cce couple_channel() spectral scale-and-add (§4.6.8.3.3)
+- scrub enumerated-denial disclaimer from channel_map provenance note
+- README + CHANGELOG — Table 1.19 default-config channel reorder
+- end-to-end channel-reorder integration tests
+- apply Table 1.19 channel reorder in the decode driver
+- channel_map — Table 1.19 default-config output reorder
+- consume coupling_channel_element() in the stream decode loop
+- add coupling_channel_element() bitstream decode (§4.6.8.3 / Table 4.8)
+- add aac-lc-chirp-windows to the validated PCM corpus (short-window path)
+- route LOAS packets through the runtime Decoder trait (carrier auto-detection)
+- LATM/LOAS → PCM decode driver (LoasDecoder) + transport-independent decode core
+- README + CHANGELOG — LATM/LOAS transport framing section
+- LOAS AudioSyncStream / EPAudioSyncStream framing (§1.7.2 Tables 1.36/1.37)
+- LATM AudioMuxElement/PayloadLengthInfo/PayloadMux decode (§1.7.3 Tables 1.41/1.44/1.45)
+- LATM StreamMuxConfig() + LatmGetValue() decode (§1.7.3 Table 1.42/1.43)
+- gate dpcm_noise_last_position on sf_escapes_present (Table 4.53)
+- RVLC integration tests + README error-resilience section
+- error-resilient scale_factor_data() RVLC branch (Table 4.53 / §4.6.16.2)
+- RVLC + RVLC-ESC codebook primitives (§4.6.16.2 / Tables 4.166–4.168)
+- SBR element framing — sbr_single/channel_pair_element (§4.4.2.8)
+- README — document the SBR bitstream-decode path
+- SBR envelope/noise DPCM reconstruction (§4.6.18.3.5)
+- sbr_envelope()/sbr_noise() raw delta decode (§4.4.2.8, Tables 4.72–4.73)
+- SBR time-frequency grid parsers — sbr_grid/sbr_dtdf/sbr_invf (§4.4.2.8)
+- sbr_header() parser with Table 4.63 Note 3 defaults (§4.4.2.8)
+- SBR Huffman codebooks + sbr_huff_dec (§4.A.6.1, Tables 4.A.79–4.A.88)
+- pin HE-AAC v1 base-layer decode through the Decoder trait (r342)
+- validate expected.wav PCM through the registered Decoder trait path (r342)
+- wire oxideav_core::Decoder + register the AAC-LC decoder (r342)
+- refresh lib.rs crate doc for the decode/pcm output stage
+- scrub attributive external-tool names from decode comments
+- RMS-domain PNS comparison + PNS decode-reproducibility pin
+- stream-level ADTS decode driver + expected.wav byte-exact harness
+- §4.6.11 integer-PCM rendering (pcm module)
+- §1.8.4.5 error-protection CRC generator (crc module)
+- §4.6.18.3.2 SBR frequency band tables (fMaster + high/low/noise) (r330)
+- §4.6.6 MPEG-2 frequency-domain prediction (Main, AOT 1) (r325)
+- wire LTP into element_decode with §4.6.7.4.1 TNS-analysis-in-loop (r319)
+- §4.6.7 Long-Term Prediction long-window synthesis (r315)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **HE-AAC v2 decodes end-to-end — PS wired into the SBR decoder,
