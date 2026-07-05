@@ -96,13 +96,18 @@
 //!   L/R domain before the M/S forward matrix (mirroring the
 //!   decoder's M/S-then-TNS order). See [`StreamEncoder::set_tns`].
 //! * **PNS (§4.6.13, opt-in)** — with [`StreamEncoder::set_pns`], a
-//!   mono long-frame band whose energy is spread across most of its
+//!   long-frame band whose energy is spread across most of its
 //!   coefficients (density `(Σ|x|)²/(width·Σx²)` above 0.4 — dense
 //!   noise measures `≈2/π`, `k` spectral lines `≈k/width`) is
 //!   transmitted as a `NOISE_HCB` band carrying only its energy
 //!   (`noise_nrg = round(4·log2‖band‖₂)`, the `2^(0.25·nrg)` ladder)
 //!   on the §4.6.13 DPCM track; the decoder re-synthesises the band
-//!   from its own generator at exactly that L2 norm. Off by default:
+//!   from its own generator at exactly that L2 norm. In a CPE the
+//!   decision runs per channel *before* the M/S matrix (mutual
+//!   exclusion, §4.6.13.5); a both-channels-noise band correlating
+//!   above [`PNS_CORR_MIN`] sets its `ms_used` bit — the §4.6.13.3
+//!   correlated-noise signal (same random vector both channels), not
+//!   an M/S flag. Off by default:
 //!   a single-frame statistic cannot tell true noise from
 //!   noise-shaped deterministic content (sweeps, dense leakage
 //!   floors), which substitutes with the right energy but the wrong
@@ -299,10 +304,16 @@ impl StreamEncoder {
 
     /// Enable / disable §4.6.13 PNS emission (default **off**).
     ///
-    /// When enabled, mono long frames transmit dense noise-like
-    /// bands (see the module docs) as `NOISE_HCB` energies instead
-    /// of spectra — a large bitrate win on noise content, validated
-    /// energy-exact through the decoder's §4.6.13.3 synthesis. It
+    /// When enabled, long frames transmit dense noise-like bands
+    /// (see the module docs) as `NOISE_HCB` energies instead of
+    /// spectra — a large bitrate win on noise content, validated
+    /// energy-exact through the decoder's §4.6.13.3 synthesis. In a
+    /// CPE the decision runs per channel on the pre-M/S spectra
+    /// (PNS and M/S are mutually exclusive per band, §4.6.13.5);
+    /// a band both channels noise-code whose content correlates
+    /// above [`PNS_CORR_MIN`] additionally sets its `ms_used` bit,
+    /// signalling the decoder to synthesise the *same* random
+    /// vector into both channels (§4.6.13.3 correlated noise). It
     /// stays opt-in because a *single-frame* spectral statistic
     /// cannot distinguish true noise from noise-shaped deterministic
     /// content (a frequency sweep, a dense leakage floor): those
@@ -559,12 +570,18 @@ impl StreamEncoder {
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
         let mut body_bits = BitWriter::new();
-        // §4.6.13 PNS emission is opt-in (set_pns) and limited to
-        // mono long frames: in a CPE, PNS interacts with the ms_used
-        // mask (correlated vs independent noise, §4.6.13.3) — an
-        // encode-side follow-up.
-        let pns_allowed = self.pns_enabled && spectra.len() == 1;
-        let quantize = |spec: &[f64], peak: f64, is_bands: &[IsBand]| -> Result<QuantizedChannel> {
+        // §4.6.13 PNS emission is opt-in (set_pns) and long-frame
+        // only. Mono grants a blanket per-band allowance (the
+        // noise-likeness test in quantize_group decides); a CPE
+        // derives per-band allowances and the §4.6.13.3 correlation
+        // flags below, before the M/S decision.
+        let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
+        let num_swb_long = NUM_SWB_LONG_WINDOW[self.fs_index as usize] as usize;
+        let quantize = |spec: &[f64],
+                        peak: f64,
+                        pns_bands: &[bool],
+                        is_bands: &[IsBand]|
+         -> Result<QuantizedChannel> {
             if seq == WindowSequence::EightShort {
                 quantize_channel_short(spec, self.fs_index, sf_offset, peak)
             } else {
@@ -574,7 +591,7 @@ impl StreamEncoder {
                     self.fs_index,
                     sf_offset,
                     peak,
-                    pns_allowed,
+                    pns_bands,
                     is_bands,
                 )
             }
@@ -589,7 +606,12 @@ impl StreamEncoder {
         match spectra {
             [mono] => {
                 let peak = mono.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-                let mut chan = quantize(mono, peak, &[])?;
+                let pns_bands = if pns_long {
+                    vec![true; num_swb_long]
+                } else {
+                    Vec::new()
+                };
+                let mut chan = quantize(mono, peak, &pns_bands, &[])?;
                 attach_tns(&mut chan, &tns[0]);
                 asm.push_channel_header(IdSynEle::Sce, 0)?;
                 chan.body.write(&mut body_bits, 2, self.fs_index, false)?;
@@ -613,6 +635,15 @@ impl StreamEncoder {
                 } else {
                     Vec::new()
                 };
+                // §4.6.13 per-band PNS decision on the original l/r
+                // spectra (a noise band must not be M/S-transformed —
+                // mutual exclusion, §4.6.13.5 — and IS wins where the
+                // two overlap).
+                let pns = if pns_long {
+                    pns_decide_pair(l_spec, r_spec, &is_bands, self.fs_index)?
+                } else {
+                    PairPns::default()
+                };
                 // §4.6.8.1: per-band M/S decision, then quantize the
                 // coding spectra (m/s on flagged bands, l/r
                 // elsewhere). Both coding channels share the pair's
@@ -632,8 +663,29 @@ impl StreamEncoder {
                         }
                     }
                 }
-                let (code_l, code_r) = if ms_used.iter().any(|&b| b) {
-                    apply_ms(l_spec, r_spec, &ms_used, self.fs_index)?
+                // A band either channel will noise-code is excluded
+                // from the M/S transform; a both-channels-noise band
+                // whose content correlates re-sets its ms_used bit,
+                // which per §4.6.13.3 signals the decoder to draw the
+                // *same* random vector for both channels (correlated
+                // noise) rather than an M/S de-matrix.
+                for (sfb, m) in ms_used.iter_mut().enumerate() {
+                    let l_n = pns.l_noise.get(sfb).copied().unwrap_or(false);
+                    let r_n = pns.r_noise.get(sfb).copied().unwrap_or(false);
+                    if l_n || r_n {
+                        *m = pns.shared.get(sfb).copied().unwrap_or(false);
+                    }
+                }
+                let ms_transform: Vec<bool> = ms_used
+                    .iter()
+                    .enumerate()
+                    .map(|(sfb, &m)| {
+                        m && !pns.l_noise.get(sfb).copied().unwrap_or(false)
+                            && !pns.r_noise.get(sfb).copied().unwrap_or(false)
+                    })
+                    .collect();
+                let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
+                    apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
                 } else {
                     (l_spec.to_vec(), r_spec.to_vec())
                 };
@@ -641,8 +693,8 @@ impl StreamEncoder {
                     .iter()
                     .chain(code_r.iter())
                     .fold(0.0f64, |m, &v| m.max(v.abs()));
-                let mut left = quantize(&code_l, pair_peak, &[])?;
-                let mut right = quantize(&code_r, pair_peak, &is_bands)?;
+                let mut left = quantize(&code_l, pair_peak, &pns.l_noise, &[])?;
+                let mut right = quantize(&code_r, pair_peak, &pns.r_noise, &is_bands)?;
                 attach_tns(&mut left, &tns[0]);
                 attach_tns(&mut right, &tns[1]);
 
@@ -943,6 +995,77 @@ fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>
     Ok(out)
 }
 
+/// Minimum normalised cross-correlation for a both-channels-noise
+/// band to be flagged *correlated* (§4.6.13.3): the decoder then
+/// draws the **same** random vector for both channels. Positive
+/// correlation only — the shared vector reproduces positively
+/// correlated noise, so anti-correlated noise stays on independent
+/// draws.
+pub const PNS_CORR_MIN: f64 = 0.5;
+
+/// Per-band §4.6.13 PNS decision for a channel pair (encode side).
+#[derive(Debug, Default)]
+struct PairPns {
+    /// Left channel per-band PNS allowance (noise-like content).
+    l_noise: Vec<bool>,
+    /// Right channel per-band PNS allowance.
+    r_noise: Vec<bool>,
+    /// Both channels noise **and** correlated above
+    /// [`PNS_CORR_MIN`] — emitted as a set `ms_used` bit
+    /// (§4.6.13.3 correlated-noise signalling).
+    shared: Vec<bool>,
+}
+
+/// Decide the §4.6.13 noise bands of a long-frame channel pair on
+/// the original (pre-M/S) spectra.
+///
+/// Per band: each channel qualifies through the same
+/// [`is_noise_like`] density statistic the mono path uses; a band
+/// where **both** qualify additionally measures its normalised
+/// cross-correlation — above [`PNS_CORR_MIN`] the band is flagged
+/// `shared`, which the CPE assembler emits as a set `ms_used` bit so
+/// the decoder synthesises the same random vector into both channels
+/// (§4.6.13.3; no M/S de-matrix is performed on such a band — PNS
+/// and M/S are mutually exclusive, §4.6.13.5). Bands claimed by
+/// intensity stereo (`is_bands`) are skipped — M/S, IS and PNS are
+/// pairwise exclusive on a band.
+fn pns_decide_pair(
+    l_spec: &[f64],
+    r_spec: &[f64],
+    is_bands: &[IsBand],
+    fs_index: u8,
+) -> Result<PairPns> {
+    let offsets = long_window_offsets(fs_index)?;
+    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let mut out = PairPns {
+        l_noise: vec![false; num_swb],
+        r_noise: vec![false; num_swb],
+        shared: vec![false; num_swb],
+    };
+    for sfb in 0..num_swb {
+        if is_bands.get(sfb).copied().flatten().is_some() {
+            continue; // intensity wins the band
+        }
+        let start = offsets[sfb] as usize;
+        let end = offsets[sfb + 1] as usize;
+        let l_band = &l_spec[start..end];
+        let r_band = &r_spec[start..end];
+        let l_n = is_noise_like(l_band);
+        let r_n = is_noise_like(r_band);
+        out.l_noise[sfb] = l_n;
+        out.r_noise[sfb] = r_n;
+        if l_n && r_n {
+            let e_l: f64 = l_band.iter().map(|&v| v * v).sum();
+            let e_r: f64 = r_band.iter().map(|&v| v * v).sum();
+            let dot: f64 = l_band.iter().zip(r_band).map(|(&a, &b)| a * b).sum();
+            if e_l > 0.0 && e_r > 0.0 && dot / (e_l * e_r).sqrt() >= PNS_CORR_MIN {
+                out.shared[sfb] = true;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// §4.6.8.1 per-band M/S decision for a channel pair.
 ///
 /// A band selects M/S coding when the mid/side transform
@@ -1082,6 +1205,7 @@ struct GroupQuant {
 /// re-quantizes with the clamped value and derives the codebook. A
 /// band whose coefficients all quantize to zero (or whose target is
 /// culled) stays `ZERO_HCB` and transmits no scalefactor.
+#[allow(clippy::too_many_arguments)]
 fn quantize_group(
     spec: &[f64],
     offsets: &[u16],
@@ -1089,7 +1213,7 @@ fn quantize_group(
     sf_offset: i32,
     frame_peak: f64,
     prev_sf: &mut Option<i32>,
-    pns_allowed: bool,
+    pns_bands: &[bool],
 ) -> GroupQuant {
     let mut x_quant = vec![0i32; spec.len()];
     let mut sfb_cb = vec![ZERO_HCB; num_swb];
@@ -1103,8 +1227,10 @@ fn quantize_group(
             continue; // culled: below the frame's masking floor
         };
         // §4.6.13 PNS: a wide band with no dominant spectral line is
-        // transmitted as a noise energy instead of coefficients.
-        if pns_allowed && is_noise_like(&spec[start..end]) {
+        // transmitted as a noise energy instead of coefficients. The
+        // per-band allowance comes from the caller (blanket for mono,
+        // the pre-M/S pair decision for a CPE channel).
+        if pns_bands.get(sfb).copied().unwrap_or(false) && is_noise_like(&spec[start..end]) {
             let nrg: f64 = spec[start..end].iter().map(|&x| x * x).sum();
             // Target L2 norm 2^(0.25·noise_nrg) == sqrt(nrg).
             let noise_nrg = (4.0 * nrg.sqrt().log2()).round() as i32;
@@ -1299,7 +1425,8 @@ fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> Result<QuantizedCha
 /// one of the three long sequences (it lands in the `ics_info`);
 /// `frame_peak` anchors the masking spread and cull — the channel's
 /// own peak for mono, the pair's loudest peak for a jointly-coded
-/// CPE. A non-empty `is_bands` (the right channel of an
+/// CPE. `pns_bands` grants the per-band §4.6.13 allowance (empty =
+/// PNS off); a non-empty `is_bands` (the right channel of an
 /// intensity-coding CPE) rewrites the selected bands into §4.6.8.2
 /// intensity records after quantization.
 #[allow(clippy::too_many_arguments)]
@@ -1309,7 +1436,7 @@ fn quantize_channel(
     fs_index: u8,
     sf_offset: i32,
     frame_peak: f64,
-    pns_allowed: bool,
+    pns_bands: &[bool],
     is_bands: &[IsBand],
 ) -> Result<QuantizedChannel> {
     debug_assert_eq!(spec.len(), FRAME_LEN);
@@ -1324,7 +1451,7 @@ fn quantize_channel(
         sf_offset,
         frame_peak,
         &mut prev_sf,
-        pns_allowed,
+        pns_bands,
     );
     if !is_bands.is_empty() {
         apply_is_overrides(&mut group, is_bands, offsets);
@@ -1375,7 +1502,7 @@ fn quantize_channel_short(
             sf_offset,
             frame_peak,
             &mut prev_sf,
-            false, // PNS stays long-frame-only for now
+            &[], // PNS stays long-frame-only for now
         ));
     }
     let info = IcsInfo {

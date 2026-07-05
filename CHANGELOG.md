@@ -18,6 +18,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   transmitted once via the left channel with codebook 15/14 and
   `is_pos = 2·log2(e_l/e_r)` on the §4.6.8.1.4 DPCM track, excluded
   from the M/S mask (per-band mutual exclusion)
+- encoder §4.6.13 PNS extended to channel pairs: per-channel noise
+  decision on the pre-M/S spectra with the §4.6.13.3 correlated-noise
+  `ms_used` signalling (shared random vector) for both-channels-noise
+  bands correlating above 0.5; pns/encoder docs now cite the staged
+  `pns-gen-rand-vector.md` clean-room analysis (band energy normative,
+  per-bin noise phase implementation-defined)
 
 ## [0.1.6](https://github.com/OxideAV/oxideav-aac/compare/v0.1.5...v0.1.6) - 2026-07-03
 

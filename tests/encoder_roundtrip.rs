@@ -917,6 +917,180 @@ fn count_noise_bands(stream: &[u8]) -> usize {
     count
 }
 
+/// Walk a stereo CPE ADTS stream and count the §4.6.13 PNS bands:
+/// `(both_noise, correlated)` — bands where *both* channels carry
+/// `NOISE_HCB`, and the subset whose `ms_used` bit is set (the
+/// §4.6.13.3 correlated-noise signal).
+fn cpe_noise_stats(stream: &[u8]) -> (usize, usize) {
+    use oxideav_aac::ics_body::IcsBody;
+    use oxideav_aac::ics_info::IcsInfo;
+    use oxideav_aac::spectral_data::SpectralData;
+    use oxideav_core::bits::BitReader;
+
+    let mut both = 0usize;
+    let mut correlated = 0usize;
+    let mut pos = 0usize;
+    while pos < stream.len() {
+        let (hdr, off) = AdtsHeader::parse(&stream[pos..]).expect("frame parses");
+        let payload = &stream[pos + off..pos + hdr.aac_frame_length as usize];
+        let mut br = BitReader::new(payload);
+        let id = br.read_u32(3).unwrap();
+        assert_eq!(id, 1, "expected CPE");
+        let _tag = br.read_u32(4).unwrap();
+        assert!(br.read_bit().unwrap(), "common_window");
+        let info = IcsInfo::parse(&mut br, 2, hdr.sampling_frequency_index, true)
+            .expect("shared ics_info parses");
+        let nbands = info.num_window_groups as usize * info.max_sfb as usize;
+        let ms_mask_present = br.read_u32(2).unwrap();
+        let ms_used: Vec<bool> = match ms_mask_present {
+            1 => (0..nbands).map(|_| br.read_bit().unwrap()).collect(),
+            2 => vec![true; nbands],
+            _ => vec![false; nbands],
+        };
+        let left =
+            IcsBody::parse_with_ics_info(&mut br, &info, 2, false).expect("left body parses");
+        SpectralData::parse(
+            &mut br,
+            &info,
+            &left.section_data,
+            hdr.sampling_frequency_index,
+        )
+        .expect("left spectral data parses");
+        let right =
+            IcsBody::parse_with_ics_info(&mut br, &info, 2, false).expect("right body parses");
+        for (g, lrow) in left.section_data.sfb_cb.iter().enumerate() {
+            for (sfb, &lcb) in lrow.iter().enumerate() {
+                let rcb = right.section_data.sfb_cb[g][sfb];
+                if lcb == 13 && rcb == 13 {
+                    both += 1;
+                    if ms_used[g * info.max_sfb as usize + sfb] {
+                        correlated += 1;
+                    }
+                }
+            }
+        }
+        pos += hdr.aac_frame_length as usize;
+    }
+    (both, correlated)
+}
+
+#[test]
+fn identical_noise_channels_emit_correlated_pns() {
+    // Both channels carry the *same* noise: every both-noise band
+    // correlates at 1.0, so the encoder must flag them all as
+    // correlated (§4.6.13.3 shared random vector) and the decoder's
+    // shared draw plus equal noise energies must keep the decoded
+    // channels essentially identical.
+    let n = 5 * FRAME_LEN;
+    let mono = noise_pcm(n, 8_000.0, 0x0DD5_EED5);
+    let mut pcm = Vec::with_capacity(n * 2);
+    for &s in &mono {
+        pcm.push(s);
+        pcm.push(s);
+    }
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 96_000,
+    })
+    .unwrap();
+    enc.set_pns(true);
+    let stream = enc.encode_all(&pcm).unwrap();
+
+    let (both, correlated) = cpe_noise_stats(&stream);
+    eprintln!("identical-noise CPE: {both} both-noise bands, {correlated} correlated");
+    assert!(both > 30, "dense noise should engage pair PNS, got {both}");
+    assert_eq!(
+        correlated, both,
+        "identical channels must flag every noise band correlated"
+    );
+
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    // Shared vectors + equal energies ⇒ near-identical channels.
+    let steady = &out[FRAME_LEN * 2..];
+    let max_lr_diff = steady
+        .chunks_exact(2)
+        .map(|p| (i32::from(p[0]) - i32::from(p[1])).abs())
+        .max()
+        .unwrap();
+    assert!(
+        max_lr_diff <= 2,
+        "correlated PNS must keep the channels together: {max_lr_diff} LSB apart"
+    );
+    // Energy tracks the input per frame (the §4.6.13 contract).
+    let rms = |s: &[i16]| -> f64 {
+        (s.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / s.len() as f64).sqrt()
+    };
+    for f in 1..(n / FRAME_LEN) {
+        let in_rms = rms(&mono[(f - 1) * FRAME_LEN..f * FRAME_LEN]);
+        let left: Vec<i16> = out[f * FRAME_LEN * 2..(f + 1) * FRAME_LEN * 2]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect();
+        let rel = (rms(&left) - in_rms).abs() / in_rms;
+        assert!(rel < 0.25, "frame {f}: decoded RMS off by {rel:.3}");
+    }
+}
+
+#[test]
+fn independent_noise_channels_stay_uncorrelated() {
+    // Fully independent noise per channel: pair PNS still fires but
+    // the correlation flag must (essentially) never be set, and the
+    // decoded channels stay decorrelated.
+    let n = 5 * FRAME_LEN;
+    let l = noise_pcm(n, 8_000.0, 0xAAAA_1111);
+    let r = noise_pcm(n, 8_000.0, 0x5555_9999);
+    let mut pcm = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        pcm.push(l[i]);
+        pcm.push(r[i]);
+    }
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 96_000,
+    })
+    .unwrap();
+    enc.set_pns(true);
+    let stream = enc.encode_all(&pcm).unwrap();
+
+    let (both, correlated) = cpe_noise_stats(&stream);
+    eprintln!("independent-noise CPE: {both} both-noise bands, {correlated} correlated");
+    assert!(both > 30, "dense noise should engage pair PNS, got {both}");
+    assert!(
+        correlated * 10 <= both,
+        "independent noise must (almost) never flag correlation: {correlated}/{both}"
+    );
+
+    // Decoded channels stay decorrelated (independent draws).
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let steady = &out[FRAME_LEN * 2..];
+    let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
+    for p in steady.chunks_exact(2) {
+        let (a, b) = (f64::from(p[0]), f64::from(p[1]));
+        dot += a * b;
+        el += a * a;
+        er += b * b;
+    }
+    let corr = dot / (el * er).sqrt().max(1.0);
+    eprintln!("decoded L/R correlation = {corr:.4}");
+    assert!(
+        corr.abs() < 0.3,
+        "independent noise must decode decorrelated: {corr:.4}"
+    );
+}
+
 #[test]
 fn noise_input_engages_pns_and_preserves_energy() {
     let n = 6 * FRAME_LEN;

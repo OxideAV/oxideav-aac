@@ -173,7 +173,13 @@ encoder alongside the decoder under id `"aac"`.
   §4.6.8.1), intensity stereo (`intensity_stereo`, §4.6.8.2), and
   Perceptual Noise Substitution (`pns`, §4.6.13). PNS produces
   energy-exact bands; only the per-coefficient phase is RNG-defined per
-  §4.6.13.3, so its output is not byte-exact against any one decoder.
+  §4.6.13.3, so its output is not byte-exact against any one decoder —
+  the staged `docs/audio/aac/pns-gen-rand-vector.md` analysis pins the
+  normative half (band selection, energy DPCM, measured-energy
+  normalisation, correlated-CPE same-vector rule — all implemented)
+  and shows the generator recurrence/seed/threading to be deliberately
+  unspecified, so cross-decoder PNS checks are energy-domain by
+  design.
 - **Coupling channel element** (`cce`) — §4.6.8.3 / Table 4.8. The CCE
   coupling header (`CouplingHeader`: `ind_sw_cce_flag`,
   `num_coupled_elements`, the per-target `cc_target_is_cpe` /
@@ -667,9 +673,10 @@ EP-tool payload de-interleave is out of scope.
   transmitted once with codebook 15/14 + `is_pos` on the §4.6.8.1.4
   track; off by default because intensity coding discards the
   pair's side information), but does not
-  yet emit pulse data, keeps M/S, PNS and IS
-  long-frame-only (PNS mono-only — the CPE `ms_used` noise
-  correlation is an encode-side follow-up), codes eight one-window
+  yet emit pulse data, keeps M/S, PNS and IS long-frame-only
+  (CPE PNS emits the §4.6.13.3 `ms_used` correlated-noise
+  signalling — shared random vector — for both-channels-noise bands
+  correlating above 0.5), codes eight one-window
   groups per `EIGHT_SHORT` frame (no `scale_factor_grouping`
   merging), and supports 1–2 channels (no multichannel PCE-driven
   layouts). Codebook choice is smallest-LAV-fits rather than

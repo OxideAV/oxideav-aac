@@ -66,6 +66,24 @@
 //! closure so a caller can substitute a different (e.g. bit-exact
 //! reference) source without changing the synthesis maths.
 //!
+//! The staged clean-room analysis
+//! (`docs/audio/aac/pns-gen-rand-vector.md`) pins down exactly how
+//! far the standard constrains this tool: the band selection, the
+//! noise-energy DPCM, the `2^(0.25·noise_nrg)` target energy, the
+//! 2009 measured-energy normalisation, and the correlated-CPE
+//! same-vector rule are all normative (and implemented here), while
+//! the generator's recurrence, seed, word→coefficient mapping, and
+//! state-threading order are **deliberately unspecified** — the spec
+//! demands only signed values with a non-zero sum of squares, one
+//! multiply-accumulate each. Byte-exact PCM against any *particular*
+//! reference decoder's PNS output would require replicating that
+//! decoder's exact generator and threading order, which no document
+//! can pin; cross-decoder PNS validation is therefore an
+//! energy-domain comparison by design (the fixtures-doc §8 check),
+//! with the per-bin noise *phase* implementation-defined. The LCG
+//! below realises the doc's example recurrence
+//! (`state·1664525 + 1013904223`), one of the admissible family.
+//!
 //! ## §4.6.13.3 channel-pair correlation (`ms_used`)
 //!
 //! For a channel pair, if the **same** `(group, sfb)` is `NOISE_HCB` in
