@@ -551,6 +551,217 @@ fn fixture_transcode_preserves_the_signal() {
     }
 }
 
+// ---- §4.6.8.2 intensity stereo (encode side) ----
+
+/// Walk a stereo CPE ADTS stream and count the right channel's
+/// intensity-coded bands, split by phase: `(in_phase, out_of_phase)`
+/// — codebooks 15 (`INTENSITY_HCB`) and 14 (`INTENSITY_HCB2`).
+fn count_intensity_bands(stream: &[u8]) -> (usize, usize) {
+    use oxideav_aac::ics_body::IcsBody;
+    use oxideav_aac::ics_info::IcsInfo;
+    use oxideav_aac::spectral_data::SpectralData;
+    use oxideav_core::bits::BitReader;
+
+    let mut in_phase = 0usize;
+    let mut out_phase = 0usize;
+    let mut pos = 0usize;
+    while pos < stream.len() {
+        let (hdr, off) = AdtsHeader::parse(&stream[pos..]).expect("frame parses");
+        let payload = &stream[pos + off..pos + hdr.aac_frame_length as usize];
+        let mut br = BitReader::new(payload);
+        let id = br.read_u32(3).unwrap();
+        assert_eq!(id, 1, "expected CPE");
+        let _tag = br.read_u32(4).unwrap();
+        let common_window = br.read_bit().unwrap();
+        assert!(common_window, "encoder always emits common_window CPEs");
+        let info = IcsInfo::parse(&mut br, 2, hdr.sampling_frequency_index, true)
+            .expect("shared ics_info parses");
+        let ms_mask_present = br.read_u32(2).unwrap();
+        if ms_mask_present == 1 {
+            let bits = info.num_window_groups as u32 * info.max_sfb as u32;
+            for _ in 0..bits {
+                br.read_bit().unwrap();
+            }
+        }
+        // Left channel body + spectral data (skipped over to reach
+        // the right channel).
+        let left =
+            IcsBody::parse_with_ics_info(&mut br, &info, 2, false).expect("left body parses");
+        SpectralData::parse(
+            &mut br,
+            &info,
+            &left.section_data,
+            hdr.sampling_frequency_index,
+        )
+        .expect("left spectral data parses");
+        let right =
+            IcsBody::parse_with_ics_info(&mut br, &info, 2, false).expect("right body parses");
+        for group in &right.section_data.sfb_cb {
+            in_phase += group.iter().filter(|&&cb| cb == 15).count();
+            out_phase += group.iter().filter(|&&cb| cb == 14).count();
+        }
+        pos += hdr.aac_frame_length as usize;
+    }
+    (in_phase, out_phase)
+}
+
+/// A stereo pair whose high half is intensity-friendly: both
+/// channels carry the same dense multitone, with the right channel
+/// scaled by `gain` (sign carries the phase relation).
+fn scaled_pair(n: usize, gain: f64) -> Vec<i16> {
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64;
+        // Tones spread from low through high frequencies so both the
+        // discrete low bands and the IS-eligible high bands carry
+        // content.
+        let v = 6000.0 * (0.031 * t).sin()
+            + 4000.0 * (0.402 * t + 1.1).sin()
+            + 3000.0 * (1.31 * t + 0.4).sin()
+            + 2500.0 * (2.17 * t + 2.0).sin()
+            + 2000.0 * (2.9 * t + 0.7).sin();
+        out.push(v as i16);
+        out.push((gain * v) as i16);
+    }
+    out
+}
+
+#[test]
+fn correlated_high_bands_engage_intensity_stereo() {
+    let n = 6 * FRAME_LEN;
+    let pcm = scaled_pair(n, 0.5);
+    let config = EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128_000,
+    };
+    let mut enc = StreamEncoder::new(config).unwrap();
+    enc.set_intensity_stereo(true);
+    let stream = enc.encode_all(&pcm).unwrap();
+
+    let (in_phase, out_phase) = count_intensity_bands(&stream);
+    eprintln!("intensity bands: {in_phase} in-phase, {out_phase} out-of-phase");
+    assert!(
+        in_phase > 20,
+        "scaled identical channels should engage IS broadly, got {in_phase}"
+    );
+    assert_eq!(out_phase, 0, "positively correlated pair must be in-phase");
+
+    // Round-trip: the derived right channel tracks 0.5x the left in
+    // the IS bands; overall reconstruction stays bounded (IS is a
+    // perceptual tool — the bar is looser than discrete coding).
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("IS stream decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN * 2..]);
+    eprintln!("intensity-stereo round-trip err/sig RMS = {ratio:.5}");
+    assert!(ratio < 0.10, "IS round-trip ratio {ratio:.5}");
+
+    // The IS stream must be smaller than the same encode without IS
+    // (the whole point: high bands transmitted once).
+    let mut enc_off = StreamEncoder::new(config).unwrap();
+    let stream_off = enc_off.encode_all(&pcm).unwrap();
+    assert_eq!(count_intensity_bands(&stream_off), (0, 0));
+    eprintln!(
+        "IS stream {} bytes vs {} without",
+        stream.len(),
+        stream_off.len()
+    );
+    assert!(
+        stream.len() < stream_off.len(),
+        "IS should shrink the stream: {} vs {}",
+        stream.len(),
+        stream_off.len()
+    );
+}
+
+#[test]
+fn anti_correlated_pair_uses_out_of_phase_book() {
+    let n = 4 * FRAME_LEN;
+    let pcm = scaled_pair(n, -0.7);
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    enc.set_intensity_stereo(true);
+    let stream = enc.encode_all(&pcm).unwrap();
+    let (in_phase, out_phase) = count_intensity_bands(&stream);
+    eprintln!("anti-correlated: {in_phase} in-phase, {out_phase} out-of-phase");
+    assert!(
+        out_phase > 20,
+        "anti-correlated pair should use INTENSITY_HCB2, got {out_phase}"
+    );
+    assert_eq!(in_phase, 0);
+
+    // The reconstruction must preserve the inversion: decoded L and
+    // R must anti-correlate strongly in the steady state.
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let steady = &out[FRAME_LEN * 2..];
+    let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
+    for p in steady.chunks_exact(2) {
+        let (l, r) = (f64::from(p[0]), f64::from(p[1]));
+        dot += l * r;
+        el += l * l;
+        er += r * r;
+    }
+    let corr = dot / (el * er).sqrt();
+    eprintln!("decoded L/R correlation = {corr:.4}");
+    assert!(
+        corr < -0.9,
+        "inversion must survive the round-trip: {corr:.4}"
+    );
+}
+
+#[test]
+fn default_config_never_emits_intensity() {
+    let n = 3 * FRAME_LEN;
+    let pcm = scaled_pair(n, 0.5);
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    let stream = enc.encode_all(&pcm).unwrap();
+    assert_eq!(count_intensity_bands(&stream), (0, 0));
+}
+
+#[test]
+fn uncorrelated_high_bands_stay_discrete_under_is() {
+    // Independent channels: even with IS enabled, no band clears the
+    // correlation threshold, so the encode is bit-identical to the
+    // IS-off encode.
+    let n = 3 * FRAME_LEN;
+    let mut pcm = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f64;
+        pcm.push((6000.0 * (1.37 * t).sin()) as i16);
+        pcm.push((6000.0 * (2.11 * t + 0.9).sin()) as i16);
+    }
+    let config = EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 160_000,
+    };
+    let mut enc_on = StreamEncoder::new(config).unwrap();
+    enc_on.set_intensity_stereo(true);
+    let with_is = enc_on.encode_all(&pcm).unwrap();
+    assert_eq!(count_intensity_bands(&with_is), (0, 0));
+    let mut enc_off = StreamEncoder::new(config).unwrap();
+    let without = enc_off.encode_all(&pcm).unwrap();
+    assert_eq!(with_is, without, "no qualifying band ⇒ identical streams");
+}
+
 // ---- §4.6.9 TNS (encode side) ----
 
 /// Count transmitted TNS filters across a mono SCE ADTS stream.

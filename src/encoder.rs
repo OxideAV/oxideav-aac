@@ -73,8 +73,17 @@
 //!   least ~9 dB lopsided, so the quiet one culls or codes cheaply).
 //!   The mask is emitted as `ms_mask_present = 2` when every band
 //!   flags (identical / phase-inverted channels), `1` + explicit
-//!   mask when mixed, `0` when no band benefits. No intensity
-//!   stereo on the encode side yet.
+//!   mask when mixed, `0` when no band benefits.
+//! * **Intensity stereo (§4.6.8.2, opt-in)** — with
+//!   [`StreamEncoder::set_intensity_stereo`], a high-frequency
+//!   long-frame CPE band whose channels correlate above
+//!   [`IS_CORR_MIN`] is transmitted once: the right channel's band
+//!   becomes the intensity pseudo codebook (15 in-phase / 14
+//!   out-of-phase) carrying only `is_pos = 2·log2(e_l/e_r)` on the
+//!   §4.6.8.1.4 DPCM track; the decoder derives
+//!   `r = ±0.5^(0.25·is_pos)·l` (§4.6.8.2.3). IS bands are excluded
+//!   from the M/S mask (per-band mutual exclusion; a set `ms_used`
+//!   bit would signal phase reversal instead).
 //! * **TNS (§4.6.9, default on)** — per analysis window, the
 //!   [`crate::encoder_tns`] pass measures the prediction gain of an
 //!   LPC over the coverable spectral region (Levinson-Durbin on the
@@ -122,7 +131,9 @@ use crate::raw_data_block::{FrameAssembler, IdSynEle};
 use crate::scale_factor_data::{
     differentiate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET,
 };
-use crate::section_data::{Section, SectionData, NOISE_HCB, ZERO_HCB};
+use crate::section_data::{
+    Section, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB,
+};
 use crate::spectral_codebook::MAX_QUANT;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::{
@@ -258,6 +269,9 @@ pub struct StreamEncoder {
     pns_enabled: bool,
     /// §4.6.9 TNS emission toggle — see [`StreamEncoder::set_tns`].
     tns_enabled: bool,
+    /// §4.6.8.2 intensity-stereo emission toggle — see
+    /// [`StreamEncoder::set_intensity_stereo`].
+    is_enabled: bool,
 }
 
 impl StreamEncoder {
@@ -279,6 +293,7 @@ impl StreamEncoder {
             short_pending: false,
             pns_enabled: false,
             tns_enabled: true,
+            is_enabled: false,
         })
     }
 
@@ -313,6 +328,30 @@ impl StreamEncoder {
     /// simply carry no filter.
     pub fn set_tns(&mut self, enabled: bool) {
         self.tns_enabled = enabled;
+    }
+
+    /// Enable / disable §4.6.8.2 intensity-stereo emission (default
+    /// **off**).
+    ///
+    /// When enabled, a high-frequency scalefactor band of a
+    /// long-frame CPE whose two channels are strongly correlated
+    /// (normalised cross-correlation above
+    /// [`IS_CORR_MIN`]) is transmitted **once**: the left channel
+    /// carries its spectrum, the right channel's band becomes the
+    /// pseudo codebook `INTENSITY_HCB` (15, in-phase) or
+    /// `INTENSITY_HCB2` (14, out-of-phase) with an intensity
+    /// position `is_pos = 2·log2(e_l/e_r)` on the §4.6.8.1.4 DPCM
+    /// track, and the decoder derives
+    /// `r = ±0.5^(0.25·is_pos) · l` per §4.6.8.2.3. Such bands are
+    /// excluded from the M/S mask (M/S, IS and PNS are mutually
+    /// exclusive per band, and a set `ms_used` bit on an intensity
+    /// band would signal the §4.6.8.2.3 phase reversal instead).
+    /// Off by default: intensity coding discards the side
+    /// information of the pair (only the energy ratio survives), a
+    /// perceptual trade appropriate for low-rate coding but not for
+    /// transparent transcodes.
+    pub fn set_intensity_stereo(&mut self, enabled: bool) {
+        self.is_enabled = enabled;
     }
 
     /// The configuration this encoder was built with.
@@ -525,11 +564,19 @@ impl StreamEncoder {
         // mask (correlated vs independent noise, §4.6.13.3) — an
         // encode-side follow-up.
         let pns_allowed = self.pns_enabled && spectra.len() == 1;
-        let quantize = |spec: &[f64], peak: f64| -> Result<QuantizedChannel> {
+        let quantize = |spec: &[f64], peak: f64, is_bands: &[IsBand]| -> Result<QuantizedChannel> {
             if seq == WindowSequence::EightShort {
                 quantize_channel_short(spec, self.fs_index, sf_offset, peak)
             } else {
-                quantize_channel(spec, seq, self.fs_index, sf_offset, peak, pns_allowed)
+                quantize_channel(
+                    spec,
+                    seq,
+                    self.fs_index,
+                    sf_offset,
+                    peak,
+                    pns_allowed,
+                    is_bands,
+                )
             }
         };
         // Attach a channel's TNS record to its wire body.
@@ -542,7 +589,7 @@ impl StreamEncoder {
         match spectra {
             [mono] => {
                 let peak = mono.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-                let mut chan = quantize(mono, peak)?;
+                let mut chan = quantize(mono, peak, &[])?;
                 attach_tns(&mut chan, &tns[0]);
                 asm.push_channel_header(IdSynEle::Sce, 0)?;
                 chan.body.write(&mut body_bits, 2, self.fs_index, false)?;
@@ -554,6 +601,18 @@ impl StreamEncoder {
                 )?;
             }
             [l_spec, r_spec] => {
+                // §4.6.8.2: per-band intensity decision first (opt-in,
+                // long frames) — an IS band is transmitted once via
+                // the left channel and must not also be M/S-coded
+                // (mutual exclusion; a set ms_used bit on an
+                // intensity band signals the §4.6.8.2.3 phase
+                // reversal, not an M/S de-matrix).
+                let is_bands: Vec<IsBand> = if self.is_enabled && seq != WindowSequence::EightShort
+                {
+                    is_decide(l_spec, r_spec, self.fs_index)?
+                } else {
+                    Vec::new()
+                };
                 // §4.6.8.1: per-band M/S decision, then quantize the
                 // coding spectra (m/s on flagged bands, l/r
                 // elsewhere). Both coding channels share the pair's
@@ -561,22 +620,29 @@ impl StreamEncoder {
                 // channel's noise floor is judged against the pair,
                 // not against its own (often tiny) peak. Short frames
                 // code the channels independently (mask 0) for now.
-                let ms_used = if seq == WindowSequence::EightShort {
+                let mut ms_used = if seq == WindowSequence::EightShort {
                     vec![]
                 } else {
                     ms_decide(l_spec, r_spec, self.fs_index)?
                 };
-                let (code_l, code_r) = if ms_used.is_empty() {
-                    (l_spec.to_vec(), r_spec.to_vec())
-                } else {
+                for (sfb, band) in is_bands.iter().enumerate() {
+                    if band.is_some() {
+                        if let Some(m) = ms_used.get_mut(sfb) {
+                            *m = false;
+                        }
+                    }
+                }
+                let (code_l, code_r) = if ms_used.iter().any(|&b| b) {
                     apply_ms(l_spec, r_spec, &ms_used, self.fs_index)?
+                } else {
+                    (l_spec.to_vec(), r_spec.to_vec())
                 };
                 let pair_peak = code_l
                     .iter()
                     .chain(code_r.iter())
                     .fold(0.0f64, |m, &v| m.max(v.abs()));
-                let mut left = quantize(&code_l, pair_peak)?;
-                let mut right = quantize(&code_r, pair_peak)?;
+                let mut left = quantize(&code_l, pair_peak, &[])?;
+                let mut right = quantize(&code_r, pair_peak, &is_bands)?;
                 attach_tns(&mut left, &tns[0]);
                 attach_tns(&mut right, &tns[1]);
 
@@ -785,6 +851,98 @@ struct QuantizedChannel {
     spectral: SpectralData,
 }
 
+/// One band's §4.6.8.2 intensity-stereo decision: `None` codes the
+/// band normally; `Some((codebook, is_pos))` transmits the right
+/// channel's band as the intensity book (15 in-phase / 14
+/// out-of-phase) at the given position on the `0.5^(0.25·is_pos)`
+/// gain ladder.
+type IsBand = Option<(u8, i32)>;
+
+/// Lowest spectral line an intensity-coded band may start at:
+/// intensity stereo exploits the ear's insensitivity to phase at
+/// high frequencies (§4.6.8.2.1), so the bottom quarter of the
+/// spectrum always keeps discrete coding.
+const IS_MIN_SPECTRAL_LINE: usize = FRAME_LEN / 4;
+
+/// Minimum normalised cross-correlation `|Σ l·r| / sqrt(Σl²·Σr²)`
+/// for a band to qualify for intensity coding. Deliberately strict:
+/// a genuine intensity image (shared content at a per-channel gain)
+/// measures ≈ 1.0, while the leakage skirts of two *different*
+/// tones — deterministic, slowly-decaying magnitude profiles — were
+/// measured correlating as high as 0.93 on synthetic two-tone
+/// content; IS-coding those would substitute the wrong (if masked)
+/// waveform for no bit win over the cull they get anyway.
+pub const IS_CORR_MIN: f64 = 0.95;
+
+/// Relative peak floor for the intensity decision: a band whose
+/// loudest coefficient (either channel) sits more than ~50 dB below
+/// the pair's frame peak carries only leakage floor — the *distant*
+/// skirts of any two windowed tones are smooth deterministic decays
+/// that correlate near 1.0 regardless of the tones' relation
+/// (measured 0.98 between two unrelated tones' far tails), so
+/// correlation alone cannot vet an image down there, and a band that
+/// quiet codes for almost nothing (or culls) discretely anyway.
+const IS_PEAK_FLOOR_RATIO: f64 = 3e-3;
+
+/// §4.6.8.2 per-band intensity-stereo decision (encode side) for a
+/// long-frame channel pair.
+///
+/// A band qualifies when it lies above [`IS_MIN_SPECTRAL_LINE`],
+/// both channels carry energy, and the normalised cross-correlation
+/// clears [`IS_CORR_MIN`]. The transmitted position quantises the
+/// energy ratio onto the §4.6.8.2.3 gain ladder —
+/// `0.5^(0.25·is_pos) = sqrt(e_r/e_l)` ⇒ `is_pos = 2·log2(e_l/e_r)`
+/// — and the codebook carries the phase: `INTENSITY_HCB` (15) when
+/// the channels correlate positively, `INTENSITY_HCB2` (14) when
+/// they anti-correlate.
+fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>> {
+    let offsets = long_window_offsets(fs_index)?;
+    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let frame_peak = l_spec
+        .iter()
+        .chain(r_spec.iter())
+        .fold(0.0f64, |m, &v| m.max(v.abs()));
+    let peak_floor = frame_peak * IS_PEAK_FLOOR_RATIO;
+    let mut out: Vec<IsBand> = vec![None; num_swb];
+    for (sfb, slot) in out.iter_mut().enumerate() {
+        let start = offsets[sfb] as usize;
+        let end = offsets[sfb + 1] as usize;
+        if start < IS_MIN_SPECTRAL_LINE {
+            continue;
+        }
+        let mut e_l = 0.0f64;
+        let mut e_r = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut band_peak = 0.0f64;
+        for k in start..end {
+            e_l += l_spec[k] * l_spec[k];
+            e_r += r_spec[k] * r_spec[k];
+            dot += l_spec[k] * r_spec[k];
+            band_peak = band_peak.max(l_spec[k].abs()).max(r_spec[k].abs());
+        }
+        if e_l <= 0.0 || e_r <= 0.0 || band_peak < peak_floor {
+            continue;
+        }
+        let corr = dot.abs() / (e_l * e_r).sqrt();
+        if corr < IS_CORR_MIN {
+            continue;
+        }
+        let pos = (2.0 * (e_l / e_r).log2()).round();
+        // Keep the position within a range the ±60-delta track can
+        // plausibly reach; a >±30 dB imbalance codes better discretely.
+        if !(-80.0..=80.0).contains(&pos) {
+            continue;
+        }
+        let cb = if dot >= 0.0 {
+            INTENSITY_HCB
+        } else {
+            INTENSITY_HCB2
+        };
+        *slot = Some((cb, pos as i32));
+    }
+    Ok(out)
+}
+
 /// §4.6.8.1 per-band M/S decision for a channel pair.
 ///
 /// A band selects M/S coding when the mid/side transform
@@ -906,6 +1064,10 @@ struct GroupQuant {
     /// §4.6.13 noise energies for PNS bands (`sfb_cb == NOISE_HCB`):
     /// the band's target L2 norm on the `2^(0.25·noise_nrg)` ladder.
     noise: Vec<Option<i32>>,
+    /// §4.6.8.2 intensity positions for IS bands (`sfb_cb == 14/15`,
+    /// right channel of a CPE only): the position on the
+    /// `0.5^(0.25·is_pos)` gain ladder.
+    is_pos: Vec<Option<i32>>,
 }
 
 /// Quantize the `num_swb` scalefactor bands of one window group.
@@ -981,6 +1143,31 @@ fn quantize_group(
         sfb_cb,
         sfs,
         noise,
+        is_pos: vec![None; num_swb],
+    }
+}
+
+/// Rewrite the right channel's IS-selected bands (§4.6.8.2 encode
+/// side): the band's codebook becomes the transmitted intensity book
+/// (15 in-phase / 14 out-of-phase), its coefficients are dropped
+/// (intensity bands carry no spectral data — the decoder derives
+/// them from the left channel), its spectrum scalefactor is retired,
+/// and the intensity position lands on the §4.6.8.1.4 `is_pos`
+/// track.
+fn apply_is_overrides(group: &mut GroupQuant, is_bands: &[IsBand], offsets: &[u16]) {
+    for (sfb, band) in is_bands.iter().enumerate().take(group.sfb_cb.len()) {
+        let Some((cb, pos)) = band else {
+            continue;
+        };
+        let start = offsets[sfb] as usize;
+        let end = (offsets[sfb + 1] as usize).min(group.x_quant.len());
+        for q in &mut group.x_quant[start..end] {
+            *q = 0;
+        }
+        group.sfb_cb[sfb] = *cb;
+        group.sfs[sfb] = None;
+        group.noise[sfb] = None;
+        group.is_pos[sfb] = Some(*pos);
     }
 }
 
@@ -1024,6 +1211,11 @@ fn scalefactor_track(groups: &[GroupQuant]) -> (u8, AbsoluteScaleFactors) {
         .unwrap_or(SF_OFFSET) as u8;
     let mut last_nrg = i32::from(global_gain) - NOISE_OFFSET - 256;
     let mut first_noise = true;
+    // §4.6.8.1.4: the intensity-position track seeds at 0 and takes
+    // the same Huffman ±60 deltas as scalefactors; requested
+    // positions are clamped onto the feasible track like the noise
+    // energies above.
+    let mut last_is = 0i32;
     let mut entries = Vec::with_capacity(groups.len());
     for g in groups {
         let mut group_out = Vec::new();
@@ -1040,6 +1232,10 @@ fn scalefactor_track(groups: &[GroupQuant]) -> (u8, AbsoluteScaleFactors) {
                 first_noise = false;
                 last_nrg += clamped;
                 group_out.push(AbsoluteScaleFactorEntry::NoiseNrg(last_nrg));
+            } else if let Some(pos) = g.is_pos[sfb] {
+                let delta = (pos - last_is).clamp(-MAX_SF_DELTA, MAX_SF_DELTA);
+                last_is += delta;
+                group_out.push(AbsoluteScaleFactorEntry::IsPos(last_is as i16));
             }
         }
         entries.push(group_out);
@@ -1103,7 +1299,10 @@ fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> Result<QuantizedCha
 /// one of the three long sequences (it lands in the `ics_info`);
 /// `frame_peak` anchors the masking spread and cull — the channel's
 /// own peak for mono, the pair's loudest peak for a jointly-coded
-/// CPE.
+/// CPE. A non-empty `is_bands` (the right channel of an
+/// intensity-coding CPE) rewrites the selected bands into §4.6.8.2
+/// intensity records after quantization.
+#[allow(clippy::too_many_arguments)]
 fn quantize_channel(
     spec: &[f64],
     seq: WindowSequence,
@@ -1111,13 +1310,14 @@ fn quantize_channel(
     sf_offset: i32,
     frame_peak: f64,
     pns_allowed: bool,
+    is_bands: &[IsBand],
 ) -> Result<QuantizedChannel> {
     debug_assert_eq!(spec.len(), FRAME_LEN);
     debug_assert!(seq != WindowSequence::EightShort);
     let offsets = long_window_offsets(fs_index)?;
     let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
     let mut prev_sf: Option<i32> = None;
-    let group = quantize_group(
+    let mut group = quantize_group(
         spec,
         offsets,
         num_swb,
@@ -1126,6 +1326,9 @@ fn quantize_channel(
         &mut prev_sf,
         pns_allowed,
     );
+    if !is_bands.is_empty() {
+        apply_is_overrides(&mut group, is_bands, offsets);
+    }
     let info = IcsInfo {
         ics_reserved_bit: false,
         window_sequence: seq,

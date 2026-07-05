@@ -661,8 +661,13 @@ EP-tool payload de-interleave is out of scope.
   under a time-domain temporal-envelope gate, PARCOR quantised on
   the §4.6.9.3 4-bit arcsine grid, and the §4.6.7.4.1 all-zero
   analysis pass derived from the *wire* coefficients so the
-  decoder's all-pole synthesis is its exact inverse), but does not
-  yet emit intensity stereo or pulse data, keeps M/S and PNS
+  decoder's all-pole synthesis is its exact inverse) and opt-in
+  §4.6.8.2 intensity-stereo emission
+  (`StreamEncoder::set_intensity_stereo` — correlated high bands
+  transmitted once with codebook 15/14 + `is_pos` on the §4.6.8.1.4
+  track; off by default because intensity coding discards the
+  pair's side information), but does not
+  yet emit pulse data, keeps M/S, PNS and IS
   long-frame-only (PNS mono-only — the CPE `ms_used` noise
   correlation is an encode-side follow-up), codes eight one-window
   groups per `EIGHT_SHORT` frame (no `scale_factor_grouping`

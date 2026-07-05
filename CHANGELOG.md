@@ -13,6 +13,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   PARCOR quantisation on the §4.6.9.3 4-bit arcsine grid, and the
   §4.6.7.4.1 all-zero analysis pass derived from the wire coefficients
   (exact inverse of the decoder's synthesis filter); `set_tns` toggle
+- encoder §4.6.8.2 intensity-stereo emission (opt-in
+  `set_intensity_stereo`): correlated high-frequency CPE bands
+  transmitted once via the left channel with codebook 15/14 and
+  `is_pos = 2·log2(e_l/e_r)` on the §4.6.8.1.4 DPCM track, excluded
+  from the M/S mask (per-band mutual exclusion)
 
 ## [0.1.6](https://github.com/OxideAV/oxideav-aac/compare/v0.1.5...v0.1.6) - 2026-07-03
 
