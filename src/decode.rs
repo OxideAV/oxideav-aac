@@ -40,11 +40,13 @@ use oxideav_core::bits::BitReader;
 
 use crate::adts::AdtsHeader;
 use crate::cce::CouplingChannelElement;
+use crate::channel_map::PceElementKind;
 use crate::element_decode::{ChannelInput, CpeJointStereo, ElementDecoder};
 use crate::extension_payload::{ExtensionPayload, ExtensionPayloadOrSbr};
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
 use crate::ms_stereo::MsMaskPresent;
+use crate::pce::Pce;
 use crate::pcm::interleave_s16;
 use crate::raw_data_block::{Element, IdSynEle, Walker};
 use crate::sbr_decoder::SbrDecoder;
@@ -52,6 +54,18 @@ use crate::sbr_extension::SbrExtensionData;
 use crate::sbr_header::SbrHeader;
 use crate::spectral_data::SpectralData;
 use crate::{Error, Result};
+
+/// Map a channel element's [`IdSynEle`] to its §8.5.2.2 PCE reference
+/// kind. `None` for elements a PCE never addresses as an output
+/// channel (CCE contributes no output channel here).
+fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
+    match kind {
+        IdSynEle::Sce => Some(PceElementKind::Sce),
+        IdSynEle::Cpe => Some(PceElementKind::Cpe),
+        IdSynEle::Lfe => Some(PceElementKind::Lfe),
+        _ => None,
+    }
+}
 
 /// The §4.6.11 per-frame sample count for the 1024-line transform
 /// family (the only family this crate's `swb_offset` layout covers).
@@ -99,6 +113,12 @@ pub struct StreamDecoder {
     /// through the §4.6.18.5 pure-upsampling path so the output rate
     /// never flaps.
     sbr_active: bool,
+    /// The active `program_config_element()` for
+    /// `channelConfiguration == 0` streams — captured from an in-band
+    /// PCE (§8.5.2.2: it takes effect at the block carrying it and
+    /// persists) or installed by [`Self::set_program_config`] when the
+    /// PCE rides inline in an out-of-band `AudioSpecificConfig`.
+    program_config: Option<Pce>,
 }
 
 impl StreamDecoder {
@@ -106,6 +126,19 @@ impl StreamDecoder {
     #[must_use]
     pub fn new() -> Self {
         StreamDecoder::default()
+    }
+
+    /// Install the program configuration of a
+    /// `channelConfiguration == 0` stream whose
+    /// `program_config_element()` rides *outside* the AAC payload —
+    /// inline in the `AudioSpecificConfig` (the MP4 / LATM case,
+    /// [`crate::asc::GaSpecificConfig::pce`]) or an `adif_header()`.
+    /// An in-band PCE inside a later `raw_data_block()` replaces it
+    /// (§8.5.2.2 persistence). The active PCE drives the §8.5.2.2
+    /// element→speaker canonical output reorder; without one, a
+    /// config-0 stream is emitted in bitstream element order.
+    pub fn set_program_config(&mut self, pce: Pce) {
+        self.program_config = Some(pce);
     }
 
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
@@ -259,7 +292,13 @@ impl StreamDecoder {
                             }
                         }
                     }
-                    Element::Data { .. } | Element::ProgramConfig(_) => {}
+                    Element::Data { .. } => {}
+                    Element::ProgramConfig(pce) => {
+                        // §8.5.2.2: the configuration takes effect at
+                        // the raw_data_block() containing the PCE and
+                        // persists until a new PCE arrives.
+                        self.program_config = Some(pce);
+                    }
                     Element::End => continue 'blocks,
                 }
             }
@@ -273,6 +312,10 @@ impl StreamDecoder {
         }
 
         let mut channels: Vec<Vec<f64>> = Vec::new();
+        // Per decoded element: (kind, instance tag, contributed
+        // channel count) — the descriptor list the §8.5.2.2 PCE
+        // reorder keys on for `channelConfiguration == 0`.
+        let mut element_desc: Vec<(PceElementKind, u8, usize)> = Vec::new();
         let mut out_rate = sample_rate;
         if self.sbr_active {
             out_rate = fs_sbr;
@@ -289,10 +332,16 @@ impl StreamDecoder {
                     Some(ext) => dec.process_frame(ext, &core)?,
                     None => dec.upsample_frame(&core)?,
                 };
+                if let Some(kind) = pce_kind(el.kind) {
+                    element_desc.push((kind, el.key.1, up.len()));
+                }
                 channels.extend(up);
             }
         } else {
             for el in elements {
+                if let Some(kind) = pce_kind(el.kind) {
+                    element_desc.push((kind, el.key.1, el.channels.len()));
+                }
                 channels.extend(el.channels);
             }
         }
@@ -301,8 +350,22 @@ impl StreamDecoder {
         // which loudspeaker each decoded element feeds. Reorder the
         // element-order channel buffers into the canonical interleaved
         // layout (a no-op for mono/stereo and for the configs this crate
-        // does not yet reorder — see `channel_map`).
-        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
+        // does not yet reorder — see `channel_map`). A
+        // `channelConfiguration == 0` frame is reordered by the active
+        // §8.5.2.2 PCE instead, when one is installed and it maps onto
+        // canonical positions; otherwise element order is kept.
+        let channels = if channel_configuration == 0 {
+            match self
+                .program_config
+                .as_ref()
+                .and_then(|pce| crate::channel_map::pce_reorder_permutation(pce, &element_desc))
+            {
+                Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
+                None => channels,
+            }
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
 
         let pcm = interleave_s16(&channels)?;
         Ok(DecodedFrame {

@@ -581,17 +581,26 @@ EP-tool payload de-interleave is out of scope.
   `channelConfiguration` through `decode_raw_data_block` and applies the
   reorder for default configs **1–6**; mono / stereo are identity
   permutations and configs **0** (PCE-defined) / **7** (the
-  amendment-specific 7.1 element→speaker mapping) are left in element
-  order pending a later pass. The reorder is validated end to end
-  against the staged 5.1 fixture: a minimal ISO 14496-12 sample-table
-  walk in `tests/multichannel_mp4.rs` feeds the `.m4a` access units
-  through `decode_raw_data_block` at config 6 and lands within
-  2.4e-4–8.9e-4 per-channel err/sig RMS of the reference decode (the
-  stream carries PNS bands, so the fixtures-doc §8 RMS domain is the
-  correct comparison), with the silent LFE reproduced exactly and the
-  per-channel source tones pinning the speaker order. The staged 7.1
-  fixture signals `channelConfiguration 0` (PCE-defined) and awaits
-  the PCE→speaker mapping pass.
+  amendment-specific 7.1 element→speaker mapping) is left in element
+  order pending a later pass. **Config 0 (PCE-defined) layouts are
+  now mapped**: `channel_map::pce_speaker_assignment` implements the
+  ISO/IEC 13818-7 §8.5.2.2 rules — the front list center-outward
+  (lone SCE = center, SCE pairs L-then-R, two front pairs = the
+  Table 42 inner Lc/Rc + outer L/R arrangement), the side list front
+  to back, the back list outside-in (outer pair = side surround,
+  inner = rear; a final unpaired SCE = rear center), one LFE — keyed
+  by `(element kind, instance tag)` so the block's element order is
+  irrelevant; unmappable shapes fall back to element order. The
+  decode driver captures an in-band PCE (§8.5.2.2 persistence),
+  `StreamDecoder::set_program_config` installs an out-of-band
+  (ASC-inline) one, and the LATM driver does so automatically. The
+  whole path is validated end to end in `tests/multichannel_mp4.rs`
+  (a minimal ISO 14496-12 sample-table + esds walk): the 5.1
+  config-6 fixture at 2.4e-4–8.9e-4 per-channel err/sig RMS, the
+  **7.1 PCE fixture at 2e-5–2.9e-4**, and the **hexagonal custom
+  6.0 PCE fixture at 2.2e-4–7.8e-4** — every speaker carries a
+  distinct source tone, so the per-channel ratios pin the mapping
+  (silent LFEs reproduced exactly).
 - **Stream-level ADTS decode driver** (`decode`) — `StreamDecoder` walks
   the §4.4.2.1 `raw_data_block()` of each ADTS frame above the
   per-element driver, keying one `ElementDecoder` per

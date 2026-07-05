@@ -8,6 +8,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §8.5.2.2 PCE-driven channel mapping for `channelConfiguration 0`:
+  front/side/back list rules (center-outward, front-to-back,
+  outside-in, lone-SCE centers) keyed by element kind + instance tag;
+  in-band PCE captured with §8.5.2.2 persistence,
+  `StreamDecoder::set_program_config` for ASC-inline PCEs (LATM wires
+  it automatically); 7.1 and hexagonal PCE MP4 fixtures validated at
+  2e-5-7.8e-4 per-channel err/sig RMS
 - 5.1 multichannel validation against the staged MP4 fixture: minimal
   ISO 14496-12 sample-table walk feeding `decode_raw_data_block` at
   config 6; per-channel err/sig RMS 2.4e-4-8.9e-4 with the Table 1.19

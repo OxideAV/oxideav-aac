@@ -961,6 +961,15 @@ impl LoasDecoder {
         // PS (HE-AAC v2) synthesis is not implemented, so a PS stream
         // decodes its HE-AAC v1 layer.
         let dec = self.streams.entry(payload.stream_id).or_default();
+        // A channelConfiguration-0 layer carries its layout in the
+        // ASC's inline program_config_element(); install it so the
+        // §8.5.2.2 canonical output reorder applies (an in-band PCE in
+        // a later raw_data_block() still supersedes it).
+        if asc.channel_configuration == 0 {
+            if let Some(pce) = &asc.ga_body.pce {
+                dec.set_program_config(pce.clone());
+            }
+        }
         // LATM carries exactly one raw_data_block() per payload.
         dec.decode_raw_data_block(
             asc.aot,
