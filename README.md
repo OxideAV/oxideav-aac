@@ -656,8 +656,13 @@ EP-tool payload de-interleave is out of scope.
   (`StreamEncoder::set_pns` — off by default because a single-frame
   spectral statistic cannot tell true noise from noise-shaped
   deterministic content such as sweeps; default-on awaits a
-  cross-frame tonality measure), but does not yet emit TNS,
-  intensity stereo, or pulse data, keeps M/S and PNS
+  cross-frame tonality measure) and default-on §4.6.9 TNS emission
+  (`encoder_tns`: per-window Levinson-Durbin prediction-gain decision
+  under a time-domain temporal-envelope gate, PARCOR quantised on
+  the §4.6.9.3 4-bit arcsine grid, and the §4.6.7.4.1 all-zero
+  analysis pass derived from the *wire* coefficients so the
+  decoder's all-pole synthesis is its exact inverse), but does not
+  yet emit intensity stereo or pulse data, keeps M/S and PNS
   long-frame-only (PNS mono-only — the CPE `ms_used` noise
   correlation is an encode-side follow-up), codes eight one-window
   groups per `EIGHT_SHORT` frame (no `scale_factor_grouping`

@@ -551,6 +551,124 @@ fn fixture_transcode_preserves_the_signal() {
     }
 }
 
+// ---- §4.6.9 TNS (encode side) ----
+
+/// Count transmitted TNS filters across a mono SCE ADTS stream.
+fn count_tns_filters(stream: &[u8]) -> usize {
+    use oxideav_aac::ics_body::IcsBody;
+    use oxideav_core::bits::BitReader;
+
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    while pos < stream.len() {
+        let (hdr, off) = AdtsHeader::parse(&stream[pos..]).expect("frame parses");
+        let payload = &stream[pos + off..pos + hdr.aac_frame_length as usize];
+        let mut br = BitReader::new(payload);
+        let id = br.read_u32(3).unwrap();
+        assert_eq!(id, 0, "expected SCE");
+        let _tag = br.read_u32(4).unwrap();
+        let body = IcsBody::parse(&mut br, 2, hdr.sampling_frequency_index, false)
+            .expect("ics body parses");
+        if let Some(tns) = &body.tns_data {
+            count += tns.windows.iter().map(|w| w.filters.len()).sum::<usize>();
+        }
+        pos += hdr.aac_frame_length as usize;
+    }
+    count
+}
+
+/// Deterministic burst-and-decay noise: a fresh noise burst every
+/// 1024 samples decaying with time constant `tau` — a strongly
+/// non-flat temporal envelope inside every long analysis window
+/// (the §4.6.9.1 case TNS exists for), while the burst-to-burst
+/// period keeps the block-switching detector quiet (each new burst
+/// jumps only ~2.3x over the previous burst's retained maximum).
+fn burst_decay_noise(n: usize, amp: f64, tau: f64, seed: u32) -> Vec<i16> {
+    let mut state = seed;
+    (0..n)
+        .map(|i| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (state as i32) as f64 / 2_147_483_648.0;
+            let phase = (i % FRAME_LEN) as f64;
+            (amp * (-phase / tau).exp() * noise) as i16
+        })
+        .collect()
+}
+
+#[test]
+fn burst_decay_noise_engages_tns_and_roundtrips() {
+    let n = 6 * FRAME_LEN;
+    let pcm = burst_decay_noise(n, 8_000.0, 300.0, 0x5EED_5EED);
+    let config = EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 128_000,
+    };
+    let mut enc = StreamEncoder::new(config).unwrap();
+    let stream = enc.encode_all(&pcm).unwrap();
+
+    // The burst-decay envelope must clear the temporal gate and the
+    // prediction-gain threshold on a substantial number of frames.
+    let filters = count_tns_filters(&stream);
+    eprintln!("TNS filters across the burst-decay stream: {filters}");
+    assert!(
+        filters >= 3,
+        "burst-decay noise should engage TNS, got {filters} filters"
+    );
+
+    // The stream must still round-trip through our decoder (whose
+    // §4.6.9.3 synthesis pass inverts the applied analysis filter).
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("TNS stream decodes");
+    let mut out = Vec::new();
+    for f in &frames {
+        out.extend_from_slice(&f.pcm);
+    }
+    let ratio = err_to_signal_rms(&pcm, &out[FRAME_LEN..]);
+    eprintln!("burst-decay TNS round-trip err/sig RMS = {ratio:.5}");
+
+    // With TNS disabled the same content carries no filters.
+    let mut enc_off = StreamEncoder::new(config).unwrap();
+    enc_off.set_tns(false);
+    let stream_off = enc_off.encode_all(&pcm).unwrap();
+    assert_eq!(count_tns_filters(&stream_off), 0);
+    // A/B: the TNS path must not degrade the reconstruction (noise
+    // content codes coarsely at any setting; TNS re-shapes the error
+    // in time rather than shrinking it, so parity is the bar).
+    let mut dec_off = StreamDecoder::new();
+    let frames_off = dec_off.decode_all(&stream_off).expect("TNS-off decodes");
+    let mut out_off = Vec::new();
+    for f in &frames_off {
+        out_off.extend_from_slice(&f.pcm);
+    }
+    let ratio_off = err_to_signal_rms(&pcm, &out_off[FRAME_LEN..]);
+    eprintln!("burst-decay TNS-off err/sig RMS = {ratio_off:.5}");
+    assert!(
+        ratio < ratio_off * 1.15,
+        "TNS must not degrade the round-trip: {ratio:.5} vs {ratio_off:.5} without"
+    );
+}
+
+#[test]
+fn steady_tonal_content_stays_tns_free() {
+    // The temporal gate must keep TNS off steady tonal windows even
+    // though their leakage skirts show spectral prediction gain.
+    let n = 5 * FRAME_LEN;
+    let pcm = multitone(n, 1);
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 1,
+        bitrate: 128_000,
+    })
+    .unwrap();
+    let stream = enc.encode_all(&pcm).unwrap();
+    assert_eq!(
+        count_tns_filters(&stream),
+        0,
+        "steady multitone must not engage TNS"
+    );
+}
+
 // ---- §4.6.13 PNS (encode side) ----
 
 /// Deterministic pseudo-noise on the ±`amp` axis (32-bit LCG).

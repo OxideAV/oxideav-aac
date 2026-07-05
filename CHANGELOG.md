@@ -6,6 +6,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- encoder §4.6.9 TNS emission (default on): per-window Levinson-Durbin
+  prediction-gain decision under a time-domain temporal-envelope gate,
+  PARCOR quantisation on the §4.6.9.3 4-bit arcsine grid, and the
+  §4.6.7.4.1 all-zero analysis pass derived from the wire coefficients
+  (exact inverse of the decoder's synthesis filter); `set_tns` toggle
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-aac/compare/v0.1.5...v0.1.6) - 2026-07-03
 
 ### Other

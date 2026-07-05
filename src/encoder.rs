@@ -73,8 +73,19 @@
 //!   least ~9 dB lopsided, so the quiet one culls or codes cheaply).
 //!   The mask is emitted as `ms_mask_present = 2` when every band
 //!   flags (identical / phase-inverted channels), `1` + explicit
-//!   mask when mixed, `0` when no band benefits. No intensity and no
-//!   TNS on the encode side yet.
+//!   mask when mixed, `0` when no band benefits. No intensity
+//!   stereo on the encode side yet.
+//! * **TNS (§4.6.9, default on)** — per analysis window, the
+//!   [`crate::encoder_tns`] pass measures the prediction gain of an
+//!   LPC over the coverable spectral region (Levinson-Durbin on the
+//!   coefficient autocorrelation); a window whose gain clears the
+//!   threshold transmits one upward Table 4.54 filter (PARCOR
+//!   quantised on the §4.6.9.3 4-bit arcsine grid) and the spectrum
+//!   is passed through the §4.6.7.4.1 all-zero analysis filter
+//!   derived from the *wire* coefficients — the exact inverse of the
+//!   decoder's §4.6.9.3 all-pole synthesis, run per channel in the
+//!   L/R domain before the M/S forward matrix (mirroring the
+//!   decoder's M/S-then-TNS order). See [`StreamEncoder::set_tns`].
 //! * **PNS (§4.6.13, opt-in)** — with [`StreamEncoder::set_pns`], a
 //!   mono long-frame band whose energy is spread across most of its
 //!   coefficients (density `(Σ|x|)²/(width·Σx²)` above 0.4 — dense
@@ -99,6 +110,7 @@
 //! ceiling), and `aac_frame_length` stays within its 13-bit field.
 
 use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ};
+use crate::encoder_tns::detect_and_apply_tns;
 use crate::filterbank::{
     forward_mdct, long_sequence_window, short_window_j, SHORT_SEQ_HOP, SHORT_SEQ_START,
 };
@@ -116,6 +128,7 @@ use crate::spectral_data::SpectralData;
 use crate::swb_offset::{
     long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
 };
+use crate::tns_data::TnsData;
 use crate::{Error, Result};
 
 use oxideav_core::bits::BitWriter;
@@ -243,6 +256,8 @@ pub struct StreamEncoder {
     short_pending: bool,
     /// §4.6.13 PNS emission toggle — see [`StreamEncoder::set_pns`].
     pns_enabled: bool,
+    /// §4.6.9 TNS emission toggle — see [`StreamEncoder::set_tns`].
+    tns_enabled: bool,
 }
 
 impl StreamEncoder {
@@ -263,6 +278,7 @@ impl StreamEncoder {
             prev_seq: WindowSequence::OnlyLong,
             short_pending: false,
             pns_enabled: false,
+            tns_enabled: true,
         })
     }
 
@@ -280,6 +296,23 @@ impl StreamEncoder {
     /// predictability measure.
     pub fn set_pns(&mut self, enabled: bool) {
         self.pns_enabled = enabled;
+    }
+
+    /// Enable / disable §4.6.9 TNS emission (default **on**).
+    ///
+    /// When enabled, each analysis window whose spectrum shows a
+    /// prediction gain above the [`crate::encoder_tns::TNS_GAIN_MIN`]
+    /// threshold (a strongly non-flat temporal envelope) transmits a
+    /// Table 4.54 noise-shaping filter, and the spectrum is passed
+    /// through the matching §4.6.7.4.1 all-zero analysis filter
+    /// before quantisation. The decoder's §4.6.9.3 all-pole synthesis
+    /// pass is the exact inverse of the applied (wire-quantised)
+    /// filter, so TNS is transparent to the reconstruction while
+    /// confining quantisation noise under the signal's temporal
+    /// envelope. Safe to leave on: windows without a clear envelope
+    /// simply carry no filter.
+    pub fn set_tns(&mut self, enabled: bool) {
+        self.tns_enabled = enabled;
     }
 
     /// The configuration this encoder was built with.
@@ -382,6 +415,30 @@ impl StreamEncoder {
         }
         self.prev_seq = seq;
 
+        // §4.6.9 TNS: per-channel decision + analysis filtering,
+        // BEFORE the M/S forward matrix — the decoder applies TNS
+        // synthesis per channel *after* the M/S de-matrix
+        // (§4.6.9.3's place in the §4.6 tool chain), so the encoder's
+        // analysis pass runs in the L/R domain. The filtering mutates
+        // the spectra once, outside the rate loop (the filter choice
+        // is independent of the scalefactor offset).
+        let max_sfb = if seq == WindowSequence::EightShort {
+            NUM_SWB_SHORT_WINDOW[self.fs_index as usize]
+        } else {
+            NUM_SWB_LONG_WINDOW[self.fs_index as usize]
+        };
+        let mut tns: Vec<Option<TnsData>> = vec![None; ch];
+        if self.tns_enabled {
+            for ((spec, slot), (hist, chan)) in spectra
+                .iter_mut()
+                .zip(tns.iter_mut())
+                .zip(self.history.iter().zip(cur.iter()))
+            {
+                let permit = tns_temporal_permits(hist, chan, seq);
+                *slot = detect_and_apply_tns(spec, seq, max_sfb, self.fs_index, &permit)?;
+            }
+        }
+
         // Rate loop: uniform scalefactor offset in ±4 steps (3 dB
         // per step on the §4.6.2.3.3 quarter-step ladder). Coarsen
         // until the raw data block fits the budget; when it already
@@ -390,17 +447,17 @@ impl StreamEncoder {
         // `-MAX_REFINE_OFFSET`.
         let budget = self.config.frame_budget_bytes();
         let mut sf_offset = 0i32;
-        let mut raw_block = self.assemble_raw_block(seq, &spectra, sf_offset)?;
+        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset)?;
         let mut iterations = 0usize;
         if raw_block.len() > budget {
             while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
                 sf_offset += 4;
-                raw_block = self.assemble_raw_block(seq, &spectra, sf_offset)?;
+                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset)?;
                 iterations += 1;
             }
         } else {
             while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer = self.assemble_raw_block(seq, &spectra, sf_offset - 4)?;
+                let finer = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4)?;
                 if finer.len() > budget {
                     break;
                 }
@@ -415,7 +472,7 @@ impl StreamEncoder {
         // once). Try the intermediate offsets, finest first.
         if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
             for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(seq, &spectra, sf_offset - fine)?;
+                let cand = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine)?;
                 if cand.len() <= budget {
                     raw_block = cand;
                     break;
@@ -449,10 +506,16 @@ impl StreamEncoder {
     /// Assemble one `raw_data_block()` (SCE for mono, one
     /// `common_window` CPE for stereo, then END) at the given
     /// rate-loop scalefactor offset.
+    ///
+    /// `tns` carries the per-channel §4.6.9 filter records decided
+    /// once per hop (the spectra arrive already analysis-filtered);
+    /// they land in each channel's `tns_data_present` / `tns_data`
+    /// wire slots.
     fn assemble_raw_block(
         &self,
         seq: WindowSequence,
         spectra: &[Vec<f64>],
+        tns: &[Option<TnsData>],
         sf_offset: i32,
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
@@ -469,10 +532,18 @@ impl StreamEncoder {
                 quantize_channel(spec, seq, self.fs_index, sf_offset, peak, pns_allowed)
             }
         };
+        // Attach a channel's TNS record to its wire body.
+        let attach_tns = |chan: &mut QuantizedChannel, slot: &Option<TnsData>| {
+            if let Some(t) = slot {
+                chan.body.tns_data_present = true;
+                chan.body.tns_data = Some(t.clone());
+            }
+        };
         match spectra {
             [mono] => {
                 let peak = mono.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-                let chan = quantize(mono, peak)?;
+                let mut chan = quantize(mono, peak)?;
+                attach_tns(&mut chan, &tns[0]);
                 asm.push_channel_header(IdSynEle::Sce, 0)?;
                 chan.body.write(&mut body_bits, 2, self.fs_index, false)?;
                 chan.spectral.write(
@@ -504,8 +575,10 @@ impl StreamEncoder {
                     .iter()
                     .chain(code_r.iter())
                     .fold(0.0f64, |m, &v| m.max(v.abs()));
-                let left = quantize(&code_l, pair_peak)?;
-                let right = quantize(&code_r, pair_peak)?;
+                let mut left = quantize(&code_l, pair_peak)?;
+                let mut right = quantize(&code_r, pair_peak)?;
+                attach_tns(&mut left, &tns[0]);
+                attach_tns(&mut right, &tns[1]);
 
                 asm.push_channel_header(IdSynEle::Cpe, 0)?;
                 // §4.4.2.3: common_window = 1, one shared ics_info,
@@ -594,6 +667,76 @@ fn detect_transient(hist: &[f64], cur: &[f64]) -> bool {
         }
     }
     false
+}
+
+/// TNS temporal-envelope gate: minimum `max / mean` subblock-energy
+/// flatness ratio of a transform window's time region for TNS to be
+/// considered on it. A steady tone (or dense steady multitone)
+/// measures close to 1; a burst-and-decay envelope inside the window
+/// measures well above. See [`tns_temporal_permits`].
+const TNS_TEMPORAL_RATIO: f64 = 3.0;
+
+/// Absolute per-window mean subblock energy floor below which the
+/// TNS gate stays closed (silence / near-silence windows carry no
+/// audible envelope to protect). One 128-sample subblock at ~±90
+/// amplitude.
+const TNS_TEMPORAL_FLOOR: f64 = 128.0 * 90.0 * 90.0;
+
+/// §4.6.9.1 temporal gate for the encode-side TNS decision: per
+/// transform window, `true` iff the window's raw time samples show a
+/// strongly non-flat energy envelope.
+///
+/// The window's time region (2048 samples for a long sequence; the
+/// 256-sample `SHORT_SEQ_START + j·SHORT_SEQ_HOP` slice per short
+/// window) is split into 16 subblocks whose energies are reduced to
+/// the `max / mean` flatness ratio; the gate opens above
+/// [`TNS_TEMPORAL_RATIO`] (with a [`TNS_TEMPORAL_FLOOR`] silence
+/// guard). This is the *time-domain* half of the TNS decision — the
+/// spectral prediction gain alone also fires on steady tonal windows
+/// (their leakage skirts are highly predictable) where the temporal
+/// envelope is flat and shaping buys nothing; measuring the envelope
+/// directly on the input samples keeps TNS to the transient /
+/// speech-like windows it exists for (§4.6.9.1's duality argument
+/// run forward).
+fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Vec<bool> {
+    let region = |i: usize| -> f64 {
+        if i < FRAME_LEN {
+            hist[i]
+        } else {
+            cur[i - FRAME_LEN]
+        }
+    };
+    let flatness_permits = |base: usize, len: usize| -> bool {
+        let sub = len / 16;
+        let energies: Vec<f64> = (0..16)
+            .map(|j| {
+                (0..sub)
+                    .map(|m| {
+                        let v = region(base + j * sub + m);
+                        v * v
+                    })
+                    .sum()
+            })
+            .collect();
+        let mean = energies.iter().sum::<f64>() / 16.0;
+        let max = energies.iter().fold(0.0f64, |a, &b| a.max(b));
+        // Normalise the floor to the subblock length (the constant is
+        // stated for a 128-sample subblock).
+        let floor = TNS_TEMPORAL_FLOOR * sub as f64 / 128.0;
+        mean > floor && max > TNS_TEMPORAL_RATIO * mean
+    };
+    if seq == WindowSequence::EightShort {
+        (0..8)
+            .map(|j| {
+                flatness_permits(
+                    SHORT_SEQ_START + j * SHORT_SEQ_HOP,
+                    2 * SHORT_WINDOW_LEN as usize,
+                )
+            })
+            .collect()
+    } else {
+        vec![flatness_permits(0, LONG_TRANSFORM_LEN)]
+    }
 }
 
 /// Run the §4.6.11.3.1 analysis transform for one channel under the
