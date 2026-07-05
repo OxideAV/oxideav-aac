@@ -8,6 +8,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- 5.1 multichannel validation against the staged MP4 fixture: minimal
+  ISO 14496-12 sample-table walk feeding `decode_raw_data_block` at
+  config 6; per-channel err/sig RMS 2.4e-4-8.9e-4 with the Table 1.19
+  reorder pinned by the per-channel source tones (LFE exactly silent)
+
 - encoder §4.6.9 TNS emission (default on): per-window Levinson-Durbin
   prediction-gain decision under a time-domain temporal-envelope gate,
   PARCOR quantisation on the §4.6.9.3 4-bit arcsine grid, and the

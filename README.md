@@ -582,10 +582,16 @@ EP-tool payload de-interleave is out of scope.
   reorder for default configs **1–6**; mono / stereo are identity
   permutations and configs **0** (PCE-defined) / **7** (the
   amendment-specific 7.1 element→speaker mapping) are left in element
-  order pending a later pass. Multichannel byte-exact validation against
-  the staged 5.1 / 7.1 `expected.wav` fixtures awaits an in-crate MP4
-  demuxer (the fixtures are `.m4a`-wrapped); the reorder itself is pinned
-  by unit + end-to-end assembled-frame tests.
+  order pending a later pass. The reorder is validated end to end
+  against the staged 5.1 fixture: a minimal ISO 14496-12 sample-table
+  walk in `tests/multichannel_mp4.rs` feeds the `.m4a` access units
+  through `decode_raw_data_block` at config 6 and lands within
+  2.4e-4–8.9e-4 per-channel err/sig RMS of the reference decode (the
+  stream carries PNS bands, so the fixtures-doc §8 RMS domain is the
+  correct comparison), with the silent LFE reproduced exactly and the
+  per-channel source tones pinning the speaker order. The staged 7.1
+  fixture signals `channelConfiguration 0` (PCE-defined) and awaits
+  the PCE→speaker mapping pass.
 - **Stream-level ADTS decode driver** (`decode`) — `StreamDecoder` walks
   the §4.4.2.1 `raw_data_block()` of each ADTS frame above the
   per-element driver, keying one `ElementDecoder` per
