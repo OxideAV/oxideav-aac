@@ -18,6 +18,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   transmitted once via the left channel with codebook 15/14 and
   `is_pos = 2·log2(e_l/e_r)` on the §4.6.8.1.4 DPCM track, excluded
   from the M/S mask (per-band mutual exclusion)
+- 2001-edition §4.6.7.3 short-window LTP synthesis
+  (`LtpState::apply_short_2001`): per flagged subwindow,
+  `lag_w = ltp_lag + ltp_short_lag[w]`, 256-point windowed MDCT of the
+  prediction, `X_rec = X_est + Y_rec` on the first 8 SFBs; the
+  per-subwindow `x_rec` index origin — which the 2001 text never
+  fixes — is an explicit caller parameter (see
+  `docs/audio/aac/short-window-ltp-blocked.md` §5)
 - encoder §4.6.13 PNS extended to channel pairs: per-channel noise
   decision on the pre-M/S spectra with the §4.6.13.3 correlated-noise
   `ms_used` signalling (shared random vector) for both-channels-noise

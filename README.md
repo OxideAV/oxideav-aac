@@ -227,8 +227,16 @@ encoder alongside the decoder under id `"aac"`.
   reusable `filterbank` primitive), and the per-sfb
   `X_rec = X_est + Y_rec` combination on the bands flagged by
   `ltp_long_used`. LTP is restricted to long windows for the AAC LTP
-  object type (§4.6.7.1); short-window LTP and the ER AAC LD `M = N/2`
-  lag offset are out of scope.
+  object type (§4.6.7.1, 2009 edition). The ISO/IEC 14496-3:**2001**
+  short-window synthesis (`LtpState::apply_short_2001`) is also
+  implemented per the 2001 §4.6.7.3 pseudo-code — per flagged
+  subwindow, `lag_w = ltp_lag + ltp_short_lag[w]`, the 256-point
+  windowed `MDCT(x_est)`, and the `X_rec = X_est + Y_rec` add on the
+  first 8 SFBs — with the one quantity the 2001 text never fixes
+  (the per-subwindow `x_rec` index origin; see the staged
+  `docs/audio/aac/short-window-ltp-blocked.md` §5) taken as an
+  explicit caller parameter rather than an invented convention. The
+  ER AAC LD `M = N/2` lag offset stays out of scope.
 - **TNS analysis filter** (`tns_coef::tns_ma_filter`,
   `tns_frame::tns_analysis_frame`) — §4.6.7.4.1 / Figure 4.30: the
   all-zero (moving-average, FIR) inverse of the §4.6.9.3 all-pole

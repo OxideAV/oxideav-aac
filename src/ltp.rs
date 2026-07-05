@@ -46,15 +46,25 @@
 //! the decode chain, so the spectrum passed in / out here is the
 //! pre-TNS reconstructed spectrum.
 
-use crate::filterbank::{forward_mdct, long_only_window};
+use crate::filterbank::{forward_mdct, long_only_window, short_window_j};
 use crate::ics_info::{IcsInfo, LtpData, WindowSequence, WindowShape};
-use crate::swb_offset::{long_window_offsets, LONG_WINDOW_LEN};
+use crate::swb_offset::{
+    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
+};
 use crate::Error;
 
 type Result<T> = core::result::Result<T, Error>;
 
 /// The long transform length `N = 2 · 1024 = 2048` (§4.6.11.3.1).
 const LONG_TRANSFORM_LEN: usize = 2 * LONG_WINDOW_LEN as usize;
+
+/// The short transform length `N_s = 2 · 128 = 256` (§4.6.11.3.1).
+const SHORT_TRANSFORM_LEN: usize = 2 * SHORT_WINDOW_LEN as usize;
+
+/// ISO/IEC 14496-3:2001 §4.6.7.3 — the number of scalefactor bands a
+/// short-window LTP contribution covers ("for (sfb = 0; sfb < 8;
+/// sfb++)": the first 8 SFBs of each predicted subwindow only).
+pub const LTP_SHORT_MAX_SFB: usize = 8;
 
 /// Table 4.98 — the 8-entry LTP coefficient codebook. `ltp_coef`
 /// (3 bits) indexes this table; the value is the single-tap predictor
@@ -282,6 +292,119 @@ impl LtpState {
         }
         Ok(())
     }
+
+    /// ISO/IEC 14496-3:**2001** §4.6.7.3 — short-window LTP synthesis
+    /// for one channel's `EIGHT_SHORT_SEQUENCE` spectrum, in place.
+    ///
+    /// This is the reconstruction counterpart of the 2001-edition
+    /// `ltp_data()` short branch (`ltp_short_used[w]` /
+    /// `ltp_short_lag[w]`, parsed under
+    /// [`crate::ics_info::LtpEdition::Iso2001`]). The 2009 edition
+    /// **removed** short-window LTP entirely (§4.6.7.1 "LTP is
+    /// restricted to long windows only"), so this entry point is never
+    /// reached by the 2009 decode chain; it exists for 2001-edition
+    /// streams. Per the 2001 pseudo-code, for each of the eight
+    /// subwindows `w` flagged `ltp_short_used[w]`:
+    ///
+    /// ```text
+    /// x_est = predict();            // lag = ltp_lag + ltp_short_lag[w]
+    /// X_est = MDCT(x_est);          // the 256-point short transform
+    /// for (sfb = 0; sfb < 8; sfb++) // first 8 SFBs only
+    ///     X_rec = X_est + Y_rec;
+    /// ```
+    ///
+    /// with the same Table 4.98 `ltp_coef` for every subwindow, and
+    /// `ltp_short_lag[w] ∈ −8..=7` a per-window *relative* delay added
+    /// to the frame's 11-bit `ltp_lag` (`0` when
+    /// `ltp_short_lag_present[w] == 0`). A negative combined lag
+    /// (possible only when `ltp_lag < 8`) is floored at `0` — the
+    /// history holds no future samples.
+    ///
+    /// ## The `window_origins` parameter — a documented spec ambiguity
+    ///
+    /// §4.6.7.3 (2001) states the `x_rec` buffer arrangement once, in
+    /// terms of a single long transform, and never respecifies the
+    /// **index origin of each subwindow** into that shared history —
+    /// i.e. which absolute history position subwindow `w`'s
+    /// `x_est(0)` reads from (see the staged analysis
+    /// `docs/audio/aac/short-window-ltp-blocked.md` §5; no encoder
+    /// emits this syntax and no reference decode exists to pin it).
+    /// Rather than invent a convention, this routine takes the
+    /// per-subwindow origin explicitly: subwindow `w` predicts
+    /// `x_est(i) = ltp_coef · x_rec(window_origins[w] + i − lag_w)`
+    /// for `i = 0..256`. When a fixture (or errata) eventually fixes
+    /// the origin rule, the caller encodes it here without touching
+    /// the pinned math.
+    ///
+    /// Errors: [`Error::LtpInvalid`] when `ics_info` is not
+    /// `EIGHT_SHORT_SEQUENCE`, `spec` is not the 8 × 128 window-major
+    /// short spectrum, `ltp.short` is missing / not 8 entries, the
+    /// frame `ltp_lag` is absent, or `ltp_coef` is out of range.
+    pub fn apply_short_2001(
+        &self,
+        spec: &mut [f64],
+        ics_info: &IcsInfo,
+        ltp: &LtpData,
+        prev_shape: Option<WindowShape>,
+        fs_index: u8,
+        window_origins: &[isize; 8],
+    ) -> Result<()> {
+        if ics_info.window_sequence != WindowSequence::EightShort {
+            return Err(Error::LtpInvalid);
+        }
+        let wlen = SHORT_WINDOW_LEN as usize;
+        if spec.len() != 8 * wlen {
+            return Err(Error::LtpInvalid);
+        }
+        let Some(short) = ltp.short.as_ref() else {
+            return Err(Error::LtpInvalid);
+        };
+        if short.len() != 8 {
+            return Err(Error::LtpInvalid);
+        }
+        if !short.iter().any(|s| s.used) {
+            return Ok(());
+        }
+        let coef = ltp_coefficient(ltp.coef)?;
+        let lag = ltp.lag.ok_or(Error::LtpInvalid)? as isize;
+        let offsets = short_window_offsets(fs_index)?;
+        let num_sfb = LTP_SHORT_MAX_SFB
+            .min(ics_info.max_sfb as usize)
+            .min(offsets.len() - 1);
+        let left_shape = prev_shape.unwrap_or(ics_info.window_shape);
+
+        for (w, sw) in short.iter().enumerate() {
+            if !sw.used {
+                continue;
+            }
+            // lag_w = ltp_lag + ltp_short_lag[w], floored at 0.
+            let lag_w = (lag + isize::from(sw.lag)).max(0);
+            let origin = window_origins[w];
+            let x_est: Vec<f64> = (0..SHORT_TRANSFORM_LEN as isize)
+                .map(|i| coef * self.x_rec(origin + i - lag_w))
+                .collect();
+            // Window subwindow w (window 0's left half inherits the
+            // previous block's shape, §4.6.11.3.2) and run the
+            // 256-point analysis transform.
+            let window = short_window_j(w, left_shape, ics_info.window_shape);
+            let z: Vec<f64> = x_est
+                .iter()
+                .zip(window.iter())
+                .map(|(&x, &wv)| x * wv)
+                .collect();
+            let x_est_spec = forward_mdct(&z, SHORT_TRANSFORM_LEN);
+            // X_rec = X_est + Y_rec on the first 8 SFBs.
+            let base = w * wlen;
+            for sfb in 0..num_sfb {
+                let start = offsets[sfb] as usize;
+                let end = (offsets[sfb + 1] as usize).min(wlen);
+                for c in start..end {
+                    spec[base + c] += x_est_spec[c];
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +535,210 @@ mod tests {
             st.push_frame(&out, &tail);
         }
         assert!(st.history.len() <= LtpState::history_cap());
+    }
+
+    // ===== ISO/IEC 14496-3:2001 §4.6.7.3 short-window LTP =====
+
+    use crate::ics_info::LtpShortWindow;
+
+    fn short_info(max_sfb: u8) -> IcsInfo {
+        IcsInfo {
+            ics_reserved_bit: false,
+            window_sequence: WindowSequence::EightShort,
+            window_shape: WindowShape::Sine,
+            max_sfb,
+            scale_factor_grouping: Some(0),
+            predictor_data_present: false,
+            predictor_data: None,
+            ltp_data_present: true,
+            ltp_data: None,
+            ltp_data_present_pair: None,
+            ltp_data_pair: None,
+            num_windows: 8,
+            num_window_groups: 8,
+            window_group_length: vec![1; 8],
+            num_swb: 14,
+        }
+    }
+
+    fn short_ltp(coef: u8, lag: u16, windows: [Option<i8>; 8]) -> LtpData {
+        LtpData {
+            lag_update: None,
+            lag: Some(lag),
+            coef,
+            long_used: vec![],
+            short: Some(
+                windows
+                    .iter()
+                    .map(|w| match w {
+                        Some(l) => LtpShortWindow {
+                            used: true,
+                            lag_present: *l != 0,
+                            lag: *l,
+                        },
+                        None => LtpShortWindow {
+                            used: false,
+                            lag_present: false,
+                            lag: 0,
+                        },
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Natural subwindow-grid origins for the tests: subwindow w's
+    /// x_est(0) reads history position w·128 (one convention among
+    /// those the 2001 text admits — the routine deliberately takes
+    /// the origins from the caller; see the method docs).
+    fn grid_origins() -> [isize; 8] {
+        core::array::from_fn(|w| (w as isize) * SHORT_WINDOW_LEN as isize)
+    }
+
+    #[test]
+    fn short_2001_rejects_bad_shapes() {
+        let st = LtpState::new();
+        let ltp = short_ltp(0, 100, [Some(0); 8]);
+        let origins = grid_origins();
+        // Long sequence rejected.
+        let mut spec = vec![0.0f64; 8 * SHORT_WINDOW_LEN as usize];
+        let info = long_info(40);
+        assert!(st
+            .apply_short_2001(&mut spec, &info, &ltp, None, 3, &origins)
+            .is_err());
+        // Wrong spectrum length rejected.
+        let sinfo = short_info(8);
+        let mut bad = vec![0.0f64; 100];
+        assert!(st
+            .apply_short_2001(&mut bad, &sinfo, &ltp, None, 3, &origins)
+            .is_err());
+        // Missing short records rejected.
+        let mut no_short = short_ltp(0, 100, [Some(0); 8]);
+        no_short.short = None;
+        assert!(st
+            .apply_short_2001(&mut spec, &sinfo, &no_short, None, 3, &origins)
+            .is_err());
+    }
+
+    #[test]
+    fn short_2001_no_used_window_is_noop() {
+        let mut st = LtpState::new();
+        st.history = vec![1.0; LtpState::history_cap()];
+        st.aliased_tail = vec![0.5; LONG_WINDOW_LEN as usize];
+        let info = short_info(8);
+        let ltp = short_ltp(3, 64, [None; 8]);
+        let mut spec = vec![2.0f64; 8 * SHORT_WINDOW_LEN as usize];
+        st.apply_short_2001(&mut spec, &info, &ltp, None, 3, &grid_origins())
+            .unwrap();
+        assert!(spec.iter().all(|&v| v == 2.0));
+    }
+
+    #[test]
+    fn short_2001_zero_history_predicts_zero() {
+        let st = LtpState::new();
+        let info = short_info(8);
+        let ltp = short_ltp(7, 64, [Some(0); 8]);
+        let mut spec = vec![1.5f64; 8 * SHORT_WINDOW_LEN as usize];
+        st.apply_short_2001(&mut spec, &info, &ltp, None, 3, &grid_origins())
+            .unwrap();
+        for &v in &spec {
+            assert!((v - 1.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn short_2001_only_used_windows_and_first_8_sfbs_change() {
+        // Non-trivial history; flag only subwindow 2. Its first-8-sfb
+        // region gains X_est energy, its upper bands stay untouched,
+        // and every other subwindow is untouched entirely.
+        let mut st = LtpState::new();
+        st.history = (0..LtpState::history_cap())
+            .map(|i| ((i % 37) as f64) / 17.0 - 1.0)
+            .collect();
+        st.aliased_tail = vec![0.25; LONG_WINDOW_LEN as usize];
+        let fs = 3u8;
+        let info = short_info(14);
+        let mut flags = [None; 8];
+        flags[2] = Some(0);
+        let ltp = short_ltp(4, 200, flags);
+        let wlen = SHORT_WINDOW_LEN as usize;
+        let mut spec = vec![0.0f64; 8 * wlen];
+        st.apply_short_2001(&mut spec, &info, &ltp, None, fs, &grid_origins())
+            .unwrap();
+
+        let offsets = short_window_offsets(fs).unwrap();
+        let cutoff = offsets[LTP_SHORT_MAX_SFB] as usize;
+        // Subwindow 2, first 8 sfbs: changed.
+        let low = &spec[2 * wlen..2 * wlen + cutoff];
+        assert!(
+            low.iter().any(|&v| v.abs() > 1e-9),
+            "flagged region changed"
+        );
+        // Subwindow 2 above sfb 8: untouched.
+        assert!(spec[2 * wlen + cutoff..3 * wlen].iter().all(|&v| v == 0.0));
+        // All other subwindows: untouched.
+        for w in [0usize, 1, 3, 4, 5, 6, 7] {
+            assert!(
+                spec[w * wlen..(w + 1) * wlen].iter().all(|&v| v == 0.0),
+                "unflagged subwindow {w} must stay silent"
+            );
+        }
+    }
+
+    #[test]
+    fn short_2001_relative_lag_shifts_the_source() {
+        // Same frame lag, different ltp_short_lag: the predictor must
+        // read a shifted history slice, so the two X_est contributions
+        // differ. History is an impulse train so any shift changes
+        // the windowed segment.
+        let mut st = LtpState::new();
+        st.history = (0..LtpState::history_cap())
+            .map(|i| if i % 64 == 0 { 1.0 } else { 0.0 })
+            .collect();
+        st.aliased_tail = vec![0.0; LONG_WINDOW_LEN as usize];
+        let info = short_info(8);
+        let wlen = SHORT_WINDOW_LEN as usize;
+        let run = |short_lag: i8| -> Vec<f64> {
+            let mut flags = [None; 8];
+            flags[0] = Some(short_lag);
+            let ltp = short_ltp(4, 300, flags);
+            let mut spec = vec![0.0f64; 8 * wlen];
+            st.apply_short_2001(&mut spec, &info, &ltp, None, 3, &grid_origins())
+                .unwrap();
+            spec[..wlen].to_vec()
+        };
+        let a = run(0);
+        let b = run(7);
+        let c = run(-8);
+        assert!(a.iter().zip(&b).any(|(x, y)| (x - y).abs() > 1e-9));
+        assert!(a.iter().zip(&c).any(|(x, y)| (x - y).abs() > 1e-9));
+    }
+
+    #[test]
+    fn short_2001_origin_convention_is_callers_choice() {
+        // The documented §4.6.7.3 (2001) ambiguity: the same frame
+        // under two different origin conventions produces different
+        // contributions — pinning that the routine faithfully defers
+        // the choice rather than hard-coding one.
+        let mut st = LtpState::new();
+        st.history = (0..LtpState::history_cap())
+            .map(|i| ((i * 7919) % 251) as f64 / 125.0 - 1.0)
+            .collect();
+        st.aliased_tail = vec![0.0; LONG_WINDOW_LEN as usize];
+        let info = short_info(8);
+        let wlen = SHORT_WINDOW_LEN as usize;
+        let mut flags = [None; 8];
+        flags[5] = Some(0);
+        let ltp = short_ltp(2, 500, flags);
+        let run = |origins: [isize; 8]| -> Vec<f64> {
+            let mut spec = vec![0.0f64; 8 * wlen];
+            st.apply_short_2001(&mut spec, &info, &ltp, None, 3, &origins)
+                .unwrap();
+            spec
+        };
+        let grid = run(grid_origins());
+        let zeroed = run([0; 8]);
+        assert!(grid.iter().zip(&zeroed).any(|(x, y)| (x - y).abs() > 1e-9));
     }
 
     #[test]
