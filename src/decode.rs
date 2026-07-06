@@ -346,11 +346,10 @@ impl StreamDecoder {
             }
         }
 
-        // §1.6.3.5 / Table 1.19: a default `channelConfiguration` fixes
-        // which loudspeaker each decoded element feeds. Reorder the
-        // element-order channel buffers into the canonical interleaved
-        // layout (a no-op for mono/stereo and for the configs this crate
-        // does not yet reorder — see `channel_map`). A
+        // §1.6.3.5 / Table 1.19: a default `channelConfiguration`
+        // (1–7) fixes which loudspeaker each decoded element feeds.
+        // Reorder the element-order channel buffers into the canonical
+        // interleaved layout (a no-op for mono/stereo). A
         // `channelConfiguration == 0` frame is reordered by the active
         // §8.5.2.2 PCE instead, when one is installed and it maps onto
         // canonical positions; otherwise element order is kept.

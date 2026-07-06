@@ -8,6 +8,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Table 1.19 config-7 (7.1) default channel mapping: centre + inner
+  Lc/Rc + outer L/R + surround pair + LFE rank-sorted to the canonical
+  `L, R, C, LFE, Lc, Rc, Ls, Rs` interleave
 - §8.5.2.2 PCE-driven channel mapping for `channelConfiguration 0`:
   front/side/back list rules (center-outward, front-to-back,
   outside-in, lone-SCE centers) keyed by element kind + instance tag;

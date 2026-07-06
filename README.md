@@ -579,11 +579,11 @@ EP-tool payload de-interleave is out of scope.
   WAVE_FORMAT_EXTENSIBLE / BS.775 convention — 5.1 becomes
   `L, R, C, LFE, Ls, Rs`). The driver threads the signalled
   `channelConfiguration` through `decode_raw_data_block` and applies the
-  reorder for default configs **1–6**; mono / stereo are identity
-  permutations and configs **0** (PCE-defined) / **7** (the
-  amendment-specific 7.1 element→speaker mapping) is left in element
-  order pending a later pass. **Config 0 (PCE-defined) layouts are
-  now mapped**: `channel_map::pce_speaker_assignment` implements the
+  reorder for every default config **1–7** — mono / stereo are identity
+  permutations and config 7 (the Table 1.19 7.1 arrangement: centre +
+  inner Lc/Rc centre-front pair + outer L/R front pair + surround pair
+  + LFE) rank-sorts to `L, R, C, LFE, Lc, Rc, Ls, Rs`. **Config 0
+  (PCE-defined) layouts are also mapped**: `channel_map::pce_speaker_assignment` implements the
   ISO/IEC 13818-7 §8.5.2.2 rules — the front list center-outward
   (lone SCE = center, SCE pairs L-then-R, two front pairs = the
   Table 42 inner Lc/Rc + outer L/R arrangement), the side list front

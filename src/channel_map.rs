@@ -38,12 +38,17 @@
 //! the index permutation. The reorder is applied by the decode driver
 //! before interleaving (see [`crate::decode`]).
 //!
-//! `channelConfiguration == 0` (custom layout, carried by a
-//! `program_config_element`) and `channelConfiguration == 7` (the 7.1
-//! layout, whose element→speaker mapping differs between ISO/IEC
-//! 14496-3 amendments and the encoders that emit it) are **not** handled
-//! here: [`reorder_permutation`] returns `None`, and the driver keeps the
-//! bitstream element order unchanged for those.
+//! | 7   | SCE, CPE, CPE, CPE, LFE        | `[C, Lc, Rc, L, R, Ls, Rs, LFE]` |
+//!
+//! Config 7 is the Table 1.19 7.1 arrangement (centre + inner
+//! left/right *centre front* pair + outer left/right front pair +
+//! surround pair + LFE); its canonical interleave follows the same
+//! WAVE/BS.775 rank order as everything else, giving
+//! `[L, R, C, LFE, Lc, Rc, Ls, Rs]`. `channelConfiguration == 0`
+//! (custom layout) is handled by the §8.5.2.2 PCE mapping below
+//! ([`pce_speaker_assignment`] / [`pce_reorder_permutation`]), driven
+//! by the `program_config_element` the decoder captured; without an
+//! active PCE the driver keeps bitstream element order.
 //!
 //! ## Clean-room provenance
 //!
@@ -76,8 +81,8 @@ pub fn layout_for_config(channel_configuration: u8) -> Option<ChannelLayout> {
 /// `channelConfiguration` — the loudspeaker each decoded channel feeds,
 /// in the order the elements appear in the `raw_data_block()`.
 ///
-/// Returns `None` for the configurations this crate does not reorder
-/// (`0`, `7`, and reserved values).
+/// Returns `None` for `0` (PCE-defined — see
+/// [`pce_speaker_assignment`]) and reserved values.
 #[must_use]
 pub fn element_speaker_order(channel_configuration: u8) -> Option<&'static [ChannelPosition]> {
     use ChannelPosition::*;
@@ -89,6 +94,21 @@ pub fn element_speaker_order(channel_configuration: u8) -> Option<&'static [Chan
         5 => &[FrontCenter, FrontLeft, FrontRight, SideLeft, SideRight],
         6 => &[
             FrontCenter,
+            FrontLeft,
+            FrontRight,
+            SideLeft,
+            SideRight,
+            LowFrequency,
+        ],
+        // Table 1.19 value 7 — 7+1: centre front; left, right CENTRE
+        // front (the inner pair); left, right OUTSIDE front; left,
+        // right surround rear (the same surround wording as configs
+        // 5/6, mapped to the side-surround positions this crate uses
+        // there); LFE.
+        7 => &[
+            FrontCenter,
+            FrontLeftOfCenter,
+            FrontRightOfCenter,
             FrontLeft,
             FrontRight,
             SideLeft,
@@ -107,23 +127,25 @@ pub fn element_speaker_order(channel_configuration: u8) -> Option<&'static [Chan
 /// channel `perm[i]`. Applying it is `out[i] = channels[perm[i]]`.
 ///
 /// Returns `None` when no reordering is defined for this configuration
-/// (`0`, `7`, reserved) — the caller keeps the bitstream element order.
-/// An identity permutation (configs 1 and 2, where element order already
-/// matches the canonical order) is returned as `Some(vec![0, 1, …])` so
-/// the caller can still validate the channel count.
+/// (`0` — PCE-defined — and reserved values); the caller keeps the
+/// bitstream element order. An identity permutation (configs 1 and 2,
+/// where element order already matches the canonical order) is
+/// returned as `Some(vec![0, 1, …])` so the caller can still validate
+/// the channel count.
 #[must_use]
 pub fn reorder_permutation(channel_configuration: u8) -> Option<Vec<usize>> {
     let element_order = element_speaker_order(channel_configuration)?;
-    let layout = layout_for_config(channel_configuration)?;
-    let canonical = layout.positions();
-    // For every canonical output slot, find the element that feeds that
-    // speaker. Each speaker appears exactly once in both lists, so the
-    // search is total and unambiguous.
-    let mut perm = Vec::with_capacity(canonical.len());
-    for &want in canonical {
-        let src = element_order.iter().position(|&p| p == want)?;
-        perm.push(src);
-    }
+    // Sort the element-order channels by their canonical WAVE/BS.775
+    // interleave rank. For configs 1–6 this reproduces exactly the
+    // `ChannelLayout::positions()` order of `layout_for_config` (the
+    // named layouts list their speakers in mask order); config 7 has
+    // no named `ChannelLayout` but ranks the same way.
+    let mut perm: Vec<usize> = (0..element_order.len()).collect();
+    let ranks: Vec<usize> = element_order
+        .iter()
+        .map(|&p| canonical_rank(p))
+        .collect::<Option<Vec<usize>>>()?;
+    perm.sort_by_key(|&i| ranks[i]);
     Some(perm)
 }
 
@@ -475,13 +497,20 @@ mod tests {
     }
 
     #[test]
-    fn config_zero_and_seven_and_reserved_are_unmapped() {
+    fn config_zero_and_reserved_are_unmapped() {
         assert_eq!(reorder_permutation(0), None);
-        assert_eq!(reorder_permutation(7), None);
         assert_eq!(reorder_permutation(8), None);
         assert_eq!(reorder_permutation(15), None);
         assert_eq!(layout_for_config(0), None);
+        // Config 7 reorders but denotes no named core layout.
         assert_eq!(layout_for_config(7), None);
+    }
+
+    #[test]
+    fn config_seven_lands_wave_rank_order() {
+        // element order [C, Lc, Rc, L, R, Ls, Rs, LFE] → canonical
+        // [L, R, C, LFE, Lc, Rc, Ls, Rs] (WAVE mask rank order).
+        assert_eq!(reorder_permutation(7), Some(vec![3, 4, 0, 7, 1, 2, 5, 6]));
     }
 
     #[test]
