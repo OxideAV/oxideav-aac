@@ -27,6 +27,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (header bits preserved verbatim); a protected rewrite of a staged
   fixture was black-box cross-checked to decode byte-identically to
   its unprotected original through an independent validator binary
+- Multi-raw-data-block ADTS frames now render as consecutive
+  1024-sample time blocks (per-block channel set + PCM
+  concatenation, per-slot state threading in block order, a
+  channel-count flip between blocks rejected) instead of flattening
+  every block's elements into one parallel channel list
+- Five docs-corpus fixtures staged (deterministic in-crate recipes,
+  pinned byte-exact by `tests/docs_crc_fixtures.rs` /
+  `tests/docs_writer_fixtures.rs`): `aac-lc-adts-crc` (Table 1.A.8
+  protected rewrite of the stereo LC fixture) and
+  `he-aac-v1-sbrcrc-adts` (`EXT_SBR_DATA` → `EXT_SBR_DATA_CRC` with
+  a computed `G10` CRC) — both black-box cross-checked to decode
+  byte-identically to their sources through an independent validator
+  binary; plus the writer-assembled `aac-cce-writer-assembled`
+  (three Table 4.8 coupling shapes under a PCE-declared
+  `valid_cc_elements` program), `aac-er-hcr-loas` (AOT-17 ER AAC LC
+  with HCR + VCB bands over LOAS, oracle = bit-identical
+  plain-decode of the same spectra), and `aac-ssr-gain-control-adts`
+  (AOT-3 gain ladders through all four window sequences with the
+  §4.6.12.3.3 variable frame lengths). The CCE staging surfaced a
+  genuine spec divergence — 13818-7:2004 §12.3.3 splits each dpcm
+  delta while the self-consistent 14496-3:2009 §4.6.8.3.3 fragment
+  (implemented here) splits the accumulated gain, that 2009 page
+  prints two conflicting pseudo-code fragments, and a third-party
+  decoder applies `cc_scale^(−gain)` with no split, matching neither
+  — recorded in the fixture notes as a standing conformance-vector
+  ask
 - SBR `bs_sbr_crc_bits` verification — the §4.4.2.8.1 CRC-10
   (`G10 = x¹⁰+x⁹+x⁵+x⁴+x+1`, zero init) recomputed over the Table
   4.62 coverage region (`num_sbr_bits − 10` bits after the CRC

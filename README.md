@@ -39,8 +39,29 @@ encoder alongside the decoder under id `"aac"`.
 
 - **ADTS fixed header** (`adts`) — ISO/IEC 13818-7 §1.A.2: sync,
   profile, sampling-frequency index, channel configuration, frame
-  length, raw-data-block count, CRC presence flag. The trailing 16-bit
-  ADTS CRC is surfaced via `protection_absent` but not yet validated.
+  length, raw-data-block count, CRC presence flag.
+- **ADTS `error_check()` + SBR CRC verification** (`adts_crc`) — the
+  ISO/IEC 13818-7:2004 §8.1.1.1 protected-bit region walk (all 56
+  header bits; the first 192 bits of every SCE / CPE / CCE / LFE with
+  the 3-bit `id_syn_ele` excluded and zero-padding of short elements;
+  the additional first-128-bits of every CPE's *second*
+  `individual_channel_stream`; all PCE / DSE bits) fed into the
+  ISO/IEC 11172-3 §2.4.3.1 CRC-16 (`0x8005`, all-ones init) that
+  13818-7 §8.1.1.2 cites. Both frame forms verify: the Table 1.A.8
+  single-raw-data-block `crc_check` and the Table 1.A.9 / 1.A.10
+  multi-RDB split (headers + `raw_data_block_position` table under
+  one CRC, one CRC per block). Wired into
+  `StreamDecoder::decode_adts_frame` / `decode_all` and the runtime
+  `Decoder`; `protect_adts_frame` / `protect_adts_stream` produce the
+  protected form (a protected rewrite of a staged fixture decodes
+  byte-identically through a black-box validator binary — which,
+  notably, does not verify the CRC *value*, so the code convention is
+  pinned to the documented §2.4.3.1 parameters). The same module
+  hosts the SBR `bs_sbr_crc_bits` CRC-10 (`G10`, zero init) computed
+  over the Table 4.62 coverage region; the FIL walk verifies every
+  `EXT_SBR_DATA_CRC` payload. Corruption of any covered bit surfaces
+  `Error::AdtsCrcMismatch` / `Error::SbrCrcMismatch`; fill bits and
+  the beyond-window element bits are provably uncovered.
 - **AudioSpecificConfig** (`asc`) — ISO/IEC 14496-3 §1.6.2.1 including
   the §4.4.1 GASpecificConfig body for all General Audio object types,
   the hierarchical SBR (AOT 5) / PS (AOT 29) wrappers, the
@@ -75,9 +96,9 @@ encoder alongside the decoder under id `"aac"`.
   is inverted"), and the [`crc::stream_mux_config_crc`] LATM helper.
   Cross-checked against an independent GF(2) long-division reference
   and the codeword-divisibility property. The ADTS
-  `adts_error_check()` region-selection CRC is *not* covered here —
-  ISO/IEC 13818-7 cites it to a different normative reference
-  (ISO/IEC 11172-3 §2.4.3.1).
+  `adts_error_check()` region-selection CRC uses a different code
+  convention (ISO/IEC 11172-3 §2.4.3.1, all-ones init, no output
+  inversion) and lives in the dedicated `adts_crc` module above.
 - **RVLC error-resilient scalefactor coding** (`rvlc`,
   `scale_factor_data::ErScaleFactorData`) — §4.6.16.2 the
   reversible-variable-length-coding replacement for the §4.6.3
@@ -235,7 +256,19 @@ encoder alongside the decoder under id `"aac"`.
   streams against the filterbank-linearity identity
   `decode([target, CCE]) = decode([target]) + cc_gain·decode([embedded])`
   (natural scaling, gain-list ×2, independently-switched, and
-  CPE-left-only layouts, ≤ 2 LSB stacked-rounding deviation).
+  CPE-left-only layouts, ≤ 2 LSB stacked-rounding deviation). A
+  writer-assembled CCE fixture cycling all three coupling shapes
+  (dpcm + sign split / ind-switched / shared natural, both domains,
+  PCE-declared `valid_cc_elements`) is staged in the docs corpus
+  (`aac-cce-writer-assembled`). Note: the two staged spec editions
+  disagree on the `gain_element_sign` split placement (13818-7:2004
+  splits each dpcm delta pre-accumulation; the self-consistent
+  14496-3:2009 fragment — implemented here — splits the accumulated
+  value, and that PDF page prints two conflicting fragments), and a
+  black-box validator applies `cc_scale^(−gain)` with no split,
+  matching *neither* text on transmitted lists while agreeing ≤ 1.2%
+  on natural-scaling lists; a genuine conformance vector or
+  corrigendum text is the standing ask.
 - **Frequency-domain prediction** (`predictor`) — §4.6.6 MPEG-2
   backward-adaptive intra-channel predictor for the AAC **Main** object
   type (AOT 1). A bank of second-order lattice predictors (one per MDCT
@@ -671,7 +704,10 @@ EP-tool payload de-interleave is out of scope.
   coupling contribution lands on the addressed SCE / CPE channels at
   the signalled `cc_domain` stage whether the CCE precedes or follows
   its targets (see the `cce` bullet above). Multi-`raw_data_block`
-  ADTS and SBR up-sampling remain out of scope.
+  frames decode as consecutive 1024-sample blocks (per-block channel
+  render + time concatenation), and `decode_adts_frame` verifies the
+  whole §8.1.1 `error_check()` CRC layer when
+  `protection_absent == 0` (see `adts_crc` above).
 - **Runtime `Decoder` registration** (`codec_decoder`) — `AacDecoder`
   adapts the persistent `StreamDecoder` / `LoasDecoder` into the
   framework's packet-in / frame-out `oxideav_core::Decoder` trait. It
@@ -755,13 +791,17 @@ EP-tool payload de-interleave is out of scope.
   measured-bit-cost.
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
-  reconstruction, IPQF — see the "SSR gain control" section above).
-  Still open: no genuine SSR-profile conformance stream is staged
-  (validation is via the in-crate Annex C.2.1.1 analysis-PQF round
-  trip and re-labelled LC streams), and the 13818-7 SSR-profile
-  *bandwidth-scalable* output modes (decoding only 1–3 PQF bands at a
-  reduced rate) are not selectable — the decoder always reconstructs
-  the full-rate signal. (The Main frequency-domain predictor,
+  reconstruction, IPQF — see the "SSR gain control" section above),
+  and a writer-assembled AOT-3 fixture driving non-unity gain
+  ladders through all four window sequences (with the §4.6.12.3.3
+  variable 1024/1472/576 frame lengths) is staged in the docs corpus
+  (`aac-ssr-gain-control-adts`; no encoder for AOT 3 exists anywhere,
+  so a captured conformance stream remains welcome — a black-box
+  validator binary reports SSR gain control unimplemented, so there
+  is no external oracle for the ladders). Still open: the 13818-7
+  SSR-profile *bandwidth-scalable* output modes (decoding only 1–3
+  PQF bands at a reduced rate) are not selectable — the decoder
+  always reconstructs the full-rate signal. (The Main frequency-domain predictor,
   §4.6.6, is now
   fully wired into `element_decode` for the AAC Main object type on long
   windows — see `predictor` above. LTP, §4.6.7, is likewise wired in
@@ -782,8 +822,11 @@ EP-tool payload de-interleave is out of scope.
   tool are **implemented end to end** (see the sections above) and
   wired into the ADTS / LATM `StreamDecoder` paths and the runtime
   `Decoder`, validated against the HE-AAC v1 (99.98% sample-exact)
-  and HE-AAC v2 (5e-5 RMS) fixtures. Still open: the 10-bit
-  `bs_sbr_crc_bits` field is captured, not verified;
+  and HE-AAC v2 (5e-5 RMS) fixtures, with the 10-bit
+  `bs_sbr_crc_bits` of every `EXT_SBR_DATA_CRC` payload now
+  **verified** (§4.4.2.8.1 `G10`, zero init, over the Table 4.62
+  region — see `adts_crc`; a derived type-14 fixture is staged as
+  `he-aac-v1-sbrcrc-adts`). Still open:
   the §4.6.18.4.3 downsampled-output mode and the §4.6.18.8 low-power
   variant are not selectable; and the ER AAC LD 480/512 transform
   variants remain out of scope. The coupling-channel (CCE) tool is
@@ -802,11 +845,16 @@ EP-tool payload de-interleave is out of scope.
   per-`channelConfiguration` element sequence — reachable from LATM
   (the LOAS driver routes AOT-17 layers there with the ASC's
   resilience triplet) and pinned bit-identical to the equivalent
-  non-resilient decode of the same spectra. Still open: the other ER
-  object types (ER AAC LTP / scalable / LD, AOTs 19 / 20 / 23 — LTP
-  state, scalable layering and the 480/512 transform family), the
-  `epConfig == 2/3` §4.5.2.4 physical-payload preprocessing, and an
-  HCR-bearing conformance stream as an external cross-check.
+  non-resilient decode of the same spectra, and a writer-assembled
+  HCR-bearing LOAS fixture (AOT 17, section + spectral resilience,
+  VCB bands) is staged in the docs corpus (`aac-er-hcr-loas`; a
+  black-box validator binary rejects ER data resilience outright, so
+  the bit-identical plain-decode identity is the oracle). Still open:
+  the other ER object types (ER AAC LTP / scalable / LD, AOTs
+  19 / 20 / 23 — LTP state, scalable layering and the 480/512
+  transform family), the `epConfig == 2/3` §4.5.2.4 physical-payload
+  preprocessing, and an encoder-produced HCR conformance stream as an
+  external cross-check.
 - LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
   `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
   `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`
@@ -817,11 +865,10 @@ EP-tool payload de-interleave is out of scope.
   recovered `MuxPayload` raw-data-blocks into a `StreamDecoder` is now
   wired (`latm::LoasDecoder` + the `codec_decoder` carrier
   auto-detection above). What remains is the `EPMuxElement()` EP-tool
-  payload de-interleave. ADTS
-  `adts_error_check()` CRC validation is likewise still open: its
-  region selection (192/128-bit element protection with the
-  double-protection edge cases) plus its ISO/IEC 11172-3 §2.4.3.1 CRC
-  reference are out of scope for the §1.8.4.5 `crc` module.
+  payload de-interleave. (ADTS `adts_error_check()` CRC validation —
+  the 192/128-bit region selection with the double-protection edge
+  cases plus the ISO/IEC 11172-3 §2.4.3.1 code — landed in the
+  dedicated `adts_crc` module; see the bitstream-parsing section.)
 
 ## License
 

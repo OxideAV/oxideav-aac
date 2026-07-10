@@ -14,8 +14,11 @@
 //! 16-bit PCM layout via [`crate::pcm`].
 //!
 //! Scope: AAC-LC (and the other General-Audio object types the
-//! per-tool chain covers) carried in ADTS, single `raw_data_block` per
-//! frame, the channel elements the staged-fixture encoders emit
+//! per-tool chain covers) carried in ADTS — including
+//! multi-`raw_data_block` frames (each block renders one consecutive
+//! 1024-sample hop) and the `error_check()` CRC layer (verified by
+//! [`StreamDecoder::decode_adts_frame`] via [`crate::adts_crc`]) —
+//! with the channel elements the staged-fixture encoders emit
 //! (SCE / LFE / CPE, plus the consumed-and-ignored FIL / DSE /
 //! PCE). A `coupling_channel_element()` (CCE) is parsed via
 //! [`crate::cce::CouplingChannelElement`] **and applied**: the walk is
@@ -26,8 +29,7 @@
 //! spectra (or, for an independently switched CCE, the time signal)
 //! into the addressed SCE / CPE channels at the signalled `cc_domain`
 //! stage. The CCE contributes no output channel of its own. SBR / PS
-//! up-sampling and multi-`raw_data_block` ADTS frames remain out of
-//! scope (the same limits the element driver carries).
+//! up-sampling ride the FIL extension walk (§4.6.18 back-end).
 //!
 //! ## Provenance
 //!
