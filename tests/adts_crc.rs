@@ -419,6 +419,37 @@ fn multi_rdb_corrupt_position_is_rejected() {
     ));
 }
 
+/// Deterministic mutation battery: the CRC-frame walk (region
+/// collection parses untrusted element bodies *before* the checksum
+/// comparison) must never panic — every mutated input decodes or
+/// errors cleanly.
+#[test]
+fn mutated_protected_frames_never_panic() {
+    let single = protect_adts_stream(&encode_tone(2)).unwrap();
+    let multi = build_multi_rdb_frame();
+    let mut state = 0x9E37_79B9u32;
+    let mut rng = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    };
+    for base in [&single[..], &multi[..]] {
+        for _ in 0..400 {
+            let mut bad = base.to_vec();
+            // 1..=3 byte mutations anywhere in the frame.
+            for _ in 0..=(rng() % 3) {
+                let idx = (rng() as usize) % bad.len();
+                bad[idx] ^= (rng() % 255 + 1) as u8;
+            }
+            let _ = StreamDecoder::new().decode_adts_frame(&bad);
+            let _ = StreamDecoder::new().decode_all(&bad);
+        }
+        // Truncations at every prefix length.
+        for len in 0..base.len() {
+            let _ = StreamDecoder::new().decode_adts_frame(&base[..len]);
+        }
+    }
+}
+
 #[test]
 fn multi_rdb_corrupt_second_block_is_rejected() {
     let frame = build_multi_rdb_frame();

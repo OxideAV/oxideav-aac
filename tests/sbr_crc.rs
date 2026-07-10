@@ -265,6 +265,30 @@ fn corrupt_covered_sbr_bit_is_rejected() {
     assert!(matches!(decode(&payload), Err(Error::SbrCrcMismatch)));
 }
 
+/// Deterministic mutation battery over the type-14 SBR block: the
+/// side-info parse runs before the CRC comparison, so every mutated
+/// payload must decode or error cleanly — never panic.
+#[test]
+fn mutated_sbr_crc_blocks_never_panic() {
+    let (base, _) = build_block(&build_sbr_fil_payload(true, false));
+    let mut state = 0x1234_5678u32;
+    let mut rng = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        state
+    };
+    for _ in 0..400 {
+        let mut bad = base.clone();
+        for _ in 0..=(rng() % 3) {
+            let idx = (rng() as usize) % bad.len();
+            bad[idx] ^= (rng() % 255 + 1) as u8;
+        }
+        let _ = decode(&bad);
+    }
+    for len in 0..base.len() {
+        let _ = decode(&base[..len]);
+    }
+}
+
 #[test]
 fn crcless_type13_payload_ignores_reserved_corruption() {
     // The same bs_reserved flip through the type-13 path must decode
