@@ -395,7 +395,7 @@ fn section_codebook(sec: &Section) -> Result<Option<(u8, usize)>> {
 
 /// Dispatch one `hcod[cb]` codeword decode onto the per-book
 /// decoder (Tables 4.A.2 … 4.A.12).
-fn decode_codeword(reader: &mut BitReader<'_>, cb: u8) -> Result<u32> {
+pub(crate) fn decode_codeword(reader: &mut BitReader<'_>, cb: u8) -> Result<u32> {
     match cb {
         1 => hcod1_decode(reader),
         2 => hcod2_decode(reader),
@@ -434,7 +434,7 @@ fn write_codeword(writer: &mut BitWriter, cb: u8, idx: u32) -> Result<()> {
 /// `pair_sign_bits` field (one bit per non-zero coefficient, low
 /// frequency first, `1` = negative) and apply it to the magnitude
 /// tuple per §4.6.3.3. Signed codebooks pass through unchanged.
-fn read_and_apply_signs(
+pub(crate) fn read_and_apply_signs(
     reader: &mut BitReader<'_>,
     cb: u8,
     dim: usize,
@@ -458,7 +458,7 @@ fn read_and_apply_signs(
 /// to `2^(N+4) + escape_word`. §4.6.1.3 caps the magnitude at
 /// `MAX_QUANT`, bounding `N ≤ 8`; a prefix run past `N == 9` cannot
 /// decode in range and is rejected without consuming further bits.
-fn read_escape_sequence(reader: &mut BitReader<'_>) -> Result<u32> {
+pub(crate) fn read_escape_sequence(reader: &mut BitReader<'_>) -> Result<u32> {
     let mut prefix_len = 0u32;
     while reader.read_bit().map_err(|_| Error::UnexpectedEnd)? {
         prefix_len += 1;
@@ -474,7 +474,12 @@ fn read_escape_sequence(reader: &mut BitReader<'_>) -> Result<u32> {
 
 /// Write one n-tuple: the Huffman codeword, the sign bits (unsigned
 /// books), and the escape sequences (ESC book, magnitudes ≥ 16).
-fn write_tuple(writer: &mut BitWriter, cb: u8, dim: usize, coeffs: &[i32]) -> Result<()> {
+pub(crate) fn write_tuple(
+    writer: &mut BitWriter,
+    cb: u8,
+    dim: usize,
+    coeffs: &[i32],
+) -> Result<()> {
     // Build the in-band tuple: for the ESC book, magnitudes >= 16
     // are clamped to the ESC_FLAG (signed, so the sign survives for
     // derive_sign_bits); §4.6.1.3 bounds the true magnitude at

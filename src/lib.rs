@@ -420,6 +420,7 @@ pub mod filterbank;
 pub mod gain_control;
 pub mod gain_control_data;
 pub mod hcr;
+pub mod hcr_decode;
 pub mod ics_body;
 pub mod ics_info;
 pub mod intensity_stereo;

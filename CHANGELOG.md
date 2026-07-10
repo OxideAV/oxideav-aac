@@ -54,6 +54,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `decode([target, CCE]) == decode([target]) + cc_gain·decode([embedded])`
   (natural scaling, common-gain ×2 second target, independently
   switched, and CPE-left-only cases, ≤ 2 LSB stacked rounding)
+- §4.6.16.3.3.4 / §4.6.16.3.4 HCR `reordered_spectral_data()` payload
+  codec (`hcr_decode`): codeword-unit enumeration in the
+  §4.6.16.3.3.1 pre-sorted order (unit-based window interleave +
+  `assignedUnitNr` stable sort), the `ReorderSpectralData()` encoder
+  scattering each unit (Huffman codeword + sign bits + escapes) over
+  the segment grid, and the length-free decoder — PCWs forward from
+  their segment starts, non-PCW sets through the direction-toggling
+  modulo-shift trial loop with codeword lengths discovered by
+  prefix-code completion. Virtual codebooks 16..=31 decode as book 11
+  under their own `maxCwLen` segment widths. Bit-exact round trips
+  across long / grouped-eight-short windows, spectrum-less-band
+  mixes, escapes, virtual codebooks and slack-padded buffers; corrupt
+  payloads error cleanly
 
 - Table 1.19 config-7 (7.1) default channel mapping: centre + inner
   Lc/Rc + outer L/R + surround pair + LFE rank-sorted to the canonical

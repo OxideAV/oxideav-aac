@@ -143,10 +143,30 @@ encoder alongside the decoder under id `"aac"`.
   `segment = (trial + codewordBase) % numberOfSegments`) to resolve,
   for each codeword, the ordered global buffer bit positions
   (MSB-first) that carry its bits — pinned by a bijection invariant
-  (every buffer bit covered exactly once). The remaining step binds
-  this geometry to the in-place §4.6.3.3 Huffman decode (PCWs first to
-  learn the non-PCW lengths) and awaits an HCR-bearing conformance
-  stream for bit-exact validation.
+  (every buffer bit covered exactly once).
+- **HCR payload codec** (`hcr_decode`) — §4.6.16.3.3.4 / §4.6.16.3.4,
+  both directions of the `reordered_spectral_data()` payload itself.
+  `encode_reordered_spectral_data` enumerates the frame's codeword
+  units (the §4.5.2.3.2 unit: Huffman codeword + sign bits + escape
+  sequences, two or four lines) in the §4.6.16.3.3.1 pre-sorted order
+  — the unit-based window interleave (Table 4.169; the §4.5.2.3.5
+  grouping interleave does not apply under HCR) stably ordered by
+  `assignedUnitNr` — encodes each unit and scatters the bits over the
+  segment grid via `ReorderPlan`. `decode_reordered_spectral_data`
+  inverts the walk without transmitted lengths: PCWs decode forward
+  from their own segment starts, then the non-PCW sets run the same
+  direction-toggling modulo-shift trial loop, each codeword consuming
+  segment free-region bits until its Huffman unit completes (prefix
+  codes make "incomplete" exactly detectable, so lengths are
+  discovered where the writer defined them). The §4.6.16.4 virtual
+  codebooks (16..=31) decode as book 11 with their own `maxCwLen`
+  segment widths. Round-tripped bit-exactly over long / eight-short
+  (two window groups), spectrum-less-band mixes, escape-bearing book
+  11, virtual codebooks, and slack-padded buffers; corrupt payloads
+  surface errors, never panics. Threading the ER triplet from
+  `GASpecificConfig` through the stream drivers (the ER top-level
+  payloads) remains open, and an HCR-bearing conformance stream is
+  still wanted as an external cross-check.
 
 ### Numeric reconstruction (AAC-LC tool chain)
 
@@ -772,22 +792,19 @@ EP-tool payload de-interleave is out of scope.
   filterbank-linearity identity on writer-assembled CCE streams; a
   third-party CCE-bearing conformance fixture would still be a welcome
   external cross-check.
-- The full `reordered_spectral_data()` (HCR) payload decode — the
-  error-resilient channel-element body (`ics_body::IcsBody::parse_er`)
-  now selects all three §4.4.6 resilience branches off the
-  `AacResilienceFlags` triplet (ER `section_data()`, RVLC
-  `scale_factor_data()`, and the HCR `length_of_reordered_spectral_data`
-  / `length_of_longest_codeword` fields), and the `hcr` module supplies
-  the §4.6.16.3.3 segmentation / pre-sorting scaffold (`maxCwLen`,
-  `codebookPriority`, `assignedUnitNr`, `segmentWidth`, the
-  `Segmentation` PCW-segment layout). What remains is the
-  §4.6.16.3.4 reordered-payload decode itself — the PCW / non-PCW
-  `WriteCodewordToSegment` trial loop inverted to recover the codeword
-  bit positions — and threading `aacScalefactorDataResilienceFlag` /
-  the rest of the triplet from `GASpecificConfig` through the ADTS /
-  LATM decode drivers (today the ER body parse is reachable directly
-  but the drivers always take the non-resilient branch). Both await an
-  HCR-bearing conformance stream for bit-exact validation.
+- Error-resilience driver threading — the ER channel-element body
+  (`ics_body::IcsBody::parse_er`) selects all three §4.4.6 resilience
+  branches off the `AacResilienceFlags` triplet, and the
+  `reordered_spectral_data()` payload itself is now **decoded and
+  encoded end to end** (`hcr_decode`, see the bitstream section
+  above; bit-exact self-round-trip across window shapes, codebook
+  mixes, virtual codebooks and slack-padded buffers). What remains is
+  threading the triplet from `GASpecificConfig` through the stream
+  drivers: the ER object types use the §4.5.2.1 ER top-level payloads
+  rather than `raw_data_block()`, so today the ER body + HCR decode
+  are reachable directly but not from the ADTS / LATM entry points.
+  An HCR-bearing conformance stream is still wanted as an external
+  cross-check.
 - LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
   `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
   `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`

@@ -294,7 +294,7 @@ impl Segmentation {
     /// The global bit offset of segment `i`'s first bit within the
     /// reordered buffer (the running sum of preceding segment widths).
     #[must_use]
-    fn segment_start(&self, i: usize) -> u32 {
+    pub(crate) fn segment_start(&self, i: usize) -> u32 {
         self.segment_bits[..i].iter().sum()
     }
 }
