@@ -214,7 +214,7 @@ pub struct BsacLayerSpec {
 /// `aacSection / Scalefactor / Spectral DataResilienceFlag` triplet from
 /// Table 4.1, only emitted when the surrounding `audioObjectType ∈
 /// {17, 19, 20, 23}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AacResilienceFlags {
     /// `aacSectionDataResilienceFlag`. Routes `section_data()` through
     /// the §4.4.6 RVLC branch in a downstream round.

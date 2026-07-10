@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use oxideav_core::bits::BitReader;
 
 use crate::adts::AdtsHeader;
+use crate::asc::AacResilienceFlags;
 use crate::cce::CouplingChannelElement;
 use crate::channel_map::PceElementKind;
 use crate::element_decode::{
@@ -525,6 +526,195 @@ impl StreamDecoder {
         Ok(frames)
     }
 
+    /// Decode one §4.4.2.3 Table 4.19 `er_raw_data_block()` payload
+    /// (the ER General-Audio top-level payload) to interleaved 16-bit
+    /// PCM.
+    ///
+    /// The ER object types do not use the tagged `raw_data_block()`
+    /// element walk: the channel-element sequence is fixed by
+    /// `channelConfiguration` (1..=7). Each element body is parsed
+    /// through the error-resilient Table 4.50 branches selected by the
+    /// ASC's [`AacResilienceFlags`] triplet, and — when
+    /// `aacSpectralDataResilienceFlag` is set — the spectrum arrives
+    /// as the two HCR length fields plus the
+    /// `reordered_spectral_data()` payload decoded by
+    /// [`crate::hcr_decode::decode_reordered_spectral_data`].
+    ///
+    /// Scope: the ER AAC LC object type (AOT 17). ER AAC LTP / scalable
+    /// / LD (AOTs 19 / 20 / 23) use LTP state, scalable layering or the
+    /// 480/512 transform family this entry point does not drive yet and
+    /// are rejected with [`Error::NotImplemented`]. The trailing
+    /// `extension_payload()` loop is consumed permissively (ignored),
+    /// matching the FIL handling of the non-ER walk; `epConfig` 2 / 3
+    /// physical-payload preprocessing (§4.5.2.4) is out of scope (the
+    /// ASC parser already rejects those configurations).
+    pub fn decode_er_raw_data_block(
+        &mut self,
+        aot: u8,
+        fs_index: u8,
+        sample_rate: u32,
+        channel_configuration: u8,
+        resilience: AacResilienceFlags,
+        payload: &[u8],
+    ) -> Result<DecodedFrame> {
+        if aot != 17 {
+            return Err(Error::NotImplemented);
+        }
+        let fs = fs_index;
+        // Table 4.19: the fixed element sequence per channelConfiguration.
+        let sequence: &[IdSynEle] = match channel_configuration {
+            1 => &[IdSynEle::Sce],
+            2 => &[IdSynEle::Cpe],
+            3 => &[IdSynEle::Sce, IdSynEle::Cpe],
+            4 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Sce],
+            5 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Cpe],
+            6 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Cpe, IdSynEle::Lfe],
+            7 => &[
+                IdSynEle::Sce,
+                IdSynEle::Cpe,
+                IdSynEle::Cpe,
+                IdSynEle::Cpe,
+                IdSynEle::Lfe,
+            ],
+            _ => return Err(Error::ElementDecodeInvalid),
+        };
+
+        let mut reader = BitReader::new(payload);
+        let mut channels: Vec<Vec<f64>> = Vec::new();
+        for &kind in sequence {
+            let element_instance_tag = reader.read_u32(4).map_err(|_| Error::UnexpectedEnd)? as u8;
+            let key = (kind_id(kind), element_instance_tag);
+            match kind {
+                IdSynEle::Sce | IdSynEle::Lfe => {
+                    let body = IcsBody::parse_er(&mut reader, aot, fs, false, resilience)?;
+                    let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
+                    let spectral =
+                        parse_er_spectral(&mut reader, &body, &ics, fs, resilience, false)?;
+                    let ch = ChannelInput {
+                        body: &body,
+                        ics_info: &ics,
+                        spectral: &spectral,
+                    };
+                    let dec = self.decoders.entry(key).or_default();
+                    channels.push(dec.decode_sce(&ch, aot, fs)?);
+                }
+                IdSynEle::Cpe => {
+                    let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+                    let dec_out = if common_window {
+                        // §4.4.2.3 shared ics_info + Table 4.4 ms_mask.
+                        let ics = IcsInfo::parse(&mut reader, aot, fs, true)?;
+                        let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
+                        let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
+                        let mut ms_used: Vec<Vec<bool>> = Vec::new();
+                        if ms_mask_present == MsMaskPresent::Mask {
+                            for _g in 0..usize::from(ics.num_window_groups) {
+                                let mut row = Vec::with_capacity(usize::from(ics.max_sfb));
+                                for _sfb in 0..usize::from(ics.max_sfb) {
+                                    row.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
+                                }
+                                ms_used.push(row);
+                            }
+                        }
+                        let left_body = IcsBody::parse_with_ics_info_er(
+                            &mut reader,
+                            &ics,
+                            aot,
+                            false,
+                            resilience,
+                        )?;
+                        let left_spectral =
+                            parse_er_spectral(&mut reader, &left_body, &ics, fs, resilience, true)?;
+                        let right_body = IcsBody::parse_with_ics_info_er(
+                            &mut reader,
+                            &ics,
+                            aot,
+                            false,
+                            resilience,
+                        )?;
+                        let right_spectral = parse_er_spectral(
+                            &mut reader,
+                            &right_body,
+                            &ics,
+                            fs,
+                            resilience,
+                            true,
+                        )?;
+                        let left = ChannelInput {
+                            body: &left_body,
+                            ics_info: &ics,
+                            spectral: &left_spectral,
+                        };
+                        let right = ChannelInput {
+                            body: &right_body,
+                            ics_info: &ics,
+                            spectral: &right_spectral,
+                        };
+                        let joint = CpeJointStereo {
+                            ms_mask_present,
+                            ms_used,
+                        };
+                        let dec = self.decoders.entry(key).or_default();
+                        dec.decode_cpe(&left, &right, &joint, aot, fs)?
+                    } else {
+                        let left_body = IcsBody::parse_er(&mut reader, aot, fs, false, resilience)?;
+                        let left_ics = left_body
+                            .ics_info
+                            .clone()
+                            .ok_or(Error::ElementDecodeInvalid)?;
+                        let left_spectral = parse_er_spectral(
+                            &mut reader,
+                            &left_body,
+                            &left_ics,
+                            fs,
+                            resilience,
+                            true,
+                        )?;
+                        let right_body =
+                            IcsBody::parse_er(&mut reader, aot, fs, false, resilience)?;
+                        let right_ics = right_body
+                            .ics_info
+                            .clone()
+                            .ok_or(Error::ElementDecodeInvalid)?;
+                        let right_spectral = parse_er_spectral(
+                            &mut reader,
+                            &right_body,
+                            &right_ics,
+                            fs,
+                            resilience,
+                            true,
+                        )?;
+                        let left = ChannelInput {
+                            body: &left_body,
+                            ics_info: &left_ics,
+                            spectral: &left_spectral,
+                        };
+                        let right = ChannelInput {
+                            body: &right_body,
+                            ics_info: &right_ics,
+                            spectral: &right_spectral,
+                        };
+                        let dec = self.decoders.entry(key).or_default();
+                        dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)?
+                    };
+                    channels.push(dec_out.0);
+                    channels.push(dec_out.1);
+                }
+                _ => return Err(Error::ElementDecodeInvalid),
+            }
+        }
+        // Trailing extension_payload() loop + byte_alignment(): consumed
+        // permissively (nothing this decoder acts on rides there yet).
+
+        // Table 1.19 canonical output reorder, same as the non-ER walk.
+        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
+        let pcm = interleave_s16(&channels)?;
+        Ok(DecodedFrame {
+            pcm,
+            channels: channels.len(),
+            sample_rate,
+        })
+    }
+
     // (the per-CPE parse lives in the free `parse_cpe` below so the
     // two-pass §4.6.8.3.3 coupling walk can defer decoding)
 }
@@ -625,6 +815,43 @@ fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
             right_spectral,
         })
     }
+}
+
+/// Parse one ER channel's spectrum: the plain Table 4.56
+/// `spectral_data()` when `aacSpectralDataResilienceFlag` is clear, or
+/// the §4.6.16.3 `reordered_spectral_data()` payload (whose two length
+/// fields the ER body already captured) decoded through
+/// [`crate::hcr_decode::decode_reordered_spectral_data`].
+fn parse_er_spectral(
+    reader: &mut BitReader<'_>,
+    body: &IcsBody,
+    ics: &IcsInfo,
+    fs: u8,
+    resilience: AacResilienceFlags,
+    is_cpe: bool,
+) -> Result<SpectralData> {
+    if !resilience.spectral_data {
+        return SpectralData::parse(reader, ics, &body.section_data, fs);
+    }
+    let (len_reordered, len_longest) = body
+        .reordered_spectral_lengths
+        .ok_or(Error::ElementDecodeInvalid)?;
+    let len = crate::hcr::clamp_reordered_length(len_reordered, is_cpe);
+    // Gather the (not necessarily byte-aligned) payload bits.
+    let mut buf = vec![0u8; usize::from(len).div_ceil(8)];
+    for i in 0..usize::from(len) {
+        if reader.read_bit().map_err(|_| Error::UnexpectedEnd)? {
+            buf[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    crate::hcr_decode::decode_reordered_spectral_data(
+        &buf,
+        len,
+        len_longest,
+        ics,
+        &body.section_data,
+        fs,
+    )
 }
 
 /// §4.6.8.3.3 `decode_coupling_channel()` — collect the coupling

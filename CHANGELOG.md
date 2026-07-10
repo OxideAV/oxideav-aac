@@ -67,6 +67,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   across long / grouped-eight-short windows, spectrum-less-band
   mixes, escapes, virtual codebooks and slack-padded buffers; corrupt
   payloads error cleanly
+- §4.4.2.3 Table 4.19 `er_raw_data_block()` stream driver
+  (`StreamDecoder::decode_er_raw_data_block`): the ER AAC LC (AOT 17)
+  fixed element sequence per `channelConfiguration` 1..=7, parsing
+  each channel through the error-resilient Table 4.50 branches and —
+  under `aacSpectralDataResilienceFlag` — the HCR reordered payload;
+  the LATM/LOAS driver routes AOT-17 layers there automatically with
+  the ASC's resilience triplet. Pinned bit-identical to the
+  equivalent non-resilient `raw_data_block()` decode of the same
+  spectra (SCE, shared-window CPE, VCB section coding) and exercised
+  through a LOAS AOT-17 stream end to end
 
 - Table 1.19 config-7 (7.1) default channel mapping: centre + inner
   Lc/Rc + outer L/R + surround pair + LFE rank-sorted to the canonical

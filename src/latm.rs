@@ -970,6 +970,26 @@ impl LoasDecoder {
                 dec.set_program_config(pce.clone());
             }
         }
+        // The ER General-Audio object types use the §4.4.2.3 Table 4.19
+        // fixed-sequence er_raw_data_block() instead of the tagged
+        // element walk; route AOT 17 (ER AAC LC) there with the ASC's
+        // resilience triplet.
+        if asc.aot == 17 {
+            let resilience = asc
+                .ga_body
+                .extension_body
+                .as_ref()
+                .and_then(|ext| ext.resilience)
+                .unwrap_or_default();
+            return dec.decode_er_raw_data_block(
+                asc.aot,
+                asc.sampling_frequency_index,
+                asc.sample_rate,
+                asc.channel_configuration,
+                resilience,
+                &payload.data,
+            );
+        }
         // LATM carries exactly one raw_data_block() per payload.
         dec.decode_raw_data_block(
             asc.aot,

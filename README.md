@@ -792,19 +792,21 @@ EP-tool payload de-interleave is out of scope.
   filterbank-linearity identity on writer-assembled CCE streams; a
   third-party CCE-bearing conformance fixture would still be a welcome
   external cross-check.
-- Error-resilience driver threading — the ER channel-element body
+- Error-resilience remainders — the ER story is now wired end to end
+  for ER AAC LC (AOT 17): the ER channel-element body
   (`ics_body::IcsBody::parse_er`) selects all three §4.4.6 resilience
-  branches off the `AacResilienceFlags` triplet, and the
-  `reordered_spectral_data()` payload itself is now **decoded and
-  encoded end to end** (`hcr_decode`, see the bitstream section
-  above; bit-exact self-round-trip across window shapes, codebook
-  mixes, virtual codebooks and slack-padded buffers). What remains is
-  threading the triplet from `GASpecificConfig` through the stream
-  drivers: the ER object types use the §4.5.2.1 ER top-level payloads
-  rather than `raw_data_block()`, so today the ER body + HCR decode
-  are reachable directly but not from the ADTS / LATM entry points.
-  An HCR-bearing conformance stream is still wanted as an external
-  cross-check.
+  branches, the `reordered_spectral_data()` payload is decoded and
+  encoded (`hcr_decode`), and the §4.4.2.3 Table 4.19
+  `er_raw_data_block()` driver
+  (`StreamDecoder::decode_er_raw_data_block`) walks the fixed
+  per-`channelConfiguration` element sequence — reachable from LATM
+  (the LOAS driver routes AOT-17 layers there with the ASC's
+  resilience triplet) and pinned bit-identical to the equivalent
+  non-resilient decode of the same spectra. Still open: the other ER
+  object types (ER AAC LTP / scalable / LD, AOTs 19 / 20 / 23 — LTP
+  state, scalable layering and the 480/512 transform family), the
+  `epConfig == 2/3` §4.5.2.4 physical-payload preprocessing, and an
+  HCR-bearing conformance stream as an external cross-check.
 - LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
   `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
   `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`
