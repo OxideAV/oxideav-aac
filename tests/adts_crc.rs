@@ -402,7 +402,10 @@ fn build_multi_rdb_frame() -> Vec<u8> {
 fn multi_rdb_frame_verifies_and_decodes() {
     let frame = build_multi_rdb_frame();
     let decoded = StreamDecoder::new().decode_adts_frame(&frame).unwrap();
-    assert!(decoded.channels > 0);
+    // Two mono raw data blocks = two consecutive 1024-sample hops of
+    // the same single-channel program.
+    assert_eq!(decoded.channels, 1);
+    assert_eq!(decoded.pcm.len(), 2 * 1024);
     assert!(decoded.pcm.iter().any(|&s| s != 0));
 }
 

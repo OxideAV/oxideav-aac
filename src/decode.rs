@@ -345,8 +345,12 @@ impl StreamDecoder {
 
         // Decode the pending channel elements in element order, with
         // each channel's coupling contributions injected at the
-        // §4.6.8.3.3 cc_domain stage.
-        let mut elements: Vec<ElementOut> = Vec::new();
+        // §4.6.8.3.3 cc_domain stage. The elements stay tagged with
+        // their raw_data_block index: a multi-RDB ADTS frame carries N
+        // *consecutive* 1024-sample blocks of the same program, so
+        // each block renders its own channel set and the per-block PCM
+        // is concatenated in time below.
+        let mut elements: Vec<(u8, ElementOut)> = Vec::new();
         for pe in pending {
             let channels = match &pe.parsed {
                 ParsedChannel::Single(sce) => {
@@ -379,80 +383,98 @@ impl StreamDecoder {
                     vec![l, r]
                 }
             };
-            elements.push(ElementOut {
-                key: pe.key,
-                kind: pe.kind,
-                channels,
-                sbr: pe.sbr,
-            });
+            elements.push((
+                pe.block,
+                ElementOut {
+                    key: pe.key,
+                    kind: pe.kind,
+                    channels,
+                    sbr: pe.sbr,
+                },
+            ));
         }
 
         // HE-AAC: once any frame carries SBR data the stream is emitted
         // at the doubled rate; frames without SBR go through the pure
         // upsampling path so the rate never flaps.
-        if elements.iter().any(|e| e.sbr.is_some()) {
+        if elements.iter().any(|(_, e)| e.sbr.is_some()) {
             self.sbr_active = true;
         }
+        let out_rate = if self.sbr_active { fs_sbr } else { sample_rate };
 
-        let mut channels: Vec<Vec<f64>> = Vec::new();
-        // Per decoded element: (kind, instance tag, contributed
-        // channel count) — the descriptor list the §8.5.2.2 PCE
-        // reorder keys on for `channelConfiguration == 0`.
-        let mut element_desc: Vec<(PceElementKind, u8, usize)> = Vec::new();
-        let mut out_rate = sample_rate;
-        if self.sbr_active {
-            out_rate = fs_sbr;
-            for el in &elements {
-                let n_ch = el.channels.len();
-                let dec = match self.sbr.entry(el.key) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(v) => {
-                        v.insert(SbrDecoder::new(fs_sbr, n_ch)?)
+        // Render block by block; each block contributes one hop of
+        // interleaved PCM (all blocks of a frame must agree on the
+        // channel count).
+        let mut pcm: Vec<i16> = Vec::new();
+        let mut frame_channels: Option<usize> = None;
+        for block in 0..num_raw_data_blocks {
+            let mut channels: Vec<Vec<f64>> = Vec::new();
+            // Per decoded element: (kind, instance tag, contributed
+            // channel count) — the descriptor list the §8.5.2.2 PCE
+            // reorder keys on for `channelConfiguration == 0`.
+            let mut element_desc: Vec<(PceElementKind, u8, usize)> = Vec::new();
+            for (_, el) in elements.iter().filter(|(b, _)| *b == block) {
+                if self.sbr_active {
+                    let n_ch = el.channels.len();
+                    let dec = match self.sbr.entry(el.key) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(SbrDecoder::new(fs_sbr, n_ch)?)
+                        }
+                    };
+                    let core: Vec<&[f64]> = el.channels.iter().map(Vec::as_slice).collect();
+                    let up = match &el.sbr {
+                        Some(ext) => dec.process_frame(ext, &core)?,
+                        None => dec.upsample_frame(&core)?,
+                    };
+                    if let Some(kind) = pce_kind(el.kind) {
+                        element_desc.push((kind, el.key.1, up.len()));
                     }
-                };
-                let core: Vec<&[f64]> = el.channels.iter().map(Vec::as_slice).collect();
-                let up = match &el.sbr {
-                    Some(ext) => dec.process_frame(ext, &core)?,
-                    None => dec.upsample_frame(&core)?,
-                };
-                if let Some(kind) = pce_kind(el.kind) {
-                    element_desc.push((kind, el.key.1, up.len()));
+                    channels.extend(up);
+                } else {
+                    if let Some(kind) = pce_kind(el.kind) {
+                        element_desc.push((kind, el.key.1, el.channels.len()));
+                    }
+                    channels.extend(el.channels.iter().cloned());
                 }
-                channels.extend(up);
             }
-        } else {
-            for el in elements {
-                if let Some(kind) = pce_kind(el.kind) {
-                    element_desc.push((kind, el.key.1, el.channels.len()));
+
+            // §1.6.3.5 / Table 1.19: a default `channelConfiguration`
+            // (1–7) fixes which loudspeaker each decoded element feeds.
+            // Reorder the element-order channel buffers into the
+            // canonical interleaved layout (a no-op for mono/stereo). A
+            // `channelConfiguration == 0` block is reordered by the
+            // active §8.5.2.2 PCE instead, when one is installed and it
+            // maps onto canonical positions; otherwise element order is
+            // kept.
+            let channels =
+                if channel_configuration == 0 {
+                    match self.program_config.as_ref().and_then(|pce| {
+                        crate::channel_map::pce_reorder_permutation(pce, &element_desc)
+                    }) {
+                        Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
+                        None => channels,
+                    }
+                } else {
+                    crate::channel_map::reorder_channels(channel_configuration, channels)
+                };
+
+            match frame_channels {
+                None => frame_channels = Some(channels.len()),
+                Some(n) if n != channels.len() => {
+                    // The blocks of one ADTS frame carry the same
+                    // program; a channel-count flip mid-frame is
+                    // structurally inconsistent.
+                    return Err(Error::ElementDecodeInvalid);
                 }
-                channels.extend(el.channels);
+                Some(_) => {}
             }
+            pcm.extend(interleave_s16(&channels)?);
         }
 
-        // §1.6.3.5 / Table 1.19: a default `channelConfiguration`
-        // (1–7) fixes which loudspeaker each decoded element feeds.
-        // Reorder the element-order channel buffers into the canonical
-        // interleaved layout (a no-op for mono/stereo). A
-        // `channelConfiguration == 0` frame is reordered by the active
-        // §8.5.2.2 PCE instead, when one is installed and it maps onto
-        // canonical positions; otherwise element order is kept.
-        let channels = if channel_configuration == 0 {
-            match self
-                .program_config
-                .as_ref()
-                .and_then(|pce| crate::channel_map::pce_reorder_permutation(pce, &element_desc))
-            {
-                Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
-                None => channels,
-            }
-        } else {
-            crate::channel_map::reorder_channels(channel_configuration, channels)
-        };
-
-        let pcm = interleave_s16(&channels)?;
         Ok(DecodedFrame {
             pcm,
-            channels: channels.len(),
+            channels: frame_channels.unwrap_or(0),
             sample_rate: out_rate,
         })
     }
