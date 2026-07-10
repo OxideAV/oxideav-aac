@@ -45,8 +45,10 @@
 //! patching, the limiter, and the envelope adjustment that produces
 //! up-sampled PCM) is **not** part of this walker — it keys off the
 //! band tables and scalefactors this produces. The `bs_sbr_crc_bits`
-//! value is captured but not verified (the §4.4.2.8 SBR CRC region is a
-//! later step).
+//! value is captured along with its §4.4.2.8.1 coverage region (the
+//! `num_sbr_bits − 10` payload bits after the CRC field); callers that
+//! own the payload buffer verify it via
+//! [`SbrExtensionData::verify_crc`] (the decode drivers do).
 //!
 //! ## Clean-room provenance
 //!
@@ -72,8 +74,14 @@ pub const SBR_CRC_BITS: u32 = 10;
 pub struct SbrExtensionData {
     /// `bs_sbr_crc_bits` (10-bit) when `crc_flag` was set (the
     /// `EXT_SBR_DATA_CRC` extension type); `None` for the plain
-    /// `EXT_SBR_DATA` type. Captured but not yet verified.
+    /// `EXT_SBR_DATA` type. Verify with [`Self::verify_crc`].
     pub crc: Option<u16>,
+    /// The protected bit range `[start, end)` — absolute positions in
+    /// the buffer the parsing [`BitReader`] was constructed over —
+    /// covering every `sbr_extension_data()` bit after the CRC field
+    /// up to the end of `sbr_data()` (the §4.4.2.8.1 coverage region,
+    /// `num_sbr_bits − 10` bits). `None` when no CRC was present.
+    pub crc_region: Option<(u64, u64)>,
     /// `bs_header_flag` — whether this payload transmitted a fresh
     /// `sbr_header()`.
     pub header_present: bool,
@@ -127,6 +135,7 @@ impl SbrExtensionData {
         } else {
             None
         };
+        let region_start = reader.bit_position();
 
         // Non-scalable core ⇒ sbr_layer == SBR_NOT_SCALABLE, so the
         // bs_header_flag is always present (Table 4.62 Note 1).
@@ -149,7 +158,8 @@ impl SbrExtensionData {
             _ => return Err(Error::SbrFreqBandInvalid),
         };
 
-        let num_sbr_bits = reader.bit_position() - start;
+        let region_end = reader.bit_position();
+        let num_sbr_bits = region_end - start;
 
         // num_align_bits = (8*cnt - 4 - num_sbr_bits) % 8. The `- 4`
         // accounts for the extension_type nibble the caller already read;
@@ -169,11 +179,31 @@ impl SbrExtensionData {
 
         Ok(SbrExtensionData {
             crc,
+            crc_region: crc.map(|_| (region_start, region_end)),
             header_present,
             header,
             element,
             num_sbr_bits,
         })
+    }
+
+    /// Verify the `bs_sbr_crc_bits` checksum against the §4.4.2.8.1
+    /// coverage region (every payload bit after the CRC field up to
+    /// the end of `sbr_data()`, before `bs_fill_bits`).
+    ///
+    /// `data` must be the same byte buffer the parsing [`BitReader`]
+    /// was constructed over ([`Self::crc_region`] holds absolute bit
+    /// positions into it). A payload without a CRC field (plain
+    /// `EXT_SBR_DATA`) verifies vacuously. Returns
+    /// [`Error::SbrCrcMismatch`] when the recomputed 10-bit `G10`
+    /// (zero-init) CRC disagrees with the transmitted value.
+    pub fn verify_crc(&self, data: &[u8]) -> Result<()> {
+        if let (Some(crc), Some((start, end))) = (self.crc, self.crc_region) {
+            if crate::adts_crc::sbr_crc(data, start, end) != crc {
+                return Err(Error::SbrCrcMismatch);
+            }
+        }
+        Ok(())
     }
 }
 

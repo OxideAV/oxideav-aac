@@ -672,6 +672,25 @@ pub enum Error {
     /// The §4.6.8.3.3 `couple_channel()` scaling-and-add is undefined for
     /// such inputs.
     CceInvalid,
+
+    /// An ADTS frame with `protection_absent == 0` carried a
+    /// `crc_check` (or, in the multi-raw-data-block form, an
+    /// `adts_header_error_check()` / `adts_raw_data_block_error_check()`
+    /// field) that does not match the CRC recomputed over the
+    /// ISO/IEC 13818-7:2004 §8.1.1.1 protected-bit region with the
+    /// ISO/IEC 11172-3 §2.4.3.1 code (16 bits, generator `0x8005`,
+    /// all-ones init). The protected header / element bits are
+    /// corrupt.
+    AdtsCrcMismatch,
+
+    /// An `EXT_SBR_DATA_CRC` fill extension carried a
+    /// `bs_sbr_crc_bits` value that does not match the 10-bit CRC
+    /// (generator `G10 = x¹⁰+x⁹+x⁵+x⁴+x+1`, zero init — ISO/IEC
+    /// 14496-3:2009 §4.4.2.8.1) recomputed over the
+    /// `sbr_extension_data()` payload bits after the CRC field
+    /// (Table 4.62, `num_sbr_bits − 10` bits before `bs_fill_bits`).
+    /// The SBR side info is corrupt.
+    SbrCrcMismatch,
 }
 
 impl core::fmt::Display for Error {
@@ -1059,6 +1078,18 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "coupling_channel_element() has an inconsistent gain-list / target geometry (§4.6.8.3)"
+                )
+            }
+            Error::AdtsCrcMismatch => {
+                write!(
+                    f,
+                    "ADTS crc_check mismatch: recomputed §8.1.1.1-region CRC-16 disagrees with the transmitted value"
+                )
+            }
+            Error::SbrCrcMismatch => {
+                write!(
+                    f,
+                    "SBR bs_sbr_crc_bits mismatch: recomputed §4.4.2.8.1 CRC-10 disagrees with the transmitted value"
                 )
             }
         }

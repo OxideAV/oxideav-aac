@@ -226,11 +226,13 @@ impl AacDecoder {
                     "oxideav-aac: ADTS frame length overruns packet",
                 ));
             }
-            let body = &data[pos + payload_offset..pos + frame_len];
+            // decode_adts_frame re-parses the header and verifies the
+            // §8.1.1 error_check() CRC layer when protection is
+            // present (payload_offset only bounds the frame here).
             let decoded = self
                 .stream
-                .decode_frame(&header, body)
-                .map_err(|e| Error::other(format!("oxideav-aac: decode_frame: {e}")))?;
+                .decode_adts_frame(&data[pos..pos + frame_len])
+                .map_err(|e| Error::other(format!("oxideav-aac: decode_adts_frame: {e}")))?;
             produced_any |= self.queue_decoded(&decoded, pts);
             pos += frame_len;
         }

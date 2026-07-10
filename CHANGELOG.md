@@ -8,6 +8,37 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- ADTS `error_check()` CRC verification (`adts_crc`) — the ISO/IEC
+  13818-7:2004 §8.1.1.1 protected-bit region walk (56 header bits,
+  the first 192 bits of every SCE / CPE / CCE / LFE with the 3-bit
+  `id_syn_ele` excluded and zero-padding of short elements, the
+  additional first-128-bits of every CPE's second
+  `individual_channel_stream`, and all PCE / DSE bits) with the
+  ISO/IEC 11172-3 §2.4.3.1 CRC-16 (`0x8005`, all-ones init) cited by
+  §8.1.1.2. Both frame forms are verified: the single-raw-data-block
+  Table 1.A.8 `crc_check` and the multi-RDB Table 1.A.9 / 1.A.10
+  header + per-block split (positions covered by the header CRC,
+  per-block CRC slots spliced out before the block walk). Wired into
+  the new `StreamDecoder::decode_adts_frame` whole-frame entry
+  point, `decode_all`, and the runtime `Decoder` ADTS path; a
+  mismatch surfaces the new `Error::AdtsCrcMismatch`.
+  `adts_crc::protect_adts_frame` / `protect_adts_stream` rewrite a
+  `protection_absent == 1` stream into its CRC-protected form
+  (header bits preserved verbatim); a protected rewrite of a staged
+  fixture was black-box cross-checked to decode byte-identically to
+  its unprotected original through an independent validator binary
+- SBR `bs_sbr_crc_bits` verification — the §4.4.2.8.1 CRC-10
+  (`G10 = x¹⁰+x⁹+x⁵+x⁴+x+1`, zero init) recomputed over the Table
+  4.62 coverage region (`num_sbr_bits − 10` bits after the CRC
+  field, before `bs_fill_bits`). `SbrExtensionData` now records the
+  coverage region (`crc_region`) and exposes `verify_crc`; the
+  stream decoder's FIL walk verifies every `EXT_SBR_DATA_CRC`
+  (type 14) payload and rejects mismatches with the new
+  `Error::SbrCrcMismatch`. End-to-end tests pin: a writer-assembled
+  type-14 stream with a correct CRC decodes byte-identically to the
+  same side info on the type-13 path, and corrupting the CRC field
+  or a covered-but-structurally-inert bit (`bs_reserved`) trips the
+  gate while the type-13 path is unaffected
 - §4.6.12.1 SSR front-half filterbank (`ssr_filterbank`), closing the
   previously docs-gapped spectrum→band de-interleave: the four
   contiguous ascending-frequency PQF-band coefficient columns, the

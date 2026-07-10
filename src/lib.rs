@@ -403,6 +403,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod adts;
+pub mod adts_crc;
 pub mod asc;
 pub mod cce;
 pub mod channel_map;

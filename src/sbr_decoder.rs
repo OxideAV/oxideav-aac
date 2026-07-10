@@ -543,6 +543,7 @@ mod tests {
         };
         SbrExtensionData {
             crc: None,
+            crc_region: None,
             header_present: true,
             header,
             element: SbrElement {

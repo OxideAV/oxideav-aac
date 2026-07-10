@@ -311,7 +311,7 @@ impl StreamDecoder {
                             .filter(|el| matches!(el.kind, IdSynEle::Sce | IdSynEle::Cpe))
                             .map(|el| (el.kind, el.key));
                         if let Some(ext) =
-                            self.consume_fill(&mut reader, payload_bytes, fs_sbr, target)?
+                            self.consume_fill(&mut reader, payload, payload_bytes, fs_sbr, target)?
                         {
                             if let Some(el) = pending.last_mut() {
                                 el.sbr = Some(ext);
@@ -459,14 +459,20 @@ impl StreamDecoder {
 
     /// Walk a FIL element's Table 4.51 `extension_payload()` chain
     /// (the body was left unconsumed by
-    /// [`Walker::next_element_keep_fill`]). `target` is the preceding
-    /// SCE / CPE this FIL would extend (its `id_syn_ele` + slot key),
-    /// or `None` when the FIL follows no channel element. Returns the
-    /// decoded SBR payload, if any; the threaded `sbr_header()` reuse
-    /// state is updated per slot.
+    /// [`Walker::next_element_keep_fill`]). `payload` is the byte
+    /// buffer `reader` was constructed over (needed to recompute the
+    /// §4.4.2.8.1 SBR CRC over its coverage region); `target` is the
+    /// preceding SCE / CPE this FIL would extend (its `id_syn_ele` +
+    /// slot key), or `None` when the FIL follows no channel element.
+    /// Returns the decoded SBR payload, if any; the threaded
+    /// `sbr_header()` reuse state is updated per slot. An
+    /// `EXT_SBR_DATA_CRC` payload whose recomputed CRC-10 disagrees
+    /// with the transmitted `bs_sbr_crc_bits` is rejected with
+    /// [`Error::SbrCrcMismatch`].
     fn consume_fill(
         &mut self,
         reader: &mut BitReader<'_>,
+        payload: &[u8],
         payload_bytes: u32,
         fs_sbr: u32,
         target: Option<(IdSynEle, (u8, u8))>,
@@ -491,6 +497,7 @@ impl StreamDecoder {
                             remaining = remaining.saturating_sub(n);
                         }
                         ExtensionPayloadOrSbr::Sbr(ext) => {
+                            ext.verify_crc(payload)?;
                             self.sbr_prev_header.insert(slot, ext.header);
                             result = Some(ext);
                             remaining = 0;
@@ -502,13 +509,108 @@ impl StreamDecoder {
         Ok(result)
     }
 
+    /// Decode one whole ADTS frame — fixed/variable header, the
+    /// optional `error_check()` CRC layer, and the `raw_data_block()`
+    /// payload(s) — to interleaved 16-bit PCM.
+    ///
+    /// `frame` must start at the ADTS syncword and carry at least
+    /// `aac_frame_length` bytes (trailing bytes are ignored). Unlike
+    /// [`Self::decode_frame`] (which receives the payload with the CRC
+    /// layer already stripped and therefore cannot verify it), this
+    /// entry point *verifies* the ISO/IEC 13818-7:2004 §8.1.1 CRCs
+    /// when `protection_absent == 0`:
+    ///
+    /// * single raw data block — the Table 1.A.8 `adts_error_check()`
+    ///   16-bit `crc_check` over the 56 header bits plus every
+    ///   §8.1.1.1 protected element region;
+    /// * multiple raw data blocks — the Table 1.A.9
+    ///   `adts_header_error_check()` (headers + the 16-bit
+    ///   `raw_data_block_position` table) followed by one Table 1.A.10
+    ///   `adts_raw_data_block_error_check()` per block, each read from
+    ///   its byte-aligned slot after the block it protects.
+    ///
+    /// A mismatch surfaces [`Error::AdtsCrcMismatch`] before any
+    /// decoder state is touched.
+    pub fn decode_adts_frame(&mut self, frame: &[u8]) -> Result<DecodedFrame> {
+        let (header, payload_offset) = AdtsHeader::parse(frame)?;
+        let frame_len = header.aac_frame_length as usize;
+        if frame_len < payload_offset || frame.len() < frame_len {
+            return Err(Error::UnexpectedEnd);
+        }
+        let frame = &frame[..frame_len];
+        if header.protection_absent {
+            return self.decode_frame(&header, &frame[payload_offset..]);
+        }
+        let aot = header.audio_object_type();
+        let fs = header.sampling_frequency_index;
+        if header.number_of_raw_data_blocks_in_frame == 1 {
+            // Table 1.A.8 adts_error_check(): one 16-bit crc_check at
+            // bytes 7..9 covering headers + the block's regions.
+            let crc = u16::from_be_bytes([frame[7], frame[8]]);
+            let payload = &frame[crate::adts::ADTS_HEADER_BYTES_WITH_CRC..];
+            let mut reader = BitReader::new(payload);
+            let regions = crate::adts_crc::collect_block_regions(&mut reader, aot, fs)?;
+            if crate::adts_crc::adts_single_crc(&frame[..7], payload, &regions) != crc {
+                return Err(Error::AdtsCrcMismatch);
+            }
+            return self.decode_frame(&header, payload);
+        }
+        // Multi-RDB form (Tables 1.A.9 / 1.A.10): N − 1 16-bit
+        // raw_data_block_position entries + the 16-bit header CRC,
+        // then each raw_data_block() followed by its own 16-bit CRC.
+        let n = usize::from(header.number_of_raw_data_blocks_in_frame);
+        let after_positions = 7 + 2 * (n - 1);
+        if frame.len() < after_positions + 2 {
+            return Err(Error::UnexpectedEnd);
+        }
+        let positions: Vec<u16> = (0..n - 1)
+            .map(|i| u16::from_be_bytes([frame[7 + 2 * i], frame[8 + 2 * i]]))
+            .collect();
+        let header_crc = u16::from_be_bytes([frame[after_positions], frame[after_positions + 1]]);
+        if crate::adts_crc::adts_header_crc(&frame[..7], &positions) != header_crc {
+            return Err(Error::AdtsCrcMismatch);
+        }
+        let payload = &frame[after_positions + 2..];
+        let mut reader = BitReader::new(payload);
+        // Verify each block's CRC, splicing the CRC fields out so the
+        // block walk below sees the contiguous raw_data_block()
+        // sequence it expects.
+        let mut clean = Vec::with_capacity(payload.len());
+        for _ in 0..n {
+            let start_byte = (reader.bit_position() / 8) as usize;
+            let regions = crate::adts_crc::collect_block_regions(&mut reader, aot, fs)?;
+            let end_bit = reader.bit_position();
+            if end_bit % 8 != 0 {
+                // A block that did not end on its §4.4.2.1
+                // byte_alignment() cannot be followed by the
+                // byte-aligned CRC slot.
+                return Err(Error::UnexpectedEnd);
+            }
+            let rdb_crc = reader.read_u32(16).map_err(|_| Error::UnexpectedEnd)? as u16;
+            if crate::adts_crc::adts_rdb_crc(payload, &regions) != rdb_crc {
+                return Err(Error::AdtsCrcMismatch);
+            }
+            clean.extend_from_slice(&payload[start_byte..(end_bit / 8) as usize]);
+        }
+        self.decode_raw_data_block(
+            aot,
+            fs,
+            header.sample_rate(),
+            header.channel_configuration,
+            header.number_of_raw_data_blocks_in_frame,
+            &clean,
+        )
+    }
+
     /// Decode a whole raw-ADTS byte buffer to a vector of per-frame
     /// interleaved PCM.
     ///
     /// Skips a leading ID3v2 tag if present, then walks consecutive ADTS
-    /// frames (`aac_frame_length`-delimited) to exhaustion. A truncated
-    /// trailing frame (fewer bytes than its `aac_frame_length`) is
-    /// rejected with [`Error::UnexpectedEnd`].
+    /// frames (`aac_frame_length`-delimited) to exhaustion, verifying
+    /// the `error_check()` CRC layer of every `protection_absent == 0`
+    /// frame (see [`Self::decode_adts_frame`]). A truncated trailing
+    /// frame (fewer bytes than its `aac_frame_length`) is rejected with
+    /// [`Error::UnexpectedEnd`].
     pub fn decode_all(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
         let data = skip_id3v2(data);
         let mut frames = Vec::new();
@@ -519,8 +621,7 @@ impl StreamDecoder {
             if frame_len < payload_offset || pos + frame_len > data.len() {
                 return Err(Error::UnexpectedEnd);
             }
-            let payload = &data[pos + payload_offset..pos + frame_len];
-            frames.push(self.decode_frame(&header, payload)?);
+            frames.push(self.decode_adts_frame(&data[pos..pos + frame_len])?);
             pos += frame_len;
         }
         Ok(frames)
@@ -724,7 +825,7 @@ impl StreamDecoder {
 /// `common_window == 1` form the shared `ics_info` is cloned into both
 /// per-channel slots (the clone carries `ltp_data_pair`, so the
 /// channel-1 LTP selection is unaffected).
-struct ParsedCpe {
+pub(crate) struct ParsedCpe {
     joint: CpeJointStereo,
     left_body: IcsBody,
     left_ics: IcsInfo,
@@ -732,6 +833,10 @@ struct ParsedCpe {
     right_body: IcsBody,
     right_ics: IcsInfo,
     right_spectral: SpectralData,
+    /// Absolute bit position (in the reader's buffer) where the second
+    /// `individual_channel_stream()` begins — the anchor of the
+    /// 13818-7:2004 §8.1.1.1 128-bit second-ICS ADTS-CRC region.
+    pub(crate) second_ics_start_bit: u64,
 }
 
 impl ParsedCpe {
@@ -757,7 +862,7 @@ impl ParsedCpe {
 /// tag): the §4.4.2.3 `common_window` fork, the Table 4.4
 /// `ms_mask_present` / `ms_used` joint-stereo header (shared form), and
 /// both channels' `individual_channel_stream()` + `spectral_data()`.
-fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
+pub(crate) fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
     let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
     if common_window {
         // §4.4.2.3: shared ics_info, then the Table 4.4 ms_mask.
@@ -776,6 +881,7 @@ fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
         }
         let left_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
         let left_spectral = SpectralData::parse(reader, &ics, &left_body.section_data, fs)?;
+        let second_ics_start_bit = reader.bit_position();
         let right_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
         let right_spectral = SpectralData::parse(reader, &ics, &right_body.section_data, fs)?;
         Ok(ParsedCpe {
@@ -789,6 +895,7 @@ fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
             right_body,
             right_ics: ics,
             right_spectral,
+            second_ics_start_bit,
         })
     } else {
         // Non-shared CPE: each channel carries its own ics_info; no
@@ -799,6 +906,7 @@ fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
             .clone()
             .ok_or(Error::ElementDecodeInvalid)?;
         let left_spectral = SpectralData::parse(reader, &left_ics, &left_body.section_data, fs)?;
+        let second_ics_start_bit = reader.bit_position();
         let right_body = IcsBody::parse(reader, aot, fs, false)?;
         let right_ics = right_body
             .ics_info
@@ -813,6 +921,7 @@ fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
             right_body,
             right_ics,
             right_spectral,
+            second_ics_start_bit,
         })
     }
 }
