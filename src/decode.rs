@@ -17,12 +17,15 @@
 //! per-tool chain covers) carried in ADTS, single `raw_data_block` per
 //! frame, the channel elements the staged-fixture encoders emit
 //! (SCE / LFE / CPE, plus the consumed-and-ignored FIL / DSE /
-//! PCE). A `coupling_channel_element()` (CCE) is now **fully consumed**
-//! from the bitstream via [`crate::cce::CouplingChannelElement`] so a
-//! CCE-bearing frame stays bit-aligned and its SCE / CPE channels still
-//! decode; the §4.6.8.3.3 cross-element coupling (scaling the CCE
-//! spectrum onto the addressed targets) is decoded but not yet applied,
-//! so the CCE contributes no output channel of its own. SBR / PS
+//! PCE). A `coupling_channel_element()` (CCE) is parsed via
+//! [`crate::cce::CouplingChannelElement`] **and applied**: the walk is
+//! two-pass — every channel element of a block is parsed first, each
+//! CCE's embedded `single_channel_element()` is decoded through its
+//! per-instance-tag [`CceDecoder`] slot, and the §4.6.8.3.3
+//! `decode_coupling_channel()` target walk then injects the scaled
+//! spectra (or, for an independently switched CCE, the time signal)
+//! into the addressed SCE / CPE channels at the signalled `cc_domain`
+//! stage. The CCE contributes no output channel of its own. SBR / PS
 //! up-sampling and multi-`raw_data_block` ADTS frames remain out of
 //! scope (the same limits the element driver carries).
 //!
@@ -41,7 +44,9 @@ use oxideav_core::bits::BitReader;
 use crate::adts::AdtsHeader;
 use crate::cce::CouplingChannelElement;
 use crate::channel_map::PceElementKind;
-use crate::element_decode::{ChannelInput, CpeJointStereo, ElementDecoder};
+use crate::element_decode::{
+    CceDecoder, ChannelInput, CouplingApply, CpeJointStereo, DecodedCce, ElementDecoder,
+};
 use crate::extension_payload::{ExtensionPayload, ExtensionPayloadOrSbr};
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
@@ -103,6 +108,10 @@ pub struct DecodedFrame {
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     decoders: HashMap<(u8, u8), ElementDecoder>,
+    /// One §4.6.8.3.3 CCE decoder per coupling-element instance tag
+    /// (its independently-switched filterbank overlap and PNS state
+    /// persist across frames).
+    cce_decoders: HashMap<u8, CceDecoder>,
     /// One §4.6.18 SBR back-end per channel-element slot (HE-AAC).
     sbr: HashMap<(u8, u8), SbrDecoder>,
     /// The threaded previous `sbr_header()` per slot (the
@@ -202,7 +211,29 @@ impl StreamDecoder {
             channels: Vec<Vec<f64>>,
             sbr: Option<Box<SbrExtensionData>>,
         }
-        let mut elements: Vec<ElementOut> = Vec::new();
+        // A channel element parsed off the bitstream but not yet
+        // decoded. Decoding is deferred until the whole block is
+        // walked so §4.6.8.3.3 coupling channel elements — which may
+        // appear before or after the SCE / CPE targets they address —
+        // can contribute at the right stage of every target's chain.
+        struct ParsedSce {
+            body: IcsBody,
+            ics: IcsInfo,
+            spectral: SpectralData,
+        }
+        enum ParsedChannel {
+            Single(Box<ParsedSce>),
+            Pair(Box<ParsedCpe>),
+        }
+        struct PendingElement {
+            key: (u8, u8),
+            kind: IdSynEle,
+            block: u8,
+            parsed: ParsedChannel,
+            sbr: Option<Box<SbrExtensionData>>,
+        }
+        let mut pending: Vec<PendingElement> = Vec::new();
+        let mut cces: Vec<(u8, CouplingChannelElement)> = Vec::new();
         let fs_sbr = sample_rate.saturating_mul(2);
 
         // `num_raw_data_blocks` is the resolved count `N`. The walker
@@ -210,7 +241,7 @@ impl StreamDecoder {
         // END (real-world encoders pad the frame but do not always
         // round-trip a trailing END marker after the last element); treat
         // that as end-of-block, the same as an `Element::End`.
-        'blocks: for _ in 0..num_raw_data_blocks {
+        'blocks: for block in 0..num_raw_data_blocks {
             while let Some(elem) = Walker::new(&mut reader).next_element_keep_fill()? {
                 match elem {
                     Element::ChannelElement {
@@ -221,17 +252,15 @@ impl StreamDecoder {
                         let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
                         let spectral =
                             SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
-                        let ch = ChannelInput {
-                            body: &body,
-                            ics_info: &ics,
-                            spectral: &spectral,
-                        };
-                        let key = (kind_id(kind), element_instance_tag);
-                        let dec = self.decoders.entry(key).or_default();
-                        elements.push(ElementOut {
-                            key,
+                        pending.push(PendingElement {
+                            key: (kind_id(kind), element_instance_tag),
                             kind,
-                            channels: vec![dec.decode_sce(&ch, aot, fs)?],
+                            block,
+                            parsed: ParsedChannel::Single(Box::new(ParsedSce {
+                                body,
+                                ics,
+                                spectral,
+                            })),
                             sbr: None,
                         });
                     }
@@ -239,12 +268,12 @@ impl StreamDecoder {
                         kind: IdSynEle::Cpe,
                         element_instance_tag,
                     } => {
-                        let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
-                        let (l, r) = self.decode_cpe(&mut reader, aot, fs, element_instance_tag)?;
-                        elements.push(ElementOut {
-                            key,
+                        let parsed = parse_cpe(&mut reader, aot, fs)?;
+                        pending.push(PendingElement {
+                            key: (kind_id(IdSynEle::Cpe), element_instance_tag),
                             kind: IdSynEle::Cpe,
-                            channels: vec![l, r],
+                            block,
+                            parsed: ParsedChannel::Pair(Box::new(parsed)),
                             sbr: None,
                         });
                     }
@@ -252,23 +281,19 @@ impl StreamDecoder {
                         kind: IdSynEle::Cce,
                         element_instance_tag,
                     } => {
-                        // §4.6.8.3 / Table 4.8: fully consume the coupling
-                        // channel element from the bitstream (header +
-                        // embedded single_channel_element + gain lists) so
-                        // the walker stays bit-aligned for the following
-                        // elements. The CCE contributes no output channel
-                        // of its own; the §4.6.8.3.3 cross-element coupling
-                        // (scale-and-add onto the addressed SCE/CPE
-                        // targets) is not yet wired, so the decoded
-                        // coupling spectrum is dropped — a stream that
-                        // carries a CCE still decodes its SCE/CPE channels
-                        // rather than aborting the whole frame.
-                        let _cce = CouplingChannelElement::parse_after_tag(
+                        // §4.6.8.3 / Table 4.8: parse the whole coupling
+                        // channel element (header + embedded
+                        // single_channel_element + gain lists). Its
+                        // embedded spectrum is decoded once per block
+                        // below and coupled onto the addressed SCE / CPE
+                        // targets per §4.6.8.3.3.
+                        let cce = CouplingChannelElement::parse_after_tag(
                             &mut reader,
                             element_instance_tag,
                             aot,
                             fs,
                         )?;
+                        cces.push((block, cce));
                     }
                     Element::ChannelElement { kind, .. } => {
                         // Any other channel-element id has no decode path.
@@ -280,14 +305,14 @@ impl StreamDecoder {
                         // any SBR payload onto the preceding channel
                         // element (§4.4.2.7: an SBR FIL directly follows
                         // the SCE/CPE it extends).
-                        let target = elements
+                        let target = pending
                             .last()
                             .filter(|el| matches!(el.kind, IdSynEle::Sce | IdSynEle::Cpe))
                             .map(|el| (el.kind, el.key));
                         if let Some(ext) =
                             self.consume_fill(&mut reader, payload_bytes, fs_sbr, target)?
                         {
-                            if let Some(el) = elements.last_mut() {
+                            if let Some(el) = pending.last_mut() {
                                 el.sbr = Some(ext);
                             }
                         }
@@ -302,6 +327,63 @@ impl StreamDecoder {
                     Element::End => continue 'blocks,
                 }
             }
+        }
+
+        // §4.6.8.3.3 — decode each CCE's embedded
+        // single_channel_element() into its cc_spectrum (and, for an
+        // independently switched CCE, its time signal), through the
+        // per-instance-tag persistent CCE decoder slot.
+        let mut decoded_cces: Vec<DecodedCce> = Vec::with_capacity(cces.len());
+        for (_, cce) in &cces {
+            let dec = self
+                .cce_decoders
+                .entry(cce.element_instance_tag)
+                .or_default();
+            decoded_cces.push(dec.decode(cce, aot, fs)?);
+        }
+
+        // Decode the pending channel elements in element order, with
+        // each channel's coupling contributions injected at the
+        // §4.6.8.3.3 cc_domain stage.
+        let mut elements: Vec<ElementOut> = Vec::new();
+        for pe in pending {
+            let channels = match &pe.parsed {
+                ParsedChannel::Single(sce) => {
+                    let coupling =
+                        coupling_for(&cces, &decoded_cces, pe.block, pe.kind, pe.key.1, 0);
+                    let ch = ChannelInput {
+                        body: &sce.body,
+                        ics_info: &sce.ics,
+                        spectral: &sce.spectral,
+                    };
+                    let dec = self.decoders.entry(pe.key).or_default();
+                    vec![dec.decode_sce_coupled(&ch, aot, fs, &coupling)?]
+                }
+                ParsedChannel::Pair(cpe) => {
+                    let left_coupling =
+                        coupling_for(&cces, &decoded_cces, pe.block, pe.kind, pe.key.1, 0);
+                    let right_coupling =
+                        coupling_for(&cces, &decoded_cces, pe.block, pe.kind, pe.key.1, 1);
+                    let (left, right, joint) = cpe.channel_inputs();
+                    let dec = self.decoders.entry(pe.key).or_default();
+                    let (l, r) = dec.decode_cpe_coupled(
+                        &left,
+                        &right,
+                        joint,
+                        aot,
+                        fs,
+                        &left_coupling,
+                        &right_coupling,
+                    )?;
+                    vec![l, r]
+                }
+            };
+            elements.push(ElementOut {
+                key: pe.key,
+                kind: pe.kind,
+                channels,
+                sbr: pe.sbr,
+            });
         }
 
         // HE-AAC: once any frame carries SBR data the stream is emitted
@@ -443,84 +525,179 @@ impl StreamDecoder {
         Ok(frames)
     }
 
-    /// Parse one CPE body (after the walker consumed its element-instance
-    /// tag) and run it through the per-slot element decoder, returning
-    /// the `(left, right)` channel time signals.
-    fn decode_cpe(
-        &mut self,
-        reader: &mut BitReader<'_>,
-        aot: u8,
-        fs: u8,
-        element_instance_tag: u8,
-    ) -> Result<(Vec<f64>, Vec<f64>)> {
-        let key = (kind_id(IdSynEle::Cpe), element_instance_tag);
-        let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
-        if common_window {
-            // §4.4.2.3: shared ics_info, then the Table 4.4 ms_mask.
-            let ics = IcsInfo::parse(reader, aot, fs, true)?;
-            let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
-            let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
-            let mut ms_used: Vec<Vec<bool>> = Vec::new();
-            if ms_mask_present == MsMaskPresent::Mask {
-                for _g in 0..usize::from(ics.num_window_groups) {
-                    let mut row = Vec::with_capacity(usize::from(ics.max_sfb));
-                    for _sfb in 0..usize::from(ics.max_sfb) {
-                        row.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
-                    }
-                    ms_used.push(row);
+    // (the per-CPE parse lives in the free `parse_cpe` below so the
+    // two-pass §4.6.8.3.3 coupling walk can defer decoding)
+}
+
+/// A parsed `channel_pair_element()` awaiting decode: both channels'
+/// bodies + spectra and the Table 4.4 joint-stereo header. For the
+/// `common_window == 1` form the shared `ics_info` is cloned into both
+/// per-channel slots (the clone carries `ltp_data_pair`, so the
+/// channel-1 LTP selection is unaffected).
+struct ParsedCpe {
+    joint: CpeJointStereo,
+    left_body: IcsBody,
+    left_ics: IcsInfo,
+    left_spectral: SpectralData,
+    right_body: IcsBody,
+    right_ics: IcsInfo,
+    right_spectral: SpectralData,
+}
+
+impl ParsedCpe {
+    /// Borrow the two [`ChannelInput`]s plus the joint-stereo header.
+    fn channel_inputs(&self) -> (ChannelInput<'_>, ChannelInput<'_>, &CpeJointStereo) {
+        (
+            ChannelInput {
+                body: &self.left_body,
+                ics_info: &self.left_ics,
+                spectral: &self.left_spectral,
+            },
+            ChannelInput {
+                body: &self.right_body,
+                ics_info: &self.right_ics,
+                spectral: &self.right_spectral,
+            },
+            &self.joint,
+        )
+    }
+}
+
+/// Parse one CPE body (after the walker consumed its element-instance
+/// tag): the §4.4.2.3 `common_window` fork, the Table 4.4
+/// `ms_mask_present` / `ms_used` joint-stereo header (shared form), and
+/// both channels' `individual_channel_stream()` + `spectral_data()`.
+fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
+    let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+    if common_window {
+        // §4.4.2.3: shared ics_info, then the Table 4.4 ms_mask.
+        let ics = IcsInfo::parse(reader, aot, fs, true)?;
+        let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
+        let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
+        let mut ms_used: Vec<Vec<bool>> = Vec::new();
+        if ms_mask_present == MsMaskPresent::Mask {
+            for _g in 0..usize::from(ics.num_window_groups) {
+                let mut row = Vec::with_capacity(usize::from(ics.max_sfb));
+                for _sfb in 0..usize::from(ics.max_sfb) {
+                    row.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
                 }
+                ms_used.push(row);
             }
-            let left_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
-            let left_spectral = SpectralData::parse(reader, &ics, &left_body.section_data, fs)?;
-            let right_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
-            let right_spectral = SpectralData::parse(reader, &ics, &right_body.section_data, fs)?;
-            let left = ChannelInput {
-                body: &left_body,
-                ics_info: &ics,
-                spectral: &left_spectral,
-            };
-            let right = ChannelInput {
-                body: &right_body,
-                ics_info: &ics,
-                spectral: &right_spectral,
-            };
-            let joint = CpeJointStereo {
+        }
+        let left_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
+        let left_spectral = SpectralData::parse(reader, &ics, &left_body.section_data, fs)?;
+        let right_body = IcsBody::parse_with_ics_info(reader, &ics, aot, false)?;
+        let right_spectral = SpectralData::parse(reader, &ics, &right_body.section_data, fs)?;
+        Ok(ParsedCpe {
+            joint: CpeJointStereo {
                 ms_mask_present,
                 ms_used,
-            };
-            let dec = self.decoders.entry(key).or_default();
-            dec.decode_cpe(&left, &right, &joint, aot, fs)
-        } else {
-            // Non-shared CPE: each channel carries its own ics_info; no
-            // M/S mask, so the joint-stereo tools do not run.
-            let left_body = IcsBody::parse(reader, aot, fs, false)?;
-            let left_ics = left_body
-                .ics_info
-                .clone()
-                .ok_or(Error::ElementDecodeInvalid)?;
-            let left_spectral =
-                SpectralData::parse(reader, &left_ics, &left_body.section_data, fs)?;
-            let right_body = IcsBody::parse(reader, aot, fs, false)?;
-            let right_ics = right_body
-                .ics_info
-                .clone()
-                .ok_or(Error::ElementDecodeInvalid)?;
-            let right_spectral =
-                SpectralData::parse(reader, &right_ics, &right_body.section_data, fs)?;
-            let left = ChannelInput {
-                body: &left_body,
-                ics_info: &left_ics,
-                spectral: &left_spectral,
-            };
-            let right = ChannelInput {
-                body: &right_body,
-                ics_info: &right_ics,
-                spectral: &right_spectral,
-            };
-            let dec = self.decoders.entry(key).or_default();
-            dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)
+            },
+            left_body,
+            left_ics: ics.clone(),
+            left_spectral,
+            right_body,
+            right_ics: ics,
+            right_spectral,
+        })
+    } else {
+        // Non-shared CPE: each channel carries its own ics_info; no
+        // M/S mask, so the joint-stereo tools do not run.
+        let left_body = IcsBody::parse(reader, aot, fs, false)?;
+        let left_ics = left_body
+            .ics_info
+            .clone()
+            .ok_or(Error::ElementDecodeInvalid)?;
+        let left_spectral = SpectralData::parse(reader, &left_ics, &left_body.section_data, fs)?;
+        let right_body = IcsBody::parse(reader, aot, fs, false)?;
+        let right_ics = right_body
+            .ics_info
+            .clone()
+            .ok_or(Error::ElementDecodeInvalid)?;
+        let right_spectral = SpectralData::parse(reader, &right_ics, &right_body.section_data, fs)?;
+        Ok(ParsedCpe {
+            joint: CpeJointStereo::default(),
+            left_body,
+            left_ics,
+            left_spectral,
+            right_body,
+            right_ics,
+            right_spectral,
+        })
+    }
+}
+
+/// §4.6.8.3.3 `decode_coupling_channel()` — collect the coupling
+/// contributions addressed at one target channel.
+///
+/// Walks every CCE of the same raw data block, replaying the spec's
+/// target loop to assign `list_index` values: an SCE target consumes
+/// one gain list; a CPE target consumes one shared list (`cc_l == cc_r
+/// == 0`, applied to both channels), or one list per flagged channel.
+/// `channel` selects the target channel of a CPE (`0` left, `1`
+/// right); an SCE target only ever matches `channel == 0`.
+fn coupling_for<'a>(
+    cces: &'a [(u8, CouplingChannelElement)],
+    decoded: &'a [DecodedCce],
+    block: u8,
+    kind: IdSynEle,
+    tag: u8,
+    channel: usize,
+) -> Vec<CouplingApply<'a>> {
+    let mut out = Vec::new();
+    for ((cce_block, cce), dec) in cces.iter().zip(decoded.iter()) {
+        if *cce_block != block {
+            continue;
+        }
+        let mut list_index = 0usize;
+        for t in &cce.header.targets {
+            if !t.is_cpe {
+                if kind == IdSynEle::Sce && tag == t.tag_select && channel == 0 {
+                    out.push(CouplingApply {
+                        cce,
+                        decoded: dec,
+                        list_index,
+                    });
+                }
+                list_index += 1;
+            } else {
+                let addressed = kind == IdSynEle::Cpe && tag == t.tag_select;
+                if !t.cc_l && !t.cc_r {
+                    // Table 4.153 shared list: both channels couple
+                    // with the same gain list.
+                    if addressed {
+                        out.push(CouplingApply {
+                            cce,
+                            decoded: dec,
+                            list_index,
+                        });
+                    }
+                    list_index += 1;
+                }
+                if t.cc_l {
+                    if addressed && channel == 0 {
+                        out.push(CouplingApply {
+                            cce,
+                            decoded: dec,
+                            list_index,
+                        });
+                    }
+                    list_index += 1;
+                }
+                if t.cc_r {
+                    if addressed && channel == 1 {
+                        out.push(CouplingApply {
+                            cce,
+                            decoded: dec,
+                            list_index,
+                        });
+                    }
+                    list_index += 1;
+                }
+            }
         }
     }
+    out
 }
 
 /// Map a channel-element `id_syn_ele` to the slot key's first component

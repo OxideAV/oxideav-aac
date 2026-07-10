@@ -38,6 +38,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   channel body — pinned bit-identical to the hand-driven pipeline and
   exercised end to end by an ADTS SSR-profile stream test (encoder
   output re-labelled to profile 2, mono + stereo)
+- §4.6.8.3.3 coupling-channel **application**: the stream decoder's
+  raw-data-block walk is now two-pass (parse every channel element,
+  decode each CCE's embedded `single_channel_element()` through a
+  per-instance-tag `CceDecoder` slot, then decode the SCE/CPE targets
+  with the coupling injected), so a CCE contributes to its addressed
+  targets regardless of element order — dependently switched CCEs are
+  scaled per gain list and added at the signalled `cc_domain` stage
+  (before/after the target's TNS), independently switched CCEs are
+  decoded to the time domain through their own persistent filterbank
+  and added on the target PCM; the `decode_coupling_channel()` target
+  walk assigns Table 4.153 gain lists (shared / left / right / both)
+  per channel. Validated end to end by writer-assembled CCE streams
+  against the filterbank-linearity identity
+  `decode([target, CCE]) == decode([target]) + cc_gain·decode([embedded])`
+  (natural scaling, common-gain ×2 second target, independently
+  switched, and CPE-left-only cases, ≤ 2 LSB stacked rounding)
 
 - Table 1.19 config-7 (7.1) default channel mapping: centre + inner
   Lc/Rc + outer L/R + surround pair + LFE rank-sorted to the canonical

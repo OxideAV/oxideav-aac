@@ -79,6 +79,7 @@
 //!   [`crate::pns::gen_rand_vector`] LCG, seeded once per decoder so the
 //!   noise is reproducible across a decode run.
 
+use crate::cce::CouplingChannelElement;
 use crate::decoded_spectrum::quant_to_spec;
 use crate::dequant::rescale_spectrum;
 use crate::filterbank::Filterbank;
@@ -266,6 +267,7 @@ fn finish_channel(
     ltp_state: &mut LtpState,
     predictor_bank: &mut Option<PredictorBank>,
     ssr: &mut Option<Box<SsrChannelDecoder>>,
+    coupling: &[CouplingApply<'_>],
 ) -> Result<Vec<f64>> {
     // §4.6.6 MPEG-2 frequency-domain prediction (AAC Main, AOT 1 only).
     // The backward-adaptive predictor bank is run on EVERY frame so its
@@ -300,6 +302,11 @@ fn finish_channel(
         })?;
     }
 
+    // §4.6.8.3.3 dependently-switched coupling with cc_domain == 0:
+    // the CCE spectra are scaled and added *before* the target's TNS
+    // decoding.
+    apply_freq_coupling(spec, ics_info, fs_index, coupling, false)?;
+
     // §4.6.9 TNS synthesis.
     if let Some(tns) = &body.tns_data {
         tns_decode_frame(
@@ -312,6 +319,10 @@ fn finish_channel(
         )?;
     }
 
+    // §4.6.8.3.3 dependently-switched coupling with cc_domain == 1:
+    // scaled and added *after* the target's TNS decoding.
+    apply_freq_coupling(spec, ics_info, fs_index, coupling, true)?;
+
     // §4.6.12 — the SSR object type (AOT 3) replaces the §4.6.11
     // filterbank with the four-band gain-control pipeline: the
     // §4.6.12.1 front-half filterbank (band split + 256/32-line
@@ -319,16 +330,208 @@ fn finish_channel(
     // frame's gain_control_data(), and the IPQF synthesis. LTP and the
     // §4.6.6 predictor are other object types' tools, so the state
     // advance below does not apply.
-    if aot == 3 {
+    let mut out = if aot == 3 {
         let dec = ssr.get_or_insert_with(Default::default);
-        return dec.decode_frame(spec, ics_info, body.gain_control_data.as_ref());
+        dec.decode_frame(spec, ics_info, body.gain_control_data.as_ref())?
+    } else {
+        // §4.6.11 filterbank → PCM, then advance the LTP history with
+        // this frame's output and aliased IMDCT tail (§4.6.7.3).
+        let out = fb.synthesize(spec, ics_info)?;
+        ltp_state.push_frame(&out, fb.aliased_tail());
+        out
+    };
+
+    // §4.6.8.3.3 independently-switched coupling: the CCE was decoded
+    // all the way to the time domain and is scaled and added here.
+    apply_time_coupling(&mut out, coupling)?;
+    Ok(out)
+}
+
+/// One §4.6.8.3.3 coupling contribution addressed at a single target
+/// channel: the parsed CCE (gain lists + embedded-SCE geometry), its
+/// decoded embedded spectrum / time signal, and the `list_index` the
+/// `decode_coupling_channel()` target walk assigned to this channel.
+#[derive(Debug, Clone, Copy)]
+pub struct CouplingApply<'a> {
+    /// The parsed `coupling_channel_element()`.
+    pub cce: &'a CouplingChannelElement,
+    /// The CCE's decoded embedded `single_channel_element()`
+    /// ([`CceDecoder::decode`]).
+    pub decoded: &'a DecodedCce,
+    /// The §4.6.8.3.3 `couple_channel()` gain-list index for this
+    /// target channel.
+    pub list_index: usize,
+}
+
+/// §4.6.8.3.3 — apply every *dependently switched* coupling
+/// contribution whose `cc_domain` matches `after_tns` onto the target
+/// spectrum in place.
+///
+/// A dependently switched CCE "must have a window state that matches
+/// all of the target SCE and CPE channels" — a `window_sequence` /
+/// window-group-geometry mismatch is rejected with
+/// [`Error::CceInvalid`] rather than mis-addressing bands.
+fn apply_freq_coupling(
+    spec: &mut [f64],
+    ics_info: &IcsInfo,
+    fs_index: u8,
+    coupling: &[CouplingApply<'_>],
+    after_tns: bool,
+) -> Result<()> {
+    for c in coupling {
+        if c.cce.header.ind_sw_cce_flag || c.cce.header.cc_domain != after_tns {
+            continue;
+        }
+        let cce_ics = &c.cce.ics_info;
+        if cce_ics.window_sequence != ics_info.window_sequence
+            || cce_ics.num_window_groups != ics_info.num_window_groups
+            || cce_ics.window_group_length != ics_info.window_group_length
+        {
+            return Err(Error::CceInvalid);
+        }
+        let offsets = if cce_ics.window_sequence == crate::ics_info::WindowSequence::EightShort {
+            crate::swb_offset::short_window_offsets(fs_index)?
+        } else {
+            crate::swb_offset::long_window_offsets(fs_index)?
+        };
+        c.cce.gains.couple_channel(
+            &c.decoded.spectrum,
+            spec,
+            c.list_index,
+            &c.cce.body.section_data.sfb_cb,
+            &cce_ics.window_group_length,
+            usize::from(cce_ics.max_sfb),
+            offsets,
+        )?;
+    }
+    Ok(())
+}
+
+/// §4.6.8.3.3 — apply every *independently switched* coupling
+/// contribution onto the target's time signal in place. An
+/// independently switched CCE only carries `common_gain_element`s, so
+/// the whole frame is scaled by one `cc_gain`.
+fn apply_time_coupling(out: &mut [f64], coupling: &[CouplingApply<'_>]) -> Result<()> {
+    for c in coupling {
+        if !c.cce.header.ind_sw_cce_flag {
+            continue;
+        }
+        let time = c.decoded.time.as_deref().ok_or(Error::CceInvalid)?;
+        if time.len() != out.len() {
+            // The SSR variable-length frames cannot take a 1024-sample
+            // time coupling; surface the mismatch instead of adding a
+            // misaligned signal.
+            return Err(Error::CceInvalid);
+        }
+        let cc_gain = c.cce.gains.cc_gain(c.list_index, 0, 0)?;
+        for (o, &t) in out.iter_mut().zip(time.iter()) {
+            *o += cc_gain * t;
+        }
+    }
+    Ok(())
+}
+
+/// The decoded embedded `single_channel_element()` of one CCE
+/// (§4.6.8.3.3 `cc_spectrum`), ready to be coupled onto targets.
+#[derive(Debug, Clone)]
+pub struct DecodedCce {
+    /// The fully decoded spectrum (pulse → dequant → `quant_to_spec()`
+    /// → PNS → the CCE's *own* TNS), window-major — the §4.6.8.3.3
+    /// `cc_spectrum[]` buffer a dependently switched CCE couples from.
+    pub spectrum: Vec<f64>,
+    /// The time-domain signal (through the CCE's own §4.6.11
+    /// filterbank) — present only for an independently switched CCE,
+    /// which §4.6.8.3.3 requires to be "decoded all the way to the
+    /// time domain … before it is scaled and added".
+    pub time: Option<Vec<f64>>,
+}
+
+/// Stateful per-CCE-slot decoder for the embedded
+/// `single_channel_element()` of a `coupling_channel_element()`
+/// (§4.6.8.3.3). Keyed per `element_instance_tag` by the stream
+/// driver so the independently-switched filterbank overlap and the
+/// PNS generator persist across frames.
+#[derive(Debug, Clone)]
+pub struct CceDecoder {
+    /// The CCE's own §4.6.11 filterbank (independently-switched CCEs
+    /// synthesize to the time domain with their own window state).
+    fb: Filterbank,
+    /// §4.6.13.3 generator state for noise bands in the embedded SCE.
+    pns_state: u32,
+}
+
+impl Default for CceDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CceDecoder {
+    /// A fresh CCE decoder with zeroed filterbank overlap.
+    #[must_use]
+    pub fn new() -> Self {
+        CceDecoder {
+            fb: Filterbank::new(),
+            pns_state: 0x0001_2345,
+        }
     }
 
-    // §4.6.11 filterbank → PCM, then advance the LTP history with this
-    // frame's output and aliased IMDCT tail (§4.6.7.3).
-    let out = fb.synthesize(spec, ics_info)?;
-    ltp_state.push_frame(&out, fb.aliased_tail());
-    Ok(out)
+    /// Decode the CCE's embedded `single_channel_element()` to the
+    /// §4.6.8.3.3 `cc_spectrum[]` (and, for an independently switched
+    /// CCE, on to the time domain through this slot's persistent
+    /// filterbank).
+    pub fn decode(
+        &mut self,
+        cce: &CouplingChannelElement,
+        aot: u8,
+        fs_index: u8,
+    ) -> Result<DecodedCce> {
+        let ch = ChannelInput {
+            body: &cce.body,
+            ics_info: &cce.ics_info,
+            spectral: &cce.spectral,
+        };
+        let (mut spec, abs) = reconstruct_pre_pair(&ch, fs_index)?;
+
+        // §4.6.13 PNS on the embedded single channel.
+        let max_sfb = usize::from(cce.ics_info.max_sfb);
+        let noise_nrg = noise_nrg_table(&abs, &cce.body.section_data.sfb_cb, max_sfb)?;
+        let state = &mut self.pns_state;
+        let mut pns_chan = PnsChannel {
+            spec: &mut spec,
+            sfb_cb: &cce.body.section_data.sfb_cb,
+            noise_nrg: &noise_nrg,
+        };
+        apply_pns(&mut pns_chan, &cce.ics_info, fs_index, |out| {
+            gen_rand_vector(out, state)
+        })?;
+
+        // The CCE's own §4.6.9 TNS (the embedded ICS is decoded like
+        // any other; the target's TNS relationship is what cc_domain
+        // selects).
+        if let Some(tns) = &cce.body.tns_data {
+            tns_decode_frame(
+                &mut spec,
+                tns,
+                cce.ics_info.window_sequence,
+                cce.ics_info.max_sfb,
+                aot,
+                fs_index,
+            )?;
+        }
+
+        // Independently switched: decode to the time domain through
+        // this slot's persistent filterbank.
+        let time = if cce.header.ind_sw_cce_flag {
+            Some(self.fb.synthesize(&spec, &cce.ics_info)?)
+        } else {
+            None
+        };
+        Ok(DecodedCce {
+            spectrum: spec,
+            time,
+        })
+    }
 }
 
 /// The shared `channel_pair_element()` joint-stereo header (Table 4.4)
@@ -439,6 +642,20 @@ impl ElementDecoder {
     /// Returns `LONG_WINDOW_LEN` (1024) PCM-domain samples for the
     /// frame.
     pub fn decode_sce(&mut self, ch: &ChannelInput<'_>, aot: u8, fs_index: u8) -> Result<Vec<f64>> {
+        self.decode_sce_coupled(ch, aot, fs_index, &[])
+    }
+
+    /// [`Self::decode_sce`] with §4.6.8.3.3 coupling contributions:
+    /// each [`CouplingApply`] is scaled and added at its signalled
+    /// stage (before / after TNS for a dependently switched CCE, on
+    /// the time signal for an independently switched one).
+    pub fn decode_sce_coupled(
+        &mut self,
+        ch: &ChannelInput<'_>,
+        aot: u8,
+        fs_index: u8,
+        coupling: &[CouplingApply<'_>],
+    ) -> Result<Vec<f64>> {
         let (mut spec, abs) = reconstruct_pre_pair(ch, fs_index)?;
         let max_sfb = ch.ics_info.max_sfb as usize;
 
@@ -466,6 +683,7 @@ impl ElementDecoder {
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
             &mut self.ssr_decoders[0],
+            coupling,
         )
     }
 
@@ -496,6 +714,24 @@ impl ElementDecoder {
         joint: &CpeJointStereo,
         aot: u8,
         fs_index: u8,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        self.decode_cpe_coupled(left, right, joint, aot, fs_index, &[], &[])
+    }
+
+    /// [`Self::decode_cpe`] with §4.6.8.3.3 coupling contributions,
+    /// one list per target channel (`cc_l` / `cc_r` and the shared
+    /// Table 4.153 layout decide which lists the stream driver builds
+    /// for each side).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_cpe_coupled(
+        &mut self,
+        left: &ChannelInput<'_>,
+        right: &ChannelInput<'_>,
+        joint: &CpeJointStereo,
+        aot: u8,
+        fs_index: u8,
+        left_coupling: &[CouplingApply<'_>],
+        right_coupling: &[CouplingApply<'_>],
     ) -> Result<(Vec<f64>, Vec<f64>)> {
         // The §4.6.8 joint-stereo tools de-matrix the two channels
         // band-for-band, so they require a shared window geometry. The
@@ -603,6 +839,7 @@ impl ElementDecoder {
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
             &mut self.ssr_decoders[0],
+            left_coupling,
         )?;
         let out_right = finish_channel(
             &mut right_spec,
@@ -615,6 +852,7 @@ impl ElementDecoder {
             &mut self.ltp_states[1],
             &mut self.predictor_banks[1],
             &mut self.ssr_decoders[1],
+            right_coupling,
         )?;
         Ok((out_left, out_right))
     }
