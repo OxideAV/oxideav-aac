@@ -67,8 +67,13 @@
 //!   coefficients keep adapting. Prediction and LTP are mutually
 //!   exclusive by object type (AOT 1 carries no `ltp_data`), so only one
 //!   predictor ever fires per channel.
-//! * The SSR (AOT 3) gain-control ladder (§4.6.12) is parsed but not
-//!   applied; this driver targets the LC / Main / LTP filterbank.
+//! * **SSR gain control (§4.6.12)** is wired in for the SSR object
+//!   type (AOT 3): [`finish_channel`] replaces the §4.6.11 filterbank
+//!   with the per-channel [`crate::ssr::SsrChannelDecoder`] pipeline —
+//!   the §4.6.12.1 four-band front-half filterbank, the §4.6.12.3 gain
+//!   compensation/overlap driven by the frame's `gain_control_data()`,
+//!   and the IPQF synthesis. Note the §4.6.12.3.3 variable per-frame
+//!   output length (1472 / 576 for `LONG_START` / `LONG_STOP`).
 //! * PNS output is RNG-defined per §4.6.13.3 (only the per-band L2 norm
 //!   is spec-determined); the driver uses the default
 //!   [`crate::pns::gen_rand_vector`] LCG, seeded once per decoder so the
@@ -87,6 +92,7 @@ use crate::predictor::PredictorBank;
 use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
+use crate::ssr::SsrChannelDecoder;
 use crate::swb_offset::apply_pulse_data;
 use crate::tns_frame::{tns_analysis_frame, tns_decode_frame};
 use crate::{Error, Result};
@@ -259,6 +265,7 @@ fn finish_channel(
     fb: &mut Filterbank,
     ltp_state: &mut LtpState,
     predictor_bank: &mut Option<PredictorBank>,
+    ssr: &mut Option<Box<SsrChannelDecoder>>,
 ) -> Result<Vec<f64>> {
     // §4.6.6 MPEG-2 frequency-domain prediction (AAC Main, AOT 1 only).
     // The backward-adaptive predictor bank is run on EVERY frame so its
@@ -303,6 +310,18 @@ fn finish_channel(
             aot,
             fs_index,
         )?;
+    }
+
+    // §4.6.12 — the SSR object type (AOT 3) replaces the §4.6.11
+    // filterbank with the four-band gain-control pipeline: the
+    // §4.6.12.1 front-half filterbank (band split + 256/32-line
+    // IMDCTs), the §4.6.12.3 gain compensation/overlap driven by this
+    // frame's gain_control_data(), and the IPQF synthesis. LTP and the
+    // §4.6.6 predictor are other object types' tools, so the state
+    // advance below does not apply.
+    if aot == 3 {
+        let dec = ssr.get_or_insert_with(Default::default);
+        return dec.decode_frame(spec, ics_info, body.gain_control_data.as_ref());
     }
 
     // §4.6.11 filterbank → PCM, then advance the LTP history with this
@@ -362,6 +381,12 @@ pub struct ElementDecoder {
     /// persists and is advanced every frame. Same channel-slot indexing
     /// as `filterbanks`.
     predictor_banks: [Option<PredictorBank>; 2],
+    /// Per-channel §4.6.12 SSR pipeline (AOT 3), replacing the §4.6.11
+    /// filterbank for the SSR object type. `None` until the first SSR
+    /// frame; thereafter the gain-control / IPQF / window-shape state
+    /// persists across frames. Same channel-slot indexing as
+    /// `filterbanks`.
+    ssr_decoders: [Option<Box<SsrChannelDecoder>>; 2],
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
     pns_state: u32,
@@ -381,6 +406,7 @@ impl ElementDecoder {
             filterbanks: [Filterbank::new(), Filterbank::new()],
             ltp_states: [LtpState::new(), LtpState::new()],
             predictor_banks: [None, None],
+            ssr_decoders: [None, None],
             // Any non-zero seed yields a non-degenerate sequence; the
             // §4.6.13.3 normalisation makes the per-band energy
             // independent of the seed, so this choice only fixes the
@@ -397,6 +423,7 @@ impl ElementDecoder {
             filterbanks: [Filterbank::new(), Filterbank::new()],
             ltp_states: [LtpState::new(), LtpState::new()],
             predictor_banks: [None, None],
+            ssr_decoders: [None, None],
             pns_state: seed,
         }
     }
@@ -438,6 +465,7 @@ impl ElementDecoder {
             &mut self.filterbanks[0],
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
+            &mut self.ssr_decoders[0],
         )
     }
 
@@ -574,6 +602,7 @@ impl ElementDecoder {
             &mut self.filterbanks[0],
             &mut self.ltp_states[0],
             &mut self.predictor_banks[0],
+            &mut self.ssr_decoders[0],
         )?;
         let out_right = finish_channel(
             &mut right_spec,
@@ -585,6 +614,7 @@ impl ElementDecoder {
             &mut self.filterbanks[1],
             &mut self.ltp_states[1],
             &mut self.predictor_banks[1],
+            &mut self.ssr_decoders[1],
         )?;
         Ok((out_left, out_right))
     }
@@ -809,6 +839,112 @@ mod tests {
         // for identical input the two frames differ only by the
         // (now non-zero) overlap contribution at frame start.
         assert_ne!(f0, f1);
+    }
+
+    // ---- SSR (AOT 3) §4.6.12 routing ----
+
+    /// AOT 3 routes the channel through the §4.6.12 SSR pipeline
+    /// instead of the §4.6.11 filterbank: same body/spectrum, different
+    /// synthesis, and the SSR output is exactly what a hand-driven
+    /// [`SsrChannelDecoder`] produces from the same decoded spectrum —
+    /// frame after frame (state threads).
+    #[test]
+    fn decode_sce_ssr_matches_direct_pipeline_and_threads_state() {
+        let body = make_body(4, 2, &[0, 0, 0, 0]);
+        let ics = body.ics_info.clone().unwrap();
+        let spectral = make_spectral(3);
+        let ch = ChannelInput {
+            body: &body,
+            ics_info: &ics,
+            spectral: &spectral,
+        };
+        let mut dec = ElementDecoder::new();
+        let mut lc = ElementDecoder::new();
+        let mut direct = SsrChannelDecoder::new();
+        for frame in 0..3 {
+            let f_ssr = dec.decode_sce(&ch, 3, 4).unwrap();
+            assert_eq!(f_ssr.len(), 1024);
+            assert!(f_ssr.iter().all(|v| v.is_finite()));
+            // Bit-identical to the direct §4.6.12 pipeline on the same
+            // decoded (post-TNS) spectrum.
+            let (spec, _) = reconstruct_pre_pair(&ch, 4).unwrap();
+            let expect = direct.decode_frame(&spec, &ics, None).unwrap();
+            assert_eq!(f_ssr, expect, "frame {frame}");
+            // …and different from the §4.6.11 LC synthesis.
+            let f_lc = lc.decode_sce(&ch, 2, 4).unwrap();
+            assert_ne!(f_lc, f_ssr, "frame {frame}");
+        }
+    }
+
+    /// A frame carrying `gain_control_data()` decodes through the
+    /// §4.6.12.3 gain compensation: its PCM differs from the same
+    /// frame without the ladder.
+    #[test]
+    fn decode_sce_ssr_gain_control_data_changes_output() {
+        use crate::gain_control_data::{GainAdjust, GainBand, GainControlData, GainWindow};
+        // 40 active scalefactor bands so the spectrum reaches well past
+        // coefficient 256 — PQF band 1 (the gain-controlled one) must
+        // carry signal for the ladder to matter.
+        let plain = make_body(40, 2, &[0; 40]);
+        let mut gained = make_body(40, 2, &[0; 40]);
+        gained.gain_control_data_present = true;
+        gained.gain_control_data = Some(GainControlData {
+            max_band: 1,
+            bands: vec![GainBand {
+                windows: vec![GainWindow {
+                    adjustments: vec![GainAdjust {
+                        alevcode: 7, // AdjLev = 3 ⇒ ALEV = 8.
+                        aloccode: 0,
+                    }],
+                }],
+            }],
+        });
+        let ics = plain.ics_info.clone().unwrap();
+        let spectral = make_spectral(3);
+        let ch_plain = ChannelInput {
+            body: &plain,
+            ics_info: &ics,
+            spectral: &spectral,
+        };
+        let ch_gained = ChannelInput {
+            body: &gained,
+            ics_info: &ics,
+            spectral: &spectral,
+        };
+        let mut a = ElementDecoder::new();
+        let mut b = ElementDecoder::new();
+        let fa = a.decode_sce(&ch_plain, 3, 4).unwrap();
+        let fb = b.decode_sce(&ch_gained, 3, 4).unwrap();
+        assert_eq!(fa.len(), fb.len());
+        assert_ne!(fa, fb, "gain ladder must alter the SSR synthesis");
+    }
+
+    /// A CPE decodes both channels through per-slot SSR pipelines.
+    #[test]
+    fn decode_cpe_ssr_both_channels() {
+        let left_body = make_body(4, 2, &[0, 0, 0, 0]);
+        let right_body = make_body(4, 2, &[0, 0, 0, 0]);
+        let ics = left_body.ics_info.clone().unwrap();
+        let left_spec = make_spectral(5);
+        let right_spec = make_spectral(2);
+        let left = ChannelInput {
+            body: &left_body,
+            ics_info: &ics,
+            spectral: &left_spec,
+        };
+        let right = ChannelInput {
+            body: &right_body,
+            ics_info: &ics,
+            spectral: &right_spec,
+        };
+        let mut dec = ElementDecoder::new();
+        let (l, r) = dec
+            .decode_cpe(&left, &right, &CpeJointStereo::default(), 3, 4)
+            .unwrap();
+        assert_eq!(l.len(), 1024);
+        assert_eq!(r.len(), 1024);
+        assert!(l.iter().chain(r.iter()).all(|v| v.is_finite()));
+        assert_ne!(l, r);
     }
 
     #[test]

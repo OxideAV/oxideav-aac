@@ -31,6 +31,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - generalized `(n_l, n_s)` §4.6.11.3.2 window builders in `filterbank`
   (the standard 2048/256 family and the SSR 512/64 family share one
   construction)
+- SSR decode-driver wiring: the SSR object type (AOT 3, ADTS profile
+  2) now routes every SCE/CPE channel through the §4.6.12 pipeline in
+  `finish_channel` — per-channel-slot `SsrChannelDecoder` state
+  persisting across frames, `gain_control_data()` consumed from the
+  channel body — pinned bit-identical to the hand-driven pipeline and
+  exercised end to end by an ADTS SSR-profile stream test (encoder
+  output re-labelled to profile 2, mono + stereo)
 
 - Table 1.19 config-7 (7.1) default channel mapping: centre + inner
   Lc/Rc + outer L/R + surround pair + LFE rank-sorted to the canonical
