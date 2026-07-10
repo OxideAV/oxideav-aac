@@ -463,6 +463,7 @@ pub mod spectral_codebook;
 pub mod spectral_data;
 pub mod spectrum_huffman;
 pub mod ssr;
+pub mod ssr_filterbank;
 pub mod swb_offset;
 pub mod tns_coef;
 pub mod tns_data;

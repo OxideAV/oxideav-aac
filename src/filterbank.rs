@@ -69,7 +69,7 @@ type Result<T> = core::result::Result<T, Error>;
 /// scale and the half-coefficient phase are the only normalization
 /// the spec attaches to the inverse transform; the energy-correcting
 /// window then follows in the per-sequence windowing step.
-fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
+pub(crate) fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
     let half = n_transform / 2;
     debug_assert_eq!(spec.len(), half);
     let n0 = (half + 1) as f64 / 2.0;
@@ -147,13 +147,27 @@ pub(crate) fn long_sequence_window(
     left_shape: WindowShape,
     right_shape: WindowShape,
 ) -> Result<Vec<f64>> {
+    long_sequence_window_n(N_L, N_S, sequence, left_shape, right_shape)
+}
+
+/// §4.6.11.3.2 — the [`long_sequence_window`] construction generalized
+/// to an arbitrary `(n_l, n_s)` transform family. The SSR gain-control
+/// filterbank (§4.6.12.1) runs the same window geometry at
+/// `(512, 64)` — one quarter of the standard family — per band.
+pub(crate) fn long_sequence_window_n(
+    n_l: usize,
+    n_s: usize,
+    sequence: WindowSequence,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+) -> Result<Vec<f64>> {
     let kind = match sequence {
         WindowSequence::OnlyLong => LongKind::OnlyLong,
         WindowSequence::LongStart => LongKind::Start,
         WindowSequence::LongStop => LongKind::Stop,
         WindowSequence::EightShort => return Err(Error::FilterbankInvalid),
     };
-    Ok(build_long_window(left_shape, right_shape, kind))
+    Ok(build_long_window_n(n_l, n_s, left_shape, right_shape, kind))
 }
 
 /// §4.6.11.3.2 c) — the length-256 window of short window `j`
@@ -165,12 +179,24 @@ pub(crate) fn short_window_j(
     left_shape: WindowShape,
     right_shape: WindowShape,
 ) -> Vec<f64> {
+    short_window_n(N_S, j, left_shape, right_shape)
+}
+
+/// §4.6.11.3.2 c) — [`short_window_j`] generalized to an arbitrary
+/// short-transform length `n_s` (64 for the SSR §4.6.12.1 per-band
+/// family).
+pub(crate) fn short_window_n(
+    n_s: usize,
+    j: usize,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+) -> Vec<f64> {
     let this_left = if j == 0 { left_shape } else { right_shape };
-    let halves = window_halves(SHORT_TRANSFORM_LEN, this_left, right_shape);
-    let mut w = vec![0.0f64; N_S];
-    w[..N_S / 2].copy_from_slice(&halves.left);
+    let halves = window_halves(n_s, this_left, right_shape);
+    let mut w = vec![0.0f64; n_s];
+    w[..n_s / 2].copy_from_slice(&halves.left);
     for (m, &rv) in halves.right.iter().enumerate() {
-        w[N_S / 2 + m] = rv;
+        w[n_s / 2 + m] = rv;
     }
     w
 }
@@ -264,15 +290,26 @@ struct WindowHalves {
 
 /// Build the left half for the requested `shape` at transform length
 /// `n_transform`.
+///
+/// The KBD kernel alpha follows the transform's *role*: the long
+/// transform of a family uses `α = 4`, the short transform `α = 6`.
+/// §4.6.11.3.2 states this for the 2048/256 (1920/240) family; for the
+/// SSR 512/64 family the same pair reproduces the normative
+/// Table 4.A.14 / Table 4.A.13 window listings (each printed value
+/// matches the α = 4 / α = 6 running-sum construction to the tables'
+/// print precision — pinned by the `ssr_kbd_*` tests below).
 fn half_window(n_transform: usize, shape: WindowShape) -> Vec<f64> {
     let half = n_transform / 2;
     match shape {
         WindowShape::Sine => sine_left(half),
         WindowShape::Kbd => {
-            let alpha = if n_transform == LONG_TRANSFORM_LEN {
-                4.0
-            } else {
-                6.0
+            let alpha = match n_transform {
+                // Long transforms: 2048 (1920) per §4.6.11.3.2; 512 per
+                // the Table 4.A.14 SSR window fit.
+                2048 | 1920 | 512 => 4.0,
+                // Short transforms: 256 (240) per §4.6.11.3.2; 64 per
+                // the Table 4.A.13 SSR window fit.
+                _ => 6.0,
             };
             kbd_left(half, alpha)
         }
@@ -469,10 +506,25 @@ fn build_long_window(
     right_shape: WindowShape,
     kind: LongKind,
 ) -> Vec<f64> {
-    let long = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
-    let short = window_halves(SHORT_TRANSFORM_LEN, left_shape, right_shape);
-    let half_l = N_L / 2; // 1024
-    let mut w = vec![0.0f64; N_L];
+    build_long_window_n(N_L, N_S, left_shape, right_shape, kind)
+}
+
+/// §4.6.11.3.2 — [`build_long_window`] generalized to an arbitrary
+/// `(n_l, n_s)` transform family; every breakpoint is the spec's
+/// `N_l`/`N_s` expression evaluated at the caller's lengths (the
+/// standard family passes `(2048, 256)`, the SSR §4.6.12.1 per-band
+/// family `(512, 64)`).
+fn build_long_window_n(
+    n_l: usize,
+    n_s: usize,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+    kind: LongKind,
+) -> Vec<f64> {
+    let long = window_halves(n_l, left_shape, right_shape);
+    let short = window_halves(n_s, left_shape, right_shape);
+    let half_l = n_l / 2;
+    let mut w = vec![0.0f64; n_l];
 
     // Left half is always the plain long left half for OnlyLong /
     // Start; Stop replaces it with the start-transition mirror.
@@ -484,11 +536,11 @@ fn build_long_window(
             // 0.0 over [0, (N_l − N_s)/4); short left half over
             // [(N_l − N_s)/4, (N_l + N_s)/4); 1.0 over
             // [(N_l + N_s)/4, N_l/2).
-            let a = (N_L - N_S) / 4; // 448
+            let a = (n_l - n_s) / 4;
             for (m, &sv) in short.left.iter().enumerate() {
                 w[a + m] = sv;
             }
-            for slot in w.iter_mut().take(half_l).skip(a + N_S / 2) {
+            for slot in w.iter_mut().take(half_l).skip(a + n_s / 2) {
                 *slot = 1.0;
             }
         }
@@ -503,7 +555,7 @@ fn build_long_window(
         LongKind::Start => {
             // 1.0 over [N_l/2, (3N_l − N_s)/4); short right half
             // over [(3N_l − N_s)/4, (3N_l + N_s)/4); 0.0 after.
-            let b = (3 * N_L - N_S) / 4; // 1472
+            let b = (3 * n_l - n_s) / 4;
             for slot in w.iter_mut().take(b).skip(half_l) {
                 *slot = 1.0;
             }
@@ -990,6 +1042,169 @@ mod tests {
         let kbd = kbd_left(1024, 4.0);
         for n in 0..1024 {
             assert!((win[n] - kbd[n]).abs() < 1e-15);
+        }
+    }
+
+    /// Table 4.A.13 — the normative Kaiser-Bessel window for the AAC
+    /// SSR object type `EIGHT_SHORT_SEQUENCE` (`N = 64`): all 32
+    /// tabulated left-half values, transcribed from the spec PDF. The
+    /// running-sum KBD construction with the short-transform `α = 6`
+    /// reproduces every entry to the table's print precision.
+    #[test]
+    fn ssr_kbd_short_window_matches_table_4_a_13() {
+        // Verbatim table transcription — keep every printed digit,
+        // including redundant trailing zeros.
+        #[allow(clippy::excessive_precision)]
+        const TABLE_4_A_13: [(usize, f64); 32] = [
+            (0, 0.0000875914060105),
+            (1, 0.0009321760265333),
+            (2, 0.0032114611466596),
+            (3, 0.0081009893216786),
+            (4, 0.0171240286619181),
+            (5, 0.0320720743527833),
+            (6, 0.0548307856028528),
+            (7, 0.0871361822564870),
+            (8, 0.1302923415174603),
+            (9, 0.1848955425508276),
+            (10, 0.2506163195331889),
+            (11, 0.3260874142923209),
+            (12, 0.4089316830907141),
+            (13, 0.4959414909423747),
+            (14, 0.5833939894958904),
+            (15, 0.6674601983218376),
+            (16, 0.7446454751465113),
+            (17, 0.8121892962974020),
+            (18, 0.8683559394406505),
+            (19, 0.9125649996381605),
+            (20, 0.9453396205809574),
+            (21, 0.9680864942677585),
+            (22, 0.9827581789763112),
+            (23, 0.9914756203467121),
+            (24, 0.9961964092194694),
+            (25, 0.9984956609571091),
+            (26, 0.9994855586984285),
+            (27, 0.9998533730714648),
+            (28, 0.9999671864476404),
+            (29, 0.9999948432453556),
+            (30, 0.9999995655238333),
+            (31, 0.9999999961638728),
+        ];
+        let left = half_window(64, WindowShape::Kbd);
+        assert_eq!(left.len(), 32);
+        for &(i, expect) in &TABLE_4_A_13 {
+            assert!(
+                (left[i] - expect).abs() < 1e-8,
+                "Table 4.A.13 w({i}): got {} expect {expect}",
+                left[i]
+            );
+        }
+        // Discriminator: the long-transform α = 4 does NOT fit.
+        let alt = kbd_left(32, 4.0);
+        assert!((alt[0] - TABLE_4_A_13[0].1).abs() > 1e-4);
+    }
+
+    /// Table 4.A.14 — the normative Kaiser-Bessel window for the SSR
+    /// object type's other window sequences (`N = 512`): a spread of
+    /// tabulated left-half values transcribed from the spec PDF. The
+    /// running-sum KBD construction with the long-transform `α = 4`
+    /// reproduces each to the table's print precision.
+    #[test]
+    fn ssr_kbd_long_window_matches_table_4_a_14() {
+        // Verbatim table transcription — keep every printed digit,
+        // including redundant trailing zeros.
+        #[allow(clippy::excessive_precision)]
+        const TABLE_4_A_14_SPREAD: [(usize, f64); 15] = [
+            (0, 0.0005851230124487),
+            (1, 0.0009642149851497),
+            (2, 0.0013558207534965),
+            (16, 0.0116765080854300),
+            (32, 0.0405466983507029),
+            (64, 0.1811734433685097),
+            (96, 0.4325622561631607),
+            (128, 0.7110428359000029),
+            (160, 0.9058173183656508),
+            (192, 0.9845850806232530),
+            (224, 0.9992757396582338),
+            (240, 0.9999442511639580),
+            (250, 0.9999962619864214),
+            (254, 0.9999995351446231),
+            (255, 0.9999998288155155),
+        ];
+        let left = half_window(512, WindowShape::Kbd);
+        assert_eq!(left.len(), 256);
+        for &(i, expect) in &TABLE_4_A_14_SPREAD {
+            assert!(
+                (left[i] - expect).abs() < 1e-8,
+                "Table 4.A.14 w({i}): got {} expect {expect}",
+                left[i]
+            );
+        }
+        // Discriminator: the short-transform α = 6 does NOT fit.
+        let alt = kbd_left(256, 6.0);
+        assert!((alt[0] - TABLE_4_A_14_SPREAD[0].1).abs() > 1e-4);
+    }
+
+    /// The generalized `(n_l, n_s)` long-window builder reproduces the
+    /// standard-family construction exactly, and the SSR family's
+    /// breakpoints land at the quarter-scaled positions.
+    #[test]
+    fn generalized_long_window_matches_standard_and_scales() {
+        for kind in [LongKind::OnlyLong, LongKind::Start, LongKind::Stop] {
+            let std = build_long_window(WindowShape::Sine, WindowShape::Sine, kind);
+            let gen = build_long_window_n(2048, 256, WindowShape::Sine, WindowShape::Sine, kind);
+            assert_eq!(std, gen);
+        }
+        // SSR LONG_START at (512, 64): 1.0 plateau over [256, 368),
+        // short descent over [368, 400), zero over [400, 512).
+        let w = build_long_window_n(
+            512,
+            64,
+            WindowShape::Sine,
+            WindowShape::Sine,
+            LongKind::Start,
+        );
+        assert_eq!(w.len(), 512);
+        for v in w.iter().take(368).skip(256) {
+            assert!((*v - 1.0).abs() < 1e-15);
+        }
+        assert!(w[368] < 1.0 && w[368] > w[399]);
+        for v in w.iter().skip(400) {
+            assert_eq!(*v, 0.0);
+        }
+        // SSR LONG_STOP mirrors: zero over [0, 112), ascent [112, 144),
+        // plateau [144, 256).
+        let w = build_long_window_n(
+            512,
+            64,
+            WindowShape::Sine,
+            WindowShape::Sine,
+            LongKind::Stop,
+        );
+        for v in w.iter().take(112) {
+            assert_eq!(*v, 0.0);
+        }
+        for v in w.iter().take(256).skip(144) {
+            assert!((*v - 1.0).abs() < 1e-15);
+        }
+    }
+
+    /// The SSR-family windows are TDAC power-complementary at every
+    /// steady overlap: `w(n)² + w(n + N/2)²` over the flanks sums to 1
+    /// for the 512 `ONLY_LONG` window (both shapes), which is the
+    /// §4.6.11 perfect-reconstruction condition the §4.6.12.3.3
+    /// per-band overlap relies on.
+    #[test]
+    fn ssr_only_long_window_is_power_complementary() {
+        for shape in [WindowShape::Sine, WindowShape::Kbd] {
+            let w = build_long_window_n(512, 64, shape, shape, LongKind::OnlyLong);
+            for n in 0..256 {
+                let s = w[n] * w[n] + w[n + 256] * w[n + 256];
+                assert!(
+                    (s - 1.0).abs() < 1e-10,
+                    "{shape:?} w²({n}) + w²({}) = {s}",
+                    n + 256
+                );
+            }
         }
     }
 }
