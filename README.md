@@ -200,12 +200,22 @@ encoder alongside the decoder under id `"aac"`.
   coefficient loop multiplying the embedded-SCE spectrum by the
   per-`(g, sfb)` `cc_gain` and adding it onto a target channel's
   window-major spectrum (implicit list 0 in natural scaling, `ZERO_HCB`
-  bands skipped). The stream decode loop fully consumes a CCE so a
-  CCE-bearing frame's SCE / CPE channels still decode; the per-band
-  coupling math is implemented and unit-tested, but the decode-loop
-  wiring that matches targets by `cc_target_tag_select` and intercepts
-  their spectra at the `cc_domain` stage awaits a CCE fixture for
-  end-to-end validation (docs-gap).
+  bands skipped). **The cross-element application is wired into the
+  stream decoder**: the raw-data-block walk is two-pass (parse every
+  channel element, then decode), each CCE's embedded SCE is decoded
+  through a per-instance-tag `CceDecoder` slot (its own pulse / dequant
+  / PNS / TNS, plus its own persistent §4.6.11 filterbank for the
+  independently-switched case), and the `decode_coupling_channel()`
+  target walk matches `cc_target_is_cpe` / `cc_target_tag_select`,
+  assigns the Table 4.153 gain lists (shared / left / right / both),
+  and injects the scaled spectrum at the signalled `cc_domain` stage
+  (before / after the target's TNS; window-state match enforced) or —
+  for an independently switched CCE — the scaled time signal after the
+  target's filterbank. Validated end to end with writer-assembled CCE
+  streams against the filterbank-linearity identity
+  `decode([target, CCE]) = decode([target]) + cc_gain·decode([embedded])`
+  (natural scaling, gain-list ×2, independently-switched, and
+  CPE-left-only layouts, ≤ 2 LSB stacked-rounding deviation).
 - **Frequency-domain prediction** (`predictor`) — §4.6.6 MPEG-2
   backward-adaptive intra-channel predictor for the AAC **Main** object
   type (AOT 1). A bank of second-order lattice predictors (one per MDCT
@@ -255,12 +265,13 @@ encoder alongside the decoder under id `"aac"`.
   so the single synthesis pass shapes the residual while undoing the
   analysis on the LTP contribution.
 
-### SSR gain control back-end (§4.6.12)
+### SSR gain control (§4.6.12) — complete decode pipeline
 
-The §4.6.12 SSR (Scalable Sample Rate, AOT 3) gain-control **back-end**
-is now implemented — the reconstruction counterpart to the
-`gain_control_data` Table 4.12 wire parser, validated independent of any
-external SSR implementation:
+The §4.6.12 SSR (Scalable Sample Rate, AOT 3) gain-control tool is
+implemented **end to end** — front-half filterbank, gain
+reconstruction, and IPQF synthesis — and wired into the decode driver
+(ADTS profile 2 routes every SCE / CPE channel through it), validated
+independent of any external SSR implementation:
 
 - **Gain-control reconstruction** (`gain_control`) — §4.6.12.3.1–3. The
   §4.6.12.3.1 gain-control data decoding (the Table 4.108 `AdjLoc()` =
@@ -295,15 +306,32 @@ external SSR implementation:
   `AS(n)` (1024 samples/frame for the steady `ONLY_LONG` / `EIGHT_SHORT`
   case). PQF band 0 is never gain-controlled.
 
-The remaining §4.6.12.1 **front half** — splitting the transmitted
-spectrum into the four PQF-band coefficient columns, the even-band
-spectral reversal, and the per-band 256-coefficient (long) /
-32-coefficient (short) IMDCTs that feed `U_{W,B}` — is **not yet
-wired**: the staged §4.6.12 text does not specify the spectrum-to-band
-arrangement (contiguous-block vs interleaved split, the precise
-even-band reversal indexing), so the spectrum→band mapping is a
-documented docs gap. The back-end above is complete and validated; only
-this front-half de-interleave is pending the spec detail.
+- **Front-half filterbank** (`ssr_filterbank`) — §4.6.12.1 /
+  13818-7 §16.1, closing the previously docs-gapped spectrum→band
+  mapping: the frequency-ascending spectrum splits into four
+  *contiguous* PQF-band quarters (the PQF's band `B` covers the `B`-th
+  quarter, Annex C.2.1.1), the "even" bands — the spec's ordinal
+  2nd/4th, i.e. 0-based 1 and 3, exactly the bands the ×4 decimation
+  spectrally inverts — are reversed, and each band runs a 256-line
+  (long) / 8 × 32-line (short) IMDCT under the quarter-scale
+  §4.6.11.3.2 window geometry (`N_l/N_s = 512/64`; the KBD windows are
+  generated with the α = 4 / α = 6 running-sum construction and pinned
+  against the normative Table 4.A.14 / 4.A.13 listings). The split +
+  reversal convention is pinned by a tone-placement test against the
+  Annex C.2.1.1 analysis-PQF definition.
+- **Per-channel pipeline + driver wiring** (`ssr::SsrChannelDecoder`,
+  `element_decode`) — the complete spectrum → PCM chain (front half →
+  §4.6.12.3 gain compensation/overlap → IPQF), replacing the §4.6.11
+  filterbank for AOT 3 in the decode driver (per-channel-slot state,
+  `gain_control_data()` from the channel body; note the §4.6.12.3.3
+  variable frame lengths — 1472 / 576 PCM samples for `LONG_START` /
+  `LONG_STOP`). Validated by full round-trip tests against the Annex
+  C.2.1.1 analysis PQF: steady long frames and a complete
+  window-transition chain reconstruct at err/sig < 1e-3 (the PQF
+  pair's near-perfect-reconstruction bound, both window shapes), gain
+  ladders applied encoder-side cancel end to end, and an
+  ADTS-profile-2 stream decodes through the public `StreamDecoder`
+  (mono + stereo).
 
 ### SBR bitstream decode (HE-AAC)
 
@@ -618,10 +646,11 @@ EP-tool payload de-interleave is out of scope.
   where the error-to-signal RMS ratio stays below 0.1%; full
   byte-exactness on those is precluded by the §4.6.13.3 spec-undefined
   noise-phase RNG (energy is normative, phase is not). A
-  `coupling_channel_element()` (CCE) carried in the block is now fully
-  consumed (parsed via `cce::CouplingChannelElement`) so the frame's
-  SCE / CPE channels still decode; the §4.6.8.3.3 coupling *contribution*
-  onto the targets is decoded but not yet applied. Multi-`raw_data_block`
+  `coupling_channel_element()` (CCE) carried in the block is **decoded
+  and applied**: the block walk is two-pass, so the §4.6.8.3.3
+  coupling contribution lands on the addressed SCE / CPE channels at
+  the signalled `cc_domain` stage whether the CCE precedes or follows
+  its targets (see the `cce` bullet above). Multi-`raw_data_block`
   ADTS and SBR up-sampling remain out of scope.
 - **Runtime `Decoder` registration** (`codec_decoder`) — `AacDecoder`
   adapts the persistent `StreamDecoder` / `LoasDecoder` into the
@@ -704,15 +733,15 @@ EP-tool payload de-interleave is out of scope.
   merging), and supports 1–2 channels (no multichannel PCE-driven
   layouts). Codebook choice is smallest-LAV-fits rather than
   measured-bit-cost.
-- The SSR gain-control tool (§4.6.12) — the §4.6.12.3.1–4 **back end**
-  is now implemented and validated (gain-control function
-  reconstruction, the per-band windowing/overlap, and the IPQF synthesis
-  filter — see the "SSR gain control back-end" section above). What
-  remains is the §4.6.12.1 **front half**: the spectrum → PQF-band
-  coefficient-column de-interleave, the even-band spectral reversal, and
-  the per-band 256/32-coefficient IMDCTs that feed `U_{W,B}` — blocked on
-  a docs gap (the staged §4.6.12 text does not specify the
-  spectrum-to-band arrangement). (The Main frequency-domain predictor,
+- SSR remainders — the §4.6.12 gain-control tool is now implemented
+  and wired **end to end** (front-half filterbank, gain
+  reconstruction, IPQF — see the "SSR gain control" section above).
+  Still open: no genuine SSR-profile conformance stream is staged
+  (validation is via the in-crate Annex C.2.1.1 analysis-PQF round
+  trip and re-labelled LC streams), and the 13818-7 SSR-profile
+  *bandwidth-scalable* output modes (decoding only 1–3 PQF bands at a
+  reduced rate) are not selectable — the decoder always reconstructs
+  the full-rate signal. (The Main frequency-domain predictor,
   §4.6.6, is now
   fully wired into `element_decode` for the AAC Main object type on long
   windows — see `predictor` above. LTP, §4.6.7, is likewise wired in
@@ -737,15 +766,12 @@ EP-tool payload de-interleave is out of scope.
   `bs_sbr_crc_bits` field is captured, not verified;
   the §4.6.18.4.3 downsampled-output mode and the §4.6.18.8 low-power
   variant are not selectable; and the ER AAC LD 480/512 transform
-  variants remain out of scope. The coupling-channel (CCE) bitstream is
-  decoded end
-  to end (`cce`, see the tool-chain section above) and consumed by the
-  stream decode loop; the §4.6.8.3.3 per-band coupling math
-  (`CouplingGains::couple_channel`) is implemented and unit-tested, but
-  the cross-element *application* (matching targets by
-  `cc_target_tag_select` and scaling the decoded CCE spectrum onto the
-  addressed SCE / CPE channels at the `cc_domain` stage) awaits a CCE
-  fixture for end-to-end validation.
+  variants remain out of scope. The coupling-channel (CCE) tool is
+  decoded **and applied** end to end (`cce` + the two-pass stream walk;
+  see the tool-chain section above), validated against the
+  filterbank-linearity identity on writer-assembled CCE streams; a
+  third-party CCE-bearing conformance fixture would still be a welcome
+  external cross-check.
 - The full `reordered_spectral_data()` (HCR) payload decode — the
   error-resilient channel-element body (`ics_body::IcsBody::parse_er`)
   now selects all three §4.4.6 resilience branches off the
