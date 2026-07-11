@@ -914,6 +914,9 @@ pub struct LoasDecoder {
     /// whose extension sampling frequency equals the core rate selects
     /// the mode per stream regardless.
     sbr_downsampled: bool,
+    /// Caller-forced §4.6.18.8 low-power SBR mode (see
+    /// [`Self::set_sbr_low_power`]).
+    sbr_low_power: bool,
 }
 
 impl LoasDecoder {
@@ -932,6 +935,14 @@ impl LoasDecoder {
     /// declares *is* the core rate). Select before decoding.
     pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
         self.sbr_downsampled = downsampled;
+    }
+
+    /// Force the §4.6.18.8 low-power SBR mode on every stream decoder
+    /// this LOAS driver creates (real-valued filterbanks + the LP
+    /// adjustment chain; PS streams are rejected in this mode). Select
+    /// before decoding.
+    pub fn set_sbr_low_power(&mut self, low_power: bool) {
+        self.sbr_low_power = low_power;
     }
 
     /// Decode a whole LOAS `AudioSyncStream()` byte buffer to a vector of
@@ -975,9 +986,11 @@ impl LoasDecoder {
         // a PS payload renders stereo through the subpart-8 tool.
         let dec = self.streams.entry(payload.stream_id).or_insert_with({
             let force_down = self.sbr_downsampled;
+            let force_lp = self.sbr_low_power;
             move || {
                 let mut d = StreamDecoder::new();
                 d.set_sbr_downsampled(force_down);
+                d.set_sbr_low_power(force_lp);
                 d
             }
         });

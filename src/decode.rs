@@ -131,6 +131,10 @@ pub struct StreamDecoder {
     /// every SBR back-end this decoder creates
     /// ([`Self::set_sbr_downsampled`]).
     sbr_downsampled: bool,
+    /// §4.6.18.8 low-power SBR mode: real-valued filterbanks and the
+    /// LP adjustment chain on every SBR back-end this decoder creates
+    /// ([`Self::set_sbr_low_power`]).
+    sbr_low_power: bool,
     /// The active `program_config_element()` for
     /// `channelConfiguration == 0` streams — captured from an in-band
     /// PCE (§8.5.2.2: it takes effect at the block carrying it and
@@ -174,6 +178,18 @@ impl StreamDecoder {
     /// rate-specific).
     pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
         self.sbr_downsampled = downsampled;
+    }
+
+    /// Select the §4.6.18.8 low-power SBR mode: every SBR back-end
+    /// runs the real-valued filterbanks with the LP adjustment chain
+    /// (×2 energy estimation, aliasing detection/reduction, modified
+    /// sinusoid injection, no gain smoothing). Composable with
+    /// [`Self::set_sbr_downsampled`]. An HE-AAC v2 (PS) stream is
+    /// rejected in this mode ([`crate::Error::SbrLowPowerPs`]) — the
+    /// subpart-8 tool needs the complex QMF domain. Select before
+    /// decoding.
+    pub fn set_sbr_low_power(&mut self, low_power: bool) {
+        self.sbr_low_power = low_power;
     }
 
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
@@ -450,6 +466,7 @@ impl StreamDecoder {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             let mut d = SbrDecoder::new(fs_sbr, n_ch)?;
                             d.set_downsampled(self.sbr_downsampled)?;
+                            d.set_low_power(self.sbr_low_power)?;
                             v.insert(d)
                         }
                     };

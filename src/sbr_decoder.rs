@@ -35,9 +35,15 @@ use crate::sbr_env_adjust::{adjust, EnvAdjustState, EnvParams};
 use crate::sbr_extension::SbrExtensionData;
 use crate::sbr_freq_bands::{k0 as derive_k0, k2 as derive_k2, master_table, HiLoTables};
 use crate::sbr_header::SbrHeader;
-use crate::sbr_hf_gen::{build_patches, chirp_factors, generate_hf, Patches, T_HF_ADJ, T_HF_GEN};
+use crate::sbr_hf_gen::{
+    build_patches, chirp_factors, generate_hf, reflection_coefficient, Patches, T_HF_ADJ, T_HF_GEN,
+};
 use crate::sbr_limiter::limiter_table;
-use crate::sbr_qmf::{AnalysisQmf, Complex, DownsampledSynthesisQmf, SynthesisQmf};
+use crate::sbr_lp::{aliasing_degree, deg_patched};
+use crate::sbr_qmf::{
+    AnalysisQmf, Complex, DownsampledSynthesisQmf, RealAnalysisQmf, RealDownsampledSynthesisQmf,
+    RealSynthesisQmf, SynthesisQmf,
+};
 use crate::sbr_reconstruct::{EnvelopeScalefactors, NoiseScalefactors};
 use crate::sbr_time_grid::derive_time_grid;
 use crate::{Error, Result};
@@ -65,40 +71,94 @@ enum SynthesisBank {
     Dual(SynthesisQmf),
     /// §4.6.18.4.3 — 32 output samples per slot (core rate).
     Down(DownsampledSynthesisQmf),
+    /// §4.6.18.8.2.3 — the real-valued low-power dual-rate bank.
+    RealDual(RealSynthesisQmf),
+    /// §4.6.18.8.2.4 — the real-valued low-power core-rate bank.
+    RealDown(RealDownsampledSynthesisQmf),
 }
 
 impl SynthesisBank {
-    fn new(downsampled: bool) -> Self {
-        if downsampled {
-            SynthesisBank::Down(DownsampledSynthesisQmf::new())
-        } else {
-            SynthesisBank::Dual(SynthesisQmf::new())
+    fn new(downsampled: bool, low_power: bool) -> Self {
+        match (low_power, downsampled) {
+            (false, false) => SynthesisBank::Dual(SynthesisQmf::new()),
+            (false, true) => SynthesisBank::Down(DownsampledSynthesisQmf::new()),
+            (true, false) => SynthesisBank::RealDual(RealSynthesisQmf::new()),
+            (true, true) => SynthesisBank::RealDown(RealDownsampledSynthesisQmf::new()),
         }
     }
 
     /// Output samples per QMF slot (64 dual-rate, 32 downsampled).
     fn samples_per_slot(&self) -> usize {
         match self {
-            SynthesisBank::Dual(_) => 64,
-            SynthesisBank::Down(_) => 32,
+            SynthesisBank::Dual(_) | SynthesisBank::RealDual(_) => 64,
+            SynthesisBank::Down(_) | SynthesisBank::RealDown(_) => 32,
         }
     }
 
     /// Synthesize one assembled `X` column, appending the slot's output
-    /// samples to `out`.
+    /// samples to `out`. The real (low-power) banks consume the real
+    /// parts — the LP signal path never populates the imaginary parts.
     fn push_slot(&mut self, x: &[Complex; 64], out: &mut Vec<f64>) -> Result<()> {
         match self {
             SynthesisBank::Dual(s) => out.extend_from_slice(&s.push_slot(x)?),
             SynthesisBank::Down(s) => out.extend_from_slice(&s.push_slot(&x[..32])?),
+            SynthesisBank::RealDual(s) => {
+                let mut re = [0.0f64; 64];
+                for (r, c) in re.iter_mut().zip(x.iter()) {
+                    *r = c.re;
+                }
+                out.extend_from_slice(&s.push_slot(&re)?);
+            }
+            SynthesisBank::RealDown(s) => {
+                let mut re = [0.0f64; 32];
+                for (r, c) in re.iter_mut().zip(x.iter()) {
+                    *r = c.re;
+                }
+                out.extend_from_slice(&s.push_slot(&re)?);
+            }
         }
         Ok(())
+    }
+}
+
+/// The analysis filterbank of one core channel: the §4.6.18.4.1
+/// complex bank, or the §4.6.18.8.2.2 real-valued low-power bank
+/// (whose output rides the same `Complex` slots with zero imaginary
+/// parts, so the HF generator and adjuster formulas apply unchanged).
+#[derive(Debug)]
+enum AnalysisBank {
+    Complex(AnalysisQmf),
+    Real(RealAnalysisQmf),
+}
+
+impl AnalysisBank {
+    fn new(low_power: bool) -> Self {
+        if low_power {
+            AnalysisBank::Real(RealAnalysisQmf::new())
+        } else {
+            AnalysisBank::Complex(AnalysisQmf::new())
+        }
+    }
+
+    fn push_slot(&mut self, samples: &[f64]) -> Result<[Complex; 32]> {
+        match self {
+            AnalysisBank::Complex(a) => a.push_slot(samples),
+            AnalysisBank::Real(a) => {
+                let w = a.push_slot(samples)?;
+                let mut out = [Complex::default(); 32];
+                for (o, &r) in out.iter_mut().zip(w.iter()) {
+                    o.re = r;
+                }
+                Ok(out)
+            }
+        }
     }
 }
 
 /// Per-channel cross-frame state.
 #[derive(Debug)]
 struct ChannelState {
-    analysis: AnalysisQmf,
+    analysis: AnalysisBank,
     synthesis: SynthesisBank,
     /// The previous frame's last `tHFGen` analysis slots (`W'`).
     w_hist: Vec<[Complex; 32]>,
@@ -117,10 +177,10 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    fn new(downsampled: bool) -> Self {
+    fn new(downsampled: bool, low_power: bool) -> Self {
         ChannelState {
-            analysis: AnalysisQmf::new(),
-            synthesis: SynthesisBank::new(downsampled),
+            analysis: AnalysisBank::new(low_power),
+            synthesis: SynthesisBank::new(downsampled, low_power),
             w_hist: vec![[Complex::default(); 32]; T_HF_GEN],
             y_prev: vec![[Complex::default(); 64]; COLS],
             t_e_last_prev: NUM_TIME_SLOTS,
@@ -165,6 +225,13 @@ pub struct SbrDecoder {
     /// 32-channel bank and every frame yields 1024 samples per channel
     /// at the *core* rate instead of 2048 at `fs_sbr`.
     downsampled: bool,
+    /// §4.6.18.8 low-power mode: real-valued filterbanks, ×2 energy
+    /// estimation, aliasing detection/reduction, modified sinusoid
+    /// injection. PS payloads are rejected ([`Error::SbrLowPowerPs`]).
+    low_power: bool,
+    /// `k0` of the active band setup (the first `fMaster` subband;
+    /// the §4.6.18.8.3 reflection coefficients cover `0 ≤ k < k0`).
+    k0: i32,
     /// Set once the first frame is processed (mode switches are then
     /// rejected — the QMF synthesis state is rate-specific).
     started: bool,
@@ -197,9 +264,11 @@ impl SbrDecoder {
             patches: None,
             f_table_lim: Vec::new(),
             downsampled: false,
+            low_power: false,
+            k0: 0,
             started: false,
             channels: (0..num_channels)
-                .map(|_| ChannelState::new(false))
+                .map(|_| ChannelState::new(false, false))
                 .collect(),
             ps: None,
         })
@@ -222,12 +291,7 @@ impl SbrDecoder {
         }
         if self.downsampled != downsampled {
             self.downsampled = downsampled;
-            for ch in &mut self.channels {
-                ch.synthesis = SynthesisBank::new(downsampled);
-            }
-            if let Some(ps) = &mut self.ps {
-                ps.synthesis_r = SynthesisBank::new(downsampled);
-            }
+            self.rebuild_banks();
         }
         Ok(())
     }
@@ -236,6 +300,46 @@ impl SbrDecoder {
     #[must_use]
     pub fn is_downsampled(&self) -> bool {
         self.downsampled
+    }
+
+    /// Select the §4.6.18.8 low-power SBR mode: the whole signal path
+    /// runs on real-valued subband signals (the §4.6.18.8.2 real
+    /// filterbanks), the envelope adjuster applies the §4.6.18.8.4
+    /// energy correction and §4.6.18.8.5 aliasing reduction / modified
+    /// sinusoid injection, and gain smoothing is disabled. Composable
+    /// with [`Self::set_downsampled`]. A PS payload on a low-power
+    /// decoder is rejected with [`Error::SbrLowPowerPs`] — the
+    /// subpart-8 tool needs the complex QMF domain.
+    ///
+    /// Must be selected before the first frame is processed
+    /// ([`Error::SbrQmfInvalid`] otherwise).
+    pub fn set_low_power(&mut self, low_power: bool) -> Result<()> {
+        if self.started {
+            return Err(Error::SbrQmfInvalid);
+        }
+        if self.low_power != low_power {
+            self.low_power = low_power;
+            self.rebuild_banks();
+        }
+        Ok(())
+    }
+
+    /// `true` ⇔ the §4.6.18.8 low-power mode is selected.
+    #[must_use]
+    pub fn is_low_power(&self) -> bool {
+        self.low_power
+    }
+
+    /// Re-instantiate every filterbank for the current mode pair
+    /// (only legal before the first frame).
+    fn rebuild_banks(&mut self) {
+        for ch in &mut self.channels {
+            ch.analysis = AnalysisBank::new(self.low_power);
+            ch.synthesis = SynthesisBank::new(self.downsampled, self.low_power);
+        }
+        if let Some(ps) = &mut self.ps {
+            ps.synthesis_r = SynthesisBank::new(self.downsampled, self.low_power);
+        }
     }
 
     /// §4.6.18.5 pure upsampling: no SBR data for this frame — run the
@@ -334,6 +438,7 @@ impl SbrDecoder {
             )?;
             self.bands = Some(bands);
             self.patches = Some(patches);
+            self.k0 = k0v;
             for ch in &mut self.channels {
                 ch.prev_invf.clear();
                 ch.prev_bw.clear();
@@ -413,6 +518,21 @@ impl SbrDecoder {
             let l_range = (RATE * grid.t_e[0])..(RATE * grid.t_e[grid.t_e.len() - 1]);
             let x_high = generate_hf(&x_low, patches, &bw, bands, l_range, LF)?;
 
+            // §4.6.18.8.3 aliasing detection (low power): reflection
+            // coefficients over the low band, the Figure 4.53 degree
+            // walk, and the patch carry onto the SBR range.
+            let dp = if self.low_power {
+                let k0_cnt = usize::try_from(self.k0).map_err(|_| Error::SbrFreqBandInvalid)?;
+                let mut refl = Vec::with_capacity(k0_cnt);
+                for k in 0..k0_cnt.min(32) {
+                    refl.push(reflection_coefficient(&x_low, k, LF)?);
+                }
+                let deg = aliasing_degree(&refl);
+                Some(deg_patched(&deg, patches, bands.k_x, bands.m)?)
+            } else {
+                None
+            };
+
             // Envelope adjustment.
             let freq_res: Vec<bool> = sbr_ch.grid.freq_res.clone();
             let params = EnvParams {
@@ -429,8 +549,8 @@ impl SbrDecoder {
                 smoothing_mode: ext.header.smoothing_mode,
                 limiter_gains: ext.header.limiter_gains,
                 reset,
-                low_power: false,
-                deg_patched: None,
+                low_power: self.low_power,
+                deg_patched: dp.as_deref(),
             };
             let y = adjust(&x_high, &params, &mut ch.env_state)?;
 
@@ -449,9 +569,20 @@ impl SbrDecoder {
                     *cell = x_low[l + T_HF_ADJ][k];
                 }
                 let hi = (kx_cur + m_cur).max(0) as usize;
-                let hi = hi.min(64);
+                // §4.6.18.8.5: the low-power sinusoid spill extends the
+                // Y range one subband above the SBR range (≤ 63)…
+                let hi = if self.low_power {
+                    (hi + 1).min(64)
+                } else {
+                    hi.min(64)
+                };
                 if kx_u < hi {
                     x[kx_u..hi].copy_from_slice(&y_col[kx_u..hi]);
+                }
+                // …and adds Y(kx − 1) onto the lowband subband rather
+                // than replacing it.
+                if self.low_power && (1..=32).contains(&kx_u) {
+                    x[kx_u - 1] += y_col[kx_u - 1];
                 }
                 x_cols.push(x);
             }
@@ -470,10 +601,15 @@ impl SbrDecoder {
             } else {
                 None
             };
+            if ps_payload.is_some() && self.low_power {
+                // §4.6.18.8: the real-valued tool cannot host the
+                // complex-domain PS processing.
+                return Err(Error::SbrLowPowerPs);
+            }
             if ps_payload.is_some() && self.ps.is_none() {
                 self.ps = Some(PsState {
                     dec: PsDecoder::new(),
-                    synthesis_r: SynthesisBank::new(self.downsampled),
+                    synthesis_r: SynthesisBank::new(self.downsampled, self.low_power),
                 });
             }
             let sps = ch.synthesis.samples_per_slot();
@@ -824,6 +960,141 @@ mod tests {
             best.0,
             best.1
         );
+    }
+
+    /// The §4.6.18.8 low-power mode reconstructs the same synthetic
+    /// SBR frame as the high-quality mode to a moderate tolerance
+    /// (the LP tool is a real-valued approximation), stays finite and
+    /// deterministic, and composes with the downsampled output.
+    #[test]
+    fn low_power_tracks_high_quality() {
+        let fs_sbr = 44_100;
+        let ext = synthetic_ext(fs_sbr, 8, 6);
+        let mut hq = SbrDecoder::new(fs_sbr, 1).unwrap();
+        let mut lp = SbrDecoder::new(fs_sbr, 1).unwrap();
+        lp.set_low_power(true).unwrap();
+        assert!(lp.is_low_power());
+        let freq = 0.055;
+        let mut out_hq = Vec::new();
+        let mut out_lp = Vec::new();
+        for f in 0..6 {
+            let core = sine(freq, 1024, f * 1024);
+            out_hq.extend_from_slice(&hq.process_frame(&ext, &[&core]).unwrap()[0]);
+            let o = lp.process_frame(&ext, &[&core]).unwrap();
+            assert_eq!(o[0].len(), 2048);
+            assert!(o[0].iter().all(|v| v.is_finite()));
+            out_lp.extend_from_slice(&o[0]);
+        }
+        assert!(lp.set_low_power(false).is_err(), "mode locked after start");
+        // Energy tracks the HQ reconstruction (the two banks share the
+        // prototype and delay).
+        let e_hq: f64 = out_hq.iter().skip(4096).map(|v| v * v).sum();
+        let e_lp: f64 = out_lp.iter().skip(4096).map(|v| v * v).sum();
+        assert!(
+            e_lp > 0.5 * e_hq && e_lp < 2.0 * e_hq,
+            "LP {e_lp} vs HQ {e_hq}"
+        );
+        // The real-valued HF processing does not reproduce the complex
+        // path's subband phases, so the comparison is energy-domain:
+        // the core tone's amplitude (quadrature probe at the upsampled
+        // frequency) must match tightly, and the per-block energy
+        // envelope must track.
+        let probe = |x: &[f64]| -> f64 {
+            let w = 2.0 * core::f64::consts::PI * freq / 2.0;
+            let (mut cs, mut sn) = (0.0f64, 0.0f64);
+            let n0 = 4096;
+            for (t, &v) in x.iter().enumerate().skip(n0) {
+                cs += v * (w * t as f64).cos();
+                sn += v * (w * t as f64).sin();
+            }
+            let n = (x.len() - n0) as f64;
+            2.0 / n * (cs * cs + sn * sn).sqrt()
+        };
+        let (a_hq, a_lp) = (probe(&out_hq), probe(&out_lp));
+        assert!(
+            (a_lp - a_hq).abs() < 0.05 * a_hq,
+            "core tone amplitude LP {a_lp} vs HQ {a_hq}"
+        );
+        for (block_hq, block_lp) in out_hq
+            .chunks_exact(1024)
+            .zip(out_lp.chunks_exact(1024))
+            .skip(4)
+        {
+            let e_h: f64 = block_hq.iter().map(|v| v * v).sum();
+            let e_l: f64 = block_lp.iter().map(|v| v * v).sum();
+            assert!(
+                e_l > 0.4 * e_h && e_l < 2.5 * e_h,
+                "block energy LP {e_l} vs HQ {e_h}"
+            );
+        }
+
+        // Determinism.
+        let mut lp2 = SbrDecoder::new(fs_sbr, 1).unwrap();
+        lp2.set_low_power(true).unwrap();
+        let mut out_lp2 = Vec::new();
+        for f in 0..6 {
+            let core = sine(freq, 1024, f * 1024);
+            out_lp2.extend_from_slice(&lp2.process_frame(&ext, &[&core]).unwrap()[0]);
+        }
+        assert_eq!(out_lp, out_lp2);
+
+        // LP + downsampled: 1024 samples per frame, finite.
+        let mut lpd = SbrDecoder::new(fs_sbr, 1).unwrap();
+        lpd.set_low_power(true).unwrap();
+        lpd.set_downsampled(true).unwrap();
+        let core = sine(freq, 1024, 0);
+        let o = lpd.process_frame(&ext, &[&core]).unwrap();
+        assert_eq!(o[0].len(), 1024);
+        assert!(o[0].iter().all(|v| v.is_finite()));
+    }
+
+    /// Low-power pure upsampling is still the identity at 2× rate
+    /// (real analysis + real synthesis pair).
+    #[test]
+    fn low_power_upsample_is_identity() {
+        let mut dec = SbrDecoder::new(44_100, 1).unwrap();
+        dec.set_low_power(true).unwrap();
+        let freq = 0.02;
+        let mut out = Vec::new();
+        for f in 0..4 {
+            let core = sine(freq, 1024, f * 1024);
+            let o = dec.upsample_frame(&[&core]).unwrap();
+            assert_eq!(o[0].len(), 2048);
+            out.extend_from_slice(&o[0]);
+        }
+        let ideal = |t: f64, d: f64| (2.0 * core::f64::consts::PI * freq * (t - d) / 2.0).sin();
+        let mut best = f64::INFINITY;
+        for delay in 0..1500usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (t, &o) in out.iter().enumerate().skip(2500) {
+                let e = o - ideal(t as f64, delay as f64);
+                err += e * e;
+                sig += o * o;
+            }
+            best = best.min(err / sig.max(1e-30));
+        }
+        assert!(best < 1e-4, "LP upsample error ratio {best}");
+    }
+
+    /// A PS payload on a low-power decoder is rejected — the
+    /// subpart-8 tool needs the complex QMF domain.
+    #[test]
+    fn low_power_rejects_ps() {
+        use crate::sbr_element::SbrExtension;
+        let fs_sbr = 44_100;
+        let mut ext = synthetic_ext(fs_sbr, 8, 6);
+        ext.element.extension = Some(SbrExtension {
+            id: EXTENSION_ID_PS,
+            data: vec![0u8; 4],
+        });
+        let mut lp = SbrDecoder::new(fs_sbr, 1).unwrap();
+        lp.set_low_power(true).unwrap();
+        let core = sine(0.05, 1024, 0);
+        assert!(matches!(
+            lp.process_frame(&ext, &[&core]),
+            Err(Error::SbrLowPowerPs)
+        ));
     }
 
     /// A channel-count / buffer-length mismatch is rejected.

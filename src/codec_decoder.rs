@@ -112,6 +112,12 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     if let Some(v) = params.options.get("sbr_downsampled") {
         dec.set_sbr_downsampled(matches!(v, "true" | "1"));
     }
+    // `{"sbr_low_power": "true"}` selects the §4.6.18.8 low-power SBR
+    // tool (real-valued filterbanks; HE-AAC v2 PS streams are
+    // rejected in this mode).
+    if let Some(v) = params.options.get("sbr_low_power") {
+        dec.set_sbr_low_power(matches!(v, "true" | "1"));
+    }
     Ok(Box::new(dec))
 }
 
@@ -143,6 +149,9 @@ pub struct AacDecoder {
     /// The caller-selected §4.6.18.4.3 downsampled SBR output mode,
     /// kept so [`Decoder::reset`] re-applies it to the fresh backends.
     sbr_downsampled: bool,
+    /// The caller-selected §4.6.18.8 low-power SBR mode, kept so
+    /// [`Decoder::reset`] re-applies it to the fresh backends.
+    sbr_low_power: bool,
 }
 
 /// The carrier syntax an [`AacDecoder`] auto-detects on its first packet.
@@ -178,6 +187,7 @@ impl AacDecoder {
             pending: VecDeque::new(),
             eof: false,
             sbr_downsampled: false,
+            sbr_low_power: false,
         }
     }
 
@@ -192,6 +202,17 @@ impl AacDecoder {
         self.sbr_downsampled = downsampled;
         self.stream.set_sbr_downsampled(downsampled);
         self.loas.set_sbr_downsampled(downsampled);
+    }
+
+    /// Select the §4.6.18.8 low-power SBR mode on both transport
+    /// backends (real-valued filterbanks + LP adjustment chain;
+    /// HE-AAC v2 PS streams are rejected in this mode). Select before
+    /// the first packet. Also reachable at construction via the
+    /// `sbr_low_power` codec option ([`make_decoder`]).
+    pub fn set_sbr_low_power(&mut self, low_power: bool) {
+        self.sbr_low_power = low_power;
+        self.stream.set_sbr_low_power(low_power);
+        self.loas.set_sbr_low_power(low_power);
     }
 
     /// The parameter set this decoder advertises for its output stream.
@@ -345,6 +366,8 @@ impl Decoder for AacDecoder {
         self.loas = LoasDecoder::new();
         self.stream.set_sbr_downsampled(self.sbr_downsampled);
         self.loas.set_sbr_downsampled(self.sbr_downsampled);
+        self.stream.set_sbr_low_power(self.sbr_low_power);
+        self.loas.set_sbr_low_power(self.sbr_low_power);
         self.transport = None;
         self.pending.clear();
         self.eof = false;

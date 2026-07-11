@@ -216,3 +216,131 @@ fn he_aac_v1_sbrcrc_downsampled_decodes_at_core_rate() {
         assert_eq!(f.pcm.len(), 1024 * usize::from(f.channels as u16));
     }
 }
+
+/// §4.6.18.8 low-power mode on the real HE-AAC v1 fixture: same
+/// dual-rate geometry, and — since the real-valued tool reconstructs
+/// the same envelopes over a different (real) HF phase — the gates are
+/// (a) the core band below the SBR crossover matches the reference
+/// tightly after an identical low-pass, and (b) the full-band energy
+/// tracks the reference per frame.
+#[test]
+fn he_aac_v1_sbr_low_power_decode() {
+    let dir = PathBuf::from("../../docs/audio/aac/fixtures/he-aac-v1-stereo-44100-32kbps-adts");
+    let Ok(data) = fs::read(dir.join("input.aac")) else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let expected = read_wav_s16(&dir.join("expected.wav")).expect("expected.wav");
+
+    let mut dec = StreamDecoder::new();
+    dec.set_sbr_low_power(true);
+    let frames = dec.decode_all(&data).expect("decode_all");
+    assert!(!frames.is_empty());
+    let mut ours: Vec<i16> = Vec::new();
+    for f in &frames {
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.sample_rate, 44_100);
+        assert_eq!(f.pcm.len(), 2048 * 2);
+        ours.extend_from_slice(&f.pcm);
+    }
+    assert_eq!(ours.len(), expected.len());
+
+    for ch in 0..2 {
+        let ref_ch = channel_f64(&expected, ch, 2);
+        let our_ch = channel_f64(&ours, ch, 2);
+        // (a) Core band: low-pass both at 4 kHz (0.0907 cycles/sample
+        // at 44.1 kHz), well under the SBR crossover; small delay
+        // search absorbs the real-vs-complex bank delay difference.
+        let ref_lp = lowpass(&ref_ch, 0.0907, 481);
+        let our_lp = lowpass(&our_ch, 0.0907, 481);
+        let mut best = f64::INFINITY;
+        for d in -16isize..=16 {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (n, &o) in our_lp.iter().enumerate().skip(1000) {
+                let idx = n as isize - d;
+                if idx < 0 || idx as usize >= ref_lp.len() {
+                    continue;
+                }
+                let e = o - ref_lp[idx as usize];
+                err += e * e;
+                sig += o * o;
+            }
+            best = best.min(err / sig.max(1e-30));
+        }
+        let rms = best.sqrt();
+        eprintln!("he-aac-v1 LP ch{ch}: core-band err/sig RMS {rms:.6}");
+        assert!(rms < 1e-3, "ch{ch} core-band err/sig RMS {rms:.6}");
+
+        // (b) Full-band energy envelope per 2048-sample frame.
+        let mut worst = 0.0f64;
+        for (fr, (b_ref, b_our)) in ref_ch
+            .chunks_exact(2048)
+            .zip(our_ch.chunks_exact(2048))
+            .enumerate()
+            .skip(2)
+        {
+            let e_r: f64 = b_ref.iter().map(|v| v * v).sum();
+            let e_o: f64 = b_our.iter().map(|v| v * v).sum();
+            if e_r > 1e3 {
+                let ratio = e_o / e_r;
+                worst = worst.max((ratio - 1.0).abs());
+                assert!(
+                    (0.8..=1.25).contains(&ratio),
+                    "frame {fr} energy ratio {ratio}"
+                );
+            }
+        }
+        eprintln!("he-aac-v1 LP ch{ch}: worst frame-energy deviation {worst:.3}");
+    }
+}
+
+/// LP + downsampled composition on the fixture: core rate, 1024
+/// samples per channel, and the same low-band gate against the
+/// decimated reference.
+#[test]
+fn he_aac_v1_sbr_low_power_downsampled_decode() {
+    let dir = PathBuf::from("../../docs/audio/aac/fixtures/he-aac-v1-stereo-44100-32kbps-adts");
+    let Ok(data) = fs::read(dir.join("input.aac")) else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let expected = read_wav_s16(&dir.join("expected.wav")).expect("expected.wav");
+
+    let mut dec = StreamDecoder::new();
+    dec.set_sbr_low_power(true);
+    dec.set_sbr_downsampled(true);
+    let frames = dec.decode_all(&data).expect("decode_all");
+    let mut ours: Vec<i16> = Vec::new();
+    for f in &frames {
+        assert_eq!(f.sample_rate, 22_050);
+        assert_eq!(f.pcm.len(), 1024 * 2);
+        ours.extend_from_slice(&f.pcm);
+    }
+    for ch in 0..2 {
+        let ref_dual = channel_f64(&expected, ch, 2);
+        let our_down = channel_f64(&ours, ch, 2);
+        // Reference low-passed at 4 kHz *at the dual rate*, decimated;
+        // ours low-passed at 4 kHz at the core rate (0.1814).
+        let ref_lp = lowpass(&ref_dual, 0.0907, 481);
+        let our_lp = lowpass(&our_down, 0.1814, 481);
+        let mut best = f64::INFINITY;
+        for d in -16isize..=16 {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (n, &o) in our_lp.iter().enumerate().skip(600) {
+                let idx = 2 * n as isize - d;
+                if idx < 0 || idx as usize >= ref_lp.len() {
+                    continue;
+                }
+                let e = o - ref_lp[idx as usize];
+                err += e * e;
+                sig += o * o;
+            }
+            best = best.min(err / sig.max(1e-30));
+        }
+        let rms = best.sqrt();
+        eprintln!("he-aac-v1 LP+down ch{ch}: core-band err/sig RMS {rms:.6}");
+        assert!(rms < 1e-3, "ch{ch} err/sig RMS {rms:.6}");
+    }
+}

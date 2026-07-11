@@ -230,3 +230,31 @@ fn he_aac_v2_ps_pcm_matches_reference() {
     assert!(ratio_l < 1e-3, "left error ratio {ratio_l:.6}");
     assert!(ratio_r < 1e-3, "right error ratio {ratio_r:.6}");
 }
+
+/// §4.6.18.8: the low-power SBR tool cannot host the complex-domain
+/// PS processing — the v2 fixture's first PS-bearing access unit is
+/// rejected with the dedicated error rather than decoded as mono.
+#[test]
+fn he_aac_v2_ps_rejected_in_low_power_mode() {
+    let dir = fixture_dir();
+    let Ok(m4a) = fs::read(dir.join("input.m4a")) else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let samples = mp4_samples(&m4a).expect("mp4 sample table");
+    let mut dec = StreamDecoder::new();
+    dec.set_sbr_low_power(true);
+    let mut rejected = false;
+    for &(off, len) in &samples {
+        let au = &m4a[off..off + len];
+        match dec.decode_raw_data_block(2, 8, 16_000, 1, 1, au) {
+            Err(oxideav_aac::Error::SbrLowPowerPs) => {
+                rejected = true;
+                break;
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+            Ok(_) => {}
+        }
+    }
+    assert!(rejected, "PS payload must be rejected in low-power mode");
+}
