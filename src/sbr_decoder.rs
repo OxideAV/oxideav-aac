@@ -429,6 +429,8 @@ impl SbrDecoder {
                 smoothing_mode: ext.header.smoothing_mode,
                 limiter_gains: ext.header.limiter_gains,
                 reset,
+                low_power: false,
+                deg_patched: None,
             };
             let y = adjust(&x_high, &params, &mut ch.env_state)?;
 

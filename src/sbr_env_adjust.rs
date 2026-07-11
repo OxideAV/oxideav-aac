@@ -22,6 +22,18 @@
 //!   mix `W2`, and the `φsin` sinusoid injection with the
 //!   `(−1)^(m+kx)` imaginary alternation, producing `Y`.
 //!
+//! **Low-power mode** (§4.6.18.8, `EnvParams::low_power`): the energy
+//! estimation carries the §4.6.18.8.4 factor 2 (real-valued subband
+//! signals hold half the energy of the complex representation), gain
+//! smoothing is disabled regardless of `bs_smoothing_mode`, the
+//! §4.6.18.8.5 aliasing reduction re-computes the limiter/boost gains
+//! over the Figure 4.54 groups (driven by the caller-supplied
+//! `degPatched`), the Table 4.A.91 noise mix keeps only its real
+//! part, and the sinusoid injection follows the §4.6.18.8.5 modified
+//! equations — real-valued `ψm` with the `−0.00815·(−1)^(m+kx)`
+//! neighbour correction, applied to the first 16 sinusoids per time
+//! segment, spilling into subbands `kx − 1` and `kx + M`.
+//!
 //! Cross-frame state (`EnvAdjustState`) carries the previous frame's
 //! last-envelope `SIndexMapped`, `lA` / `LE`, the `GTemp` / `QTemp`
 //! smoothing tails, and the running `indexNoise` / `indexSine`.
@@ -35,6 +47,7 @@
 
 use crate::sbr_freq_bands::HiLoTables;
 use crate::sbr_hf_gen::T_HF_ADJ;
+use crate::sbr_lp::{aliasing_reduction, gain_groups};
 use crate::sbr_noise_table::NOISE_TABLE;
 use crate::sbr_qmf::Complex;
 use crate::{Error, Result};
@@ -95,6 +108,13 @@ pub struct EnvParams<'a> {
     pub limiter_gains: u8,
     /// The §4.6.18.3.3 reset flag (header band geometry changed).
     pub reset: bool,
+    /// §4.6.18.8 low-power mode: ×2 energy estimation, no gain
+    /// smoothing, aliasing reduction, real-only noise, and the
+    /// modified sinusoid injection.
+    pub low_power: bool,
+    /// The §4.6.18.8.3 `degPatched` (`kx`-relative, `M` entries) —
+    /// required when `low_power` is set.
+    pub deg_patched: Option<&'a [f64]>,
 }
 
 /// Cross-frame envelope-adjuster state for one channel.
@@ -275,6 +295,9 @@ pub fn adjust(
     }
 
     // ---- §4.6.18.7.3 current envelope ----------------------------
+    // §4.6.18.8.4: the real-valued low-power signals carry half the
+    // energy of the complex representation — the estimation doubles.
+    let e_scale = if p.low_power { 2.0 } else { 1.0 };
     let mut e_curr = vec![vec![0.0f64; m_cnt]; l_e];
     for (l, e_curr_l) in e_curr.iter_mut().enumerate() {
         let lo = (rate * p.t_e[l] + T_HF_ADJ as i32) as usize;
@@ -284,7 +307,7 @@ pub fn adjust(
             for (m, e) in e_curr_l.iter_mut().enumerate() {
                 let k = (k_x as usize) + m;
                 let sum: f64 = x_high[lo..hi].iter().map(|col| col[k].norm_sqr()).sum();
-                *e = sum / width;
+                *e = e_scale * sum / width;
             }
         } else {
             let f = f_of(p.freq_res[l]);
@@ -298,7 +321,7 @@ pub fn adjust(
                         .map(|col| col[j as usize].norm_sqr())
                         .sum::<f64>();
                 }
-                let avg = sum / (width * f64::from(kh - kl + 1));
+                let avg = e_scale * sum / (width * f64::from(kh - kl + 1));
                 for j in kl..=kh {
                     let m_rel = j - k_x;
                     if m_rel >= 0 && (m_rel as usize) < m_cnt {
@@ -396,8 +419,27 @@ pub fn adjust(
         }
     }
 
+    // ---- §4.6.18.8.5 aliasing reduction (low power) --------------
+    // GA replaces GLimBoost in the assembly below.
+    if p.low_power {
+        let dp = p.deg_patched.ok_or(Error::SbrFreqBandInvalid)?;
+        if dp.len() != m_cnt {
+            return Err(Error::SbrFreqBandInvalid);
+        }
+        for l in 0..l_e {
+            let groups = gain_groups(dp, &s_map[l], k_x);
+            aliasing_reduction(&mut g_lim_boost[l], &e_curr[l], dp, &groups, k_x)?;
+        }
+    }
+
     // ---- §4.6.18.7.6 assembly ------------------------------------
-    let h_sl: usize = if p.smoothing_mode { 0 } else { 4 };
+    // §4.6.18.8.5: the low-power tool never smooths, regardless of
+    // bs_smoothing_mode.
+    let h_sl: usize = if p.smoothing_mode || p.low_power {
+        0
+    } else {
+        4
+    };
 
     // GTemp / QTemp with the hSL-column prefix.
     let mut g_temp = vec![vec![0.0f64; m_cnt]; n_cols + h_sl];
@@ -428,6 +470,30 @@ pub fn adjust(
         g_temp[c + h_sl].clone_from(&g_lim_boost[l]);
         q_temp[c + h_sl].clone_from(&q_m_lim_boost[l]);
     }
+
+    // §4.6.18.8.5: the modified sinusoid equations apply to the first
+    // 16 sinusoids (in increasing frequency order) of every time
+    // segment; later sinusoids keep the original (real-part) term.
+    let lp_first16: Vec<Vec<bool>> = if p.low_power {
+        s_index
+            .iter()
+            .map(|row| {
+                let mut count = 0usize;
+                row.iter()
+                    .map(|&on| {
+                        if on {
+                            count += 1;
+                            count <= 16
+                        } else {
+                            false
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut y = vec![[Complex::default(); 64]; x_high.len()];
     let mut f_index_noise = 0usize;
@@ -464,13 +530,19 @@ pub fn adjust(
             // W1 = GFilt · XHigh.
             let w1 = x_high[col][k] * g_filt;
 
-            // W2 = W1 + QFilt · V(fIndexNoise).
+            // W2 = W1 + QFilt · V(fIndexNoise). The low-power tool
+            // ignores every imaginary part (§4.6.18.8.1).
             f_index_noise = (st.index_noise + c * m_cnt + m + 1) % 512;
             let (v_re, v_im) = NOISE_TABLE[f_index_noise];
-            let mut out = Complex::new(w1.re + q_filt * v_re, w1.im + q_filt * v_im);
+            let mut out = if p.low_power {
+                Complex::new(w1.re + q_filt * v_re, 0.0)
+            } else {
+                Complex::new(w1.re + q_filt * v_re, w1.im + q_filt * v_im)
+            };
 
-            // Y = W2 + ψ (sinusoids).
-            if s_index[l][m] {
+            // Y = W2 + ψ (sinusoids; the low-power injection runs as
+            // a separate per-column pass below).
+            if !p.low_power && s_index[l][m] {
                 let s = s_m_boost[l][m];
                 let alt = if (m + k_x as usize) % 2 == 1 {
                     -1.0
@@ -481,6 +553,47 @@ pub fn adjust(
                 out.im += s * alt * sin_im;
             }
             y[col][k] = out;
+        }
+
+        if p.low_power {
+            // §4.6.18.8.5 sinusoid injection: real-valued ψm with the
+            // −0.00815·(−1)^(m+kx) neighbour correction, over targets
+            // m ∈ −1..=M — spilling into the lowband subband kx − 1
+            // and the subband kx + M just above the SBR range.
+            let phi_re_at = |off: i64| -> f64 {
+                let idx = (st.index_sine as i64 + c as i64 + off).rem_euclid(4) as usize;
+                PHI_SIN[idx].0
+            };
+            let f0 = phi_re_at(0);
+            let fm1 = phi_re_at(-1);
+            let fp1 = phi_re_at(1);
+            let first16 = &lp_first16[l];
+            // ψRe of the (first-16) sinusoid in band m, else 0.
+            let s16 = |m: i64| -> f64 {
+                if m >= 0 && (m as usize) < m_cnt && first16[m as usize] {
+                    s_m_boost[l][m as usize]
+                } else {
+                    0.0
+                }
+            };
+            for t in -1..=(m_cnt as i64) {
+                let band = i64::from(k_x) + t;
+                if !(0..64).contains(&band) {
+                    continue;
+                }
+                let alt = if band.rem_euclid(2) == 1 { -1.0 } else { 1.0 };
+                let psi = s16(t) * f0 - 0.00815 * alt * (s16(t - 1) * fm1 + s16(t + 1) * fp1);
+                if psi != 0.0 {
+                    y[col][band as usize].re += psi;
+                }
+            }
+            // Sinusoids beyond the sixteenth keep the original term
+            // (real part only).
+            for (m, &on) in s_index[l].iter().enumerate() {
+                if on && !first16[m] {
+                    y[col][(k_x as usize) + m].re += s_m_boost[l][m] * f0;
+                }
+            }
         }
     }
 
@@ -556,6 +669,8 @@ mod tests {
             smoothing_mode: true,
             limiter_gains: 3,
             reset: false,
+            low_power: false,
+            deg_patched: None,
         }
     }
 
@@ -759,5 +874,156 @@ mod tests {
         let g_late = (y[T_HF_ADJ + 20][9].norm_sqr() / x[T_HF_ADJ + 20][9].norm_sqr()).sqrt();
         assert!(g0 < 6.0, "g0 = {g0}");
         assert!((g_late - 10.0).abs() < 0.1, "g_late = {g_late}");
+    }
+
+    /// Low-power mode requires `deg_patched`, doubles the energy
+    /// estimation (§4.6.18.8.4: with EOrig = G²·(2|X|² + ε) the flat
+    /// gain lands on G), and produces a purely real Y.
+    #[test]
+    fn low_power_energy_doubling_and_real_output() {
+        let b = bands();
+        let lim = [8, 16];
+        let t_e = [0, 16];
+        let t_q = [0, 16];
+        let fr = [true];
+        let amp = 100.0;
+        let target_gain = 3.0;
+        let e_target = target_gain * target_gain * (2.0 * amp * amp + EPS);
+        let e_orig = vec![vec![e_target; 4]];
+        let q_orig = vec![vec![0.0]];
+        let dp = [0.0f64; 8];
+        let mut p = params(&b, &lim, &t_e, &t_q, &fr, &e_orig, &q_orig, &[]);
+        p.low_power = true;
+        // deg_patched is mandatory in low-power mode.
+        let x = flat_x_high(amp, 40);
+        let mut st = EnvAdjustState::new();
+        assert!(adjust(&x, &p, &mut st).is_err());
+        p.deg_patched = Some(&dp);
+        let mut st = EnvAdjustState::new();
+        let y = adjust(&x, &p, &mut st).unwrap();
+        for c in 0..32usize {
+            let col = c + T_HF_ADJ;
+            for cell in &y[col][8..16] {
+                assert_eq!(cell.im, 0.0, "LP Y must be real");
+            }
+        }
+        // Noise-free path: the applied gain is uniform on the real
+        // part; ECurr = 2·|X|², so G = √(EOrig/(ε + 2·amp²)) = 3.
+        let g = (y[T_HF_ADJ][12].re / x[T_HF_ADJ][12].re).abs();
+        let expect = (e_target / (EPS + 2.0 * amp * amp)).sqrt();
+        assert!(
+            (g - expect).abs() < 1e-3 * expect,
+            "LP gain {g} vs expected {expect}"
+        );
+    }
+
+    /// The §4.6.18.8.5 sinusoid injection: real-valued main term on
+    /// the φRe cycle, the −0.00815 neighbour corrections one subband
+    /// away (with the (−1)^band alternation), and no imaginary part.
+    #[test]
+    fn low_power_sinusoid_injection_pattern() {
+        let b = bands();
+        let lim = [8, 16];
+        let t_e = [0, 16];
+        let t_q = [0, 16];
+        let fr = [true];
+        let e_orig = vec![vec![64.0; 4]];
+        let q_orig = vec![vec![0.0]];
+        // Harmonic in high band 1 → mid subband (10 + 12)/2 = 11.
+        let add = [false, true, false, false];
+        let dp = [0.0f64; 8];
+        let mut p = params(&b, &lim, &t_e, &t_q, &fr, &e_orig, &q_orig, &add);
+        p.low_power = true;
+        p.deg_patched = Some(&dp);
+        let x = vec![[Complex::default(); 64]; 40];
+        let mut st = EnvAdjustState::new();
+        let y = adjust(&x, &p, &mut st).unwrap();
+        let s = 64.0f64.sqrt() * MAX_BOOST; // SM boosted (ECurr = 0)
+
+        // c = 0: φRe(0) = 1 → main term s in band 11; φRe(±1) = 0 →
+        // no neighbour corrections.
+        assert!((y[T_HF_ADJ][11].re - s).abs() < 1e-9);
+        assert_eq!(y[T_HF_ADJ][11].im, 0.0);
+        assert_eq!(y[T_HF_ADJ][10].re, 0.0);
+        assert_eq!(y[T_HF_ADJ][12].re, 0.0);
+
+        // c = 1: φRe(1) = 0 → no main term; band 10 sees the m+1
+        // neighbour at i+1 (φRe(2) = −1): ψ = −0.00815·(+1)·(−s);
+        // band 12 sees the m−1 neighbour at i−1 (φRe(0) = 1):
+        // ψ = −0.00815·(+1)·(s).
+        let col1 = T_HF_ADJ + 1;
+        assert!(y[col1][11].re.abs() < 1e-12);
+        assert!(
+            (y[col1][10].re - 0.00815 * s).abs() < 1e-9,
+            "{}",
+            y[col1][10].re
+        );
+        assert!(
+            (y[col1][12].re + 0.00815 * s).abs() < 1e-9,
+            "{}",
+            y[col1][12].re
+        );
+        // Everything stays real.
+        for col in y.iter() {
+            for cell in col.iter() {
+                assert_eq!(cell.im, 0.0);
+            }
+        }
+    }
+
+    /// LP mode never smooths: a gain step lands instantly even with
+    /// bs_smoothing_mode = 0, and the aliasing reduction equalizes a
+    /// full-degree group while preserving its output energy.
+    #[test]
+    fn low_power_no_smoothing_and_aliasing_reduction() {
+        let b = bands();
+        let lim = [8, 16];
+        let t_e = [0, 16];
+        let t_q = [0, 16];
+        let fr = [true];
+        let amp = 10.0;
+        let x = flat_x_high(amp, 40);
+        let e_lo = vec![vec![2.0 * (amp * amp) + EPS; 4]];
+        let e_hi = vec![vec![100.0 * (2.0 * (amp * amp) + EPS); 4]];
+        let q_orig = vec![vec![0.0]];
+        let dp = [0.0f64; 8];
+        let mut p1 = params(&b, &lim, &t_e, &t_q, &fr, &e_lo, &q_orig, &[]);
+        p1.smoothing_mode = false; // requests smoothing…
+        p1.low_power = true; // …which LP overrides
+        p1.deg_patched = Some(&dp);
+        let mut st = EnvAdjustState::new();
+        let _ = adjust(&x, &p1, &mut st).unwrap();
+        // No smoothing tail is carried in LP mode.
+        assert!(st.g_temp_tail.is_empty());
+        let mut p2 = params(&b, &lim, &t_e, &t_q, &fr, &e_hi, &q_orig, &[]);
+        p2.smoothing_mode = false;
+        p2.low_power = true;
+        p2.deg_patched = Some(&dp);
+        let y = adjust(&x, &p2, &mut st).unwrap();
+        let g0 = (y[T_HF_ADJ][9].re / x[T_HF_ADJ][9].re).abs();
+        assert!((g0 - 10.0).abs() < 0.5, "gain step not instant: {g0}");
+
+        // With a full-degree dp the group gains equalize but keep the
+        // envelope's output energy (checked via the flat spectrum).
+        let dp_full = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let e_skew = vec![vec![
+            1.0 * (2.0 * amp * amp + EPS),
+            4.0 * (2.0 * amp * amp + EPS),
+            9.0 * (2.0 * amp * amp + EPS),
+            16.0 * (2.0 * amp * amp + EPS),
+        ]];
+        let mut p3 = params(&b, &lim, &t_e, &t_q, &fr, &e_skew, &q_orig, &[]);
+        p3.low_power = true;
+        p3.deg_patched = Some(&dp_full);
+        let mut st3 = EnvAdjustState::new();
+        let y3 = adjust(&x, &p3, &mut st3).unwrap();
+        // Adjacent grouped subbands carry (near-)equal gains.
+        let g_at = |k: usize| (y3[T_HF_ADJ + 4][k].re / x[T_HF_ADJ + 4][k].re).abs();
+        assert!(
+            (g_at(9) - g_at(10)).abs() < 1e-6 * g_at(9),
+            "grouped gains differ: {} vs {}",
+            g_at(9),
+            g_at(10)
+        );
     }
 }
