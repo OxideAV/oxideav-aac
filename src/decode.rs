@@ -125,6 +125,12 @@ pub struct StreamDecoder {
     /// through the §4.6.18.5 pure-upsampling path so the output rate
     /// never flaps.
     sbr_active: bool,
+    /// §4.6.18.4.3 downsampled SBR output mode: SBR frames are
+    /// synthesized through the 32-channel bank and emitted at the
+    /// *core* rate (1024 samples per channel per block). Installed on
+    /// every SBR back-end this decoder creates
+    /// ([`Self::set_sbr_downsampled`]).
+    sbr_downsampled: bool,
     /// The active `program_config_element()` for
     /// `channelConfiguration == 0` streams — captured from an in-band
     /// PCE (§8.5.2.2: it takes effect at the block carrying it and
@@ -151,6 +157,23 @@ impl StreamDecoder {
     /// config-0 stream is emitted in bitstream element order.
     pub fn set_program_config(&mut self, pce: Pce) {
         self.program_config = Some(pce);
+    }
+
+    /// Select the §4.6.18.4.3 downsampled SBR output mode: every SBR
+    /// back-end runs the 32-channel synthesis bank, so an SBR-active
+    /// stream is emitted at the *core* sampling rate (1024 samples per
+    /// channel per block) instead of the doubled `fs_sbr` rate. The
+    /// reconstructed SBR bands below the core Nyquist are kept; the
+    /// range above it is discarded by construction. An explicitly
+    /// signalled `AudioSpecificConfig` whose `extensionSamplingFrequency`
+    /// equals the core rate is the in-band request for this mode
+    /// (§4.6.18.2.6, `FsSBR` definition).
+    ///
+    /// Select the mode before decoding: back-ends already created for
+    /// earlier frames keep their rate (the QMF history is
+    /// rate-specific).
+    pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
+        self.sbr_downsampled = downsampled;
     }
 
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
@@ -402,7 +425,11 @@ impl StreamDecoder {
         if elements.iter().any(|(_, e)| e.sbr.is_some()) {
             self.sbr_active = true;
         }
-        let out_rate = if self.sbr_active { fs_sbr } else { sample_rate };
+        let out_rate = if self.sbr_active && !self.sbr_downsampled {
+            fs_sbr
+        } else {
+            sample_rate
+        };
 
         // Render block by block; each block contributes one hop of
         // interleaved PCM (all blocks of a frame must agree on the
@@ -421,7 +448,9 @@ impl StreamDecoder {
                     let dec = match self.sbr.entry(el.key) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                         std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert(SbrDecoder::new(fs_sbr, n_ch)?)
+                            let mut d = SbrDecoder::new(fs_sbr, n_ch)?;
+                            d.set_downsampled(self.sbr_downsampled)?;
+                            v.insert(d)
                         }
                     };
                     let core: Vec<&[f64]> = el.channels.iter().map(Vec::as_slice).collect();

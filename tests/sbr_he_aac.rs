@@ -89,3 +89,130 @@ fn he_aac_v1_sbr_pcm_byte_exact() {
     assert!(max_err <= 1, "max per-sample error {max_err} exceeds 1 LSB");
     assert!(ratio < 1e-3, "error-to-signal RMS {ratio:.6}");
 }
+
+/// Zero-delay windowed-sinc low-pass (Blackman window, odd `taps`),
+/// normalized cutoff `fc` in cycles per input sample.
+fn lowpass(x: &[f64], fc: f64, taps: usize) -> Vec<f64> {
+    assert!(taps % 2 == 1);
+    let c = (taps - 1) / 2;
+    let mut h = vec![0.0f64; taps];
+    let mut sum = 0.0;
+    for (k, hk) in h.iter_mut().enumerate() {
+        let t = k as f64 - c as f64;
+        let sinc = if t == 0.0 {
+            2.0 * fc
+        } else {
+            (2.0 * std::f64::consts::PI * fc * t).sin() / (std::f64::consts::PI * t)
+        };
+        let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / (taps - 1) as f64).cos()
+            + 0.08 * (4.0 * std::f64::consts::PI * k as f64 / (taps - 1) as f64).cos();
+        *hk = sinc * w;
+        sum += *hk;
+    }
+    // Unity DC gain.
+    for hk in &mut h {
+        *hk /= sum;
+    }
+    let mut y = vec![0.0f64; x.len()];
+    for (n, yn) in y.iter_mut().enumerate() {
+        let mut acc = 0.0;
+        for (k, &hk) in h.iter().enumerate() {
+            let idx = n as isize - k as isize + c as isize;
+            if idx >= 0 && (idx as usize) < x.len() {
+                acc += hk * x[idx as usize];
+            }
+        }
+        *yn = acc;
+    }
+    y
+}
+
+/// De-interleave one channel of interleaved s16 PCM to f64.
+fn channel_f64(pcm: &[i16], ch: usize, n_ch: usize) -> Vec<f64> {
+    pcm.iter()
+        .skip(ch)
+        .step_by(n_ch)
+        .map(|&v| f64::from(v))
+        .collect()
+}
+
+/// §4.6.18.4.3 downsampled mode on the real HE-AAC v1 fixture: the
+/// stream decodes at the core rate (22.05 kHz, 1024 samples per
+/// channel per frame), and the output matches a band-limited 2:1
+/// decimation of the reference `expected.wav` — the downsampled bank
+/// keeps exactly the sub-Nyquist half of the dual-rate spectrum.
+#[test]
+fn he_aac_v1_sbr_downsampled_matches_decimated_reference() {
+    let dir = PathBuf::from("../../docs/audio/aac/fixtures/he-aac-v1-stereo-44100-32kbps-adts");
+    let Ok(data) = fs::read(dir.join("input.aac")) else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let expected = read_wav_s16(&dir.join("expected.wav")).expect("expected.wav");
+
+    let mut dec = StreamDecoder::new();
+    dec.set_sbr_downsampled(true);
+    let frames = dec.decode_all(&data).expect("decode_all");
+    assert!(!frames.is_empty());
+    let mut ours: Vec<i16> = Vec::new();
+    for f in &frames {
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.sample_rate, 22_050, "downsampled mode = core rate");
+        assert_eq!(f.pcm.len(), 1024 * 2, "1024 samples per channel");
+        ours.extend_from_slice(&f.pcm);
+    }
+    assert_eq!(ours.len() * 2, expected.len(), "half the dual-rate count");
+
+    // Reference: low-pass the dual-rate expected.wav just below the
+    // new Nyquist (0.245 cycles/sample at 44.1 kHz) and decimate 2:1.
+    // The residual against our output concentrates in the sinc-vs-QMF
+    // transition band around 11.025 kHz; measured 1.8e-4 per channel.
+    let mut worst = 0.0f64;
+    for ch in 0..2 {
+        let ref_dual = channel_f64(&expected, ch, 2);
+        let our_down = channel_f64(&ours, ch, 2);
+        let ref_lp = lowpass(&ref_dual, 0.245, 481);
+        // Small integer delay search (dual-rate samples, both signs)
+        // to absorb the bank-pair delay difference.
+        let mut best = f64::INFINITY;
+        for d in -8isize..=8 {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (n, &od) in our_down.iter().enumerate().skip(500) {
+                let idx = 2 * n as isize - d;
+                if idx < 0 || idx as usize >= ref_lp.len() {
+                    continue;
+                }
+                let e = od - ref_lp[idx as usize];
+                err += e * e;
+                sig += od * od;
+            }
+            best = best.min(err / sig.max(1e-30));
+        }
+        let rms = best.sqrt();
+        eprintln!("he-aac-v1 downsampled ch{ch}: err/sig RMS {rms:.6}");
+        worst = worst.max(rms);
+        assert!(rms < 1e-3, "ch{ch} err/sig RMS {rms:.6}");
+    }
+    let _ = worst;
+}
+
+/// The SBR-CRC (type-14) fixture decodes in downsampled mode too, at
+/// the core rate, byte-identical to the plain fixture's downsampled
+/// decode (the payloads differ only in the verified CRC framing).
+#[test]
+fn he_aac_v1_sbrcrc_downsampled_decodes_at_core_rate() {
+    let dir = PathBuf::from("../../docs/audio/aac/fixtures/he-aac-v1-sbrcrc-adts");
+    let Ok(data) = fs::read(dir.join("input.aac")) else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let mut dec = StreamDecoder::new();
+    dec.set_sbr_downsampled(true);
+    let frames = dec.decode_all(&data).expect("decode_all");
+    assert!(!frames.is_empty());
+    for f in &frames {
+        assert_eq!(f.sample_rate, 22_050);
+        assert_eq!(f.pcm.len(), 1024 * usize::from(f.channels as u16));
+    }
+}
