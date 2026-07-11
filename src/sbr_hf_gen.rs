@@ -263,6 +263,35 @@ pub fn prediction_coefficients(
     Ok((alpha0, alpha1))
 }
 
+/// §4.6.18.8.3 reflection coefficient for the low-power SBR aliasing
+/// detection: `ref(k) = min(max(−φk(0,1)/φk(1,1), −1), 1)` when
+/// `φk(1,1) ≠ 0`, else `0`, with the covariance sums of §4.6.18.6.2
+/// (over the same `numTimeSlots·RATE + 6` window). The low-power tool
+/// operates on real-valued subband signals, so the real parts carry
+/// the whole covariance.
+pub fn reflection_coefficient(
+    x_low: &[[Complex; 32]],
+    k: usize,
+    n_slots_frame: usize,
+) -> Result<f64> {
+    if k >= 32 || x_low.len() < n_slots_frame + 6 + T_HF_ADJ {
+        return Err(Error::SbrFreqBandInvalid);
+    }
+    let mut phi01 = 0.0f64;
+    let mut phi11 = 0.0f64;
+    for n in 0..(n_slots_frame + 6) {
+        let a = x_low[n + T_HF_ADJ][k].re;
+        let b = x_low[n + T_HF_ADJ - 1][k].re;
+        phi01 += a * b;
+        phi11 += b * b;
+    }
+    Ok(if phi11 != 0.0 {
+        (-phi01 / phi11).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    })
+}
+
 /// §4.6.18.6.3 — generate `XHigh` from `XLow` over the patch mapping.
 ///
 /// * `x_low` — slot-major analysis output (spec absolute columns).
@@ -370,6 +399,24 @@ mod tests {
             cur = chirp_factors(&[0], &[0], &cur);
         }
         assert_eq!(cur[0], 0.0);
+    }
+
+    /// §4.6.18.8.3 reflection coefficient: a constant subband signal
+    /// has φ(0,1) = φ(1,1) → ref = −1; an alternating-sign signal has
+    /// φ(0,1) = −φ(1,1) → ref = +1; silence → 0; and the clamp holds.
+    #[test]
+    fn reflection_coefficient_orientations() {
+        let n = 32usize;
+        let cols = n + 6 + T_HF_ADJ;
+        let mut x = vec![[Complex::default(); 32]; cols];
+        for (c, col) in x.iter_mut().enumerate() {
+            col[3] = Complex::new(1.0, 0.0); // constant
+            col[4] = Complex::new(if c % 2 == 0 { 1.0 } else { -1.0 }, 0.0); // alternating
+        }
+        assert_eq!(reflection_coefficient(&x, 3, n).unwrap(), -1.0);
+        assert_eq!(reflection_coefficient(&x, 4, n).unwrap(), 1.0);
+        assert_eq!(reflection_coefficient(&x, 5, n).unwrap(), 0.0);
+        assert!(reflection_coefficient(&x, 32, n).is_err());
     }
 
     /// Figure 4.48 on a hand-walked geometry: fMaster = 8..=24 step 2,

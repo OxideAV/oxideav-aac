@@ -455,6 +455,7 @@ pub mod sbr_header;
 pub mod sbr_hf_gen;
 pub mod sbr_huffman;
 pub mod sbr_limiter;
+pub mod sbr_lp;
 pub mod sbr_noise_table;
 pub mod sbr_qmf;
 pub mod sbr_reconstruct;
