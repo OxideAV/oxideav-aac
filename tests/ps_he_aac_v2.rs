@@ -258,3 +258,132 @@ fn he_aac_v2_ps_rejected_in_low_power_mode() {
     }
     assert!(rejected, "PS payload must be rejected in low-power mode");
 }
+
+/// PS + §4.6.18.4.3 downsampled composition: the v2 fixture renders
+/// stereo through two 32-channel banks at the core rate (16 kHz,
+/// 1024 samples per channel), matching a band-limited 2:1 decimation
+/// of the reference decode.
+#[test]
+fn he_aac_v2_ps_downsampled_matches_decimated_reference() {
+    let dir = fixture_dir();
+    let Ok(m4a) = fs::read(dir.join("input.m4a")) else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let expected = read_wav_s16(&dir.join("expected.wav")).expect("expected.wav");
+    let samples = mp4_samples(&m4a).expect("mp4 sample table");
+
+    let mut dec = StreamDecoder::new();
+    dec.set_sbr_downsampled(true);
+    let mut ours: Vec<i16> = Vec::new();
+    for &(off, len) in &samples {
+        let au = &m4a[off..off + len];
+        let f = dec
+            .decode_raw_data_block(2, 8, 16_000, 1, 1, au)
+            .expect("decode AU");
+        assert_eq!(f.sample_rate, 16_000, "downsampled = core rate");
+        assert_eq!(f.channels, 2, "PS stereo");
+        assert_eq!(f.pcm.len(), 1024 * 2);
+        ours.extend_from_slice(&f.pcm);
+    }
+    // The reference has the encoder priming trimmed (MP4 edit list),
+    // so ours is longer; alignment is found by the lag search below.
+
+    // Zero-delay windowed-sinc low-pass just below the new Nyquist
+    // (0.245 cycles/sample at 32 kHz), 2:1 decimation, small delay
+    // search per channel.
+    let lowpass = |x: &[f64], fc: f64, taps: usize| -> Vec<f64> {
+        let c = (taps - 1) / 2;
+        let mut h = vec![0.0f64; taps];
+        let mut sum = 0.0;
+        for (k, hk) in h.iter_mut().enumerate() {
+            let t = k as f64 - c as f64;
+            let sinc = if t == 0.0 {
+                2.0 * fc
+            } else {
+                (2.0 * std::f64::consts::PI * fc * t).sin() / (std::f64::consts::PI * t)
+            };
+            let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / (taps - 1) as f64).cos()
+                + 0.08 * (4.0 * std::f64::consts::PI * k as f64 / (taps - 1) as f64).cos();
+            *hk = sinc * w;
+            sum += *hk;
+        }
+        for hk in &mut h {
+            *hk /= sum;
+        }
+        let mut y = vec![0.0f64; x.len()];
+        for (n, yn) in y.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for (k, &hk) in h.iter().enumerate() {
+                let idx = n as isize - k as isize + c as isize;
+                if idx >= 0 && (idx as usize) < x.len() {
+                    acc += hk * x[idx as usize];
+                }
+            }
+            *yn = acc;
+        }
+        y
+    };
+    let channel = |pcm: &[i16], ch: usize| -> Vec<f64> {
+        pcm.iter()
+            .skip(ch)
+            .step_by(2)
+            .map(|&v| f64::from(v))
+            .collect()
+    };
+    // Coarse-then-fine lag search on the left channel (the trim is
+    // several thousand dual-rate samples), then gate both channels.
+    let ref_lp: Vec<Vec<f64>> = (0..2)
+        .map(|ch| lowpass(&channel(&expected, ch), 0.245, 481))
+        .collect();
+    let our_down: Vec<Vec<f64>> = (0..2).map(|ch| channel(&ours, ch)).collect();
+    let score = |d: isize, step: usize| -> f64 {
+        let mut err = 0.0;
+        let mut sig = 0.0;
+        let mut n = 400usize;
+        while n < our_down[0].len() {
+            let idx = 2 * n as isize - d;
+            if idx >= 0 && (idx as usize) < ref_lp[0].len() {
+                let e = our_down[0][n] - ref_lp[0][idx as usize];
+                err += e * e;
+                sig += our_down[0][n] * our_down[0][n];
+            }
+            n += step;
+        }
+        err / sig.max(1e-30)
+    };
+    let mut coarse = (f64::INFINITY, 0isize);
+    let mut d = 0isize;
+    while d < 16_000 {
+        let s = score(d, 7);
+        if s < coarse.0 {
+            coarse = (s, d);
+        }
+        d += 2;
+    }
+    let mut best_d = coarse.1;
+    let mut best_s = f64::INFINITY;
+    for d in (coarse.1 - 6)..=(coarse.1 + 6) {
+        let s = score(d, 1);
+        if s < best_s {
+            best_s = s;
+            best_d = d;
+        }
+    }
+    for ch in 0..2 {
+        let mut err = 0.0;
+        let mut sig = 0.0;
+        for (n, &o) in our_down[ch].iter().enumerate().skip(400) {
+            let idx = 2 * n as isize - best_d;
+            if idx < 0 || idx as usize >= ref_lp[ch].len() {
+                continue;
+            }
+            let e = o - ref_lp[ch][idx as usize];
+            err += e * e;
+            sig += o * o;
+        }
+        let rms = (err / sig.max(1e-30)).sqrt();
+        eprintln!("he-aac-v2 PS downsampled ch{ch}: lag {best_d}, err/sig RMS {rms:.6}");
+        assert!(rms < 2e-3, "ch{ch} err/sig RMS {rms:.6}");
+    }
+}
