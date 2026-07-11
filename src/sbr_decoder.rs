@@ -8,6 +8,10 @@
 //! previous frame's `Y'` against the current `XLow` / `Y`), and the
 //! §4.6.18.4.2 64-band synthesis QMF producing `numTimeSlots·RATE·64 =
 //! 2048` output samples per 1024-sample core frame (dual-rate SBR).
+//! [`SbrDecoder::set_downsampled`] selects the §4.6.18.4.3 downsampled
+//! output mode instead: the 32-channel synthesis bank keeps the output
+//! at the core rate (1024 samples per frame), discarding the assembled
+//! `X` subbands above the core Nyquist.
 //!
 //! [`SbrDecoder::process_frame`] drives a parsed
 //! [`crate::sbr_extension::SbrExtensionData`];
@@ -33,7 +37,7 @@ use crate::sbr_freq_bands::{k0 as derive_k0, k2 as derive_k2, master_table, HiLo
 use crate::sbr_header::SbrHeader;
 use crate::sbr_hf_gen::{build_patches, chirp_factors, generate_hf, Patches, T_HF_ADJ, T_HF_GEN};
 use crate::sbr_limiter::limiter_table;
-use crate::sbr_qmf::{AnalysisQmf, Complex, SynthesisQmf};
+use crate::sbr_qmf::{AnalysisQmf, Complex, DownsampledSynthesisQmf, SynthesisQmf};
 use crate::sbr_reconstruct::{EnvelopeScalefactors, NoiseScalefactors};
 use crate::sbr_time_grid::derive_time_grid;
 use crate::{Error, Result};
@@ -50,11 +54,52 @@ const LF: usize = (NUM_TIME_SLOTS * RATE) as usize;
 /// Total `XLow` / `XHigh` / `Y` columns (`lf + tHFGen`).
 const COLS: usize = LF + T_HF_GEN;
 
+/// The synthesis filterbank of one output channel: the §4.6.18.4.2
+/// 64-band dual-rate bank, or the §4.6.18.4.3 32-channel downsampled
+/// bank that keeps the output at the core rate (fed the first 32
+/// subbands of the assembled `X` matrix; the SBR content above the
+/// core Nyquist is discarded by construction).
+#[derive(Debug)]
+enum SynthesisBank {
+    /// §4.6.18.4.2 — 64 output samples per slot (2× rate).
+    Dual(SynthesisQmf),
+    /// §4.6.18.4.3 — 32 output samples per slot (core rate).
+    Down(DownsampledSynthesisQmf),
+}
+
+impl SynthesisBank {
+    fn new(downsampled: bool) -> Self {
+        if downsampled {
+            SynthesisBank::Down(DownsampledSynthesisQmf::new())
+        } else {
+            SynthesisBank::Dual(SynthesisQmf::new())
+        }
+    }
+
+    /// Output samples per QMF slot (64 dual-rate, 32 downsampled).
+    fn samples_per_slot(&self) -> usize {
+        match self {
+            SynthesisBank::Dual(_) => 64,
+            SynthesisBank::Down(_) => 32,
+        }
+    }
+
+    /// Synthesize one assembled `X` column, appending the slot's output
+    /// samples to `out`.
+    fn push_slot(&mut self, x: &[Complex; 64], out: &mut Vec<f64>) -> Result<()> {
+        match self {
+            SynthesisBank::Dual(s) => out.extend_from_slice(&s.push_slot(x)?),
+            SynthesisBank::Down(s) => out.extend_from_slice(&s.push_slot(&x[..32])?),
+        }
+        Ok(())
+    }
+}
+
 /// Per-channel cross-frame state.
 #[derive(Debug)]
 struct ChannelState {
     analysis: AnalysisQmf,
-    synthesis: SynthesisQmf,
+    synthesis: SynthesisBank,
     /// The previous frame's last `tHFGen` analysis slots (`W'`).
     w_hist: Vec<[Complex; 32]>,
     /// The previous frame's `Y` buffer (spec absolute columns).
@@ -72,10 +117,10 @@ struct ChannelState {
 }
 
 impl ChannelState {
-    fn new() -> Self {
+    fn new(downsampled: bool) -> Self {
         ChannelState {
             analysis: AnalysisQmf::new(),
-            synthesis: SynthesisQmf::new(),
+            synthesis: SynthesisBank::new(downsampled),
             w_hist: vec![[Complex::default(); 32]; T_HF_GEN],
             y_prev: vec![[Complex::default(); 64]; COLS],
             t_e_last_prev: NUM_TIME_SLOTS,
@@ -116,6 +161,13 @@ pub struct SbrDecoder {
     bands: Option<HiLoTables>,
     patches: Option<Patches>,
     f_table_lim: Vec<i32>,
+    /// §4.6.18.4.3 downsampled output mode: the synthesis runs the
+    /// 32-channel bank and every frame yields 1024 samples per channel
+    /// at the *core* rate instead of 2048 at `fs_sbr`.
+    downsampled: bool,
+    /// Set once the first frame is processed (mode switches are then
+    /// rejected — the QMF synthesis state is rate-specific).
+    started: bool,
     channels: Vec<ChannelState>,
     /// Annex 8.A parametric stereo state, created when a
     /// single-channel element first carries a PS extension. Holds the
@@ -128,7 +180,7 @@ pub struct SbrDecoder {
 #[derive(Debug)]
 struct PsState {
     dec: PsDecoder,
-    synthesis_r: SynthesisQmf,
+    synthesis_r: SynthesisBank,
 }
 
 impl SbrDecoder {
@@ -144,21 +196,60 @@ impl SbrDecoder {
             bands: None,
             patches: None,
             f_table_lim: Vec::new(),
-            channels: (0..num_channels).map(|_| ChannelState::new()).collect(),
+            downsampled: false,
+            started: false,
+            channels: (0..num_channels)
+                .map(|_| ChannelState::new(false))
+                .collect(),
             ps: None,
         })
     }
 
+    /// Select the §4.6.18.4.3 downsampled output mode: the SBR-processed
+    /// subband signals are synthesized through the 32-channel QMF bank,
+    /// so the output stays at the *core* coder rate (1024 samples per
+    /// channel per frame) instead of the dual `fs_sbr` rate. The SBR
+    /// range above the core Nyquist (assembled `X` subbands 32..64) is
+    /// discarded by construction; the reconstructed bands below it are
+    /// kept, so the mode is still an SBR decode, not a plain core decode.
+    ///
+    /// Must be selected before the first frame is processed — the QMF
+    /// synthesis history is rate-specific ([`Error::SbrQmfInvalid`]
+    /// otherwise).
+    pub fn set_downsampled(&mut self, downsampled: bool) -> Result<()> {
+        if self.started {
+            return Err(Error::SbrQmfInvalid);
+        }
+        if self.downsampled != downsampled {
+            self.downsampled = downsampled;
+            for ch in &mut self.channels {
+                ch.synthesis = SynthesisBank::new(downsampled);
+            }
+            if let Some(ps) = &mut self.ps {
+                ps.synthesis_r = SynthesisBank::new(downsampled);
+            }
+        }
+        Ok(())
+    }
+
+    /// `true` ⇔ the §4.6.18.4.3 downsampled output mode is selected.
+    #[must_use]
+    pub fn is_downsampled(&self) -> bool {
+        self.downsampled
+    }
+
     /// §4.6.18.5 pure upsampling: no SBR data for this frame — run the
     /// analysis / synthesis pair with the high 32 bands zero, keeping
-    /// the output at 2× the core rate and the QMF state continuous.
+    /// the output rate steady and the QMF state continuous.
     ///
     /// `core` holds one 1024-sample time signal per channel; returns
-    /// 2048 samples per channel.
+    /// 2048 samples per channel (1024 in the §4.6.18.4.3 downsampled
+    /// mode).
     pub fn upsample_frame(&mut self, core: &[&[f64]]) -> Result<Vec<Vec<f64>>> {
         if core.len() != self.channels.len() {
             return Err(Error::SbrQmfInvalid);
         }
+        self.started = true;
         let mut out = Vec::with_capacity(core.len());
         let n_ch = self.channels.len();
         for (ch, core_ch) in self.channels.iter_mut().zip(core.iter()) {
@@ -169,6 +260,7 @@ impl SbrDecoder {
                 x[..32].copy_from_slice(&x_low[l + T_HF_ADJ]);
                 x_cols.push(x);
             }
+            let sps = ch.synthesis.samples_per_slot();
             // A PS-active stream holds its stereo parameters over a
             // frame without SBR/PS payload (Annex 8.A.3); the whole
             // 32-band spectrum counts as SBR-covered for the partial
@@ -178,11 +270,11 @@ impl SbrDecoder {
                 if let Some(ps) = self.ps.as_mut() {
                     let x_input = build_x_input(&x_cols, &x_low);
                     if let Some((lq, rq)) = ps.dec.process(None, &x_input, 32)? {
-                        let mut pcm_l = Vec::with_capacity(LF * 64);
-                        let mut pcm_r = Vec::with_capacity(LF * 64);
+                        let mut pcm_l = Vec::with_capacity(LF * sps);
+                        let mut pcm_r = Vec::with_capacity(LF * sps);
                         for l in 0..LF {
-                            pcm_l.extend_from_slice(&ch.synthesis.push_slot(&lq[l])?);
-                            pcm_r.extend_from_slice(&ps.synthesis_r.push_slot(&rq[l])?);
+                            ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
+                            ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
                         }
                         out.push(pcm_l);
                         out.push(pcm_r);
@@ -191,9 +283,9 @@ impl SbrDecoder {
                 }
             }
             if !emitted {
-                let mut pcm = Vec::with_capacity(LF * 64);
+                let mut pcm = Vec::with_capacity(LF * sps);
                 for x in &x_cols {
-                    pcm.extend_from_slice(&ch.synthesis.push_slot(x)?);
+                    ch.synthesis.push_slot(x, &mut pcm)?;
                 }
                 out.push(pcm);
             }
@@ -209,7 +301,8 @@ impl SbrDecoder {
 
     /// Decode one SBR frame: `ext` is the parsed `sbr_extension_data()`
     /// for this element, `core` one 1024-sample signal per channel.
-    /// Returns 2048 samples per channel at the SBR rate.
+    /// Returns 2048 samples per channel at the SBR rate (1024 per
+    /// channel at the core rate in the §4.6.18.4.3 downsampled mode).
     pub fn process_frame(
         &mut self,
         ext: &SbrExtensionData,
@@ -219,6 +312,7 @@ impl SbrDecoder {
         if core.len() != n_ch || ext.element.channels.len() != n_ch {
             return Err(Error::SbrFreqBandInvalid);
         }
+        self.started = true;
 
         // §4.6.18.3.3 reset: first header, or a transmitted header that
         // changes the band geometry.
@@ -377,20 +471,21 @@ impl SbrDecoder {
             if ps_payload.is_some() && self.ps.is_none() {
                 self.ps = Some(PsState {
                     dec: PsDecoder::new(),
-                    synthesis_r: SynthesisQmf::new(),
+                    synthesis_r: SynthesisBank::new(self.downsampled),
                 });
             }
+            let sps = ch.synthesis.samples_per_slot();
             let mut emitted = false;
             if n_ch == 1 {
                 if let Some(ps) = self.ps.as_mut() {
                     let x_input = build_x_input(&x_cols, &x_low);
                     let kx_plus_m = (bands.k_x + bands.m).max(0) as usize;
                     if let Some((lq, rq)) = ps.dec.process(ps_payload, &x_input, kx_plus_m)? {
-                        let mut pcm_l = Vec::with_capacity(LF * 64);
-                        let mut pcm_r = Vec::with_capacity(LF * 64);
+                        let mut pcm_l = Vec::with_capacity(LF * sps);
+                        let mut pcm_r = Vec::with_capacity(LF * sps);
                         for l in 0..LF {
-                            pcm_l.extend_from_slice(&ch.synthesis.push_slot(&lq[l])?);
-                            pcm_r.extend_from_slice(&ps.synthesis_r.push_slot(&rq[l])?);
+                            ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
+                            ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
                         }
                         out.push(pcm_l);
                         out.push(pcm_r);
@@ -399,9 +494,9 @@ impl SbrDecoder {
                 }
             }
             if !emitted {
-                let mut pcm = Vec::with_capacity(LF * 64);
+                let mut pcm = Vec::with_capacity(LF * sps);
                 for x in &x_cols {
-                    pcm.extend_from_slice(&ch.synthesis.push_slot(x)?);
+                    ch.synthesis.push_slot(x, &mut pcm)?;
                 }
                 out.push(pcm);
             }
@@ -624,6 +719,109 @@ mod tests {
             }
         }
         assert!(hi_l > hi_q * 4.0, "loud {hi_l} vs quiet {hi_q}");
+    }
+
+    /// Downsampled pure upsampling is the identity at the core rate
+    /// (up to the analysis+synthesis delay), and each frame yields
+    /// 1024 samples.
+    #[test]
+    fn downsampled_upsample_is_identity_at_core_rate() {
+        let mut dec = SbrDecoder::new(44_100, 1).unwrap();
+        dec.set_downsampled(true).unwrap();
+        assert!(dec.is_downsampled());
+        let freq = 0.02;
+        let mut input_all = Vec::new();
+        let mut out = Vec::new();
+        for f in 0..4 {
+            let core = sine(freq, 1024, f * 1024);
+            input_all.extend_from_slice(&core);
+            let o = dec.upsample_frame(&[&core]).unwrap();
+            assert_eq!(o[0].len(), 1024);
+            out.extend_from_slice(&o[0]);
+        }
+        // Mode switches after the first frame are rejected.
+        assert!(dec.set_downsampled(false).is_err());
+        let mut best = (f64::INFINITY, 0usize);
+        for delay in 0..1024usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for t in 1500..out.len() {
+                if t < delay {
+                    continue;
+                }
+                let e = out[t] - input_all[t - delay];
+                err += e * e;
+                sig += out[t] * out[t];
+            }
+            let ratio = err / sig.max(1e-30);
+            if ratio < best.0 {
+                best = (ratio, delay);
+            }
+        }
+        assert!(
+            best.0 < 1e-4,
+            "identity error ratio {} at {}",
+            best.0,
+            best.1
+        );
+    }
+
+    /// With the whole SBR range inside the first 32 QMF bands, the
+    /// dual-rate output is band-limited below the core Nyquist, so the
+    /// downsampled decode must match a straight 2:1 decimation of the
+    /// dual-rate decode (same synthetic SBR frames, delay-searched).
+    #[test]
+    fn downsampled_matches_decimated_dual_rate() {
+        // The synthetic header at 44.1 kHz derives kx 14, M 15 —
+        // kx + M = 29 ≤ 32, so no SBR content crosses the core Nyquist.
+        let fs_sbr = 44_100;
+        let ext = synthetic_ext(fs_sbr, 8, 6);
+        let bands = ext.header.derive_bands(fs_sbr).unwrap();
+        assert!(
+            bands.k_x + bands.m <= 32,
+            "test premise: SBR range within 32 bands (kx {} M {})",
+            bands.k_x,
+            bands.m
+        );
+        let mut dual = SbrDecoder::new(fs_sbr, 1).unwrap();
+        let mut down = SbrDecoder::new(fs_sbr, 1).unwrap();
+        down.set_downsampled(true).unwrap();
+        let freq = 0.055;
+        let mut out_dual = Vec::new();
+        let mut out_down = Vec::new();
+        for f in 0..6 {
+            let core = sine(freq, 1024, f * 1024);
+            out_dual.extend_from_slice(&dual.process_frame(&ext, &[&core]).unwrap()[0]);
+            let o = down.process_frame(&ext, &[&core]).unwrap();
+            assert_eq!(o[0].len(), 1024);
+            out_down.extend_from_slice(&o[0]);
+        }
+        // out_down[n] ≈ out_dual[2n − d] for some fixed integer d
+        // (either parity): search d, then gate the steady-state error.
+        let mut best = (f64::INFINITY, 0usize);
+        for d in 0..1400usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (n, &od) in out_down.iter().enumerate().skip(1200) {
+                let idx = 2 * n;
+                if idx < d || idx - d >= out_dual.len() {
+                    continue;
+                }
+                let e = od - out_dual[idx - d];
+                err += e * e;
+                sig += od * od;
+            }
+            let ratio = err / sig.max(1e-30);
+            if ratio < best.0 {
+                best = (ratio, d);
+            }
+        }
+        assert!(
+            best.0 < 1e-3,
+            "decimation mismatch ratio {} at delay {}",
+            best.0,
+            best.1
+        );
     }
 
     /// A channel-count / buffer-length mismatch is rejected.
