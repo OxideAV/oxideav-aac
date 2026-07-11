@@ -233,8 +233,9 @@ impl AacDecoder {
         AudioFrame {
             // Per-channel sample count from the interleaved buffer:
             // 1024 for the plain AAC path, 2048 for an SBR (HE-AAC)
-            // dual-rate frame. A fill-only frame (`channels == 0`)
-            // carries no samples.
+            // dual-rate frame (1024 again in the downsampled SBR
+            // mode). A fill-only frame (`channels == 0`) carries no
+            // samples.
             samples: decoded.pcm.len().checked_div(decoded.channels).unwrap_or(0) as u32,
             pts,
             data: vec![bytes],

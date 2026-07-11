@@ -17,7 +17,8 @@
 //! [`crate::sbr_extension::SbrExtensionData`];
 //! [`SbrDecoder::upsample_frame`] is the §4.6.18.5 "pure upsampling
 //! without SBR processing" path used when a frame carries no SBR
-//! payload, keeping the 2× output rate and the QMF state continuous.
+//! payload, keeping the selected output rate and the QMF state
+//! continuous.
 //!
 //! ## Provenance
 //!

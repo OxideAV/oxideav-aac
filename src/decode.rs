@@ -91,12 +91,14 @@ pub struct DecodedFrame {
     /// (an SCE/LFE contributes one channel, a CPE two). Length is
     /// `FRAME_LEN * channels` for the plain AAC path, or
     /// `2 * FRAME_LEN * channels` once the stream is SBR-active
-    /// (HE-AAC dual-rate output).
+    /// (HE-AAC dual-rate output; `FRAME_LEN * channels` again when
+    /// the §4.6.18.4.3 downsampled SBR mode is selected).
     pub pcm: Vec<i16>,
     /// Number of interleaved channels this frame produced.
     pub channels: usize,
     /// The frame's sampling rate in Hz: the ADTS-signalled core rate,
-    /// doubled once the stream is SBR-active.
+    /// doubled once the stream is SBR-active (kept at the core rate
+    /// in the §4.6.18.4.3 downsampled SBR mode).
     pub sample_rate: u32,
 }
 
@@ -121,9 +123,9 @@ pub struct StreamDecoder {
     /// `bs_header_flag == 0` reuse path).
     sbr_prev_header: HashMap<(u8, u8), SbrHeader>,
     /// Latched once any frame carries SBR data: from then on every
-    /// frame is emitted at the doubled (SBR) rate — SBR-less frames go
-    /// through the §4.6.18.5 pure-upsampling path so the output rate
-    /// never flaps.
+    /// frame is emitted at the SBR output rate (doubled, or the core
+    /// rate in downsampled mode) — SBR-less frames go through the
+    /// §4.6.18.5 pure-upsampling path so the output rate never flaps.
     sbr_active: bool,
     /// §4.6.18.4.3 downsampled SBR output mode: SBR frames are
     /// synthesized through the 32-channel bank and emitted at the
