@@ -22,7 +22,11 @@ against the staged `expected.wav` corpus — **including the HE-AAC v1
 SBR fixture, which decodes 99.98% sample-exact with a max error of
 1 LSB** at the doubled output rate, and the **HE-AAC v2 fixture, whose
 PS stereo reconstruction lands at a 5e-5 per-channel error-to-signal
-RMS** against the reference decode.
+RMS** against the reference decode. The §4.6.18.4.3 **downsampled**
+output mode (core-rate SBR, auto-selected from a core-rate
+`extensionSamplingFrequency` ASC) and the §4.6.18.8 **low power** SBR
+tool (real-valued filterbanks + aliasing detection/reduction) are
+selectable on every decode entry point.
 The crate also ships an **end-to-end AAC-LC encoder** (`encoder` /
 `codec_encoder`): PCM → §4.6.11.3.1 forward-MDCT analysis with
 §4.6.11.3.2 block switching (transient-driven
@@ -502,6 +506,39 @@ signal to dual-rate PCM, validated **99.98% sample-exact (max error
   SBR-less frames upsampled so the output rate never flaps. The
   runtime `Decoder` trait surfaces the dual-rate frames unchanged
   (pinned byte-identical to the raw `StreamDecoder`).
+- **Downsampled output mode** (§4.6.18.4.3) — selectable end to end:
+  `SbrDecoder::set_downsampled` / `StreamDecoder::set_sbr_downsampled`
+  / the `sbr_downsampled` codec option run the 32-channel synthesis
+  bank so an SBR-active stream is emitted at the *core* rate (1024
+  samples per channel per frame; the SBR range above the core Nyquist
+  is discarded by construction, the bands below it are kept). The
+  LATM driver selects the mode automatically when an explicitly
+  signalled ASC carries `extensionSamplingFrequency ==
+  samplingFrequency` (the §4.6.18.2.6 in-band core-rate declaration),
+  and PS composes (stereo through two downsampled banks). Validated
+  on the HE-AAC v1 fixture at **1.8e-4** per-channel err/sig RMS
+  against a band-limited 2:1 decimation of the reference decode
+  (v2 PS at 1.95e-4), byte-identical between the LATM and forced-ADTS
+  paths.
+- **Low power SBR tool** (§4.6.18.8) — selectable end to end
+  (`SbrDecoder::set_low_power` / `StreamDecoder::set_sbr_low_power` /
+  the `sbr_low_power` codec option; composes with the downsampled
+  output): the §4.6.18.8.2 real-valued filterbank trio (`sbr_qmf`),
+  the §4.6.18.8.3 aliasing detection (`sbr_lp` + the reflection
+  coefficients in `sbr_hf_gen`: the Figure 4.53 degree walk, the
+  patch-carried `degPatched`, the Figure 4.54 gain groups), the
+  §4.6.18.8.4 ×2 energy estimation, and the §4.6.18.8.5 aliasing
+  reduction (`GLimBoost → GA`, exact group-energy restoration),
+  no-smoothing rule, modified real-valued sinusoid injection
+  (−0.00815 neighbour correction, first-16 rule, `kx − 1` / `kx + M`
+  spill) and modified `X` assembly. Validated on the HE-AAC v1
+  fixture: sub-crossover content at **9e-5** err/sig RMS against the
+  reference with per-frame full-band energy within 0.05% (the
+  real-valued HF path is energy-normative, not phase-normative). A
+  PS payload in this mode is rejected (`Error::SbrLowPowerPs` — the
+  subpart-8 tool needs the complex QMF domain). All four mode
+  combinations survive a deterministic corruption battery
+  (`tests/sbr_mode_mutations.rs`).
 
 ### SBR frequency band setup (HE-AAC)
 
@@ -826,10 +863,12 @@ EP-tool payload de-interleave is out of scope.
   `bs_sbr_crc_bits` of every `EXT_SBR_DATA_CRC` payload now
   **verified** (§4.4.2.8.1 `G10`, zero init, over the Table 4.62
   region — see `adts_crc`; a derived type-14 fixture is staged as
-  `he-aac-v1-sbrcrc-adts`). Still open:
-  the §4.6.18.4.3 downsampled-output mode and the §4.6.18.8 low-power
-  variant are not selectable; and the ER AAC LD 480/512 transform
-  variants remain out of scope. The coupling-channel (CCE) tool is
+  `he-aac-v1-sbrcrc-adts`). The §4.6.18.4.3 downsampled-output mode
+  and the §4.6.18.8 low-power variant are now **both selectable end
+  to end** (see the SBR back-end section above). Still open: the ER
+  AAC LD 480/512 transform variants remain out of scope, and
+  low-power PS is undefined by design (the subpart-8 tool needs the
+  complex QMF domain, so LP + PS is rejected). The coupling-channel (CCE) tool is
   decoded **and applied** end to end (`cce` + the two-pass stream walk;
   see the tool-chain section above), validated against the
   filterbank-linearity identity on writer-assembled CCE streams; a

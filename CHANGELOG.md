@@ -8,6 +8,46 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4.6.18.4.3 **downsampled SBR output mode**, selectable end to end:
+  `SbrDecoder::set_downsampled` synthesizes through the 32-channel QMF
+  bank so an SBR-active stream is emitted at the *core* sampling rate
+  (1024 samples per channel per frame) instead of the doubled rate;
+  `StreamDecoder::set_sbr_downsampled`, `LoasDecoder` (with automatic
+  per-layer selection when an explicitly signalled ASC carries
+  `extensionSamplingFrequency == samplingFrequency`, the §4.6.18.2.6
+  in-band declaration of a core-rate SBR output), and the runtime
+  `Decoder`'s `sbr_downsampled` codec option /
+  `AacDecoder::set_sbr_downsampled` (kept across `reset()`) plumb the
+  mode through every entry point. PS composes (stereo through two
+  downsampled banks). Fixture-gated: the HE-AAC v1 fixture decodes at
+  22.05 kHz to 1.8e-4 per-channel err/sig RMS against a band-limited
+  2:1 decimation of the reference decode, a core-rate-extension LATM
+  re-mux decodes byte-identical to the forced ADTS path, and the
+  HE-AAC v2 fixture renders PS stereo at the core rate at 1.95e-4
+- §4.6.18.8 **low power SBR tool**, selectable end to end:
+  the real-valued filterbank trio (§4.6.18.8.2 — `RealAnalysisQmf`,
+  `RealSynthesisQmf`, `RealDownsampledSynthesisQmf` on the shared
+  Table 4.A.89 prototype), the §4.6.18.8.3 aliasing detection
+  (reflection coefficients over the low band, the Figure 4.53 degree
+  walk, the patch carry `degPatched`, the Figure 4.54 gain groups),
+  the §4.6.18.8.4 ×2 energy estimation, and the §4.6.18.8.5 aliasing
+  reduction (`GLimBoost → GA` with the exact energy-restoring
+  normalization), unconditional no-smoothing rule, modified
+  real-valued sinusoid injection (the `−0.00815·(−1)^(m+kx)`
+  neighbour correction, first 16 sinusoids per time segment, spill
+  into subbands `kx − 1` / `kx + M`) and modified `X` assembly.
+  `SbrDecoder::set_low_power` / `StreamDecoder::set_sbr_low_power` /
+  `LoasDecoder::set_sbr_low_power` / the `sbr_low_power` codec option
+  select it; it composes with the downsampled output. A PS payload in
+  this mode is rejected with the new `Error::SbrLowPowerPs` (the
+  subpart-8 tool needs the complex QMF domain). Fixture-gated:
+  sub-crossover content at 9e-5 (dual) / 1.1e-4 (downsampled)
+  err/sig RMS against the reference decode with per-frame full-band
+  energy within 0.05%
+- Deterministic mutation battery over all four SBR mode combinations
+  (`tests/sbr_mode_mutations.rs`): fixed-LCG XOR / truncation / burst
+  corruptions of the HE-AAC fixtures must never panic in any mode
+
 - ADTS `error_check()` CRC verification (`adts_crc`) — the ISO/IEC
   13818-7:2004 §8.1.1.1 protected-bit region walk (56 header bits,
   the first 192 bits of every SCE / CPE / CCE / LFE with the 3-bit
