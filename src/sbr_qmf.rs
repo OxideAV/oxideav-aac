@@ -12,6 +12,16 @@
 //! * [`DownsampledSynthesisQmf`] — §4.6.18.4.3 / Figure 4.44: the
 //!   32-channel variant that keeps the output at the core rate.
 //!
+//! The low-power SBR tool (§4.6.18.8) replaces the complex banks with
+//! real-valued ones (§4.6.18.8.2):
+//!
+//! * [`RealAnalysisQmf`] — §4.6.18.8.2.2 / Figure 4.50: 32 real-valued,
+//!   critically sampled subband signals.
+//! * [`RealSynthesisQmf`] — §4.6.18.8.2.3 / Figure 4.51: the 64-subband
+//!   real synthesis bank (dual-rate output).
+//! * [`RealDownsampledSynthesisQmf`] — §4.6.18.8.2.4 / Figure 4.52: the
+//!   32-channel real variant at the core rate.
+//!
 //! The 640-tap prototype window `c[i]` is Table 4.A.89, transcribed
 //! from the staged ISO/IEC 14496-3:2009 spec PDF (`docs/audio/aac/`).
 //! The table prints `c[639]` with nine decimals (`-0.000552528`); every
@@ -487,6 +497,213 @@ impl DownsampledSynthesisQmf {
     }
 }
 
+/// §4.6.18.8.2.2 / Figure 4.50 — the 32-band real-valued analysis QMF
+/// bank of the low-power SBR tool (critically sampled).
+#[derive(Debug, Clone)]
+pub struct RealAnalysisQmf {
+    /// The Figure 4.50 input history; a higher index is an older sample.
+    x: Vec<f64>,
+    /// Precomputed modulation matrix
+    /// `2·cos(π/64·(k + 0.5)·(2n − 96))`, row-major `[k][n]`.
+    m: Vec<f64>,
+}
+
+impl Default for RealAnalysisQmf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealAnalysisQmf {
+    /// A fresh real-valued analysis bank with an all-zero history.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut m = Vec::with_capacity(32 * 64);
+        for k in 0..32 {
+            for n in 0..64 {
+                let arg = core::f64::consts::PI / 64.0 * (k as f64 + 0.5) * (2.0 * n as f64 - 96.0);
+                m.push(2.0 * arg.cos());
+            }
+        }
+        RealAnalysisQmf {
+            x: vec![0.0; 320],
+            m,
+        }
+    }
+
+    /// Run one Figure 4.50 loop: shift in 32 new time samples (oldest
+    /// first within `samples`) and return the 32 real subband samples
+    /// `W[k]` for this slot.
+    pub fn push_slot(&mut self, samples: &[f64]) -> Result<[f64; 32]> {
+        if samples.len() != 32 {
+            return Err(Error::SbrQmfInvalid);
+        }
+        // As Figure 4.42: newest input sample lands at index 0.
+        self.x.copy_within(0..288, 32);
+        for (n, s) in samples.iter().enumerate() {
+            self.x[31 - n] = *s;
+        }
+        // z[n] = x[n] · c[2n]; u[n] = Σ_{j=0..=4} z[n + 64j].
+        let mut u = [0.0f64; 64];
+        for (n, un) in u.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for j in 0..5 {
+                let idx = n + j * 64;
+                acc += self.x[idx] * QMF_WINDOW[2 * idx];
+            }
+            *un = acc;
+        }
+        // W[k] = Σ_n u[n] · 2·cos(π/64·(k + 0.5)(2n − 96)).
+        let mut w = [0.0f64; 32];
+        for (k, wk) in w.iter_mut().enumerate() {
+            let row = &self.m[k * 64..(k + 1) * 64];
+            let mut acc = 0.0;
+            for (n, cell) in row.iter().enumerate() {
+                acc += *cell * u[n];
+            }
+            *wk = acc;
+        }
+        Ok(w)
+    }
+}
+
+/// §4.6.18.8.2.3 / Figure 4.51 — the 64-subband real-valued synthesis
+/// QMF bank (dual-rate low-power SBR output).
+#[derive(Debug, Clone)]
+pub struct RealSynthesisQmf {
+    /// The Figure 4.51 synthesis history `v`.
+    v: Vec<f64>,
+    /// Precomputed `cos(π/128·(k + 0.5)·(2n − 64)) / 32`, row-major
+    /// `[n][k]`.
+    n_mat: Vec<f64>,
+}
+
+impl Default for RealSynthesisQmf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealSynthesisQmf {
+    /// A fresh real synthesis bank with an all-zero history.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut n_mat = Vec::with_capacity(128 * 64);
+        for n in 0..128 {
+            for k in 0..64 {
+                let arg =
+                    core::f64::consts::PI / 128.0 * (k as f64 + 0.5) * (2.0 * n as f64 - 64.0);
+                n_mat.push(arg.cos() / 32.0);
+            }
+        }
+        RealSynthesisQmf {
+            v: vec![0.0; 1280],
+            n_mat,
+        }
+    }
+
+    /// Run one Figure 4.51 loop: consume the 64 real subband samples
+    /// `X[k]` of one slot and return the 64 real output samples.
+    pub fn push_slot(&mut self, bands: &[f64]) -> Result<[f64; 64]> {
+        if bands.len() != 64 {
+            return Err(Error::SbrQmfInvalid);
+        }
+        // Shift v by 128 (discard the oldest 128 samples).
+        self.v.copy_within(0..1152, 128);
+        // v[n] = Σ_k X[k]/32 · cos(π/128·(k + 0.5)(2n − 64)).
+        for n in 0..128 {
+            let row = &self.n_mat[n * 64..(n + 1) * 64];
+            let mut acc = 0.0;
+            for (k, cell) in row.iter().enumerate() {
+                acc += bands[k] * *cell;
+            }
+            self.v[n] = acc;
+        }
+        // g extraction (as Figure 4.51), full-window multiply, ten-tap
+        // sum.
+        let mut out = [0.0f64; 64];
+        for (k, o) in out.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for n in 0..5 {
+                // g[128n + k] = v[256n + k]; w = g·c.
+                acc += self.v[256 * n + k] * QMF_WINDOW[128 * n + k];
+                // g[128n + 64 + k] = v[256n + 192 + k].
+                acc += self.v[256 * n + 192 + k] * QMF_WINDOW[128 * n + 64 + k];
+            }
+            *o = acc;
+        }
+        Ok(out)
+    }
+}
+
+/// §4.6.18.8.2.4 / Figure 4.52 — the 32-channel downsampled real-valued
+/// synthesis QMF bank (core-rate low-power SBR output).
+#[derive(Debug, Clone)]
+pub struct RealDownsampledSynthesisQmf {
+    /// The Figure 4.52 synthesis history `v`.
+    v: Vec<f64>,
+    /// Precomputed `cos(π/64·(k + 0.5)·(2n − 32)) / 32`, row-major
+    /// `[n][k]`.
+    n_mat: Vec<f64>,
+}
+
+impl Default for RealDownsampledSynthesisQmf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RealDownsampledSynthesisQmf {
+    /// A fresh downsampled real synthesis bank with an all-zero history.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut n_mat = Vec::with_capacity(64 * 32);
+        for n in 0..64 {
+            for k in 0..32 {
+                let arg = core::f64::consts::PI / 64.0 * (k as f64 + 0.5) * (2.0 * n as f64 - 32.0);
+                n_mat.push(arg.cos() / 32.0);
+            }
+        }
+        RealDownsampledSynthesisQmf {
+            v: vec![0.0; 640],
+            n_mat,
+        }
+    }
+
+    /// Run one Figure 4.52 loop: consume the 32 real subband samples
+    /// `X[k]` of one slot and return the 32 real output samples.
+    pub fn push_slot(&mut self, bands: &[f64]) -> Result<[f64; 32]> {
+        if bands.len() != 32 {
+            return Err(Error::SbrQmfInvalid);
+        }
+        // Shift v by 64 (discard the oldest 64 samples).
+        self.v.copy_within(0..576, 64);
+        // v[n] = Σ_k X[k]/32 · cos(π/64·(k + 0.5)(2n − 32)).
+        for n in 0..64 {
+            let row = &self.n_mat[n * 32..(n + 1) * 32];
+            let mut acc = 0.0;
+            for (k, cell) in row.iter().enumerate() {
+                acc += bands[k] * *cell;
+            }
+            self.v[n] = acc;
+        }
+        // g extraction (as Figure 4.52), every-other-coefficient
+        // windowing, ten-tap sum.
+        let mut out = [0.0f64; 32];
+        for (k, o) in out.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for n in 0..5 {
+                // g[64n + k] = v[128n + k]; w[n] = g[n]·c[2n].
+                acc += self.v[128 * n + k] * QMF_WINDOW[2 * (64 * n + k)];
+                // g[64n + 32 + k] = v[128n + 96 + k].
+                acc += self.v[128 * n + 96 + k] * QMF_WINDOW[2 * (64 * n + 32 + k)];
+            }
+            *o = acc;
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +867,138 @@ mod tests {
             for k in 0..32 {
                 let d = ws[k] - (wa[k] + wb[k]);
                 assert!(d.norm_sqr() < 1e-18);
+            }
+        }
+    }
+
+    /// The real-valued LP bank pair (§4.6.18.8.2.2 + §4.6.18.8.2.4)
+    /// reconstructs the input at the core rate: real-QMF aliasing
+    /// between adjacent subbands cancels in the matched synthesis.
+    #[test]
+    fn real_analysis_downsampled_synthesis_is_identity() {
+        let mut a = RealAnalysisQmf::new();
+        let mut s = RealDownsampledSynthesisQmf::new();
+        let freq = 0.037;
+        let slots = 96;
+        let mut input_all = Vec::new();
+        let mut output = Vec::new();
+        for slot in 0..slots {
+            let mut input = [0.0f64; 32];
+            for (n, v) in input.iter_mut().enumerate() {
+                let t = (slot * 32 + n) as f64;
+                *v = (2.0 * core::f64::consts::PI * freq * t).sin()
+                    + 0.5 * (2.0 * core::f64::consts::PI * 2.9 * freq * t).cos();
+            }
+            input_all.extend_from_slice(&input);
+            let w = a.push_slot(&input).unwrap();
+            output.extend_from_slice(&s.push_slot(&w).unwrap());
+        }
+        let mut best = (f64::INFINITY, 0usize);
+        for delay in 0..640usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (t, &o) in output.iter().enumerate().skip(900) {
+                if t < delay {
+                    continue;
+                }
+                let e = o - input_all[t - delay];
+                err += e * e;
+                sig += o * o;
+            }
+            let ratio = err / sig.max(1e-30);
+            if ratio < best.0 {
+                best = (ratio, delay);
+            }
+        }
+        assert!(
+            best.0 < 1e-4,
+            "identity error ratio {} at delay {}",
+            best.0,
+            best.1
+        );
+    }
+
+    /// Real analysis → 64-band real synthesis (top half zero)
+    /// reconstructs the 2×-upsampled input (§4.6.18.8.2.3).
+    #[test]
+    fn real_analysis_synthesis_upsamples_a_sine() {
+        let mut a = RealAnalysisQmf::new();
+        let mut s = RealSynthesisQmf::new();
+        let freq = 0.043;
+        let slots = 96;
+        let mut output = Vec::new();
+        for slot in 0..slots {
+            let mut input = [0.0f64; 32];
+            for (n, v) in input.iter_mut().enumerate() {
+                let t = (slot * 32 + n) as f64;
+                *v = (2.0 * core::f64::consts::PI * freq * t).sin();
+            }
+            let w = a.push_slot(&input).unwrap();
+            let mut x = [0.0f64; 64];
+            x[..32].copy_from_slice(&w);
+            output.extend_from_slice(&s.push_slot(&x).unwrap());
+        }
+        let ideal =
+            |t: f64, delay: f64| (2.0 * core::f64::consts::PI * freq * (t - delay) / 2.0).sin();
+        let mut best = (f64::INFINITY, 0usize);
+        for delay in 0..1200usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (t, &out) in output.iter().enumerate().skip(1600) {
+                let e = out - ideal(t as f64, delay as f64);
+                err += e * e;
+                sig += out * out;
+            }
+            let ratio = err / sig.max(1e-30);
+            if ratio < best.0 {
+                best = (ratio, delay);
+            }
+        }
+        assert!(
+            best.0 < 1e-4,
+            "reconstruction error ratio {} at delay {}",
+            best.0,
+            best.1
+        );
+    }
+
+    /// The real analysis output is the real part structure of the
+    /// complex bank only in aggregate — but silence and shape checks
+    /// hold exactly, and the bank is linear.
+    #[test]
+    fn real_banks_silence_shape_linearity() {
+        let mut a = RealAnalysisQmf::new();
+        assert!(matches!(a.push_slot(&[0.0; 16]), Err(Error::SbrQmfInvalid)));
+        for _ in 0..4 {
+            let w = a.push_slot(&[0.0; 32]).unwrap();
+            assert!(w.iter().all(|&c| c == 0.0));
+        }
+        let mut s = RealSynthesisQmf::new();
+        assert!(matches!(s.push_slot(&[0.0; 32]), Err(Error::SbrQmfInvalid)));
+        assert!(s.push_slot(&[0.0; 64]).unwrap().iter().all(|&x| x == 0.0));
+        let mut d = RealDownsampledSynthesisQmf::new();
+        assert!(matches!(d.push_slot(&[0.0; 64]), Err(Error::SbrQmfInvalid)));
+        assert!(d.push_slot(&[0.0; 32]).unwrap().iter().all(|&x| x == 0.0));
+
+        // Linearity.
+        let mut qa = RealAnalysisQmf::new();
+        let mut qb = RealAnalysisQmf::new();
+        let mut qs = RealAnalysisQmf::new();
+        for slot in 0..8 {
+            let mut va = [0.0f64; 32];
+            let mut vb = [0.0f64; 32];
+            let mut sum = [0.0f64; 32];
+            for n in 0..32 {
+                let t = (slot * 32 + n) as f64;
+                va[n] = (0.13 * t).sin();
+                vb[n] = (0.029 * t + 0.4).cos();
+                sum[n] = va[n] + vb[n];
+            }
+            let wa = qa.push_slot(&va).unwrap();
+            let wb = qb.push_slot(&vb).unwrap();
+            let ws = qs.push_slot(&sum).unwrap();
+            for k in 0..32 {
+                assert!((ws[k] - (wa[k] + wb[k])).abs() < 1e-9);
             }
         }
     }
