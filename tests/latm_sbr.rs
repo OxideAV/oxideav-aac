@@ -174,3 +174,70 @@ fn latm_implicit_sbr_matches_adts_byte_exact() {
     let reference = decode_adts_pcm(&adts);
     assert_eq!(ours, reference, "LATM implicit-SBR PCM diverges from ADTS");
 }
+
+/// Explicit signalling *at the core rate*: outer AOT 5 with
+/// `extensionSamplingFrequencyIndex` equal to the core index — the
+/// §4.6.18.2.6 declaration that the SBR output rate is the core rate,
+/// i.e. the §4.6.18.4.3 downsampled mode.
+fn write_downsampled_sbr_asc(w: &mut BitWriter) {
+    w.write_u32(5, 5); // outer audioObjectType = SBR
+    w.write_u32(7, 4); // samplingFrequencyIndex = 22050
+    w.write_u32(2, 4); // channelConfiguration = stereo
+    w.write_u32(7, 4); // extensionSamplingFrequencyIndex = 22050 (core)
+    w.write_u32(2, 5); // inner audioObjectType = AAC LC
+    w.write_bit(false); // frameLengthFlag
+    w.write_bit(false); // dependsOnCoreCoder
+    w.write_bit(false); // extensionFlag
+}
+
+/// An explicit AOT-5 ASC whose extension sampling frequency equals the
+/// core rate auto-selects the §4.6.18.4.3 downsampled output: frames
+/// come out at 22.05 kHz with 1024 samples per channel, byte-identical
+/// to the ADTS path decoded with the downsampled mode forced.
+#[test]
+fn latm_core_rate_extension_selects_downsampled_sbr() {
+    let Some(adts) = fixture_adts() else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let payloads = adts_payloads(&adts);
+    let loas = build_loas(&payloads, write_downsampled_sbr_asc);
+
+    let mut dec = LoasDecoder::new();
+    let frames = dec.decode_all(&loas).expect("LOAS decode");
+    assert!(!frames.is_empty());
+    let mut ours = Vec::new();
+    for f in &frames {
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.sample_rate, 22_050, "downsampled SBR = core rate");
+        assert_eq!(f.pcm.len(), 1024 * 2);
+        ours.extend_from_slice(&f.pcm);
+    }
+
+    let mut adts_dec = StreamDecoder::new();
+    adts_dec.set_sbr_downsampled(true);
+    let mut reference = Vec::new();
+    for f in &adts_dec.decode_all(&adts).expect("ADTS decode") {
+        reference.extend_from_slice(&f.pcm);
+    }
+    assert_eq!(ours, reference, "LATM downsampled PCM diverges from ADTS");
+}
+
+/// The forced LoasDecoder-level downsampled mode applies even when the
+/// ASC signals the doubled extension rate.
+#[test]
+fn latm_forced_downsampled_overrides_dual_rate_asc() {
+    let Some(adts) = fixture_adts() else {
+        eprintln!("skip: fixtures unavailable");
+        return;
+    };
+    let payloads = adts_payloads(&adts);
+    let loas = build_loas(&payloads, write_explicit_sbr_asc);
+    let mut dec = LoasDecoder::new();
+    dec.set_sbr_downsampled(true);
+    let frames = dec.decode_all(&loas).expect("LOAS decode");
+    for f in &frames {
+        assert_eq!(f.sample_rate, 22_050);
+        assert_eq!(f.pcm.len(), 1024 * 2);
+    }
+}

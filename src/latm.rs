@@ -898,9 +898,9 @@ use crate::decode::{DecodedFrame, StreamDecoder};
 /// Targets the core (AAC-LC / Main / LTP) tool chain the
 /// [`StreamDecoder`] covers, **plus §4.6.18 SBR (HE-AAC v1)** — the
 /// shared `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`
-/// FIL payloads in-band and doubles the output rate, so an
-/// SBR-signalling ASC decodes rather than being rejected (PS synthesis
-/// is still absent; an HE-AAC v2 stream decodes its v1 layer). The
+/// FIL payloads in-band and doubles the output rate (or keeps the core
+/// rate in the §4.6.18.4.3 downsampled mode), and a PS payload renders
+/// stereo through the subpart-8 tool (HE-AAC v2). The
 /// `audioObjectType` carried by the ASC must be a General Audio
 /// type whose `raw_data_block()` the core driver understands; otherwise
 /// the underlying decode surfaces its own element-level error.
@@ -909,15 +909,29 @@ pub struct LoasDecoder {
     /// One [`StreamDecoder`] per `streamID`, so each multiplexed stream's
     /// inter-frame state stays independent.
     streams: HashMap<u8, StreamDecoder>,
+    /// Caller-forced §4.6.18.4.3 downsampled SBR output (see
+    /// [`Self::set_sbr_downsampled`]); an explicitly signalled ASC
+    /// whose extension sampling frequency equals the core rate selects
+    /// the mode per stream regardless.
+    sbr_downsampled: bool,
 }
 
 impl LoasDecoder {
     /// A fresh LOAS decoder with no per-stream state.
     #[must_use]
     pub fn new() -> Self {
-        LoasDecoder {
-            streams: HashMap::new(),
-        }
+        LoasDecoder::default()
+    }
+
+    /// Force the §4.6.18.4.3 downsampled SBR output mode on every
+    /// stream decoder this LOAS driver creates: SBR-active streams are
+    /// emitted at the core sampling rate. Independent of the forced
+    /// mode, a layer whose explicitly signalled `AudioSpecificConfig`
+    /// carries `extensionSamplingFrequency == samplingFrequency`
+    /// selects the mode by itself (the SBR output rate the ASC
+    /// declares *is* the core rate). Select before decoding.
+    pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
+        self.sbr_downsampled = downsampled;
     }
 
     /// Decode a whole LOAS `AudioSyncStream()` byte buffer to a vector of
@@ -957,10 +971,22 @@ impl LoasDecoder {
         // `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`
         // FIL payloads in-band and doubles the output rate (§4.6.18).
         // The decode runs at the *core* configuration (`asc.aot` is the
-        // unwrapped core object type, `asc.sample_rate` the core rate).
-        // PS (HE-AAC v2) synthesis is not implemented, so a PS stream
-        // decodes its HE-AAC v1 layer.
-        let dec = self.streams.entry(payload.stream_id).or_default();
+        // unwrapped core object type, `asc.sample_rate` the core rate);
+        // a PS payload renders stereo through the subpart-8 tool.
+        let dec = self.streams.entry(payload.stream_id).or_insert_with({
+            let force_down = self.sbr_downsampled;
+            move || {
+                let mut d = StreamDecoder::new();
+                d.set_sbr_downsampled(force_down);
+                d
+            }
+        });
+        // §4.6.18.2.6: FsSBR is twice the core rate; an explicit SBR
+        // ASC whose extensionSamplingFrequency equals the core rate is
+        // therefore declaring the §4.6.18.4.3 downsampled output.
+        if asc.sbr_present && asc.extension_sample_rate == Some(asc.sample_rate) {
+            dec.set_sbr_downsampled(true);
+        }
         // A channelConfiguration-0 layer carries its layout in the
         // ASC's inline program_config_element(); install it so the
         // §8.5.2.2 canonical output reorder applies (an in-band PCE in

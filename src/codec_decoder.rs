@@ -105,10 +105,14 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     out_params.channels = Some(channels);
     out_params.sample_format = Some(SampleFormat::S16);
 
-    Ok(Box::new(AacDecoder::new(
-        CodecId::new(CODEC_ID_STR),
-        out_params,
-    )))
+    let mut dec = AacDecoder::new(CodecId::new(CODEC_ID_STR), out_params);
+    // `{"sbr_downsampled": "true"}` selects the §4.6.18.4.3
+    // downsampled SBR output mode: HE-AAC streams are emitted at the
+    // core sampling rate instead of the doubled SBR rate.
+    if let Some(v) = params.options.get("sbr_downsampled") {
+        dec.set_sbr_downsampled(matches!(v, "true" | "1"));
+    }
+    Ok(Box::new(dec))
 }
 
 /// Packet-to-frame adaptor wrapping [`StreamDecoder`] in the framework
@@ -136,6 +140,9 @@ pub struct AacDecoder {
     transport: Option<Transport>,
     pending: VecDeque<AudioFrame>,
     eof: bool,
+    /// The caller-selected §4.6.18.4.3 downsampled SBR output mode,
+    /// kept so [`Decoder::reset`] re-applies it to the fresh backends.
+    sbr_downsampled: bool,
 }
 
 /// The carrier syntax an [`AacDecoder`] auto-detects on its first packet.
@@ -170,7 +177,21 @@ impl AacDecoder {
             transport: None,
             pending: VecDeque::new(),
             eof: false,
+            sbr_downsampled: false,
         }
+    }
+
+    /// Select the §4.6.18.4.3 downsampled SBR output mode on both
+    /// transport backends: HE-AAC (SBR-active) streams are synthesized
+    /// through the 32-channel QMF bank and emitted at the *core*
+    /// sampling rate (1024 samples per channel per block) instead of
+    /// the doubled SBR rate. Select before the first packet. Also
+    /// reachable at construction via the `sbr_downsampled` codec
+    /// option ([`make_decoder`]).
+    pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
+        self.sbr_downsampled = downsampled;
+        self.stream.set_sbr_downsampled(downsampled);
+        self.loas.set_sbr_downsampled(downsampled);
     }
 
     /// The parameter set this decoder advertises for its output stream.
@@ -322,6 +343,8 @@ impl Decoder for AacDecoder {
         // and re-arm transport auto-detection.
         self.stream = StreamDecoder::new();
         self.loas = LoasDecoder::new();
+        self.stream.set_sbr_downsampled(self.sbr_downsampled);
+        self.loas.set_sbr_downsampled(self.sbr_downsampled);
         self.transport = None;
         self.pending.clear();
         self.eof = false;
@@ -876,5 +899,48 @@ mod tests {
                 "tag {tag:?} did not resolve to aac",
             );
         }
+    }
+
+    /// The `sbr_downsampled` codec option: the HE-AAC v1 fixture
+    /// decodes at the core 22.05 kHz rate with 1024 samples per
+    /// channel per frame, and the mode survives `reset()`.
+    #[test]
+    fn sbr_downsampled_option_emits_core_rate() {
+        let Some(buf) = fixture_bytes("he-aac-v1-stereo-44100-32kbps-adts") else {
+            return;
+        };
+        let packets = split_into_packets(&buf);
+        assert!(packets.len() > 2);
+
+        let mut params = build_params(22_050, 2);
+        params.options.insert("sbr_downsampled", "true");
+        let mut dec = make_decoder(&params).unwrap();
+
+        let run = |dec: &mut Box<dyn Decoder>, pkts: &[Packet]| -> Vec<AudioFrame> {
+            let mut frames = Vec::new();
+            for pkt in pkts {
+                dec.send_packet(pkt).unwrap();
+                while let Ok(Frame::Audio(f)) = dec.receive_frame() {
+                    frames.push(f);
+                }
+            }
+            frames
+        };
+        let frames = run(&mut dec, &packets[..2]);
+        assert_eq!(frames.len(), 2);
+        for f in &frames {
+            assert_eq!(f.samples, 1024, "downsampled SBR frame length");
+            assert_eq!(f.data[0].len(), 1024 * 2 * 2);
+        }
+
+        // reset() keeps the selected mode.
+        dec.reset().unwrap();
+        let frames2 = run(&mut dec, &packets[..2]);
+        assert_eq!(frames2.len(), 2);
+        assert_eq!(frames2[0].samples, 1024);
+        assert_eq!(
+            frames2[0].data[0], frames[0].data[0],
+            "post-reset decode differs"
+        );
     }
 }
