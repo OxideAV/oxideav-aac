@@ -1002,6 +1002,17 @@ impl LoasDecoder {
                 d
             }
         });
+        // A mid-stream StreamMuxConfig replacement can change the
+        // layer's frame family; the per-element overlap/LTP state is
+        // family-shaped, so a mismatched decoder is rebuilt from
+        // scratch rather than fed the wrong geometry.
+        if dec.frame_family() != family {
+            let mut d = StreamDecoder::new();
+            d.set_sbr_downsampled(self.sbr_downsampled);
+            d.set_sbr_low_power(self.sbr_low_power);
+            d.set_frame_family(family);
+            *dec = d;
+        }
         // §4.6.18.2.6: FsSBR is twice the core rate; an explicit SBR
         // ASC whose extensionSamplingFrequency equals the core rate is
         // therefore declaring the §4.6.18.4.3 downsampled output.

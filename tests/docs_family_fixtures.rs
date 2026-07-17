@@ -713,3 +713,24 @@ fn sbr_on_960_family_is_rejected() {
         .unwrap_err();
     assert_eq!(err, oxideav_aac::Error::SbrUnsupportedFrameFamily);
 }
+
+/// A mid-stream StreamMuxConfig replacement that changes the layer's
+/// frame family must rebuild the per-stream decoder (the overlap/LTP
+/// state is family-shaped): a 960-frame stream followed by an inline
+/// reconfiguration to the LD-512 family decodes both halves at their
+/// own frame lengths.
+#[test]
+fn latm_family_reconfiguration_resets_stream_state() {
+    let lc = build_lc960_payloads();
+    let ld = build_ld_payloads(FrameFamily::Ld512);
+    let mut stream = wrap_loas(&lc[..2], AOT_LC, FrameFamily::Lc960);
+    // Second LOAS run re-sends an inline config (i == 0 path) for the
+    // LD layer.
+    stream.extend_from_slice(&wrap_loas(&ld[..2], AOT_ER_LD, FrameFamily::Ld512));
+    let frames = LoasDecoder::new().decode_all(&stream).unwrap();
+    assert_eq!(frames.len(), 4);
+    assert_eq!(frames[0].pcm.len(), 960);
+    assert_eq!(frames[1].pcm.len(), 960);
+    assert_eq!(frames[2].pcm.len(), 512);
+    assert_eq!(frames[3].pcm.len(), 512);
+}
