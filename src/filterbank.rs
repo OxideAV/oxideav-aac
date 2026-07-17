@@ -116,17 +116,28 @@ pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
         .collect()
 }
 
-/// §4.6.11.3.2 — build the length-2048 `ONLY_LONG_SEQUENCE` analysis
-/// window `[W_LEFT_l | W_RIGHT_l]` for the given left/right shapes.
+/// §4.6.11.3.2 — build the `ONLY_LONG_SEQUENCE` analysis window
+/// `[W_LEFT_l | W_RIGHT_l]` at the family's long transform length,
+/// with the family's window style (the LD families map
+/// `window_shape == 1` to the §4.6.17.2.3 low-overlap window).
 ///
 /// Exposed for the §4.6.7.3 LTP loop, which windows the predicted time
 /// signal `x_est` with the current long window before the analysis
-/// [`forward_mdct`]. (LTP for the AAC LTP object type is restricted to
-/// long windows, §4.6.7.1.)
-pub(crate) fn long_only_window(left_shape: WindowShape, right_shape: WindowShape) -> Vec<f64> {
-    let halves = window_halves(LONG_TRANSFORM_LEN, left_shape, right_shape);
-    let half_l = LONG_TRANSFORM_LEN / 2;
-    let mut w = vec![0.0f64; LONG_TRANSFORM_LEN];
+/// [`forward_mdct`]. (LTP is restricted to long windows, §4.6.7.1.)
+pub(crate) fn long_only_window_family(
+    family: FrameFamily,
+    left_shape: WindowShape,
+    right_shape: WindowShape,
+) -> Vec<f64> {
+    let n_l = family.long_transform_len();
+    let halves = window_halves_style(
+        n_l,
+        left_shape,
+        right_shape,
+        WindowStyle::for_family(family),
+    );
+    let half_l = n_l / 2;
+    let mut w = vec![0.0f64; n_l];
     w[..half_l].copy_from_slice(&halves.left);
     for (m, &rv) in halves.right.iter().enumerate() {
         w[half_l + m] = rv;

@@ -602,10 +602,30 @@ impl CouplingChannelElement {
         aot: u8,
         fs_index: u8,
     ) -> Result<Self> {
+        Self::parse_after_tag_family(
+            reader,
+            crate::swb_offset::FrameFamily::Lc1024,
+            element_instance_tag,
+            aot,
+            fs_index,
+        )
+    }
+
+    /// [`Self::parse_after_tag`] under an explicit §4.5.1.1
+    /// frame-length family (a 960-line `raw_data_block()` may carry a
+    /// CCE like any other; the ER payloads — including LD — have no
+    /// CCE at all per §4.5.2.4, so the LD families never reach here).
+    pub fn parse_after_tag_family(
+        reader: &mut BitReader<'_>,
+        family: crate::swb_offset::FrameFamily,
+        element_instance_tag: u8,
+        aot: u8,
+        fs_index: u8,
+    ) -> Result<Self> {
         let header = CouplingHeader::parse(reader)?;
         // Embedded individual_channel_stream(0,0): common_window = 0 and
         // scale_flag = 0 per Table 4.8.
-        let body = IcsBody::parse(reader, aot, fs_index, false)?;
+        let body = IcsBody::parse_family(reader, family, aot, fs_index, false)?;
         let ics_info = body.ics_info.clone().ok_or(Error::CceInvalid)?;
         let spectral = SpectralData::parse(reader, &ics_info, &body.section_data, fs_index)?;
         let gains = CouplingGains::parse(

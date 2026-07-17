@@ -136,25 +136,35 @@ pub const TRAILING_EXTENSION_AOT_SBR: u8 = 5;
 /// trailing probe (Table 1.15).
 pub const TRAILING_EXTENSION_AOT_BSAC: u8 = 22;
 
-/// Length of the IMDCT frame in samples for a GA AOT, controlled by
-/// `frameLengthFlag`. ISO/IEC 14496-3 §4.4.1 semantics.
+/// The raw `frameLengthFlag` of `GASpecificConfig` — ISO/IEC 14496-3
+/// §4.5.1.1 semantics. The flag's meaning is AOT-dependent: for every
+/// GA AOT except AAC SSR and ER AAC LD it selects 1024 vs 960 IMDCT
+/// lines; for ER AAC LD (AOT 23) the same flag selects 512 vs 480
+/// (use [`crate::swb_offset::FrameFamily::from_aot_and_flag`] to
+/// resolve the actual frame geometry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameLength {
-    /// 1024 samples per channel (frameLengthFlag = 0, all GA AOTs
-    /// except SSR / ELD).
+    /// `frameLengthFlag == 0` — 1024 lines (512 for ER AAC LD).
     Long1024,
-    /// 960 samples per channel (frameLengthFlag = 1, all GA AOTs
-    /// except SSR / ELD).
+    /// `frameLengthFlag == 1` — 960 lines (480 for ER AAC LD).
     Long960,
 }
 
 impl FrameLength {
-    /// Resolved sample count per output channel.
+    /// Resolved sample count per output channel for the non-LD GA
+    /// AOTs. For ER AAC LD resolve through
+    /// [`crate::swb_offset::FrameFamily::from_aot_and_flag`] instead
+    /// (the same flag means 512/480 there).
     pub fn samples(self) -> u32 {
         match self {
             FrameLength::Long1024 => 1024,
             FrameLength::Long960 => 960,
         }
+    }
+
+    /// Resolve the §4.5.1.1 frame-length family for `aot`.
+    pub fn family(self, aot: u8) -> crate::swb_offset::FrameFamily {
+        crate::swb_offset::FrameFamily::from_aot_and_flag(aot, self == FrameLength::Long960)
     }
 }
 

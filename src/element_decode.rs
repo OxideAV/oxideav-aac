@@ -457,8 +457,15 @@ impl CceDecoder {
     /// A fresh CCE decoder with zeroed filterbank overlap.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_family(crate::swb_offset::FrameFamily::Lc1024)
+    }
+
+    /// A fresh CCE decoder for an arbitrary §4.5.1.1 frame-length
+    /// family.
+    #[must_use]
+    pub fn new_family(family: crate::swb_offset::FrameFamily) -> Self {
         CceDecoder {
-            fb: Filterbank::new(),
+            fb: Filterbank::new_family(family),
             pns_state: 0x0001_2345,
         }
     }
@@ -585,9 +592,18 @@ impl ElementDecoder {
     /// A fresh element decoder with zeroed filterbank overlap and a
     /// fixed PNS generator seed.
     pub fn new() -> Self {
+        Self::new_family(crate::swb_offset::FrameFamily::Lc1024)
+    }
+
+    /// A fresh element decoder whose per-channel filterbank and LTP
+    /// state run an arbitrary §4.5.1.1 frame-length family.
+    pub fn new_family(family: crate::swb_offset::FrameFamily) -> Self {
         ElementDecoder {
-            filterbanks: [Filterbank::new(), Filterbank::new()],
-            ltp_states: [LtpState::new(), LtpState::new()],
+            filterbanks: [
+                Filterbank::new_family(family),
+                Filterbank::new_family(family),
+            ],
+            ltp_states: [LtpState::new_family(family), LtpState::new_family(family)],
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
             // Any non-zero seed yields a non-degenerate sequence; the

@@ -61,6 +61,7 @@ use crate::sbr_decoder::SbrDecoder;
 use crate::sbr_extension::SbrExtensionData;
 use crate::sbr_header::SbrHeader;
 use crate::spectral_data::SpectralData;
+use crate::swb_offset::FrameFamily;
 use crate::{Error, Result};
 
 /// Map a channel element's [`IdSynEle`] to its §8.5.2.2 PCE reference
@@ -143,6 +144,12 @@ pub struct StreamDecoder {
     /// persists) or installed by [`Self::set_program_config`] when the
     /// PCE rides inline in an out-of-band `AudioSpecificConfig`.
     program_config: Option<Pce>,
+    /// The §4.5.1.1 frame-length family every block of this stream
+    /// decodes under. ADTS cannot signal anything but the 1024-line
+    /// family (the default); a LATM / raw caller with an
+    /// `AudioSpecificConfig` installs the ASC-resolved family via
+    /// [`Self::set_frame_family`] before the first block.
+    family: FrameFamily,
 }
 
 impl StreamDecoder {
@@ -180,6 +187,23 @@ impl StreamDecoder {
     /// rate-specific).
     pub fn set_sbr_downsampled(&mut self, downsampled: bool) {
         self.sbr_downsampled = downsampled;
+    }
+
+    /// Install the §4.5.1.1 frame-length family (from
+    /// `GASpecificConfig.frameLengthFlag` + the AOT) for every later
+    /// block. Affects the SWB tables, transform lengths and the
+    /// per-frame PCM sample count (1024 / 960 / 512 / 480). ADTS
+    /// cannot signal anything but the default 1024-line family; a
+    /// LATM / raw caller with an `AudioSpecificConfig` selects the
+    /// ASC-resolved family before the first block (the per-element
+    /// state is keyed to the family at slot creation).
+    pub fn set_frame_family(&mut self, family: FrameFamily) {
+        self.family = family;
+    }
+
+    /// The active §4.5.1.1 frame-length family.
+    pub fn frame_family(&self) -> FrameFamily {
+        self.family
     }
 
     /// Select the §4.6.18.8 low-power SBR mode: every SBR back-end
@@ -244,6 +268,7 @@ impl StreamDecoder {
         payload: &[u8],
     ) -> Result<DecodedFrame> {
         let fs = fs_index;
+        let family = self.family;
         let mut reader = BitReader::new(payload);
 
         // Per channel-element outputs in element order: the decoded
@@ -292,7 +317,7 @@ impl StreamDecoder {
                         kind: kind @ (IdSynEle::Sce | IdSynEle::Lfe),
                         element_instance_tag,
                     } => {
-                        let body = IcsBody::parse(&mut reader, aot, fs, false)?;
+                        let body = IcsBody::parse_family(&mut reader, family, aot, fs, false)?;
                         let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
                         let spectral =
                             SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
@@ -312,7 +337,7 @@ impl StreamDecoder {
                         kind: IdSynEle::Cpe,
                         element_instance_tag,
                     } => {
-                        let parsed = parse_cpe(&mut reader, aot, fs)?;
+                        let parsed = parse_cpe_family(&mut reader, family, aot, fs)?;
                         pending.push(PendingElement {
                             key: (kind_id(IdSynEle::Cpe), element_instance_tag),
                             kind: IdSynEle::Cpe,
@@ -331,8 +356,9 @@ impl StreamDecoder {
                         // embedded spectrum is decoded once per block
                         // below and coupled onto the addressed SCE / CPE
                         // targets per §4.6.8.3.3.
-                        let cce = CouplingChannelElement::parse_after_tag(
+                        let cce = CouplingChannelElement::parse_after_tag_family(
                             &mut reader,
+                            family,
                             element_instance_tag,
                             aot,
                             fs,
@@ -382,7 +408,7 @@ impl StreamDecoder {
             let dec = self
                 .cce_decoders
                 .entry(cce.element_instance_tag)
-                .or_default();
+                .or_insert_with(|| CceDecoder::new_family(family));
             decoded_cces.push(dec.decode(cce, aot, fs)?);
         }
 
@@ -404,7 +430,10 @@ impl StreamDecoder {
                         ics_info: &sce.ics,
                         spectral: &sce.spectral,
                     };
-                    let dec = self.decoders.entry(pe.key).or_default();
+                    let dec = self
+                        .decoders
+                        .entry(pe.key)
+                        .or_insert_with(|| ElementDecoder::new_family(family));
                     vec![dec.decode_sce_coupled(&ch, aot, fs, &coupling)?]
                 }
                 ParsedChannel::Pair(cpe) => {
@@ -413,7 +442,10 @@ impl StreamDecoder {
                     let right_coupling =
                         coupling_for(&cces, &decoded_cces, pe.block, pe.kind, pe.key.1, 1);
                     let (left, right, joint) = cpe.channel_inputs();
-                    let dec = self.decoders.entry(pe.key).or_default();
+                    let dec = self
+                        .decoders
+                        .entry(pe.key)
+                        .or_insert_with(|| ElementDecoder::new_family(family));
                     let (l, r) = dec.decode_cpe_coupled(
                         &left,
                         &right,
@@ -569,6 +601,14 @@ impl StreamDecoder {
                             remaining = remaining.saturating_sub(n);
                         }
                         ExtensionPayloadOrSbr::Sbr(ext) => {
+                            // The §4.6.18 SBR tool in this crate is
+                            // defined over the 1024-line core frame
+                            // (32-subband analysis / 2048-sample
+                            // output); a 960-line or LD core cannot
+                            // feed it.
+                            if self.family != FrameFamily::Lc1024 {
+                                return Err(Error::SbrUnsupportedFrameFamily);
+                            }
                             ext.verify_crc(payload)?;
                             self.sbr_prev_header.insert(slot, ext.header);
                             result = Some(ext);
@@ -730,10 +770,22 @@ impl StreamDecoder {
         resilience: AacResilienceFlags,
         payload: &[u8],
     ) -> Result<DecodedFrame> {
-        if aot != 17 {
+        // AOT 17 (ER AAC LC) and AOT 23 (ER AAC LD) share the
+        // Table 4.19 er_raw_data_block(); LD differs only in the
+        // 512/480-line frame family this decoder was configured with
+        // (§4.6.17) and its ltp_data() branch. The other ER GA types
+        // (19 scalable-LTP state / 20 scalable layering) stay out.
+        if aot != 17 && aot != 23 {
             return Err(Error::NotImplemented);
         }
+        // An LD stream must run an LD family and vice versa — a
+        // mismatch means the caller never installed the ASC-resolved
+        // family, which would silently mis-decode every band.
+        if (aot == 23) != self.family.is_ld() {
+            return Err(Error::ElementDecodeInvalid);
+        }
         let fs = fs_index;
+        let family = self.family;
         // Table 4.19: the fixed element sequence per channelConfiguration.
         let sequence: &[IdSynEle] = match channel_configuration {
             1 => &[IdSynEle::Sce],
@@ -759,7 +811,8 @@ impl StreamDecoder {
             let key = (kind_id(kind), element_instance_tag);
             match kind {
                 IdSynEle::Sce | IdSynEle::Lfe => {
-                    let body = IcsBody::parse_er(&mut reader, aot, fs, false, resilience)?;
+                    let body =
+                        IcsBody::parse_er_family(&mut reader, family, aot, fs, false, resilience)?;
                     let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
                     let spectral =
                         parse_er_spectral(&mut reader, &body, &ics, fs, resilience, false)?;
@@ -768,14 +821,17 @@ impl StreamDecoder {
                         ics_info: &ics,
                         spectral: &spectral,
                     };
-                    let dec = self.decoders.entry(key).or_default();
+                    let dec = self
+                        .decoders
+                        .entry(key)
+                        .or_insert_with(|| ElementDecoder::new_family(family));
                     channels.push(dec.decode_sce(&ch, aot, fs)?);
                 }
                 IdSynEle::Cpe => {
                     let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
                     let dec_out = if common_window {
                         // §4.4.2.3 shared ics_info + Table 4.4 ms_mask.
-                        let ics = IcsInfo::parse(&mut reader, aot, fs, true)?;
+                        let ics = IcsInfo::parse_family(&mut reader, family, aot, fs, true)?;
                         let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
                         let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
                         let mut ms_used: Vec<Vec<bool>> = Vec::new();
@@ -826,10 +882,20 @@ impl StreamDecoder {
                             ms_mask_present,
                             ms_used,
                         };
-                        let dec = self.decoders.entry(key).or_default();
+                        let dec = self
+                            .decoders
+                            .entry(key)
+                            .or_insert_with(|| ElementDecoder::new_family(family));
                         dec.decode_cpe(&left, &right, &joint, aot, fs)?
                     } else {
-                        let left_body = IcsBody::parse_er(&mut reader, aot, fs, false, resilience)?;
+                        let left_body = IcsBody::parse_er_family(
+                            &mut reader,
+                            family,
+                            aot,
+                            fs,
+                            false,
+                            resilience,
+                        )?;
                         let left_ics = left_body
                             .ics_info
                             .clone()
@@ -842,8 +908,14 @@ impl StreamDecoder {
                             resilience,
                             true,
                         )?;
-                        let right_body =
-                            IcsBody::parse_er(&mut reader, aot, fs, false, resilience)?;
+                        let right_body = IcsBody::parse_er_family(
+                            &mut reader,
+                            family,
+                            aot,
+                            fs,
+                            false,
+                            resilience,
+                        )?;
                         let right_ics = right_body
                             .ics_info
                             .clone()
@@ -866,7 +938,10 @@ impl StreamDecoder {
                             ics_info: &right_ics,
                             spectral: &right_spectral,
                         };
-                        let dec = self.decoders.entry(key).or_default();
+                        let dec = self
+                            .decoders
+                            .entry(key)
+                            .or_insert_with(|| ElementDecoder::new_family(family));
                         dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)?
                     };
                     channels.push(dec_out.0);
@@ -935,10 +1010,20 @@ impl ParsedCpe {
 /// `ms_mask_present` / `ms_used` joint-stereo header (shared form), and
 /// both channels' `individual_channel_stream()` + `spectral_data()`.
 pub(crate) fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<ParsedCpe> {
+    parse_cpe_family(reader, FrameFamily::Lc1024, aot, fs)
+}
+
+/// [`parse_cpe`] under an explicit §4.5.1.1 frame-length family.
+pub(crate) fn parse_cpe_family(
+    reader: &mut BitReader<'_>,
+    family: FrameFamily,
+    aot: u8,
+    fs: u8,
+) -> Result<ParsedCpe> {
     let common_window = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
     if common_window {
         // §4.4.2.3: shared ics_info, then the Table 4.4 ms_mask.
-        let ics = IcsInfo::parse(reader, aot, fs, true)?;
+        let ics = IcsInfo::parse_family(reader, family, aot, fs, true)?;
         let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
         let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
         let mut ms_used: Vec<Vec<bool>> = Vec::new();
@@ -972,14 +1057,14 @@ pub(crate) fn parse_cpe(reader: &mut BitReader<'_>, aot: u8, fs: u8) -> Result<P
     } else {
         // Non-shared CPE: each channel carries its own ics_info; no
         // M/S mask, so the joint-stereo tools do not run.
-        let left_body = IcsBody::parse(reader, aot, fs, false)?;
+        let left_body = IcsBody::parse_family(reader, family, aot, fs, false)?;
         let left_ics = left_body
             .ics_info
             .clone()
             .ok_or(Error::ElementDecodeInvalid)?;
         let left_spectral = SpectralData::parse(reader, &left_ics, &left_body.section_data, fs)?;
         let second_ics_start_bit = reader.bit_position();
-        let right_body = IcsBody::parse(reader, aot, fs, false)?;
+        let right_body = IcsBody::parse_family(reader, family, aot, fs, false)?;
         let right_ics = right_body
             .ics_info
             .clone()

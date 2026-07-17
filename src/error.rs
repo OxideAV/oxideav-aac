@@ -83,6 +83,13 @@ pub enum Error {
     /// malformed.
     LdShortWindow,
 
+    /// An SBR extension payload arrived on a stream running a
+    /// non-1024-line §4.5.1.1 frame family. The §4.6.18 SBR tool in
+    /// this crate covers the 1024-line core (32-subband QMF analysis,
+    /// 2048-sample dual-rate output); SBR over a 960-line core (and
+    /// the §4.6.19 LD SBR tool) is out of scope.
+    SbrUnsupportedFrameFamily,
+
     /// [`crate::ics_info::IcsInfo::write`] was handed an in-memory
     /// [`crate::ics_info::IcsInfo`] whose field combination cannot
     /// be represented on the wire under ISO/IEC 14496-3 Table 4.6 /
@@ -765,6 +772,12 @@ impl core::fmt::Display for Error {
                     f,
                     "ics_info sampling_frequency_index {} is outside the 0..=11 SWB-table range",
                     idx
+                )
+            }
+            Error::SbrUnsupportedFrameFamily => {
+                write!(
+                    f,
+                    "SBR extension on a non-1024-line frame family: the §4.6.18 tool covers the 1024-line core only"
                 )
             }
             Error::LdShortWindow => {

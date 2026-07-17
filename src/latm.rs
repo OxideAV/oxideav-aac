@@ -984,6 +984,13 @@ impl LoasDecoder {
         // The decode runs at the *core* configuration (`asc.aot` is the
         // unwrapped core object type, `asc.sample_rate` the core rate);
         // a PS payload renders stereo through the subpart-8 tool.
+        // §4.5.1.1 — resolve the frame-length family from the layer's
+        // ASC (`frameLengthFlag` semantics depend on the AOT: 1024/960
+        // lines for the general GA types, 512/480 for ER AAC LD).
+        let family = crate::swb_offset::FrameFamily::from_aot_and_flag(
+            asc.aot,
+            asc.ga_body.frame_length == crate::asc::FrameLength::Long960,
+        );
         let dec = self.streams.entry(payload.stream_id).or_insert_with({
             let force_down = self.sbr_downsampled;
             let force_lp = self.sbr_low_power;
@@ -991,6 +998,7 @@ impl LoasDecoder {
                 let mut d = StreamDecoder::new();
                 d.set_sbr_downsampled(force_down);
                 d.set_sbr_low_power(force_lp);
+                d.set_frame_family(family);
                 d
             }
         });
@@ -1011,9 +1019,10 @@ impl LoasDecoder {
         }
         // The ER General-Audio object types use the §4.4.2.3 Table 4.19
         // fixed-sequence er_raw_data_block() instead of the tagged
-        // element walk; route AOT 17 (ER AAC LC) there with the ASC's
-        // resilience triplet.
-        if asc.aot == 17 {
+        // element walk; route AOT 17 (ER AAC LC) and AOT 23 (ER AAC
+        // LD, §4.6.17 — the 512/480-line family installed above) there
+        // with the ASC's resilience triplet.
+        if asc.aot == 17 || asc.aot == 23 {
             let resilience = asc
                 .ga_body
                 .extension_body

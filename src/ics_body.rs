@@ -115,6 +115,7 @@ use crate::ics_info::{IcsInfo, WindowSequence};
 use crate::pulse_data::PulseData;
 use crate::scale_factor_data::{ErScaleFactorData, ScaleFactorData};
 use crate::section_data::SectionData;
+use crate::swb_offset::FrameFamily;
 use crate::tns_data::TnsData;
 use crate::{Error, Result};
 
@@ -225,8 +226,29 @@ impl IcsBody {
         // CPE-shared-info form is handled by parse_with_ics_info; the
         // public `parse` always reads its own ics_info, which matches
         // the SCE / LFE / non-common-window CPE case.
+        Self::parse_family(
+            reader,
+            FrameFamily::Lc1024,
+            audio_object_type,
+            sampling_frequency_index,
+            scale_flag,
+        )
+    }
+
+    /// [`IcsBody::parse`] under an explicit §4.5.1.1 frame-length
+    /// family (the inline `ics_info()` is parsed with
+    /// [`IcsInfo::parse_family`], so the 960 / LD band geometry and
+    /// the LD `ONLY_LONG` constraint apply).
+    pub fn parse_family(
+        reader: &mut BitReader<'_>,
+        family: FrameFamily,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        scale_flag: bool,
+    ) -> Result<Self> {
         Self::parse_inner(
             reader,
+            family,
             audio_object_type,
             sampling_frequency_index,
             false,
@@ -284,6 +306,7 @@ impl IcsBody {
 
     fn parse_inner(
         reader: &mut BitReader<'_>,
+        family: FrameFamily,
         audio_object_type: u8,
         sampling_frequency_index: u8,
         common_window: bool,
@@ -297,8 +320,9 @@ impl IcsBody {
         // Table 4.50: `if (!common_window && !scale_flag) ics_info();`
         // — `parse` is the !common_window path (the caller of
         // `parse_with_ics_info` covers the other branch).
-        let ics_info = IcsInfo::parse(
+        let ics_info = IcsInfo::parse_family(
             reader,
+            family,
             audio_object_type,
             sampling_frequency_index,
             common_window,
@@ -360,12 +384,40 @@ impl IcsBody {
         scale_flag: bool,
         resilience: AacResilienceFlags,
     ) -> Result<Self> {
+        Self::parse_er_family(
+            reader,
+            FrameFamily::Lc1024,
+            audio_object_type,
+            sampling_frequency_index,
+            scale_flag,
+            resilience,
+        )
+    }
+
+    /// [`IcsBody::parse_er`] under an explicit §4.5.1.1 frame-length
+    /// family — the ER AAC LD (AOT 23) payloads ride the same
+    /// Table 4.19 `er_raw_data_block()` as ER AAC LC, differing only
+    /// in the 512/480-line geometry this parameter selects.
+    pub fn parse_er_family(
+        reader: &mut BitReader<'_>,
+        family: FrameFamily,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        scale_flag: bool,
+        resilience: AacResilienceFlags,
+    ) -> Result<Self> {
         if scale_flag {
             return Err(Error::NotImplemented);
         }
         let start = reader.bit_position();
         let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
-        let ics_info = IcsInfo::parse(reader, audio_object_type, sampling_frequency_index, false)?;
+        let ics_info = IcsInfo::parse_family(
+            reader,
+            family,
+            audio_object_type,
+            sampling_frequency_index,
+            false,
+        )?;
         let mut body = Self::finish_er_shared(
             reader,
             global_gain,

@@ -354,7 +354,11 @@ impl PredictorBank {
             return Err(Error::PredictorInvalid);
         }
 
-        let offsets = long_window_offsets(fs_index)?;
+        // Family-aware long-window offsets (the §4.6.6 predictor is a
+        // long-window tool; the 960-line family shares every band
+        // start below the PRED_SFB_MAX region with the 1024 table, so
+        // the bank sizing from `new` stays valid).
+        let offsets = ics_info.swb_offsets(fs_index)?;
         let pred_sfb_max = PRED_SFB_MAX[fs_index as usize] as usize;
         let max_sfb = ics_info.max_sfb as usize;
 
