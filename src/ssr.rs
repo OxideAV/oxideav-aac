@@ -237,6 +237,7 @@ mod round_trip_tests {
     fn ics(shape: WindowShape, seq: WindowSequence) -> IcsInfo {
         let short = seq == WindowSequence::EightShort;
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: seq,
             window_shape: shape,

@@ -124,9 +124,8 @@ use crate::spectrum_huffman::{
     hcod5_write, hcod6_decode, hcod6_write, hcod7_decode, hcod7_write, hcod8_decode, hcod8_write,
     hcod9_decode, hcod9_write,
 };
-use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-};
+#[cfg(test)]
+use crate::swb_offset::{long_window_offsets, short_window_offsets};
 use crate::{Error, Result};
 
 /// `QUAD_LEN` — coefficients per codeword for the dim-4 books
@@ -164,7 +163,7 @@ pub const ESC_FLAG: i32 = 16;
 pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>> {
     let max_sfb = ics_info.max_sfb as usize;
     if ics_info.window_sequence.is_eight_short() {
-        let swb = short_window_offsets(fs_index)?;
+        let swb = ics_info.swb_offsets(fs_index)?;
         // `swb` has num_swb + 1 entries; band widths exist for
         // sfb < num_swb only.
         if max_sfb + 1 > swb.len() {
@@ -185,7 +184,7 @@ pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>
         }
         Ok(per_group)
     } else {
-        let swb = long_window_offsets(fs_index)?;
+        let swb = ics_info.swb_offsets(fs_index)?;
         if max_sfb + 1 > swb.len() {
             return Err(Error::SpectralDataInvalid);
         }
@@ -210,10 +209,16 @@ pub struct SpectralData {
 impl SpectralData {
     /// Length of one window group's coefficient buffer.
     fn group_len(ics_info: &IcsInfo, g: usize) -> usize {
+        // The parser rejects LD + EIGHT_SHORT, so window_len() cannot
+        // fail on a parsed ics_info; fall back to the family frame
+        // length defensively.
+        let window_len = ics_info
+            .window_len()
+            .unwrap_or_else(|_| ics_info.family.frame_len());
         if ics_info.window_sequence.is_eight_short() {
-            ics_info.window_group_length[g] as usize * SHORT_WINDOW_LEN as usize
+            ics_info.window_group_length[g] as usize * window_len
         } else {
-            LONG_WINDOW_LEN as usize
+            window_len
         }
     }
 
@@ -536,6 +541,7 @@ mod tests {
     /// the given max_sfb.
     fn long_ics_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: crate::ics_info::WindowShape::Sine,
@@ -559,6 +565,7 @@ mod tests {
     fn short_ics_info(max_sfb: u8, window_group_length: Vec<u8>) -> IcsInfo {
         let num_window_groups = window_group_length.len() as u8;
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::EightShort,
             window_shape: crate::ics_info::WindowShape::Sine,

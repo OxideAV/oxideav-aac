@@ -57,13 +57,14 @@
 //! path is wired, matching the standing `int_tns_decode_coef()`
 //! deferral.
 
+use crate::ics_info::IcsInfo;
 use crate::ics_info::WindowSequence;
-use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-};
+#[cfg(test)]
+use crate::swb_offset::{long_window_offsets, short_window_offsets};
+use crate::swb_offset::{long_window_offsets_family, short_window_offsets_family, FrameFamily};
 use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc, tns_ma_filter};
 use crate::tns_data::{num_windows, TnsData};
-use crate::tns_max::{clamp_tns_band, clamp_tns_order};
+use crate::tns_max::{clamp_tns_band_family, clamp_tns_order};
 use crate::{Error, Result};
 
 /// Apply §4.6.9.3 `tns_decode_frame()` to one channel's dequantised
@@ -120,8 +121,33 @@ pub fn tns_decode_frame(
     tns_frame_filter(
         spec,
         tns,
+        FrameFamily::Lc1024,
         window_sequence,
         max_sfb,
+        aot,
+        fs_index,
+        TnsFilterKind::Synthesis,
+    )
+}
+
+/// [`tns_decode_frame`] driven by a parsed [`IcsInfo`] — the frame's
+/// §4.5.1.1 family, `window_sequence` and `max_sfb` all come from the
+/// side info, so the 960 / LD geometries (window lengths, family SWB
+/// tables and the §4.6.17.2.5 LD `TNS_MAX_BANDS`) are selected
+/// consistently with the rest of the channel decode.
+pub fn tns_decode_frame_ics(
+    spec: &mut [f64],
+    tns: &TnsData,
+    ics_info: &IcsInfo,
+    aot: u8,
+    fs_index: u8,
+) -> Result<()> {
+    tns_frame_filter(
+        spec,
+        tns,
+        ics_info.family,
+        ics_info.window_sequence,
+        ics_info.max_sfb,
         aot,
         fs_index,
         TnsFilterKind::Synthesis,
@@ -157,8 +183,30 @@ pub fn tns_analysis_frame(
     tns_frame_filter(
         spec,
         tns,
+        FrameFamily::Lc1024,
         window_sequence,
         max_sfb,
+        aot,
+        fs_index,
+        TnsFilterKind::Analysis,
+    )
+}
+
+/// [`tns_analysis_frame`] driven by a parsed [`IcsInfo`] (see
+/// [`tns_decode_frame_ics`] for the family selection).
+pub fn tns_analysis_frame_ics(
+    spec: &mut [f64],
+    tns: &TnsData,
+    ics_info: &IcsInfo,
+    aot: u8,
+    fs_index: u8,
+) -> Result<()> {
+    tns_frame_filter(
+        spec,
+        tns,
+        ics_info.family,
+        ics_info.window_sequence,
+        ics_info.max_sfb,
         aot,
         fs_index,
         TnsFilterKind::Analysis,
@@ -179,9 +227,11 @@ enum TnsFilterKind {
 /// Shared §4.6.9.3 region walk for both TNS polarities. Identical band
 /// clamping, coefficient decode and region selection; only the final
 /// per-region filter call differs (`kind`).
+#[allow(clippy::too_many_arguments)]
 fn tns_frame_filter(
     spec: &mut [f64],
     tns: &TnsData,
+    family: FrameFamily,
     window_sequence: WindowSequence,
     max_sfb: u8,
     aot: u8,
@@ -190,9 +240,15 @@ fn tns_frame_filter(
 ) -> Result<()> {
     let windows = num_windows(window_sequence);
     let (window_len, offsets) = if window_sequence.is_eight_short() {
-        (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
+        (
+            family.short_window_len().ok_or(Error::LdShortWindow)?,
+            short_window_offsets_family(family, fs_index)?,
+        )
     } else {
-        (LONG_WINDOW_LEN as usize, long_window_offsets(fs_index)?)
+        (
+            family.frame_len(),
+            long_window_offsets_family(family, fs_index)?,
+        )
     };
 
     if tns.windows.len() != windows {
@@ -238,8 +294,16 @@ fn tns_frame_filter(
             // Band indices are at most `num_swb` (bottom/top start
             // there and only decrease), so the u8 narrowing is exact:
             // every standard table has num_swb <= 51.
-            let start_band = clamp_tns_band(bottom as u8, max_sfb, aot, window_sequence, fs_index)?;
-            let end_band = clamp_tns_band(top as u8, max_sfb, aot, window_sequence, fs_index)?;
+            let start_band = clamp_tns_band_family(
+                bottom as u8,
+                max_sfb,
+                family,
+                aot,
+                window_sequence,
+                fs_index,
+            )?;
+            let end_band =
+                clamp_tns_band_family(top as u8, max_sfb, family, aot, window_sequence, fs_index)?;
             let start = offsets[start_band as usize] as usize;
             let end = offsets[end_band as usize] as usize;
             if end <= start {

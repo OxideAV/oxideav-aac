@@ -239,6 +239,45 @@ pub fn tns_max_bands(aot: u8, window_sequence: WindowSequence, fs_index: u8) -> 
     Ok(table[idx])
 }
 
+/// [`tns_max_bands`] under an explicit §4.5.1.1 frame-length family.
+///
+/// * `Lc1024` / `Lc960` read Table 4.157 (its values are per sampling
+///   rate, not per frame length; the §4.6.9.3 three-way `min` with
+///   `max_sfb` keeps any 960-family band-count difference in bounds).
+/// * `Ld512` / `Ld480` read the §4.6.17.2.5 LD tables (Tables 4.173 /
+///   4.172), with the §4.5.1.1 nearest-defined-table rule for the
+///   rates those tables omit: 96 / 88.2 / 64 kHz resolve to the
+///   48 kHz entry, 16 kHz and below to the 22.05 kHz entry.
+pub fn tns_max_bands_family(
+    family: crate::swb_offset::FrameFamily,
+    aot: u8,
+    window_sequence: WindowSequence,
+    fs_index: u8,
+) -> Result<u8> {
+    use crate::swb_offset::FrameFamily;
+    match family {
+        FrameFamily::Lc1024 | FrameFamily::Lc960 => tns_max_bands(aot, window_sequence, fs_index),
+        FrameFamily::Ld512 | FrameFamily::Ld480 => {
+            if window_sequence.is_eight_short() {
+                return Err(Error::LdShortWindow);
+            }
+            // §4.5.1.1 nearest-defined-table rule (the LD tables only
+            // cover fs 3..=7).
+            let slot = match fs_index {
+                0..=3 => 3,
+                4..=7 => fs_index,
+                8..=11 => 7,
+                other => return Err(Error::IcsInfoUnsupportedSampleRateIndex(other)),
+            };
+            if family == FrameFamily::Ld512 {
+                tns_max_bands_ld_512(slot)
+            } else {
+                tns_max_bands_ld_480(slot)
+            }
+        }
+    }
+}
+
 /// Look up `TNS_MAX_BANDS` for an AAC LD stream with a 480-sample
 /// frame, per ISO/IEC 14496-3 Table 4.119.
 ///
@@ -308,6 +347,20 @@ pub fn clamp_tns_band(
     fs_index: u8,
 ) -> Result<u8> {
     let cap = tns_max_bands(aot, window_sequence, fs_index)?;
+    Ok(band.min(cap).min(max_sfb))
+}
+
+/// [`clamp_tns_band`] under an explicit §4.5.1.1 frame-length family
+/// (the `TNS_MAX_BANDS` operand comes from [`tns_max_bands_family`]).
+pub fn clamp_tns_band_family(
+    band: u8,
+    max_sfb: u8,
+    family: crate::swb_offset::FrameFamily,
+    aot: u8,
+    window_sequence: WindowSequence,
+    fs_index: u8,
+) -> Result<u8> {
+    let cap = tns_max_bands_family(family, aot, window_sequence, fs_index)?;
     Ok(band.min(cap).min(max_sfb))
 }
 

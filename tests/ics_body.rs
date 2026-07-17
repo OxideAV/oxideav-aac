@@ -22,6 +22,7 @@ use oxideav_core::bits::{BitReader, BitWriter};
 /// Build a minimal long-window `IcsInfo` for an AAC-LC frame.
 fn make_lc_long_ics_info(max_sfb: u8, num_swb: u8) -> IcsInfo {
     IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -45,6 +46,7 @@ fn make_lc_long_ics_info(max_sfb: u8, num_swb: u8) -> IcsInfo {
 /// 1..=7 merge into the same group as window 0).
 fn make_lc_eight_short_ics_info(max_sfb: u8, num_swb: u8) -> IcsInfo {
     IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,

@@ -132,6 +132,7 @@ fn stage_or_pin(name: &str, input_name: &str, input: &[u8], pcm: &[i16], ch: u16
 fn ics_info_for(seq: WindowSequence, max_sfb: u8) -> IcsInfo {
     let short = seq == WindowSequence::EightShort;
     IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: seq,
         window_shape: WindowShape::Sine,

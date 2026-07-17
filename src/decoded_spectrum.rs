@@ -70,10 +70,8 @@ use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
 use crate::scale_factor_data::accumulate;
 use crate::spectral_data::SpectralData;
-use crate::swb_offset::{
-    apply_pulse_data, long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-};
-use crate::tns_frame::tns_decode_frame;
+use crate::swb_offset::apply_pulse_data_family;
+use crate::tns_frame::tns_decode_frame_ics;
 use crate::{Error, Result};
 
 /// §4.6.3.3 `quant_to_spec()` — de-interleave per-group
@@ -97,11 +95,8 @@ use crate::{Error, Result};
 ///   length disagreeing with the `ics_info` grouping, or a grouping
 ///   whose `window_group_length` sum is not `num_windows`.
 pub fn quant_to_spec(groups: &[Vec<f64>], ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<f64>> {
-    let (window_len, offsets) = if ics_info.window_sequence.is_eight_short() {
-        (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
-    } else {
-        (LONG_WINDOW_LEN as usize, long_window_offsets(fs_index)?)
-    };
+    let window_len = ics_info.window_len()?;
+    let offsets = ics_info.swb_offsets(fs_index)?;
     let num_swb = offsets.len() - 1;
     let num_windows = ics_info.num_windows as usize;
     let num_groups = ics_info.num_window_groups as usize;
@@ -185,7 +180,7 @@ pub fn decode_channel_spectrum(
     let x_quant: &SpectralData = &if let Some(pd) = &body.pulse_data {
         let mut patched = spectral.clone();
         let group0 = patched.x_quant.first_mut().ok_or(Error::DequantInvalid)?;
-        apply_pulse_data(group0, fs_index, pd)?;
+        apply_pulse_data_family(group0, ics_info.family, fs_index, pd)?;
         patched
     } else {
         spectral.clone()
@@ -212,14 +207,7 @@ pub fn decode_channel_spectrum(
 
     // 5. §4.6.9 TNS.
     if let Some(tns) = &body.tns_data {
-        tns_decode_frame(
-            &mut spec,
-            tns,
-            ics_info.window_sequence,
-            ics_info.max_sfb,
-            aot,
-            fs_index,
-        )?;
+        tns_decode_frame_ics(&mut spec, tns, ics_info, aot, fs_index)?;
     }
     Ok(spec)
 }
@@ -231,6 +219,7 @@ mod tests {
 
     fn long_ics_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,
@@ -252,6 +241,7 @@ mod tests {
     fn short_ics_info(max_sfb: u8, window_group_length: Vec<u8>) -> IcsInfo {
         let num_window_groups = window_group_length.len() as u8;
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::EightShort,
             window_shape: WindowShape::Sine,

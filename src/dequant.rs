@@ -131,10 +131,11 @@ pub fn rescale_spectrum(
     let mut out = Vec::with_capacity(num_groups);
     for (g, group_offsets) in offsets.iter().enumerate() {
         let x_quant = &spectral.x_quant[g];
+        let window_len = ics_info.window_len().map_err(|_| Error::DequantInvalid)?;
         let expected_len = if ics_info.window_sequence.is_eight_short() {
-            ics_info.window_group_length[g] as usize * crate::swb_offset::SHORT_WINDOW_LEN as usize
+            ics_info.window_group_length[g] as usize * window_len
         } else {
-            crate::swb_offset::LONG_WINDOW_LEN as usize
+            window_len
         };
         if x_quant.len() != expected_len || sfb_cb[g].len() != ics_info.max_sfb as usize {
             return Err(Error::DequantInvalid);
@@ -187,6 +188,7 @@ mod tests {
 
     fn long_ics_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,
@@ -333,6 +335,7 @@ mod tests {
     #[test]
     fn rescale_short_grouped_band_shares_one_gain() {
         let info = IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::EightShort,
             window_shape: WindowShape::Sine,

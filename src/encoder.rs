@@ -1457,6 +1457,7 @@ fn quantize_channel(
         apply_is_overrides(&mut group, is_bands, offsets);
     }
     let info = IcsInfo {
+        family: crate::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: seq,
         window_shape: WindowShape::Sine,
@@ -1506,6 +1507,7 @@ fn quantize_channel_short(
         ));
     }
     let info = IcsInfo {
+        family: crate::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,

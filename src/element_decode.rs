@@ -95,7 +95,7 @@ use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
 use crate::ssr::SsrChannelDecoder;
 use crate::swb_offset::apply_pulse_data;
-use crate::tns_frame::{tns_analysis_frame, tns_decode_frame};
+use crate::tns_frame::{tns_analysis_frame_ics, tns_decode_frame_ics};
 use crate::{Error, Result};
 
 /// One channel's parsed Table 4.50 body plus its Table 4.56 spectrum,
@@ -292,11 +292,9 @@ fn finish_channel(
     if let Some(ltp) = ltp {
         let prev_shape = fb.prev_shape();
         let tns = body.tns_data.as_ref();
-        let ws = ics_info.window_sequence;
-        let max_sfb = ics_info.max_sfb;
         ltp_state.apply_long_with_analysis(spec, ics_info, ltp, prev_shape, fs_index, |x_est| {
             if let Some(tns) = tns {
-                tns_analysis_frame(x_est, tns, ws, max_sfb, aot, fs_index)?;
+                tns_analysis_frame_ics(x_est, tns, ics_info, aot, fs_index)?;
             }
             Ok(())
         })?;
@@ -309,14 +307,7 @@ fn finish_channel(
 
     // §4.6.9 TNS synthesis.
     if let Some(tns) = &body.tns_data {
-        tns_decode_frame(
-            spec,
-            tns,
-            ics_info.window_sequence,
-            ics_info.max_sfb,
-            aot,
-            fs_index,
-        )?;
+        tns_decode_frame_ics(spec, tns, ics_info, aot, fs_index)?;
     }
 
     // §4.6.8.3.3 dependently-switched coupling with cc_domain == 1:
@@ -389,11 +380,7 @@ fn apply_freq_coupling(
         {
             return Err(Error::CceInvalid);
         }
-        let offsets = if cce_ics.window_sequence == crate::ics_info::WindowSequence::EightShort {
-            crate::swb_offset::short_window_offsets(fs_index)?
-        } else {
-            crate::swb_offset::long_window_offsets(fs_index)?
-        };
+        let offsets = cce_ics.swb_offsets(fs_index)?;
         c.cce.gains.couple_channel(
             &c.decoded.spectrum,
             spec,
@@ -510,14 +497,7 @@ impl CceDecoder {
         // any other; the target's TNS relationship is what cc_domain
         // selects).
         if let Some(tns) = &cce.body.tns_data {
-            tns_decode_frame(
-                &mut spec,
-                tns,
-                cce.ics_info.window_sequence,
-                cce.ics_info.max_sfb,
-                aot,
-                fs_index,
-            )?;
+            tns_decode_frame_ics(&mut spec, tns, &cce.ics_info, aot, fs_index)?;
         }
 
         // Independently switched: decode to the time domain through
@@ -957,6 +937,7 @@ mod tests {
 
     fn long_ics_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,

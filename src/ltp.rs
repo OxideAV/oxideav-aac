@@ -414,6 +414,7 @@ mod tests {
 
     fn long_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,
@@ -543,6 +544,7 @@ mod tests {
 
     fn short_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::EightShort,
             window_shape: WindowShape::Sine,

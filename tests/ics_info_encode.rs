@@ -44,6 +44,7 @@ fn long_lc_no_predictor_roundtrips() {
     // AOT 2 (LC), 44.1 kHz, max_sfb = 49, predictor_data_present = 0.
     // Wire bits: 1 (reserved) + 2 (ws) + 1 (shape) + 6 (max_sfb) + 1 (pred) = 11.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -67,6 +68,7 @@ fn long_lc_no_predictor_roundtrips() {
 #[test]
 fn long_lc_kbd_window_shape_roundtrips() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Kbd,
@@ -89,6 +91,7 @@ fn long_lc_kbd_window_shape_roundtrips() {
 #[test]
 fn long_start_no_predictor_roundtrips() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::LongStart,
         window_shape: WindowShape::Sine,
@@ -113,6 +116,7 @@ fn long_stop_with_reserved_bit_set_roundtrips() {
     // Parser surfaces ics_reserved_bit verbatim even when non-zero;
     // the writer must round-trip the same wire value.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: true,
         window_sequence: WindowSequence::LongStop,
         window_shape: WindowShape::Sine,
@@ -137,6 +141,7 @@ fn max_sfb_zero_long_roundtrips() {
     // max_sfb == 0 is permitted; downstream tools (section_data) just
     // emit empty sections per group.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -164,6 +169,7 @@ fn eight_short_no_grouping_roundtrips() {
     // EIGHT_SHORT_SEQUENCE: max_sfb 4 bits, scale_factor_grouping 7 bits.
     // grouping = 0 → eight separate window groups (each window alone).
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -190,6 +196,7 @@ fn eight_short_all_grouped_roundtrips() {
     // grouping = 0b111_1111 → all eight windows merge into a single
     // group (every bit 6-i merges window i+1).
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -229,6 +236,7 @@ fn eight_short_mixed_grouping_roundtrips() {
         }
     }
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Kbd,
@@ -254,6 +262,7 @@ fn eight_short_mixed_grouping_roundtrips() {
 fn main_predictor_no_reset_roundtrips() {
     // AOT 1, 44.1 kHz: PRED_SFB_MAX = 40, max_sfb = 30 → 30 prediction bits.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -283,6 +292,7 @@ fn main_predictor_no_reset_roundtrips() {
 #[test]
 fn main_predictor_with_reset_roundtrips() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -313,6 +323,7 @@ fn main_predictor_max_sfb_caps_at_pred_sfb_max_roundtrips() {
     // AOT 1, 96 kHz (fs_index 0): PRED_SFB_MAX = 33; max_sfb = 41 →
     // 33 prediction bits (capped).
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -345,6 +356,7 @@ fn ltp_long_roundtrips() {
     // AOT 4 (LTP), long sequence: 11-bit lag, 3-bit coef, max_sfb
     // bits of ltp_long_used.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -377,6 +389,7 @@ fn ltp_long_caps_at_max_ltp_long_sfb_roundtrips() {
     // max_sfb = 49 (44.1 kHz long max) > MAX_LTP_LONG_SFB (40) →
     // long_used.len() should be 40.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -444,6 +457,7 @@ fn ltp_er_aac_ld_with_lag_update_roundtrips() {
     // AOT 23 (ER AAC LD): lag_update (1) + lag (10) + coef (3) +
     // long_used[max_sfb].
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -477,6 +491,7 @@ fn ltp_er_aac_ld_with_lag_update_roundtrips() {
 #[test]
 fn ltp_er_aac_ld_without_lag_update_roundtrips() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -522,6 +537,7 @@ fn ltp_common_window_paired_roundtrips() {
         short: None,
     };
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -548,6 +564,7 @@ fn ltp_common_window_pair_absent_roundtrips() {
     // common_window == true, ltp_data_present_pair == Some(false):
     // the 1-bit pair flag is still written, no second ltp_data.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -580,6 +597,7 @@ fn ltp_common_window_pair_absent_roundtrips() {
 #[test]
 fn write_rejects_max_sfb_overflow_long() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -606,6 +624,7 @@ fn write_rejects_max_sfb_overflow_long() {
 #[test]
 fn write_rejects_max_sfb_overflow_short() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -632,6 +651,7 @@ fn write_rejects_max_sfb_overflow_short() {
 #[test]
 fn write_rejects_eight_short_without_grouping() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -658,6 +678,7 @@ fn write_rejects_eight_short_without_grouping() {
 #[test]
 fn write_rejects_long_with_grouping() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -684,6 +705,7 @@ fn write_rejects_long_with_grouping() {
 #[test]
 fn write_rejects_grouping_overflow() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -710,6 +732,7 @@ fn write_rejects_grouping_overflow() {
 #[test]
 fn write_rejects_predictor_data_on_short() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -737,6 +760,7 @@ fn write_rejects_predictor_data_on_short() {
 fn write_rejects_predictor_data_with_wrong_aot() {
     // AOT 2 (LC) must not own a PredictorData (Main is AOT 1).
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -768,6 +792,7 @@ fn write_rejects_predictor_data_with_wrong_aot() {
 fn write_rejects_ltp_data_on_main_aot() {
     // AOT 1 must not own an LtpData (LTP is for AOT != 1).
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -801,6 +826,7 @@ fn write_rejects_ltp_data_on_main_aot() {
 fn write_rejects_predictor_with_inconsistent_reset() {
     // reset == true but reset_group_number is None.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -832,6 +858,7 @@ fn write_rejects_predictor_with_inconsistent_reset() {
 fn write_rejects_prediction_used_wrong_length() {
     // max_sfb=10 → expect 10 prediction bits; we supply 5.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -864,6 +891,7 @@ fn write_rejects_pair_slot_without_common_window() {
     // common_window == false but ltp_data_present_pair == Some(_):
     // Table 4.6 does not emit the pair bit, so the slot must be None.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -898,6 +926,7 @@ fn write_rejects_stale_data_on_no_predictor_branch() {
     // predictor_data_present == false but ltp_data is populated —
     // the writer would silently drop the body, breaking round-trip.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -930,6 +959,7 @@ fn write_rejects_stale_data_on_no_predictor_branch() {
 #[test]
 fn write_rejects_ltp_coef_overflow() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -963,6 +993,7 @@ fn write_rejects_ltp_coef_overflow() {
 fn write_rejects_ltp_long_used_wrong_length() {
     // max_sfb=5 but long_used has 7 entries.
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -996,6 +1027,7 @@ fn write_rejects_ltp_long_used_wrong_length() {
 fn write_rejects_ltp_ld_missing_lag_update() {
     // AOT 23 (LD) requires lag_update == Some(_).
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -1028,6 +1060,7 @@ fn write_rejects_ltp_ld_missing_lag_update() {
 #[test]
 fn write_rejects_invalid_fs_index() {
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -1064,6 +1097,7 @@ fn long_lc_wire_layout_pin() {
     // Bit string: 0 00 0 011001 0 = 0000_0110_010x  (11 bits, x = pad)
     //           = 0x06 0x40
     let info = IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,

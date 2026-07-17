@@ -117,9 +117,8 @@
 
 use crate::ics_info::IcsInfo;
 use crate::section_data::NOISE_HCB;
-use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-};
+#[cfg(test)]
+use crate::swb_offset::{long_window_offsets, LONG_WINDOW_LEN};
 use crate::{Error, Result};
 
 /// §4.6.13.3 `is_noise(group,sfb)` — the noise-band predicate.
@@ -221,11 +220,8 @@ fn channel_geometry<'a>(
     ics_info: &IcsInfo,
     fs_index: u8,
 ) -> Result<(usize, &'a [u16])> {
-    let (window_len, offsets) = if ics_info.window_sequence.is_eight_short() {
-        (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
-    } else {
-        (LONG_WINDOW_LEN as usize, long_window_offsets(fs_index)?)
-    };
+    let window_len = ics_info.window_len()?;
+    let offsets = ics_info.swb_offsets(fs_index)?;
     let num_swb = offsets.len() - 1;
     let num_windows = ics_info.num_windows as usize;
     let num_groups = ics_info.num_window_groups as usize;
@@ -466,6 +462,7 @@ mod tests {
     /// `max_sfb` bands) for synthesis tests at fs_index 3 (48 kHz).
     fn long_ics(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,

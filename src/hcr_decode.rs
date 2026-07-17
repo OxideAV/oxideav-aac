@@ -56,9 +56,9 @@ use crate::section_data::SectionData;
 use crate::spectral_data::{
     decode_codeword, read_and_apply_signs, read_escape_sequence, write_tuple, SpectralData,
 };
-use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-};
+#[cfg(test)]
+use crate::swb_offset::{long_window_offsets, short_window_offsets};
+use crate::swb_offset::{LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
 use crate::{Error, Result};
 
 /// The `ESC_FLAG` magnitude of the escape book (§4.6.3.3).
@@ -98,11 +98,8 @@ fn enumerate_presorted(
     fs_index: u8,
 ) -> Result<Vec<HcrCodeword>> {
     let short = ics_info.window_sequence.is_eight_short();
-    let (window_len, offsets) = if short {
-        (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
-    } else {
-        (LONG_WINDOW_LEN as usize, long_window_offsets(fs_index)?)
-    };
+    let window_len = ics_info.window_len()?;
+    let offsets = ics_info.swb_offsets(fs_index)?;
     let max_lines = window_len as u32;
     let max_windows: u32 = if short { 8 } else { 1 };
     let max_sfb = usize::from(ics_info.max_sfb);
@@ -520,6 +517,7 @@ mod tests {
 
     fn long_ics(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,
@@ -541,6 +539,7 @@ mod tests {
     /// An `EIGHT_SHORT` ics_info with two groups (3 + 5 windows).
     fn short_ics(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::EightShort,
             window_shape: WindowShape::Sine,

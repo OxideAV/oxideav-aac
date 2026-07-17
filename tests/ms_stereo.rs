@@ -17,6 +17,7 @@ const FS_44100: u8 = 4;
 
 fn long_ics_info(max_sfb: u8) -> IcsInfo {
     IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,

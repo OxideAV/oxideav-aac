@@ -79,6 +79,7 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
+use crate::swb_offset::{long_window_offsets_family, short_window_offsets_family, FrameFamily};
 use crate::{Error, Result};
 
 /// Sentinel for the `EIGHT_SHORT_SEQUENCE` window-sequence value.
@@ -323,6 +324,11 @@ pub const NUM_SWB_SHORT_WINDOW: [u8; 12] = [12, 12, 12, 14, 14, 14, 15, 15, 15, 
 /// that depend on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IcsInfo {
+    /// The §4.5.1.1 frame-length family this `ics_info()` was parsed
+    /// under (`frameLengthFlag` + AOT). Governs every derived band
+    /// geometry: the `num_swb` below, the SWB offset tables the
+    /// numeric chain reads, and the §4.6.11 transform lengths.
+    pub family: FrameFamily,
     /// `ics_reserved_bit` — spec mandates `0`; the parser surfaces
     /// the wire value without enforcement (some encoders set it
     /// even though they shouldn't).
@@ -404,6 +410,30 @@ impl IcsInfo {
         sampling_frequency_index: u8,
         common_window: bool,
     ) -> Result<Self> {
+        Self::parse_family(
+            reader,
+            FrameFamily::Lc1024,
+            audio_object_type,
+            sampling_frequency_index,
+            common_window,
+        )
+    }
+
+    /// [`IcsInfo::parse`] under an explicit §4.5.1.1 frame-length
+    /// family. The wire layout of `ics_info()` itself is
+    /// family-independent; the family drives the derived band counts
+    /// (`num_swb` comes from the family's own SWB tables) and the LD
+    /// constraint checks: an ER AAC LD stream has no block switching
+    /// (§4.6.17.2.2), so any `window_sequence` other than
+    /// `ONLY_LONG_SEQUENCE` under an LD family surfaces
+    /// [`Error::LdShortWindow`].
+    pub fn parse_family(
+        reader: &mut BitReader<'_>,
+        family: FrameFamily,
+        audio_object_type: u8,
+        sampling_frequency_index: u8,
+        common_window: bool,
+    ) -> Result<Self> {
         let fs_index = sampling_frequency_index as usize;
         if fs_index >= NUM_SWB_LONG_WINDOW.len() {
             return Err(Error::IcsInfoUnsupportedSampleRateIndex(
@@ -415,6 +445,10 @@ impl IcsInfo {
         let window_sequence_bits = read_u8(reader, 2)?;
         let window_sequence = WindowSequence::from_bits(window_sequence_bits);
         let window_shape = WindowShape::from_bit(read_bit(reader)?);
+
+        if family.is_ld() && window_sequence != WindowSequence::OnlyLong {
+            return Err(Error::LdShortWindow);
+        }
 
         let mut scale_factor_grouping = None;
         let mut predictor_data_present = false;
@@ -484,9 +518,15 @@ impl IcsInfo {
 
         // §4.5.2.3.4 derivations.
         let (num_windows, num_window_groups, window_group_length, num_swb) =
-            derive_window_grouping(window_sequence, scale_factor_grouping, fs_index);
+            derive_window_grouping_family(
+                family,
+                window_sequence,
+                scale_factor_grouping,
+                sampling_frequency_index,
+            )?;
 
         Ok(IcsInfo {
+            family,
             ics_reserved_bit,
             window_sequence,
             window_shape,
@@ -503,6 +543,33 @@ impl IcsInfo {
             window_group_length,
             num_swb,
         })
+    }
+
+    /// The active per-window spectral length for this frame's
+    /// `window_sequence` under the frame's [`FrameFamily`]: the
+    /// family's short-window length (128 / 120) for
+    /// `EIGHT_SHORT_SEQUENCE`, the family's frame length
+    /// (1024 / 960 / 512 / 480) otherwise. The parser guarantees an
+    /// LD family never carries a short sequence, so the LD lookup
+    /// error is unreachable through parsed values.
+    pub fn window_len(&self) -> Result<usize> {
+        if self.window_sequence.is_eight_short() {
+            self.family.short_window_len().ok_or(Error::LdShortWindow)
+        } else {
+            Ok(self.family.frame_len())
+        }
+    }
+
+    /// The active `swb_offset` table for this frame's
+    /// `window_sequence` under the frame's [`FrameFamily`] at
+    /// `fs_index` — the short-window table for `EIGHT_SHORT_SEQUENCE`,
+    /// the long-window table otherwise.
+    pub fn swb_offsets(&self, fs_index: u8) -> Result<&'static [u16]> {
+        if self.window_sequence.is_eight_short() {
+            short_window_offsets_family(self.family, fs_index)
+        } else {
+            long_window_offsets_family(self.family, fs_index)
+        }
     }
 
     /// Encode `ics_info()` onto `writer`, the inverse of
@@ -551,6 +618,11 @@ impl IcsInfo {
     ) -> Result<()> {
         let fs_index = sampling_frequency_index as usize;
         if fs_index >= NUM_SWB_LONG_WINDOW.len() {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        // §4.6.17.2.2 — an LD-family ics_info can only carry
+        // ONLY_LONG_SEQUENCE (no block switching exists for LD).
+        if self.family.is_ld() && self.window_sequence != WindowSequence::OnlyLong {
             return Err(Error::IcsInfoEncodeInvalid);
         }
 
@@ -950,6 +1022,32 @@ pub fn derive_window_grouping(
     if !window_sequence.is_eight_short() {
         return (1, 1, vec![1], NUM_SWB_LONG_WINDOW[fs_index]);
     }
+    derive_short_grouping(scale_factor_grouping, NUM_SWB_SHORT_WINDOW[fs_index])
+}
+
+/// [`derive_window_grouping`] under an explicit §4.5.1.1 frame-length
+/// family: `num_swb` is read from the family's own SWB offset tables
+/// ([`crate::swb_offset::long_window_offsets_family`] /
+/// [`crate::swb_offset::short_window_offsets_family`]), so the 960 /
+/// LD band counts come out right. Errors surface for rates a family
+/// table does not define and for a short-window request under an LD
+/// family.
+pub fn derive_window_grouping_family(
+    family: FrameFamily,
+    window_sequence: WindowSequence,
+    scale_factor_grouping: Option<u8>,
+    fs_index: u8,
+) -> Result<(u8, u8, Vec<u8>, u8)> {
+    if !window_sequence.is_eight_short() {
+        let num_swb = (long_window_offsets_family(family, fs_index)?.len() - 1) as u8;
+        return Ok((1, 1, vec![1], num_swb));
+    }
+    let num_swb = (short_window_offsets_family(family, fs_index)?.len() - 1) as u8;
+    Ok(derive_short_grouping(scale_factor_grouping, num_swb))
+}
+
+/// Shared `EIGHT_SHORT_SEQUENCE` §4.5.2.3.4 grouping walk.
+fn derive_short_grouping(scale_factor_grouping: Option<u8>, num_swb: u8) -> (u8, u8, Vec<u8>, u8) {
     // EIGHT_SHORT_SEQUENCE: scale_factor_grouping must be present
     // per Table 4.6. derive_window_grouping treats a missing mask
     // as the "no grouping" form (one group per window) so it
@@ -968,7 +1066,7 @@ pub fn derive_window_grouping(
         }
     }
     let num_window_groups = groups.len() as u8;
-    (8, num_window_groups, groups, NUM_SWB_SHORT_WINDOW[fs_index])
+    (8, num_window_groups, groups, num_swb)
 }
 
 fn read_u8(reader: &mut BitReader<'_>, n: u32) -> Result<u8> {

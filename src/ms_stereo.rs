@@ -72,9 +72,8 @@
 
 use crate::ics_info::IcsInfo;
 use crate::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
-use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-};
+#[cfg(test)]
+use crate::swb_offset::{long_window_offsets, short_window_offsets, SHORT_WINDOW_LEN};
 use crate::{Error, Result};
 
 /// §4.6.8.1.2 `ms_mask_present` — the two-bit field decoded from the
@@ -192,11 +191,8 @@ pub fn apply_ms_stereo(
         left_sfb_cb,
         right_sfb_cb,
     } = pair;
-    let (window_len, offsets) = if ics_info.window_sequence.is_eight_short() {
-        (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
-    } else {
-        (LONG_WINDOW_LEN as usize, long_window_offsets(fs_index)?)
-    };
+    let window_len = ics_info.window_len()?;
+    let offsets = ics_info.swb_offsets(fs_index)?;
     let num_swb = offsets.len() - 1;
     let num_windows = ics_info.num_windows as usize;
     let num_groups = ics_info.num_window_groups as usize;
@@ -293,6 +289,7 @@ mod tests {
 
     fn long_ics_info(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,
@@ -314,6 +311,7 @@ mod tests {
     fn short_ics_info(max_sfb: u8, window_group_length: Vec<u8>) -> IcsInfo {
         let num_window_groups = window_group_length.len() as u8;
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::EightShort,
             window_shape: WindowShape::Sine,

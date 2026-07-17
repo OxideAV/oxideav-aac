@@ -19,6 +19,7 @@ use oxideav_core::bits::{BitReader, BitWriter};
 /// Long-window AAC-LC `IcsInfo` for `fs_index` 4 (44.1 kHz).
 fn long_ics_info(max_sfb: u8) -> IcsInfo {
     IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::OnlyLong,
         window_shape: WindowShape::Sine,
@@ -41,6 +42,7 @@ fn long_ics_info(max_sfb: u8) -> IcsInfo {
 fn short_ics_info(max_sfb: u8, window_group_length: Vec<u8>, scale_factor_grouping: u8) -> IcsInfo {
     let num_window_groups = window_group_length.len() as u8;
     IcsInfo {
+        family: oxideav_aac::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,

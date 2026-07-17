@@ -413,6 +413,7 @@ mod tests {
     /// Build a minimal long-window `IcsInfo` for predictor tests.
     fn long_ics(max_sfb: u8) -> IcsInfo {
         IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
             ics_reserved_bit: false,
             window_sequence: WindowSequence::OnlyLong,
             window_shape: WindowShape::Sine,
