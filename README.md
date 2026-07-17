@@ -212,8 +212,13 @@ encoder alongside the decoder under id `"aac"`.
 - **Filterbank** (`filterbank`) — §4.6.11 stateful per-channel IMDCT
   with sine / KBD windows, all four `window_sequence` shapes, eight-short
   internal overlap-add, and inter-frame overlap-add. Pinned by streaming
-  TDAC perfect-reconstruction tests. Scope is the 1024/128-line transform
-  family; the 960/120-line (`N = 1920/240`) family is out of scope.
+  TDAC perfect-reconstruction tests. Covers **all four §4.5.1.1
+  frame-length families**: the 1024/128- and 960/120-line
+  block-switching families (`N = 2048/256` and `1920/240`) and the
+  long-only ER AAC LD 512/480-line families (`N = 1024/960`), where
+  the `window_shape == 1` bit selects the §4.6.17.2.3 Table 4.171
+  **low-overlap window** in place of KBD (power-complementarity and
+  streaming TDAC pinned per family).
 - **Channel-pair / noise tools** — M/S stereo de-matrix (`ms_stereo`,
   §4.6.8.1), intensity stereo (`intensity_stereo`, §4.6.8.2), and
   Perceptual Noise Substitution (`pns`, §4.6.13). PNS produces
@@ -303,7 +308,9 @@ encoder alongside the decoder under id `"aac"`.
   (the per-subwindow `x_rec` index origin; see the staged
   `docs/audio/aac/short-window-ltp-blocked.md` §5) taken as an
   explicit caller parameter rather than an invented convention. The
-  ER AAC LD `M = N/2` lag offset stays out of scope.
+  **ER AAC LD branch is implemented**: the 10-bit lag with the
+  `ltp_lag_update` repeat state (`ltp_prev_lag`) and the §4.6.7.3
+  `M = N/2` lag offset, applied at the LD transform lengths.
 - **TNS analysis filter** (`tns_coef::tns_ma_filter`,
   `tns_frame::tns_analysis_frame`) — §4.6.7.4.1 / Figure 4.30: the
   all-zero (moving-average, FIR) inverse of the §4.6.9.3 all-pole
@@ -321,6 +328,52 @@ encoder alongside the decoder under id `"aac"`.
   filter applied to `X_est`) *before* the §4.6.9 TNS synthesis filter,
   so the single synthesis pass shapes the residual while undoing the
   analysis on the LTP contribution.
+
+### Frame-length families — §4.5.1.1 / §4.6.17 (960, LD 512/480)
+
+All four `frameLengthFlag` frame geometries decode end to end, keyed
+by `swb_offset::FrameFamily` (resolved from the AOT + flag; the
+LATM/LOAS driver installs it per layer from the ASC,
+`StreamDecoder::set_frame_family` serves raw callers — ADTS can only
+carry the default 1024-line family):
+
+- **AAC-LC at 960/120 lines** (`frameLengthFlag == 1`) — the
+  bracketed "values for 1920/240" columns of Tables 4.129–4.141, the
+  `N = 1920/240` transform pair with all four window sequences, both
+  window shapes, grouping, TNS and the full joint-stereo/noise tool
+  chain; 960 PCM samples per channel per frame. Verified **bit-exact
+  against a black-box decoder binary** on writer-assembled streams,
+  and staged with mutation coverage as `aac-lc-960-writer-loas`.
+- **ER AAC LD at 512/480 lines** (AOT 23, §4.6.17) — Tables
+  4.142–4.147 (with the §4.5.1.1 nearest-defined-table rule for the
+  rates those tables omit), long-only frames (a non-`ONLY_LONG`
+  `window_sequence` is rejected, §4.6.17.2.2), the §4.6.17.2.3
+  Table 4.171 **low-overlap window** on the `window_shape == 1` bit,
+  the §4.6.17.2.5 LD `TNS_MAX_BANDS` tables, the §4.6.7 **LD LTP**
+  branch (10-bit lag, `ltp_lag_update` repeat via a per-channel
+  `ltp_prev_lag`, `M = N/2` lag offset at the LD transform lengths),
+  and the Table 4.19 `er_raw_data_block()` element walk shared with
+  ER AAC LC; 512/480 PCM samples per channel per frame. The LD-512
+  geometry (every swb band boundary, both window shapes, the
+  transform/overlap-add) is verified **bit-exact against two
+  independent black-box decoder binaries**; LD-480 against one (the
+  other binary decodes 480-line streams on the wrong 512-line
+  frequency grid — probed and documented in the fixture notes).
+  Staged fixtures: `aac-ld-512-writer-loas`, `aac-ld-480-writer-loas`.
+- **Known ecosystem divergence — LD TNS wire (docs ask pending)**:
+  the one available LD encoder binary emits TNS side info that is not
+  parseable under the literal Table 4.54 / Table 4.155 field widths
+  (its TNS-bearing AUs overrun their spectral payload), and the two
+  deployed black-box decoders do not even agree with each other on
+  such streams (one decodes them, the other drops those frames), nor
+  does either round-trip a spec-literal no-op TNS record. This crate
+  keeps the spec-literal reading; a clean-room trace of the deployed
+  LD `tns_data()` layout (or the corrigendum / original amendment
+  text) is the standing docs ask.
+- An SBR payload on a 960-line or LD stream is rejected before its
+  body is parsed (`Error::SbrUnsupportedFrameFamily`) — the §4.6.18
+  tool here is defined over the 1024-line core, and the §4.6.19 LD
+  SBR tool belongs to ELD (out of scope).
 
 ### SSR gain control (§4.6.12) — complete decode pipeline
 
@@ -854,7 +907,9 @@ EP-tool payload de-interleave is out of scope.
   unimplemented: the 2001 §4.6.7.3 text defines the `x_rec` buffer
   arrangement once but never fixes the per-subframe index origin for
   the eight windows, and no LTP fixture exists to disambiguate. The
-  ER AAC LD `M = N/2` lag offset likewise remains out of scope.)
+  ER AAC LD long-window LTP — 10-bit lag, `ltp_lag_update` repeat,
+  `M = N/2` — is implemented and exercised by the staged LD
+  fixtures.)
 - SBR/PS remainders — the §4.6.18 SBR tool **and** the subpart-8 PS
   tool are **implemented end to end** (see the sections above) and
   wired into the ADTS / LATM `StreamDecoder` paths and the runtime
@@ -865,35 +920,36 @@ EP-tool payload de-interleave is out of scope.
   region — see `adts_crc`; a derived type-14 fixture is staged as
   `he-aac-v1-sbrcrc-adts`). The §4.6.18.4.3 downsampled-output mode
   and the §4.6.18.8 low-power variant are now **both selectable end
-  to end** (see the SBR back-end section above). Still open: the ER
-  AAC LD 480/512 transform variants remain out of scope, and
-  low-power PS is undefined by design (the subpart-8 tool needs the
-  complex QMF domain, so LP + PS is rejected). The coupling-channel (CCE) tool is
+  to end** (see the SBR back-end section above). Still open: SBR is
+  defined here over the 1024-line core only — an SBR payload on a
+  960-line or LD stream is rejected
+  (`Error::SbrUnsupportedFrameFamily`; the §4.6.19 LD SBR tool is
+  ELD's and stays out of scope) — and low-power PS is undefined by
+  design (the subpart-8 tool needs the complex QMF domain, so LP +
+  PS is rejected). The coupling-channel (CCE) tool is
   decoded **and applied** end to end (`cce` + the two-pass stream walk;
   see the tool-chain section above), validated against the
   filterbank-linearity identity on writer-assembled CCE streams; a
   third-party CCE-bearing conformance fixture would still be a welcome
   external cross-check.
 - Error-resilience remainders — the ER story is now wired end to end
-  for ER AAC LC (AOT 17): the ER channel-element body
-  (`ics_body::IcsBody::parse_er`) selects all three §4.4.6 resilience
-  branches, the `reordered_spectral_data()` payload is decoded and
-  encoded (`hcr_decode`), and the §4.4.2.3 Table 4.19
-  `er_raw_data_block()` driver
+  for ER AAC LC (AOT 17) **and ER AAC LD (AOT 23)**: the ER
+  channel-element body (`ics_body::IcsBody::parse_er`) selects all
+  three §4.4.6 resilience branches, the `reordered_spectral_data()`
+  payload is decoded and encoded (`hcr_decode`), and the §4.4.2.3
+  Table 4.19 `er_raw_data_block()` driver
   (`StreamDecoder::decode_er_raw_data_block`) walks the fixed
-  per-`channelConfiguration` element sequence — reachable from LATM
-  (the LOAS driver routes AOT-17 layers there with the ASC's
-  resilience triplet) and pinned bit-identical to the equivalent
-  non-resilient decode of the same spectra, and a writer-assembled
-  HCR-bearing LOAS fixture (AOT 17, section + spectral resilience,
-  VCB bands) is staged in the docs corpus (`aac-er-hcr-loas`; a
-  black-box validator binary rejects ER data resilience outright, so
-  the bit-identical plain-decode identity is the oracle). Still open:
-  the other ER object types (ER AAC LTP / scalable / LD, AOTs
-  19 / 20 / 23 — LTP state, scalable layering and the 480/512
-  transform family), the `epConfig == 2/3` §4.5.2.4 physical-payload
-  preprocessing, and an encoder-produced HCR conformance stream as an
-  external cross-check.
+  per-`channelConfiguration` element sequence for both AOTs —
+  reachable from LATM (the LOAS driver routes AOT-17/23 layers there
+  with the ASC's resilience triplet and the ASC-resolved §4.5.1.1
+  frame family). AOT 17 is pinned bit-identical to the equivalent
+  non-resilient decode of the same spectra (`aac-er-hcr-loas`);
+  AOT 23 is pinned by the staged LD fixtures (see the frame-length
+  families section above). Still open: ER AAC LTP / scalable
+  (AOTs 19 / 20 — LTP state and scalable layering), the
+  `epConfig == 2/3` §4.5.2.4 physical-payload preprocessing, and an
+  encoder-produced HCR conformance stream as an external
+  cross-check.
 - LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
   `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
   `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`

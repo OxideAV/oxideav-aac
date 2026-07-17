@@ -592,6 +592,24 @@ impl StreamDecoder {
                     let n = p.byte_length().max(1);
                     remaining = remaining.saturating_sub(n);
                 }
+                Some(_) if self.family != FrameFamily::Lc1024 => {
+                    // The §4.6.18 SBR tool in this crate is defined
+                    // over the 1024-line core frame (32-subband
+                    // analysis / 2048-sample output); a 960-line or
+                    // LD core cannot feed it, so an SBR extension
+                    // type is rejected before its body is even
+                    // parsed. Non-SBR payload types stay usable.
+                    match ExtensionPayload::parse(reader, remaining) {
+                        Ok(p) => {
+                            let n = p.byte_length().max(1);
+                            remaining = remaining.saturating_sub(n);
+                        }
+                        Err(Error::UnsupportedExtensionSbr(_)) => {
+                            return Err(Error::SbrUnsupportedFrameFamily);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 Some((id_aac, slot)) => {
                     let prev = self.sbr_prev_header.get(&slot).copied();
                     match ExtensionPayload::parse_with_sbr(reader, remaining, id_aac, fs_sbr, prev)?
@@ -601,14 +619,6 @@ impl StreamDecoder {
                             remaining = remaining.saturating_sub(n);
                         }
                         ExtensionPayloadOrSbr::Sbr(ext) => {
-                            // The §4.6.18 SBR tool in this crate is
-                            // defined over the 1024-line core frame
-                            // (32-subband analysis / 2048-sample
-                            // output); a 960-line or LD core cannot
-                            // feed it.
-                            if self.family != FrameFamily::Lc1024 {
-                                return Err(Error::SbrUnsupportedFrameFamily);
-                            }
                             ext.verify_crc(payload)?;
                             self.sbr_prev_header.insert(slot, ext.header);
                             result = Some(ext);

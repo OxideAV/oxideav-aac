@@ -6,6 +6,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- the §4.5.1.1 **frame-length families**, end to end: the 960/120-line
+  AAC-LC family (`frameLengthFlag == 1` — the bracketed "values for
+  1920/240" columns of Tables 4.129–4.141, the 1920/240-point
+  transform pair with all four window sequences and both window
+  shapes) and the **ER AAC LD** 512/480-line families (§4.6.17 —
+  Tables 4.142–4.147 with the §4.5.1.1 nearest-defined-table rule,
+  the §4.6.17.2.3 Table 4.171 **low-overlap window** in place of KBD,
+  no block switching, the §4.6.17.2.5 LD `TNS_MAX_BANDS` tables, and
+  the §4.6.7 LD LTP branch with the 10-bit lag, the `ltp_lag_update`
+  repeat state and the `M = N/2` lag offset). `FrameFamily`
+  (`swb_offset`) resolves from the AOT + `frameLengthFlag`;
+  `StreamDecoder::set_frame_family` installs it for raw callers, the
+  LATM/LOAS driver resolves it per layer from the ASC automatically,
+  and AOT 23 routes through the Table 4.19 `er_raw_data_block()` walk
+  next to ER AAC LC. Per-frame output is 960 / 512 / 480 samples per
+  channel accordingly. Cross-verified bit-exact against two
+  independent black-box decoder binaries everywhere the deployed
+  ecosystem implements the family (LC-960 and LD-512: both binaries;
+  LD-480: one — the other decodes 480 streams on the wrong 512 grid);
+  three writer-assembled LOAS fixtures are staged in the docs corpus
+  (`aac-lc-960-writer-loas`, `aac-ld-512-writer-loas`,
+  `aac-ld-480-writer-loas`) with mutation batteries over each
+- an SBR extension payload on a non-1024-line stream is rejected
+  cleanly (`Error::SbrUnsupportedFrameFamily`) before its body is
+  parsed — the §4.6.18 tool is defined over the 1024-line core
+
+### Fixed
+
+- a corrupted stream pairing `pulse_data_present` with a truncated
+  group buffer could hit a debug assertion in the pulse
+  reconstruction; it now surfaces `Error::PulseDataEncodeInvalid`
+
 ### Changed
 
 - internal modules (syntax-element parsers, filterbank/SBR/PS

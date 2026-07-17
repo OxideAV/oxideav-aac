@@ -654,11 +654,12 @@ pub fn apply_pulse_data_family(
     fs_index: u8,
     pulse_data: &PulseData,
 ) -> Result<()> {
-    debug_assert!(
-        x_quant.len() >= family.frame_len(),
-        "x_quant length must be at least the family frame length ({})",
-        family.frame_len()
-    );
+    // A corrupted stream can pair a pulse_data_present flag with a
+    // group buffer shorter than the family frame length (e.g. a
+    // flipped window_sequence bit) — reject rather than assert.
+    if x_quant.len() < family.frame_len() {
+        return Err(Error::PulseDataEncodeInvalid);
+    }
 
     if pulse_data.pulses.is_empty() || pulse_data.pulses.len() > crate::pulse_data::MAX_PULSES {
         return Err(Error::PulseDataEncodeInvalid);
