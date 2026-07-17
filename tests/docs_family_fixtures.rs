@@ -658,7 +658,9 @@ fn ld_families_are_wire_incompatible() {
             &p512[0],
         )
         .unwrap();
-    match dec480.decode_er_raw_data_block(
+    // Structural rejection is equally fine; what must never happen
+    // is an identical decode under the wrong family.
+    if let Ok(f) = dec480.decode_er_raw_data_block(
         AOT_ER_LD,
         FS_INDEX,
         SAMPLE_RATE,
@@ -666,8 +668,7 @@ fn ld_families_are_wire_incompatible() {
         AacResilienceFlags::default(),
         &p512[0],
     ) {
-        Ok(f) => assert_ne!(f.pcm, ok.pcm, "families must not alias"),
-        Err(_) => {} // structural rejection is equally fine
+        assert_ne!(f.pcm, ok.pcm, "families must not alias");
     }
 }
 
