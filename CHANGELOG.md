@@ -6,6 +6,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- internal modules (syntax-element parsers, filterbank/SBR/PS
+  reconstruction plumbing, CRC registers — everything outside the
+  documented `adts` / `asc` / `pce` / `decode` / `latm` / `encoder` /
+  `codec_decoder` / `codec_encoder` surface and the crate-root
+  `register` / `Error` / `Result`) are now `#[doc(hidden)]`; they
+  remain `pub` for the crate's tests/fuzz harnesses but are no longer
+  part of the stable, semver-checked API
+
 ### Added
 
 - §4.6.18.4.3 **downsampled SBR output mode**, selectable end to end:

@@ -81,17 +81,25 @@ use crate::{Error, Result};
 
 /// Low-order terms of the ADTS generator `x¹⁶ + x¹⁵ + x² + 1`
 /// (ISO/IEC 11172-3 §2.4.3.1 via 13818-7:2004 §8.1.1.2).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const ADTS_CRC_POLY: u32 = 0x8005;
 
 /// ADTS CRC initial register value (all ones).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const ADTS_CRC_INIT: u32 = 0xFFFF;
 
 /// Low-order terms of the SBR generator `x¹⁰ + x⁹ + x⁵ + x⁴ + x + 1`
 /// (ISO/IEC 14496-3:2009 §4.4.2.8.1).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SBR_CRC_POLY: u32 = 0x0233;
 
 /// MSB-first CRC shift register (see module docs for the feedback
 /// convention shared by the ADTS and SBR codes).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 pub struct CrcRegister {
     reg: u32,
@@ -164,6 +172,8 @@ impl CrcRegister {
 /// end_bit)` of `data` — the `sbr_extension_data()` payload bits
 /// after the `bs_sbr_crc_bits` field, before the `bs_fill_bits`
 /// (ISO/IEC 14496-3:2009 Table 4.62 / §4.4.2.8.1).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn sbr_crc(data: &[u8], start_bit: u64, end_bit: u64) -> u16 {
     let mut reg = CrcRegister::sbr();
     reg.feed_bit_range(data, start_bit, end_bit);
@@ -175,6 +185,8 @@ pub fn sbr_crc(data: &[u8], start_bit: u64, end_bit: u64) -> u16 {
 /// and zero-padded to `pad_to` bits when a protection length applies
 /// (192 for a channel element, 128 for a CPE's second ICS; `None`
 /// feeds the whole range, the PCE / DSE case).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtectedRegion {
     /// First protected bit (absolute bit offset into the payload).
@@ -205,6 +217,8 @@ impl ProtectedRegion {
 /// Table 1.A.8, region per 13818-7:2004 §8.1.1.1): the 56 header bits
 /// followed by every protected element region of the one
 /// `raw_data_block()`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn adts_single_crc(header: &[u8], payload: &[u8], regions: &[ProtectedRegion]) -> u16 {
     let mut reg = CrcRegister::adts();
     reg.feed_bit_range(header, 0, 56);
@@ -217,6 +231,8 @@ pub fn adts_single_crc(header: &[u8], payload: &[u8], regions: &[ProtectedRegion
 /// Compute the multi-RDB `adts_header_error_check()` CRC (Table
 /// 1.A.9): the 56 header bits followed by every 16-bit
 /// `raw_data_block_position`, in order.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn adts_header_crc(header: &[u8], positions: &[u16]) -> u16 {
     let mut reg = CrcRegister::adts();
     reg.feed_bit_range(header, 0, 56);
@@ -231,6 +247,8 @@ pub fn adts_header_crc(header: &[u8], positions: &[u16]) -> u16 {
 /// Compute one multi-RDB `adts_raw_data_block_error_check()` CRC
 /// (Table 1.A.10): the protected element regions of a single
 /// `raw_data_block()`, headers *not* re-included.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn adts_rdb_crc(payload: &[u8], regions: &[ProtectedRegion]) -> u16 {
     let mut reg = CrcRegister::adts();
     for r in regions {
@@ -250,6 +268,8 @@ pub fn adts_rdb_crc(payload: &[u8], regions: &[ProtectedRegion]) -> u16 {
 /// check()` field or the next block begins. Returns the regions; an
 /// exhausted payload before an explicit END terminates the block the
 /// same way the decode driver treats it.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn collect_block_regions(
     reader: &mut BitReader<'_>,
     aot: u8,

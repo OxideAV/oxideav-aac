@@ -405,72 +405,194 @@ use oxideav_core::RuntimeContext;
 pub mod adts;
 pub mod adts_crc;
 pub mod asc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cce;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod channel_map;
 pub mod codec_decoder;
 pub mod codec_encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod crc;
 pub mod decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod decoded_spectrum;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dequant;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod element_decode;
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod encoder_tns;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod extension_payload;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod filterbank;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod gain_control;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod gain_control_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod hcr;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod hcr_decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ics_body;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ics_info;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod intensity_stereo;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ipqf;
 pub mod latm;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ltp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ms_stereo;
 pub mod pce;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pcm;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pns;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod predictor;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_decorr;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_huffman;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_hybrid;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_map;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_stereo;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pulse_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod raw_data_block;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod rvlc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_dequant;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_element;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_env_adjust;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_envelope;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_extension;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_freq_bands;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_grid;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_hf_gen;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_huffman;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_limiter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_lp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_noise_table;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_qmf;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_reconstruct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod sbr_time_grid;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod scale_factor_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod section_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod spectral_codebook;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod spectral_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod spectrum_huffman;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ssr;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ssr_filterbank;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod swb_offset;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tns_coef;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tns_data;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tns_frame;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tns_max;
 
 mod error;
