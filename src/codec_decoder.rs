@@ -24,9 +24,11 @@
 //!   filterbank / LTP / predictor state threads across packet boundaries
 //!   exactly as it does across the frames of a contiguous stream.
 //! * [`receive_frame`](Decoder::receive_frame) returns one
-//!   [`AudioFrame`] per decoded ADTS frame: [`FRAME_LEN`] = 1024 samples
-//!   per channel (the 1024-line transform family this crate covers),
-//!   interleaved little-endian `i16` in element order ([`SampleFormat::S16`]).
+//!   [`AudioFrame`] per decoded access unit: [`FRAME_LEN`] = 1024
+//!   samples per channel for the default frame family (960 / 512 /
+//!   480 under the §4.5.1.1 families a LATM-carried ASC can select,
+//!   2048 for a dual-rate SBR frame), interleaved little-endian
+//!   `i16` in element order ([`SampleFormat::S16`]).
 //! * [`flush`](Decoder::flush) marks end-of-stream so subsequent
 //!   `receive_frame` calls return [`Error::Eof`] once the pending queue
 //!   drains.

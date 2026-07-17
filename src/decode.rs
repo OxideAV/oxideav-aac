@@ -76,8 +76,10 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
     }
 }
 
-/// The §4.6.11 per-frame sample count for the 1024-line transform
-/// family (the only family this crate's `swb_offset` layout covers).
+/// The §4.6.11 per-frame sample count for the default 1024-line
+/// transform family. The other §4.5.1.1 families emit 960 / 512 /
+/// 480 samples per frame per channel
+/// ([`crate::swb_offset::FrameFamily::frame_len`]).
 pub const FRAME_LEN: usize = 1024;
 
 /// One decoded ADTS frame: the interleaved 16-bit PCM plus the geometry
