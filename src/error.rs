@@ -75,6 +75,14 @@ pub enum Error {
     /// index before invoking the ics_info parser.
     IcsInfoUnsupportedSampleRateIndex(u8),
 
+    /// An `EIGHT_SHORT_SEQUENCE` (or any short-window geometry) was
+    /// requested for an ER AAC LD frame family. §4.6.17.2.2: the low
+    /// delay coder has no block switching, so the 512/480-line
+    /// families define no short-window tables at all — a stream
+    /// signalling a non-`ONLY_LONG` window sequence under AOT 23 is
+    /// malformed.
+    LdShortWindow,
+
     /// [`crate::ics_info::IcsInfo::write`] was handed an in-memory
     /// [`crate::ics_info::IcsInfo`] whose field combination cannot
     /// be represented on the wire under ISO/IEC 14496-3 Table 4.6 /
@@ -757,6 +765,12 @@ impl core::fmt::Display for Error {
                     f,
                     "ics_info sampling_frequency_index {} is outside the 0..=11 SWB-table range",
                     idx
+                )
+            }
+            Error::LdShortWindow => {
+                write!(
+                    f,
+                    "ER AAC LD: the 512/480-line families are long-only (§4.6.17.2.2) — no short-window geometry exists"
                 )
             }
             Error::IcsInfoEncodeInvalid => {
