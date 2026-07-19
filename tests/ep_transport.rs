@@ -11,19 +11,17 @@ use oxideav_aac::ep_frame::{EpFrameCodec, EpFrameData};
 use oxideav_aac::latm::{ep_sync_header_parity, LoasDecoder};
 use oxideav_core::bits::{BitReader, BitWriter};
 
-/// AAC-LC 44.1 kHz stereo ASC (16 bits).
+/// AAC-LC 44.1 kHz mono ASC (16 bits).
 fn write_aac_lc_asc(w: &mut BitWriter) {
     w.write_u32(2, 5); // AOT LC
     w.write_u32(4, 4); // fsIndex
-    w.write_u32(2, 4); // chanConfig
+    w.write_u32(1, 4); // chanConfig
     w.write_bit(false);
     w.write_bit(false);
     w.write_bit(false);
 }
 
-/// A tiny stereo CPE raw_data_block (shared helper style: all-zero
-/// spectra keep it small; the PCM is then all zeros but the transport
-/// equivalence is still byte-exact).
+/// A tiny mono SCE raw_data_block with small book-1 spectra.
 fn tiny_raw_data_block() -> Vec<u8> {
     use oxideav_aac::ics_body::IcsBody;
     use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
@@ -101,9 +99,7 @@ fn tiny_raw_data_block() -> Vec<u8> {
 }
 
 /// The plain AudioMuxElement(1) bytes for one payload (first frame
-/// carries the StreamMuxConfig; ASC is mono-config LC despite the
-/// helper name writing chanConfig 2 — kept stereo-agnostic by the
-/// payload itself).
+/// carries the StreamMuxConfig).
 fn audio_mux_element(payload: &[u8], first: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     if first {
@@ -272,6 +268,21 @@ fn ep_transport_matches_plain_loas() {
         assert_eq!(a.channels, b.channels, "frame {i}");
         assert!(a.pcm.iter().any(|&s| s != 0), "frame {i} silent");
     }
+
+    // Docs-corpus fixture: the deterministic EP-protected LOAS
+    // stream plus this crate's own decode.
+    let mut pcm = Vec::new();
+    for f in &ep_frames {
+        pcm.extend_from_slice(&f.pcm);
+    }
+    stage_or_pin(
+        "aac-ep-writer-loas",
+        "input.eploas",
+        &ep_stream,
+        &pcm,
+        1,
+        44_100,
+    );
 }
 
 #[test]
@@ -334,4 +345,61 @@ fn ep_mux_battery_never_panics() {
     let mut dec = LoasDecoder::new();
     assert_eq!(dec.decode_all_ep(&stream).unwrap().len(), 1);
     let _ = BitReader::new(&stream);
+}
+
+// ==================================================================
+// Docs-corpus staging (mirrors docs_family_fixtures.rs)
+// ==================================================================
+
+fn fixtures_root() -> std::path::PathBuf {
+    std::path::PathBuf::from("../../docs/audio/aac/fixtures")
+}
+
+fn stage_enabled() -> bool {
+    std::env::var_os("OXIDEAV_AAC_STAGE_FIXTURES").is_some()
+}
+
+fn wav_bytes(pcm: &[i16], channels: u16, sample_rate: u32) -> Vec<u8> {
+    let data_len = (pcm.len() * 2) as u32;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
+    let block_align = channels * 2;
+    let mut out = Vec::with_capacity(44 + pcm.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for &s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+fn stage_or_pin(name: &str, input_name: &str, input: &[u8], pcm: &[i16], ch: u16, rate: u32) {
+    use std::fs;
+    let dir = fixtures_root().join(name);
+    let input_path = dir.join(input_name);
+    let wav_path = dir.join("expected.wav");
+    let wav = wav_bytes(pcm, ch, rate);
+    if stage_enabled() {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&input_path, input).unwrap();
+        fs::write(&wav_path, &wav).unwrap();
+        eprintln!("staged {}", dir.display());
+        return;
+    }
+    match (fs::read(&input_path), fs::read(&wav_path)) {
+        (Ok(staged_in), Ok(staged_wav)) => {
+            assert_eq!(staged_in, input, "{name}: staged {input_name} drifted");
+            assert_eq!(staged_wav, wav, "{name}: staged expected.wav drifted");
+        }
+        _ => eprintln!("skip: {} not staged yet", dir.display()),
+    }
 }

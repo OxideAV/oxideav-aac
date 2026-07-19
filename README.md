@@ -375,6 +375,111 @@ carry the default 1024-line family):
   tool here is defined over the 1024-line core, and the §4.6.19 LD
   SBR tool belongs to ELD (out of scope).
 
+### Scalable AAC (AOT 6) / ER AAC scalable (AOT 20) — §4.4.2.2 / §4.5.2.2
+
+The AAC-only scalable combinations decode end to end (`scalable`):
+one `aac_scalable_main_element()` plus up to seven extension
+elements, each on its own elementary stream / LATM layer
+(mono-only, stereo-only and mixed mono→stereo stacks, Table 4.87).
+
+- **Syntax** — Tables 4.13–4.18: the main/extension headers
+  (window geometry hoisted out of `ics_info()`, per-channel TNS on
+  the first mono and first stereo layer, per-channel LTP on the main
+  layer, the §4.6.8.1.4 *incremental* `ms_data()` over
+  `last_max_sfb_ms..max_sfb`, per-channel `diff_control_data_lr()`
+  with the Table 4.18 `ms_used` gating), and the Table 4.50
+  `scale_flag == 1` ICS form (`IcsBody::parse_scale` — no inline
+  `ics_info()`, no tool dispatch trio). For AOT 20 the §4.4.6
+  resilience triplet selects the ER wire branches per channel
+  (5-bit-`sect_cb` sections, RVLC scalefactors, inline HCR
+  `reordered_spectral_data()`); the element syntax itself is
+  unchanged (§4.5.2.4), pinned bit-identical to the AOT-6 decode of
+  the same spectra. `ScalableFrame::parse` / `::write` round-trip
+  the whole per-layer payload stack byte-exactly.
+- **Layer combination** (§4.5.2.2.4 SIAQ, `ScalableDecoder`): the
+  dequantized spectra of all layers sum per output path under the
+  Table 4.91–4.93 per-band tool rules — a lower layer's PNS band
+  survives only while every higher layer decodes the band to zero
+  (§4.6.13.6), intensity accumulates the M/L channel with positions
+  from the highest layer, invalid combinations surface
+  `Error::ScalableLayerCombination` — then the §4.6.14.2.1 FSS merges
+  the combined mono spectrum into the stereo pair (`L/R += 2·M''` on
+  clear `diff_control_lr` bits, `M = M'' + M'` on M/S bands; long
+  and short windows), the cumulative-mask M/S butterfly, the
+  scalable-invariant intensity reconstruction
+  (`invert_intensity() = +1`), correlated PNS via `ms_used`, the
+  §4.6.9.5 / Table 4.158 **serial TNS** layout (first mono layer's
+  filter serves the low bands up to the highest mono `max_sfb`,
+  first stereo layer's filters serve L/R, with the lower-boundary
+  override rule) and the §4.6.11 filterbank. §4.6.7.5 **base-layer
+  LTP** runs on the lowest layer only, its reconstruction history
+  fed by a parallel first-layer-alone synthesis chain (pinned by a
+  history-isolation test). Both the 1024- and 960-line families.
+- **Transport**: the LATM/LOAS driver recognises AOT-6/20 layers,
+  collects each program's layer payloads per access unit and decodes
+  them combined through a persistent per-program `ScalableDecoder`
+  (`ScalableConfig::from_layer_ascs` validates the layer stack;
+  `dependsOnCoreCoder == 1` — a CELP core — and TwinVQ lower layers
+  are out of scope, `Error::ScalableUnsupportedCore`).
+- Single-layer scalable streams are pinned **bit-identical** to the
+  equivalent SCE / common-window CPE decodes; multi-layer stacks are
+  pinned against references composed from the crate's own
+  reconstruction primitives; every branch carries a deterministic
+  bit-flip / truncation battery (`tests/scalable_*.rs`).
+
+### Error protection (EP) tool — §1.8
+
+The MPEG-4 Audio unequal-error-protection layer, from the out-of-band
+configuration to the LOAS EP carrier (`ep_config` / `ep_fec` /
+`ep_rs` / `ep_frame`):
+
+- **`ErrorProtectionSpecificConfig()`** (Table 1.49) — parse +
+  bit-exact write with reserved-field rejection, the §1.8.4.2
+  `class_optional` expansion (pinned against the spec's own
+  Table 1.57/1.58 example), and ASC integration: `epConfig == 2 / 3`
+  now parse the inline config and the `directMapping` bit.
+- **SRCPC** (§1.8.4.6) — the rate-1/4 systematic recursive
+  convolutional encoder (Figure 1.10 equations), the Table 1.61
+  puncture family 8/8..8/32, §1.8.4.6.2 termination (the `u = d`
+  tail rule, proven identical to the whole Table 1.60 listing) and a
+  hard-decision 16-state Viterbi decoder correcting channel errors.
+- **In-band header FEC** (§1.8.4.3 Table 1.59) — majority, BCH(7,4),
+  BCH(15,7), Golay(23,12), BCH(31,16) with the normative generators
+  and bounded-distance correction; CRC4 + terminated SRCPC 8/16 for
+  17+ bits; the extended `header_protection` path.
+- **Shortened Reed-Solomon** (§1.8.4.7) — `SRS(255−l, 255−2k−l)`
+  over the spec's GF(2⁸) (`m(x) = x⁸+x⁴+x³+x²+1`; the generated
+  antilog table is pinned against Table 1.62 rows), the part split
+  with zero-padded last part, lowest-order-first parity, and the
+  syndrome / Berlekamp-Massey / Chien / Forney correction chain
+  (`k` byte errors per part corrected, `k+1` rejected).
+- **`ep_frame()`** (§1.8.2.2, `EpFrameCodec`) — the FEC-protected
+  `choice_of_pred` + `class_attrib()` header (in-band Table 1.55
+  rate / Table 1.56 CRC escapes, `num_stuffing_bits`), per-class
+  §1.8.4.5 CRC (the family now reaches down to CRC1) + SRCPC / SRS
+  protection, §1.8.4.4 RS chains, the "until the end" class-length
+  recovery (§1.8.4.1), §1.8.4.9 class-reordered transmission, and
+  the §1.8.4.8 recursive interleaver (`k = m·D + min(m, d) + n`;
+  bitwise for SRCPC, bytewise for RS) in modes 0 / 1 / 2 with the
+  per-class mode-2 `interleave_switch`. Encode ↔ decode round-trips
+  across the configuration matrix; errors are corrected through the
+  whole frame; a full bit-flip battery never panics. Two
+  under-specified corners (an escaped rate on an RS class; byte-wise
+  interleave over a non-octet-aligned Y stream) are rejected rather
+  than guessed.
+- **LOAS EP carrier** (§1.7) — the `EPAudioSyncStream()` BCH(36,18)
+  `headerParity` (§1.7.2.2.2 generator; generate + verify),
+  `EPMuxElement(1, 1)` (majority-protected `epUsePreviousMuxConfig`,
+  Golay-protected `epSpecificConfigLength`, Table 1.59-protected
+  inline config with threaded reuse), and
+  `LoasDecoder::decode_all_ep` — the recovered `ep_frame()` class
+  concatenation is the plain `AudioMuxElement()` bit stream
+  (§1.7.3.2.1: the sensitivity-category instances ride in syntax
+  order), so payloads (scalable programs included) ride the
+  existing decode paths. A writer-assembled EP stream decodes
+  **byte-identical** to its plain LOAS equivalent and survives
+  correctable channel errors.
+
 ### SSR gain control (§4.6.12) — complete decode pipeline
 
 The §4.6.12 SSR (Scalable Sample Rate, AOT 3) gain-control tool is
@@ -728,8 +833,9 @@ field sourced from the ISO/IEC 14496-3 §1.7 syntax tables.
 
 The runtime `Decoder` (`codec_decoder::AacDecoder`) auto-detects its
 carrier on the first packet and routes LOAS packets through `LoasDecoder`
-(see "Runtime `Decoder` registration" below). The `EPMuxElement()`
-EP-tool payload de-interleave is out of scope.
+(see "Runtime `Decoder` registration" below). The `EPMuxElement()` EP-tool
+payload de-interleave decodes via `LoasDecoder::decode_all_ep` (see
+the EP section below).
 
 ### Stream decode + PCM output
 
@@ -945,11 +1051,19 @@ EP-tool payload de-interleave is out of scope.
   frame family). AOT 17 is pinned bit-identical to the equivalent
   non-resilient decode of the same spectra (`aac-er-hcr-loas`);
   AOT 23 is pinned by the staged LD fixtures (see the frame-length
-  families section above). Still open: ER AAC LTP / scalable
-  (AOTs 19 / 20 — LTP state and scalable layering), the
-  `epConfig == 2/3` §4.5.2.4 physical-payload preprocessing, and an
-  encoder-produced HCR conformance stream as an external
-  cross-check.
+  families section above). **ER AAC scalable (AOT 20) now decodes end
+  to end** (see the scalable section above), and the §1.8 EP tool —
+  `ErrorProtectionSpecificConfig()`, SRCPC / RS / interleaving, the
+  `ep_frame()` codec and the LOAS `EPMuxElement` /
+  `EPAudioSyncStream` carrier — is implemented (see the EP section
+  above). Still open: ER AAC LTP (AOT 19 — the LTP state rules over
+  er_raw_data_block), the §4.5.2.4 Table 4.148/4.149 per-element
+  category *split* of the codec payloads themselves (reassembling an
+  er_raw_data_block whose bits arrive as separate
+  error-sensitivity-category instances under `epConfig == 1` /
+  `directMapping` — the ep_frame class concatenation covers the
+  in-order case), and an encoder-produced HCR conformance stream as
+  an external cross-check.
 - LATM/LOAS transport framing (§1.7) — the `StreamMuxConfig()`,
   `AudioMuxElement()`, `PayloadLengthInfo()`, `PayloadMux()`,
   `LatmGetValue()`, `AudioSyncStream()` and `EPAudioSyncStream()`
@@ -959,8 +1073,9 @@ EP-tool payload de-interleave is out of scope.
   module. The runtime `Decoder` LOAS entry point that routes the
   recovered `MuxPayload` raw-data-blocks into a `StreamDecoder` is now
   wired (`latm::LoasDecoder` + the `codec_decoder` carrier
-  auto-detection above). What remains is the `EPMuxElement()` EP-tool
-  payload de-interleave. (ADTS `adts_error_check()` CRC validation —
+  auto-detection above). The `EPMuxElement()` EP-tool payload
+  de-interleave is now implemented (`LoasDecoder::decode_all_ep`; see
+  the EP section above). (ADTS `adts_error_check()` CRC validation —
   the 192/128-bit region selection with the double-protection edge
   cases plus the ISO/IEC 11172-3 §2.4.3.1 code — landed in the
   dedicated `adts_crc` module; see the bitstream-parsing section.)

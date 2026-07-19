@@ -243,4 +243,76 @@ fn loas_two_layer_scalable_program() {
         assert_eq!(got.pcm, want.pcm, "frame {f}");
         assert!(got.pcm.iter().any(|&s| s != 0), "frame {f} silent");
     }
+
+    // Docs-corpus fixture: the deterministic two-layer scalable LOAS
+    // stream plus this crate's own decode.
+    let mut pcm = Vec::new();
+    for f in &frames {
+        pcm.extend_from_slice(&f.pcm);
+    }
+    stage_or_pin(
+        "aac-scalable-2layer-writer-loas",
+        "input.latm",
+        &loas,
+        &pcm,
+        2,
+        SAMPLE_RATE,
+    );
+}
+
+// ==================================================================
+// Docs-corpus staging (mirrors docs_family_fixtures.rs)
+// ==================================================================
+
+fn fixtures_root() -> std::path::PathBuf {
+    std::path::PathBuf::from("../../docs/audio/aac/fixtures")
+}
+
+fn stage_enabled() -> bool {
+    std::env::var_os("OXIDEAV_AAC_STAGE_FIXTURES").is_some()
+}
+
+fn wav_bytes(pcm: &[i16], channels: u16, sample_rate: u32) -> Vec<u8> {
+    let data_len = (pcm.len() * 2) as u32;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
+    let block_align = channels * 2;
+    let mut out = Vec::with_capacity(44 + pcm.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for &s in pcm {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+fn stage_or_pin(name: &str, input_name: &str, input: &[u8], pcm: &[i16], ch: u16, rate: u32) {
+    use std::fs;
+    let dir = fixtures_root().join(name);
+    let input_path = dir.join(input_name);
+    let wav_path = dir.join("expected.wav");
+    let wav = wav_bytes(pcm, ch, rate);
+    if stage_enabled() {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&input_path, input).unwrap();
+        fs::write(&wav_path, &wav).unwrap();
+        eprintln!("staged {}", dir.display());
+        return;
+    }
+    match (fs::read(&input_path), fs::read(&wav_path)) {
+        (Ok(staged_in), Ok(staged_wav)) => {
+            assert_eq!(staged_in, input, "{name}: staged {input_name} drifted");
+            assert_eq!(staged_wav, wav, "{name}: staged expected.wav drifted");
+        }
+        _ => eprintln!("skip: {} not staged yet", dir.display()),
+    }
 }

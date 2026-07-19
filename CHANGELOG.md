@@ -8,6 +8,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Scalable AAC** (AOT 6) and **ER AAC scalable** (AOT 20), AAC-only
+  combinations, end to end (`scalable`): the §4.4.2.2 Tables 4.13–4.18
+  `aac_scalable_main_element()` / `aac_scalable_extension_element()`
+  syntax (header-hoisted window/grouping, per-channel TNS + LTP on the
+  layers that carry them, the §4.6.8.1.4 incremental `ms_data()`, the
+  Table 4.18 `diff_control_data_lr()`), the Table 4.50
+  `scale_flag == 1` ICS form (`IcsBody::parse_scale` /
+  `write_scale`, with the AOT-20 §4.4.6 resilience branches — ER
+  section data, RVLC scalefactors, inline HCR spectra), and the
+  §4.5.2.2.4 SIAQ layer combination: per-band Table 4.91–4.93 tool
+  rules (PNS survival per §4.6.13.6, intensity M/L-channel
+  accumulation with positions from the highest layer, invalid
+  combinations surfaced), the §4.6.14.2.1 mono→stereo FSS
+  (`L/R += 2·M''` / `M = M'' + M'`, long and short windows),
+  cumulative-mask M/S, the §4.6.9.5 / Table 4.158 serial TNS layout,
+  §4.6.7.5 base-layer LTP with its own first-layer synthesis chain
+  for the reconstruction history, and both the 1024- and 960-line
+  families. `ScalableFrame` parses/re-emits the per-layer payloads
+  bit-exactly; `ScalableDecoder` holds the persistent per-program
+  state. The LATM/LOAS driver collects each program's layer payloads
+  per access unit and decodes them combined
+  (`LoasDecoder::push_scalable_payload`,
+  `ScalableConfig::from_layer_ascs`); single-layer scalable streams
+  are pinned bit-identical to the equivalent SCE / common-window CPE
+  decodes, and every new branch carries a deterministic corruption
+  battery.
+- the §1.8 **error-protection (EP) tool**: the Table 1.49
+  `ErrorProtectionSpecificConfig()` (parse + bit-exact write,
+  reserved-field rejection) with the §1.8.4.2 `class_optional`
+  expansion pinned against the spec's Table 1.57/1.58 example, and
+  the ASC now parsing the inline config + `directMapping` for
+  `epConfig == 2 / 3` (`ep_config`); the §1.8.4.6 SRCPC — Figure
+  1.10 encoder, Table 1.61 puncture family 8/8..8/32, §1.8.4.6.2
+  termination proven equal to the Table 1.60 listing, hard-decision
+  16-state Viterbi decoding — plus the Table 1.59 in-band-header
+  block codes (majority / BCH(7,4) / BCH(15,7) / Golay(23,12) /
+  BCH(31,16) / CRC4+SRCPC-8/16) with bounded-distance correction
+  (`ep_fec`), and the §1.8.4.7 shortened Reed-Solomon codes over the
+  spec's GF(2⁸) (antilog table pinned against Table 1.62; part
+  split, lowest-order-first parity, Berlekamp-Massey / Chien /
+  Forney correction) (`ep_rs`); the §1.8.2.2 `ep_frame()` codec
+  (`ep_frame::EpFrameCodec`) — FEC-protected `choice_of_pred` +
+  `class_attrib()`, per-class CRC + SRCPC/SRS, §1.8.4.4 RS chains,
+  until-the-end length recovery, §1.8.4.9 reordered transmission and
+  the §1.8.4.8 recursive interleaver in modes 0/1/2; and the LOAS EP
+  carrier — the §1.7.2.2.2 BCH(36,18) `EPAudioSyncStream()` header
+  parity, `EPMuxElement(1,1)` with threaded config reuse, and
+  `LoasDecoder::decode_all_ep` decoding a protected multiplex
+  byte-identical to its plain-LOAS equivalent while correcting
+  channel errors. §1.8.4.5 gains the CRC1/CRC2/CRC3 generators.
+
 - the §4.5.1.1 **frame-length families**, end to end: the 960/120-line
   AAC-LC family (`frameLengthFlag == 1` — the bracketed "values for
   1920/240" columns of Tables 4.129–4.141, the 1920/240-point
