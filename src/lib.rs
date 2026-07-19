@@ -563,6 +563,15 @@ pub mod scalable;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ep_config;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod ep_fec;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod ep_rs;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod ep_frame;
 #[doc(hidden)]
 pub mod scale_factor_data;
 // internal — exposed for tests/fuzz; not part of the stable API
