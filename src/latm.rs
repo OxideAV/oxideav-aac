@@ -830,6 +830,182 @@ impl EpAudioSyncHeader {
     }
 }
 
+/// Generator polynomial of the `EPAudioSyncStream()` `headerParity`
+/// BCH(36,18) code (§1.7.2.2.2):
+/// x¹⁸+x¹⁷+x¹⁶+x¹⁵+x⁹+x⁷+x⁶+x³+x²+x+1, stored without the leading
+/// x¹⁸ term.
+const EP_SYNC_BCH_GEN: u32 = (1 << 17)
+    | (1 << 16)
+    | (1 << 15)
+    | (1 << 9)
+    | (1 << 7)
+    | (1 << 6)
+    | (1 << 3)
+    | (1 << 2)
+    | (1 << 1)
+    | 1;
+
+/// Compute the §1.7.2.2.2 `headerParity` — the 18 parity bits of the
+/// shortened BCH(36,18) over `audioMuxLengthBytes` (13 bits) followed
+/// by `frameCounter` (5 bits), `R(x)` of `M(x)·x¹⁸ mod G(x)` per
+/// §1.8.4.3.
+pub fn ep_sync_header_parity(audio_mux_length_bytes: u16, frame_counter: u8) -> u32 {
+    let msg: u32 =
+        (u32::from(audio_mux_length_bytes & 0x1FFF) << 5) | u32::from(frame_counter & 0x1F);
+    let mut reg: u32 = 0;
+    let top = 1u32 << 17;
+    let feed = |reg: &mut u32, bit: bool| {
+        let high = *reg & top != 0;
+        *reg = (*reg << 1) & 0x3FFFF;
+        if high {
+            *reg ^= EP_SYNC_BCH_GEN;
+        }
+        if bit {
+            *reg ^= 1;
+        }
+    };
+    for i in (0..18).rev() {
+        feed(&mut reg, msg & (1 << i) != 0);
+    }
+    for _ in 0..18 {
+        let high = reg & top != 0;
+        reg = (reg << 1) & 0x3FFFF;
+        if high {
+            reg ^= EP_SYNC_BCH_GEN;
+        }
+    }
+    reg
+}
+
+impl EpAudioSyncHeader {
+    /// Verify the §1.7.2.2.2 BCH(36,18) `headerParity` against the
+    /// received `audioMuxLengthBytes` / `frameCounter`.
+    pub fn parity_ok(&self) -> bool {
+        ep_sync_header_parity(self.audio_mux_length_bytes, self.frame_counter) == self.header_parity
+    }
+}
+
+/// Threaded cross-frame state of an `EPMuxElement()` stream: the
+/// active EP-tool configuration and the previous `StreamMuxConfig`.
+#[derive(Debug, Default)]
+pub struct EpMuxState {
+    /// The active `ErrorProtectionSpecificConfig()` (threaded across
+    /// `epUsePreviousMuxConfig == 1` elements).
+    pub ep_config: Option<crate::ep_config::ErrorProtectionSpecificConfig>,
+    /// The previous `StreamMuxConfig` for `useSameStreamMux`.
+    pub prev_config: Option<StreamMuxConfig>,
+}
+
+/// A decoded `EPMuxElement(1, 1)` (§1.7.3.1 Table 1.40): the EP-tool
+/// configuration in force plus the recovered (error-corrected)
+/// `AudioMuxElement()`.
+#[derive(Debug)]
+pub struct EpMuxElement {
+    /// `epUsePreviousMuxConfig` (majority-decoded).
+    pub use_previous_mux_config: bool,
+    /// The recovered inner `AudioMuxElement()`.
+    pub element: AudioMuxElement,
+}
+
+impl EpMuxElement {
+    /// Parse an `EPMuxElement(epDataPresent = 1, muxConfigPresent = 1)`
+    /// from `data` (the whole element, byte-aligned), threading
+    /// `state` across elements.
+    ///
+    /// Layout per Table 1.40: `epUsePreviousMuxConfig` + its 2-bit
+    /// repetition parity (majority decides, §1.7.3.2.1); when clear,
+    /// the 10-bit `epSpecificConfigLength` protected by the Table 1.59
+    /// Golay(23,12) 11-bit parity, then
+    /// `ErrorProtectionSpecificConfig()` + its Table 1.59 parity;
+    /// `ByteAlign()`; then `EPAudioMuxElement(1)` — the EP-tool
+    /// `ep_frame()` whose decoded class concatenation is the plain
+    /// `AudioMuxElement(1)` bit stream (the §1.7.3.2.1 sensitivity
+    /// category instances ride in syntax order).
+    pub fn parse(data: &[u8], state: &mut EpMuxState) -> Result<Self> {
+        let mut reader = BitReader::new(data);
+        // epUsePreviousMuxConfig + 2-bit repetition parity.
+        let b0 = read_bit(&mut reader)?;
+        let b1 = read_bit(&mut reader)?;
+        let b2 = read_bit(&mut reader)?;
+        let use_prev = (u8::from(b0) + u8::from(b1) + u8::from(b2)) >= 2;
+        if !use_prev {
+            // epSpecificConfigLength (10) + Golay parity (11).
+            let mut len_bits_field = [false; 10];
+            for b in len_bits_field.iter_mut() {
+                *b = read_bit(&mut reader)?;
+            }
+            let mut parity = [false; 11];
+            for b in parity.iter_mut() {
+                *b = read_bit(&mut reader)?;
+            }
+            let corrected = crate::ep_fec::header_fec_decode(&len_bits_field, &parity)?;
+            let mut cfg_len = 0usize;
+            for &b in &corrected {
+                cfg_len = (cfg_len << 1) | usize::from(b);
+            }
+            // ErrorProtectionSpecificConfig() (self-terminating) +
+            // Table 1.59 parity over its bits.
+            let cfg_start = reader.bit_position();
+            let epsc = crate::ep_config::ErrorProtectionSpecificConfig::parse(&mut reader)?;
+            let consumed = (reader.bit_position() - cfg_start) as usize;
+            // `epSpecificConfigLength` indicates the size of the
+            // config; validate in bits (with a byte-unit fallback —
+            // the staged text does not name the unit).
+            if cfg_len != consumed && cfg_len != consumed.div_ceil(8) {
+                return Err(Error::EpFrameInvalid);
+            }
+            let cfg_bits = read_back_bits(data, cfg_start, cfg_start + consumed as u64)?;
+            let parity_len = crate::ep_fec::HeaderFec::for_len(consumed)?.parity_bits(consumed)?;
+            let mut cfg_parity = Vec::with_capacity(parity_len);
+            for _ in 0..parity_len {
+                cfg_parity.push(read_bit(&mut reader)?);
+            }
+            let corrected_cfg = crate::ep_fec::header_fec_decode(&cfg_bits, &cfg_parity)?;
+            if corrected_cfg != cfg_bits {
+                // The FEC corrected config bits: re-parse from the
+                // corrected sequence.
+                let mut bytes = vec![0u8; corrected_cfg.len().div_ceil(8)];
+                for (i, &b) in corrected_cfg.iter().enumerate() {
+                    if b {
+                        bytes[i / 8] |= 0x80 >> (i % 8);
+                    }
+                }
+                let mut r2 = BitReader::new(&bytes);
+                state.ep_config = Some(crate::ep_config::ErrorProtectionSpecificConfig::parse(
+                    &mut r2,
+                )?);
+            } else {
+                state.ep_config = Some(epsc);
+            }
+        }
+        // ByteAlign().
+        reader.align_to_byte();
+        let epsc = state.ep_config.clone().ok_or(Error::EpFrameInvalid)?;
+        let codec = crate::ep_frame::EpFrameCodec::new(epsc)?;
+        let body = crate::ep_frame::read_remaining_bytes(&mut reader, data.len())?;
+        let frame = codec.decode(&body)?;
+        // The class concatenation is the AudioMuxElement(1) bits.
+        let mut au_bits: Vec<bool> = Vec::new();
+        for c in &frame.classes {
+            au_bits.extend_from_slice(c);
+        }
+        let mut au_bytes = vec![0u8; au_bits.len().div_ceil(8)];
+        for (i, &b) in au_bits.iter().enumerate() {
+            if b {
+                au_bytes[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        let mut au_reader = BitReader::new(&au_bytes);
+        let element =
+            AudioMuxElement::parse(&mut au_reader, &au_bytes, true, state.prev_config.as_ref())?;
+        state.prev_config = Some(element.config.clone());
+        Ok(EpMuxElement {
+            use_previous_mux_config: use_prev,
+            element,
+        })
+    }
+}
+
 // ---- bit helpers -----------------------------------------------------
 
 fn read_u8(reader: &mut BitReader<'_>, n: u32) -> Result<u8> {
@@ -1042,6 +1218,47 @@ impl LoasDecoder {
         let dec = self.scalable.get_mut(&prog).expect("just inserted");
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         dec.decode_frame(&refs).map(Some)
+    }
+
+    /// Decode a whole `EPAudioSyncStream()` byte buffer (§1.7.2.1
+    /// Table 1.37) to per-access-unit PCM frames: every `0x4DE1` sync
+    /// frame's BCH(36,18)-verified header is walked, its
+    /// `EPMuxElement(1, 1)` is EP-decoded ([`EpMuxElement::parse`] —
+    /// FEC-corrected, CRC-checked, de-interleaved) and the recovered
+    /// `AudioMuxElement()` payloads decode exactly as on the plain
+    /// LOAS path (scalable programs included).
+    pub fn decode_all_ep(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
+        let mut out = Vec::new();
+        let mut ep_state = EpMuxState::default();
+        let mut pos = 0usize;
+        while let Some(header) = EpAudioSyncHeader::parse(data, pos)? {
+            if !header.parity_ok() {
+                return Err(Error::EpFrameInvalid);
+            }
+            let body_end = header
+                .body_offset
+                .checked_add(usize::from(header.audio_mux_length_bytes))
+                .ok_or(Error::UnexpectedEnd)?;
+            if body_end > data.len() {
+                return Err(Error::UnexpectedEnd);
+            }
+            let mux = EpMuxElement::parse(&data[header.body_offset..body_end], &mut ep_state)?;
+            for payload in &mux.element.payloads {
+                let config = &mux.element.config;
+                let layer = config
+                    .layer(payload.stream_id)
+                    .ok_or(Error::LatmConfigOutOfRange)?;
+                if layer.effective_asc.aot == 6 || layer.effective_asc.aot == 20 {
+                    if let Some(decoded) = self.push_scalable_payload(config, payload)? {
+                        out.push(decoded);
+                    }
+                    continue;
+                }
+                out.push(self.decode_payload(config, payload)?);
+            }
+            pos = body_end;
+        }
+        Ok(out)
     }
 
     /// Decode one recovered [`MuxPayload`] to PCM, routing it to the
