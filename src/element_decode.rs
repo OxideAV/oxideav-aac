@@ -168,7 +168,7 @@ where
 
 /// Band-indexed `is_pos[g][sfb]` (§4.6.8.1.4), default `0` on
 /// non-intensity bands.
-fn is_pos_table(
+pub(crate) fn is_pos_table(
     abs: &AbsoluteScaleFactors,
     sfb_cb: &[Vec<u8>],
     max_sfb: usize,
@@ -181,7 +181,7 @@ fn is_pos_table(
 
 /// Band-indexed `noise_nrg[g][sfb]` (§4.6.13.3), default `0` on
 /// non-noise bands.
-fn noise_nrg_table(
+pub(crate) fn noise_nrg_table(
     abs: &AbsoluteScaleFactors,
     sfb_cb: &[Vec<u8>],
     max_sfb: usize,

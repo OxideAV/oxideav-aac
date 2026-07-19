@@ -284,6 +284,30 @@ pub enum Error {
     /// [`crate::asc::AudioSpecificConfig::ep_config`].
     UnsupportedEpConfig(u8),
 
+    /// A scalable-AAC (§4.4.2.2 / §4.5.2.2) layer configuration or
+    /// per-layer payload violates a normative shape: an empty or
+    /// over-long layer list (one main + at most 7 extension layers,
+    /// §4.5.2.2.4), a mono layer following a stereo layer
+    /// (Table 4.87), a payload count that does not match the
+    /// configured layer count, a reserved `ms_mask_present == 3`
+    /// (§4.6.8.1.2), an LD frame family (the scalable object types
+    /// are defined over the 1024/960-line families only), or a
+    /// per-layer element that overruns its payload.
+    ScalableInvalid,
+
+    /// The scalable configuration signals a non-AAC lower layer —
+    /// `dependsOnCoreCoder == 1` (a CELP core, §4.5.2.2.5) or a
+    /// TwinVQ layer (§4.5.2.2.6). This crate decodes the AAC-only
+    /// scalable combinations (§4.5.2.2.4); the CELP / TwinVQ
+    /// base-layer codecs belong to other subparts.
+    ScalableUnsupportedCore,
+
+    /// An invalid per-band tool combination between two scalable
+    /// layers per Tables 4.91–4.93 (e.g. a plain-coded band followed
+    /// by a PNS band in the next layer, or an intensity band on top
+    /// of a plain-coded stereo band).
+    ScalableLayerCombination,
+
     /// `extensionFlag3` was set to `1` inside the `GASpecificConfig`
     /// `extensionFlag` body (Table 4.1). ISO/IEC 14496-3:2009 reserves
     /// the body behind this flag with the comment "tbd in version 3";
@@ -875,6 +899,24 @@ impl core::fmt::Display for Error {
                     f,
                     "AudioSpecificConfig epConfig {} requires ErrorProtectionSpecificConfig parsing (Phase 1 supports only epConfig 0 and 1)",
                     value
+                )
+            }
+            Error::ScalableInvalid => {
+                write!(
+                    f,
+                    "scalable AAC: layer configuration or per-layer payload violates the §4.4.2.2 / §4.5.2.2 shape"
+                )
+            }
+            Error::ScalableUnsupportedCore => {
+                write!(
+                    f,
+                    "scalable AAC: CELP core / TwinVQ lower layers are out of scope (AAC-only combinations per §4.5.2.2.4)"
+                )
+            }
+            Error::ScalableLayerCombination => {
+                write!(
+                    f,
+                    "scalable AAC: invalid per-band tool combination between layers (Tables 4.91-4.93)"
                 )
             }
             Error::UnsupportedAscExtensionFlag3 => {

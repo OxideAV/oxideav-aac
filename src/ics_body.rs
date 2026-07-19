@@ -527,6 +527,123 @@ impl IcsBody {
         })
     }
 
+    /// Parse a Table 4.50 body with `scale_flag == 1` — the
+    /// `individual_channel_stream(1, 1)` form the scalable payloads
+    /// (Tables 4.13 / 4.14, AOTs 6 / 20) embed.
+    ///
+    /// Per Table 4.50 the scale-flag form reads neither `ics_info()`
+    /// (the window geometry lives in the `aac_scalable_main_header()`)
+    /// nor the pulse / TNS / gain-control dispatch trio (TNS rides in
+    /// the scalable headers; pulse and SSR gain control do not exist
+    /// in the scalable object types): the body is `global_gain` →
+    /// `section_data()` → `scale_factor_data()` → the spectral branch.
+    ///
+    /// * `ics_info` — the per-layer geometry (the header-transmitted
+    ///   `window_sequence` / `window_shape` / grouping with **this
+    ///   layer's** `max_sfb`).
+    /// * `resilience` — the ASC triplet for AOT 20 (ER AAC scalable);
+    ///   pass `AacResilienceFlags::default()` for AOT 6. The branches
+    ///   behave exactly as in [`IcsBody::parse_er`]: 5-bit `sect_cb`
+    ///   `section_data()`, RVLC `scale_factor_data()`, and the HCR
+    ///   length fields in place of `spectral_data()`.
+    ///
+    /// The trailing `spectral_data()` / `reordered_spectral_data()` is
+    /// the caller's responsibility, as on every other parse path.
+    pub fn parse_scale(
+        reader: &mut BitReader<'_>,
+        ics_info: &IcsInfo,
+        resilience: AacResilienceFlags,
+    ) -> Result<Self> {
+        let start = reader.bit_position();
+        let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
+        let section_data = if resilience.section_data {
+            SectionData::parse_er(
+                reader,
+                ics_info.window_sequence,
+                ics_info.num_window_groups,
+                ics_info.max_sfb,
+            )?
+        } else {
+            SectionData::parse(
+                reader,
+                ics_info.window_sequence,
+                ics_info.num_window_groups,
+                ics_info.max_sfb,
+            )?
+        };
+        let (scale_factor_data, er_scale_factor_data) = if resilience.scalefactor_data {
+            let er =
+                ErScaleFactorData::parse(reader, &section_data.sfb_cb, ics_info.window_sequence)?;
+            (er.data.clone(), Some(er))
+        } else {
+            (ScaleFactorData::parse(reader, &section_data.sfb_cb)?, None)
+        };
+        // Table 4.50: `if (!scale_flag) { pulse/tns/gain dispatch }` —
+        // all three tools are skipped on the scale-flag form.
+        let reordered_spectral_lengths = if resilience.spectral_data {
+            let len_reordered = reader.read_u32(14).map_err(|_| Error::UnexpectedEnd)? as u16;
+            let len_longest = reader.read_u32(6).map_err(|_| Error::UnexpectedEnd)? as u8;
+            Some((len_reordered, len_longest))
+        } else {
+            None
+        };
+        let spectral_data_bit_offset = reader.bit_position() - start;
+        Ok(IcsBody {
+            global_gain,
+            ics_info: None,
+            section_data,
+            scale_factor_data,
+            pulse_data_present: false,
+            pulse_data: None,
+            tns_data_present: false,
+            tns_data: None,
+            gain_control_data_present: false,
+            gain_control_data: None,
+            spectral_data_bit_offset,
+            er_scale_factor_data,
+            reordered_spectral_lengths,
+        })
+    }
+
+    /// Write a Table 4.50 `scale_flag == 1` body — the inverse of
+    /// [`IcsBody::parse_scale`], emitting `global_gain` →
+    /// `section_data()` → `scale_factor_data()` (→ the HCR length
+    /// fields when `resilience.spectral_data` is set). The trailing
+    /// spectrum block is the caller's responsibility.
+    pub fn write_scale(
+        &self,
+        writer: &mut BitWriter,
+        ics_info: &IcsInfo,
+        resilience: AacResilienceFlags,
+    ) -> Result<()> {
+        writer.write_u32(u32::from(self.global_gain), GLOBAL_GAIN_BITS);
+        if resilience.section_data {
+            self.section_data
+                .write_er(writer, ics_info.window_sequence, ics_info.max_sfb)?;
+        } else {
+            self.section_data
+                .write(writer, ics_info.window_sequence, ics_info.max_sfb)?;
+        }
+        if resilience.scalefactor_data {
+            let er = self
+                .er_scale_factor_data
+                .as_ref()
+                .ok_or(Error::ElementDecodeInvalid)?;
+            er.write(writer, &self.section_data.sfb_cb, ics_info.window_sequence)?;
+        } else {
+            self.scale_factor_data
+                .write(writer, &self.section_data.sfb_cb)?;
+        }
+        if resilience.spectral_data {
+            let (len_reordered, len_longest) = self
+                .reordered_spectral_lengths
+                .ok_or(Error::ElementDecodeInvalid)?;
+            writer.write_u32(u32::from(len_reordered), 14);
+            writer.write_u32(u32::from(len_longest), 6);
+        }
+        Ok(())
+    }
+
     /// Write a Table 4.50 body whose `ics_info()` is inline.
     ///
     /// Mirrors [`IcsBody::parse`] — emits `global_gain`, `ics_info()`,
