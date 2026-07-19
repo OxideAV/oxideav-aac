@@ -909,6 +909,13 @@ pub struct LoasDecoder {
     /// One [`StreamDecoder`] per `streamID`, so each multiplexed stream's
     /// inter-frame state stays independent.
     streams: HashMap<u8, StreamDecoder>,
+    /// One §4.5.2.2 [`crate::scalable::ScalableDecoder`] per *program*
+    /// for the scalable object types (AOTs 6 / 20), whose layers ride
+    /// separate `streamID`s but decode to one combined output.
+    scalable: HashMap<u8, crate::scalable::ScalableDecoder>,
+    /// Per-program buffer collecting the current subframe's scalable
+    /// layer payloads (in layer order) until the stack is complete.
+    scalable_pending: HashMap<u8, Vec<Vec<u8>>>,
     /// Caller-forced §4.6.18.4.3 downsampled SBR output (see
     /// [`Self::set_sbr_downsampled`]); an explicitly signalled ASC
     /// whose extension sampling frequency equals the core rate selects
@@ -958,11 +965,83 @@ impl LoasDecoder {
         let mut walker = AudioSyncStream::new(data);
         while let Some(frame) = walker.next_frame()? {
             for payload in &frame.element.payloads {
-                let decoded = self.decode_payload(&frame.element.config, payload)?;
+                // A scalable (AOT 6 / 20) layer joins its program's
+                // pending stack; the stack decodes as one combined
+                // access unit when the last layer arrives (§4.5.2.2:
+                // one elementary stream per layer, one output).
+                let config = &frame.element.config;
+                let layer = config
+                    .layer(payload.stream_id)
+                    .ok_or(Error::LatmConfigOutOfRange)?;
+                if layer.effective_asc.aot == 6 || layer.effective_asc.aot == 20 {
+                    if let Some(decoded) = self.push_scalable_payload(config, payload)? {
+                        out.push(decoded);
+                    }
+                    continue;
+                }
+                let decoded = self.decode_payload(config, payload)?;
                 out.push(decoded);
             }
         }
         Ok(out)
+    }
+
+    /// Feed one scalable-program layer payload; returns the combined
+    /// [`DecodedFrame`] when the payload completes the program's layer
+    /// stack for the current access unit, `None` while the stack is
+    /// still filling.
+    ///
+    /// Layers must arrive in layer order within each access unit
+    /// (which is how `AudioMuxElement()` multiplexes them under
+    /// `allStreamsSameTimeFraming`); an out-of-order layer surfaces
+    /// [`Error::ScalableInvalid`].
+    pub fn push_scalable_payload(
+        &mut self,
+        config: &StreamMuxConfig,
+        payload: &MuxPayload,
+    ) -> Result<Option<DecodedFrame>> {
+        let layer = config
+            .layer(payload.stream_id)
+            .ok_or(Error::LatmConfigOutOfRange)?;
+        let prog = layer.prog;
+        let n_layers = usize::from(
+            *config
+                .num_layer
+                .get(usize::from(prog))
+                .ok_or(Error::LatmConfigOutOfRange)?,
+        ) + 1;
+        let pending = self.scalable_pending.entry(prog).or_default();
+        if usize::from(layer.lay) != pending.len() {
+            self.scalable_pending.remove(&prog);
+            return Err(Error::ScalableInvalid);
+        }
+        pending.push(payload.data.clone());
+        if pending.len() < n_layers {
+            return Ok(None);
+        }
+        let payloads = self.scalable_pending.remove(&prog).unwrap_or_default();
+
+        // Resolve the program's ScalableConfig from the layer ASCs.
+        let mut ascs: Vec<&crate::asc::AudioSpecificConfig> = Vec::with_capacity(n_layers);
+        for lay in 0..n_layers {
+            let sid = config
+                .stream_id(prog, lay as u8)
+                .ok_or(Error::LatmConfigOutOfRange)?;
+            let lc = config.layer(sid).ok_or(Error::LatmConfigOutOfRange)?;
+            ascs.push(&lc.effective_asc);
+        }
+        let cfg = crate::scalable::ScalableConfig::from_layer_ascs(&ascs)?;
+        // Reuse the persistent decoder while the configuration holds;
+        // a mid-stream StreamMuxConfig change rebuilds it (the
+        // overlap/LTP state is geometry-shaped).
+        let rebuild = !matches!(self.scalable.get(&prog), Some(d) if d.config() == &cfg);
+        if rebuild {
+            self.scalable
+                .insert(prog, crate::scalable::ScalableDecoder::new(cfg)?);
+        }
+        let dec = self.scalable.get_mut(&prog).expect("just inserted");
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        dec.decode_frame(&refs).map(Some)
     }
 
     /// Decode one recovered [`MuxPayload`] to PCM, routing it to the
@@ -977,6 +1056,21 @@ impl LoasDecoder {
             .layer(payload.stream_id)
             .ok_or(Error::LatmConfigOutOfRange)?;
         let asc = &layer.effective_asc;
+        // The scalable object types decode per *program*, not per
+        // stream: route through the layer-stack collector. While a
+        // multi-layer stack is still filling, an empty frame (0
+        // channels) is returned — [`Self::decode_all`] instead calls
+        // [`Self::push_scalable_payload`] directly and skips these.
+        if asc.aot == 6 || asc.aot == 20 {
+            let sample_rate = asc.sample_rate;
+            return Ok(self
+                .push_scalable_payload(config, payload)?
+                .unwrap_or(DecodedFrame {
+                    pcm: Vec::new(),
+                    channels: 0,
+                    sample_rate,
+                }));
+        }
         // An SBR-signalling ASC (explicit AOT 5 wrapper or the implicit
         // trailing probe) needs no pre-rejection: the shared
         // `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`

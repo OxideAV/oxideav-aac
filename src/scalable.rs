@@ -160,6 +160,65 @@ impl ScalableConfig {
         self.mono_layer_flag() && self.first_stereo_layer() == Some(lay)
     }
 
+    /// Build a [`ScalableConfig`] from the per-layer
+    /// `AudioSpecificConfig`s of a LATM program (§1.7.3: one layer per
+    /// `streamID[prog][lay]`, in layer order).
+    ///
+    /// Shape rules enforced here: every layer carries the same
+    /// scalable AOT (6 / 20), the same `samplingFrequencyIndex` and
+    /// the same `frameLengthFlag`; each `channelConfiguration` is 1
+    /// (mono) or 2 (stereo); a `dependsOnCoreCoder == 1` layer (CELP
+    /// core, §4.5.2.2.5) is rejected with
+    /// [`Error::ScalableUnsupportedCore`]; the AOT-20 resilience
+    /// triplet comes from the first layer and must match on every
+    /// layer.
+    pub fn from_layer_ascs(ascs: &[&crate::asc::AudioSpecificConfig]) -> Result<Self> {
+        let first = ascs.first().ok_or(Error::ScalableInvalid)?;
+        if first.aot != 6 && first.aot != 20 {
+            return Err(Error::ScalableInvalid);
+        }
+        let family = FrameFamily::from_aot_and_flag(
+            first.aot,
+            first.ga_body.frame_length == crate::asc::FrameLength::Long960,
+        );
+        let resilience = |asc: &crate::asc::AudioSpecificConfig| {
+            asc.ga_body
+                .extension_body
+                .as_ref()
+                .and_then(|ext| ext.resilience)
+                .unwrap_or_default()
+        };
+        let res0 = resilience(first);
+        let mut layer_stereo = Vec::with_capacity(ascs.len());
+        for asc in ascs {
+            if asc.aot != first.aot
+                || asc.sampling_frequency_index != first.sampling_frequency_index
+                || asc.ga_body.frame_length != first.ga_body.frame_length
+                || resilience(asc) != res0
+            {
+                return Err(Error::ScalableInvalid);
+            }
+            if asc.ga_body.depends_on_core_coder {
+                return Err(Error::ScalableUnsupportedCore);
+            }
+            layer_stereo.push(match asc.channel_configuration {
+                1 => false,
+                2 => true,
+                _ => return Err(Error::ScalableInvalid),
+            });
+        }
+        let cfg = ScalableConfig {
+            aot: first.aot,
+            fs_index: first.sampling_frequency_index,
+            sample_rate: first.sample_rate,
+            family,
+            resilience: res0,
+            layer_stereo,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     /// Number of output channels (2 iff any layer is stereo).
     pub fn output_channels(&self) -> usize {
         if self.layer_stereo.iter().any(|&s| s) {
