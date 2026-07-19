@@ -284,6 +284,22 @@ pub enum Error {
     /// [`crate::asc::AudioSpecificConfig::ep_config`].
     UnsupportedEpConfig(u8),
 
+    /// An `ErrorProtectionSpecificConfig()` (§1.8.2.1 Table 1.49)
+    /// carries a reserved or inconsistent field: `interleave_type ==
+    /// 3`, `number_of_concatenated_frame == 0` (Table 1.54), `fec_type
+    /// == 3`, an SRCPC `class_rate > 24`, a `class_crclen > 18`, a
+    /// width-28 intraclass `interleave_switch` on an RS class
+    /// (Table 1.64), or a `class_output_order` that is not a
+    /// permutation.
+    EpConfigInvalid,
+
+    /// An EP-tool frame (`ep_frame()`, §1.8.2.2) violates its
+    /// configuration: a `choice_of_pred` beyond the expanded set
+    /// list, a class overrunning the frame, a failed class CRC, an
+    /// uncorrectable FEC codeword, or a malformed EPMuxElement /
+    /// EPAudioSyncStream carrier.
+    EpFrameInvalid,
+
     /// A scalable-AAC (§4.4.2.2 / §4.5.2.2) layer configuration or
     /// per-layer payload violates a normative shape: an empty or
     /// over-long layer list (one main + at most 7 extension layers,
@@ -899,6 +915,18 @@ impl core::fmt::Display for Error {
                     f,
                     "AudioSpecificConfig epConfig {} requires ErrorProtectionSpecificConfig parsing (Phase 1 supports only epConfig 0 and 1)",
                     value
+                )
+            }
+            Error::EpConfigInvalid => {
+                write!(
+                    f,
+                    "ErrorProtectionSpecificConfig: reserved or inconsistent field (Table 1.49 / 1.54 / 1.64)"
+                )
+            }
+            Error::EpFrameInvalid => {
+                write!(
+                    f,
+                    "EP-tool frame violates its configuration (ep_frame() vs ErrorProtectionSpecificConfig)"
                 )
             }
             Error::ScalableInvalid => {

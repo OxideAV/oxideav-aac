@@ -335,6 +335,15 @@ pub struct AudioSpecificConfig {
     /// does **not** parse that body and surfaces
     /// [`Error::UnsupportedEpConfig`] at the call site.
     pub ep_config: Option<u8>,
+
+    /// The parsed `ErrorProtectionSpecificConfig()` (§1.8.2.1
+    /// Table 1.49) when `epConfig == 2 || epConfig == 3`.
+    pub error_protection: Option<crate::ep_config::ErrorProtectionSpecificConfig>,
+
+    /// `directMapping` (1 bit, Table 1.15) when `epConfig == 3`: the
+    /// §1.8.1 EP-class ↔ error-sensitivity-category-instance mapping
+    /// selector.
+    pub direct_mapping: Option<bool>,
     /// Result of the Table 1.15 trailing `syncExtensionType == 0x2b7`
     /// implicit-SBR probe (§1.6.5). Only ever populated when the
     /// outer `audioObjectType` is not the explicit SBR (5) or PS
@@ -493,10 +502,20 @@ impl AudioSpecificConfig {
         // for ER object types. `epConfig == 2 || epConfig == 3`
         // triggers the `ErrorProtectionSpecificConfig()` body which
         // Phase 1 does not parse.
+        let mut error_protection = None;
+        let mut direct_mapping = None;
         let ep_config = if EP_CONFIG_AOTS.contains(&effective_aot) {
             let v = read_u8(reader, 2)?;
+            // Table 1.15: epConfig 2 / 3 carry the inline
+            // ErrorProtectionSpecificConfig(); epConfig 3 additionally
+            // signals the §1.8.1 directMapping selector.
             if v == 2 || v == 3 {
-                return Err(Error::UnsupportedEpConfig(v));
+                error_protection = Some(crate::ep_config::ErrorProtectionSpecificConfig::parse(
+                    reader,
+                )?);
+            }
+            if v == 3 {
+                direct_mapping = Some(read_bit(reader)?);
             }
             Some(v)
         } else {
@@ -516,6 +535,8 @@ impl AudioSpecificConfig {
             extension_channel_configuration: ext_chan_cfg,
             ga_body,
             ep_config,
+            error_protection,
+            direct_mapping,
             trailing_sbr_probe: None,
         })
     }

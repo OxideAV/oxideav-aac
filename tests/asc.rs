@@ -341,22 +341,72 @@ fn er_aac_lc_ep_config_one_is_accepted() {
     assert_eq!(asc.ep_config, Some(1));
 }
 
-#[test]
-fn er_aac_lc_ep_config_two_is_rejected() {
-    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 2);
-    assert_eq!(
-        AudioSpecificConfig::parse(&buf),
-        Err(Error::UnsupportedEpConfig(2))
-    );
+/// Append a minimal one-set / one-class `ErrorProtectionSpecificConfig()`
+/// (Table 1.49) to an ASC prefix under construction.
+fn build_er_asc_with_epsc(ep_config: u32) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+    bw.write_u32(17, 5); // outer AOT = ER AAC LC
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_bit(false); // frameLengthFlag
+    bw.write_bit(false); // dependsOnCoreCoder
+    bw.write_bit(true); // extensionFlag
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false);
+    bw.write_bit(false); // extensionFlag3
+    bw.write_u32(ep_config, 2);
+    // ErrorProtectionSpecificConfig():
+    bw.write_u32(1, 8); // number_of_predefined_set
+    bw.write_u32(0, 2); // interleave_type
+    bw.write_u32(0, 3); // bit_stuffing
+    bw.write_u32(1, 3); // number_of_concatenated_frame
+    bw.write_u32(1, 6); // number_of_class
+    bw.write_bit(false); // length_escape
+    bw.write_bit(false); // rate_escape
+    bw.write_bit(false); // crclen_escape
+    bw.write_u32(0, 2); // fec_type = SRCPC
+    bw.write_bit(true); // termination_switch
+    bw.write_bit(false); // class_optional
+    bw.write_u32(96, 16); // class_length
+    bw.write_u32(0, 5); // class_rate (8/8)
+    bw.write_u32(6, 5); // class_crclen (CRC6)
+    bw.write_bit(false); // class_reordered_output
+    bw.write_bit(false); // header_protection
+    if ep_config == 3 {
+        bw.write_bit(true); // directMapping
+    }
+    bw.finish()
 }
 
 #[test]
-fn er_aac_lc_ep_config_three_is_rejected() {
-    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 3);
-    assert_eq!(
-        AudioSpecificConfig::parse(&buf),
-        Err(Error::UnsupportedEpConfig(3))
-    );
+fn er_aac_lc_ep_config_two_parses_error_protection() {
+    let buf = build_er_asc_with_epsc(2);
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(asc.ep_config, Some(2));
+    let ep = asc.error_protection.as_ref().unwrap();
+    assert_eq!(ep.sets.len(), 1);
+    assert_eq!(ep.sets[0].classes.len(), 1);
+    assert_eq!(ep.sets[0].classes[0].class_length, Some(96));
+    assert_eq!(ep.sets[0].classes[0].class_crclen, Some(6));
+    assert_eq!(asc.direct_mapping, None);
+}
+
+#[test]
+fn er_aac_lc_ep_config_three_parses_direct_mapping() {
+    let buf = build_er_asc_with_epsc(3);
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(asc.ep_config, Some(3));
+    assert!(asc.error_protection.is_some());
+    assert_eq!(asc.direct_mapping, Some(true));
+}
+
+#[test]
+fn er_aac_lc_ep_config_two_truncated_body_is_rejected() {
+    // The old 2-bit-only tail (no ErrorProtectionSpecificConfig body)
+    // is now a truncated stream.
+    let buf = build_er_aac_lc_asc(4, 2, false, false, false, 2);
+    assert!(AudioSpecificConfig::parse(&buf).is_err());
 }
 
 #[test]

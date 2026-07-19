@@ -73,6 +73,12 @@
 /// conventional for a shift-register CRC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrcPoly {
+    /// 1-bit CRC: x + 1 (§1.8.4.5, EP-tool class CRCs).
+    Crc1,
+    /// 2-bit CRC: x² + x + 1.
+    Crc2,
+    /// 3-bit CRC: x³ + x + 1.
+    Crc3,
     /// 4-bit CRC: x⁴ + x³ + x² + 1.
     Crc4,
     /// 5-bit CRC: x⁵ + x⁴ + x² + 1.
@@ -111,6 +117,9 @@ impl CrcPoly {
     /// The CRC width `k` in bits.
     pub const fn width(self) -> u32 {
         match self {
+            CrcPoly::Crc1 => 1,
+            CrcPoly::Crc2 => 2,
+            CrcPoly::Crc3 => 3,
             CrcPoly::Crc4 => 4,
             CrcPoly::Crc5 => 5,
             CrcPoly::Crc6 => 6,
@@ -138,6 +147,12 @@ impl CrcPoly {
     /// `x⁴ + x³ + x² + x⁰`, i.e. bits 4, 3, 2, 0 ⇒ `0b0001_1101`.
     pub const fn generator(self) -> u64 {
         match self {
+            // x+1                   → bit 0
+            CrcPoly::Crc1 => bits(&[0]),
+            // x²+x+1                → bits 1,0
+            CrcPoly::Crc2 => bits(&[1, 0]),
+            // x³+x+1                → bits 1,0
+            CrcPoly::Crc3 => bits(&[1, 0]),
             // x⁴+x³+x²+1            → bits 3,2,0
             CrcPoly::Crc4 => bits(&[3, 2, 0]),
             // x⁵+x⁴+x²+1            → bits 4,2,0

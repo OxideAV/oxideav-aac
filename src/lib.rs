@@ -560,6 +560,9 @@ pub mod sbr_reconstruct;
 pub mod sbr_time_grid;
 // internal — exposed for tests/fuzz; not part of the stable API
 pub mod scalable;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod ep_config;
 #[doc(hidden)]
 pub mod scale_factor_data;
 // internal — exposed for tests/fuzz; not part of the stable API
