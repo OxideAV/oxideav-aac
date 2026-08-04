@@ -887,9 +887,36 @@ impl StreamEncoder {
             .iter()
             .chain(code_r.iter())
             .fold(0.0f64, |m, &v| m.max(v.abs()));
-        let mut left = self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?;
-        let mut right =
-            self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?;
+        let (mut left, mut right) = if seq == WindowSequence::EightShort {
+            // A common_window CPE shares one ics_info, so the
+            // §4.5.2.3.4 grouping is decided ONCE on the pair
+            // envelope (per-coefficient L/R energy sum) and imposed
+            // on both channels — independent decisions could
+            // diverge and desync the shared wire layout.
+            let combined: Vec<f64> = code_l
+                .iter()
+                .zip(code_r.iter())
+                .map(|(&l, &r)| (l * l + r * r).sqrt())
+                .collect();
+            let offsets = short_window_offsets(self.fs_index)?;
+            let num_swb = NUM_SWB_SHORT_WINDOW[self.fs_index as usize] as usize;
+            let wgl = decide_short_grouping(&combined, offsets, num_swb);
+            (
+                quantize_channel_short_grouped(
+                    &code_l,
+                    self.fs_index,
+                    sf_offset,
+                    pair_peak,
+                    wgl.clone(),
+                )?,
+                quantize_channel_short_grouped(&code_r, self.fs_index, sf_offset, pair_peak, wgl)?,
+            )
+        } else {
+            (
+                self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?,
+                self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?,
+            )
+        };
         attach_tns(&mut left, tns_l);
         attach_tns(&mut right, tns_r);
 
@@ -1938,11 +1965,28 @@ fn quantize_channel_short(
     sf_offset: i32,
     frame_peak: f64,
 ) -> Result<QuantizedChannel> {
+    let offsets = short_window_offsets(fs_index)?;
+    let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let window_group_length = decide_short_grouping(spec, offsets, num_swb);
+    quantize_channel_short_grouped(spec, fs_index, sf_offset, frame_peak, window_group_length)
+}
+
+/// [`quantize_channel_short`] under an *imposed* grouping — the
+/// `common_window` CPE path must quantize both channels under one
+/// shared `ics_info`, so the §4.5.2.3.4 grouping decision is made
+/// once (jointly, on the pair envelope) and both channels' section /
+/// scalefactor / interleave layouts follow it.
+fn quantize_channel_short_grouped(
+    spec: &[f64],
+    fs_index: u8,
+    sf_offset: i32,
+    frame_peak: f64,
+    window_group_length: Vec<u8>,
+) -> Result<QuantizedChannel> {
     let short_len = SHORT_WINDOW_LEN as usize;
     debug_assert_eq!(spec.len(), 8 * short_len);
     let offsets = short_window_offsets(fs_index)?;
     let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
-    let window_group_length = decide_short_grouping(spec, offsets, num_swb);
     let mask = grouping_mask(&window_group_length);
     let mut prev_sf: Option<i32> = None;
     let mut groups = Vec::with_capacity(window_group_length.len());
@@ -2346,6 +2390,83 @@ mod tests {
         assert_eq!(spectral, chan.spectral);
         assert_eq!(body.section_data, chan.body.section_data);
         assert_eq!(body.scale_factor_data, chan.body.scale_factor_data);
+    }
+
+    /// The `common_window` CPE short path imposes ONE grouping on
+    /// both channels even when their independent decisions would
+    /// diverge — a divergent pair would desync the shared-`ics_info`
+    /// wire layout (verified: reverting to per-channel decisions
+    /// fails this test). The frame must decode consistently through
+    /// the stream decoder with the burst energy on the right
+    /// channels.
+    #[test]
+    fn cpe_short_grouping_is_joint() {
+        let fs_index = 4u8;
+        let short_len = SHORT_WINDOW_LEN as usize;
+        let offsets = short_window_offsets(fs_index).unwrap();
+        let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+        // L jumps 60 dB at window 2, R at window 5: the independent
+        // groupings differ (the premise of the regression).
+        let mut l_spec = vec![0.0f64; 8 * short_len];
+        let mut r_spec = vec![0.0f64; 8 * short_len];
+        for w in 0..8 {
+            for k in 0..short_len {
+                let l_gain = if w < 2 { 30.0 } else { 30000.0 };
+                let r_gain = if w < 5 { 30.0 } else { 30000.0 };
+                l_spec[w * short_len + k] = l_gain * ((k as f64) * 0.23).sin();
+                r_spec[w * short_len + k] = r_gain * ((k as f64) * 0.19).sin();
+            }
+        }
+        let gl = decide_short_grouping(&l_spec, offsets, num_swb);
+        let gr = decide_short_grouping(&r_spec, offsets, num_swb);
+        assert_ne!(gl, gr, "premise: independent groupings diverge");
+
+        // Encode a stereo stream engineered to hit EIGHT_SHORT with
+        // per-channel attacks at different windows, and decode it
+        // with the crate's own decoder — a desynced CPE would fail
+        // to parse (or reconstruct garbage).
+        let n = 4 * FRAME_LEN;
+        let mut pcm = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f64;
+            let in_l = (FRAME_LEN + 256..FRAME_LEN + 640).contains(&i);
+            let in_r = (FRAME_LEN + 640..FRAME_LEN + 1024).contains(&i);
+            let base = 400.0 * (0.09 * t).sin();
+            let l = base + if in_l { 20000.0 * (0.5 * t).sin() } else { 0.0 };
+            let r = base
+                + if in_r {
+                    20000.0 * (0.43 * t).sin()
+                } else {
+                    0.0
+                };
+            pcm.push(l.round() as i16);
+            pcm.push(r.round() as i16);
+        }
+        let mut enc = StreamEncoder::new(EncoderConfig {
+            sample_rate: 44_100,
+            channels: 2,
+            bitrate: 192_000,
+        })
+        .unwrap();
+        let stream = enc.encode_all(&pcm).unwrap();
+        let mut dec = crate::decode::StreamDecoder::new();
+        let frames = dec.decode_all(&stream).unwrap();
+        assert!(frames.len() >= 4);
+        // The burst energy must come back on the right channels.
+        let mut decoded = Vec::new();
+        for f in &frames {
+            decoded.extend_from_slice(&f.pcm);
+        }
+        let aligned = &decoded[FRAME_LEN * 2..];
+        let window_energy = |c: usize, range: core::ops::Range<usize>| -> f64 {
+            range.map(|i| f64::from(aligned[i * 2 + c]).powi(2)).sum()
+        };
+        let l_burst = window_energy(0, FRAME_LEN + 256..FRAME_LEN + 640);
+        let r_quiet = window_energy(1, FRAME_LEN + 256..FRAME_LEN + 640);
+        assert!(
+            l_burst > 20.0 * r_quiet,
+            "left burst region not reconstructed: {l_burst:.0} vs {r_quiet:.0}"
+        );
     }
 
     #[test]
