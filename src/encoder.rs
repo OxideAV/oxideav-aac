@@ -85,7 +85,10 @@
 //!   least ~9 dB lopsided, so the quiet one culls or codes cheaply).
 //!   The mask is emitted as `ms_mask_present = 2` when every band
 //!   flags (identical / phase-inverted channels), `1` + explicit
-//!   mask when mixed, `0` when no band benefits.
+//!   mask when mixed, `0` when no band benefits. `EIGHT_SHORT`
+//!   frames decide per `(window group, sfb)` under the pair's joint
+//!   grouping — the Table 4.5 `ms_used[g][sfb]` granularity
+//!   ([`ms_decide_short`]).
 //! * **Intensity stereo (§4.6.8.2, opt-in)** — with
 //!   [`StreamEncoder::set_intensity_stereo`], a high-frequency
 //!   long-frame CPE band whose channels correlate above
@@ -838,97 +841,110 @@ impl StreamEncoder {
         } else {
             PairPns::default()
         };
-        // §4.6.8.1: per-band M/S decision, then quantize the
-        // coding spectra (m/s on flagged bands, l/r
-        // elsewhere). Both coding channels share the pair's
-        // loudest peak for the masking spread, so the side
-        // channel's noise floor is judged against the pair,
-        // not against its own (often tiny) peak. Short frames
-        // code the channels independently (mask 0) for now.
-        let mut ms_used = if seq == WindowSequence::EightShort {
-            vec![]
-        } else {
-            ms_decide(l_spec, r_spec, self.fs_index)?
-        };
-        for (sfb, band) in is_bands.iter().enumerate() {
-            if band.is_some() {
-                if let Some(m) = ms_used.get_mut(sfb) {
-                    *m = false;
-                }
-            }
-        }
-        // A band either channel will noise-code is excluded
-        // from the M/S transform; a both-channels-noise band
-        // whose content correlates re-sets its ms_used bit,
-        // which per §4.6.13.3 signals the decoder to draw the
-        // *same* random vector for both channels (correlated
-        // noise) rather than an M/S de-matrix.
-        for (sfb, m) in ms_used.iter_mut().enumerate() {
-            let l_n = pns.l_noise.get(sfb).copied().unwrap_or(false);
-            let r_n = pns.r_noise.get(sfb).copied().unwrap_or(false);
-            if l_n || r_n {
-                *m = pns.shared.get(sfb).copied().unwrap_or(false);
-            }
-        }
-        let ms_transform: Vec<bool> = ms_used
-            .iter()
-            .enumerate()
-            .map(|(sfb, &m)| {
-                m && !pns.l_noise.get(sfb).copied().unwrap_or(false)
-                    && !pns.r_noise.get(sfb).copied().unwrap_or(false)
-            })
-            .collect();
-        let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
-            apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
-        } else {
-            (l_spec.to_vec(), r_spec.to_vec())
-        };
-        let pair_peak = code_l
-            .iter()
-            .chain(code_r.iter())
-            .fold(0.0f64, |m, &v| m.max(v.abs()));
-        let (mut left, mut right) = if seq == WindowSequence::EightShort {
+        // §4.6.8.1: per-band M/S decision, then quantize the coding
+        // spectra (m/s on flagged bands, l/r elsewhere). Both coding
+        // channels share the pair's loudest peak for the masking
+        // spread, so the side channel's noise floor is judged
+        // against the pair, not against its own (often tiny) peak.
+        // The mask is one row per window group (`ms_used[g][sfb]`);
+        // long sequences have one group, EIGHT_SHORT frames decide
+        // per (group, sfb) under the jointly-decided grouping.
+        let (ms_rows, mut left, mut right);
+        if seq == WindowSequence::EightShort {
             // A common_window CPE shares one ics_info, so the
             // §4.5.2.3.4 grouping is decided ONCE on the pair
             // envelope (per-coefficient L/R energy sum) and imposed
             // on both channels — independent decisions could
             // diverge and desync the shared wire layout.
-            let combined: Vec<f64> = code_l
+            let combined: Vec<f64> = l_spec
                 .iter()
-                .zip(code_r.iter())
+                .zip(r_spec.iter())
                 .map(|(&l, &r)| (l * l + r * r).sqrt())
                 .collect();
             let offsets = short_window_offsets(self.fs_index)?;
             let num_swb = NUM_SWB_SHORT_WINDOW[self.fs_index as usize] as usize;
             let wgl = decide_short_grouping(&combined, offsets, num_swb);
-            (
-                quantize_channel_short_grouped(
-                    &code_l,
-                    self.fs_index,
-                    sf_offset,
-                    pair_peak,
-                    wgl.clone(),
-                )?,
-                quantize_channel_short_grouped(&code_r, self.fs_index, sf_offset, pair_peak, wgl)?,
-            )
+            let rows = ms_decide_short(l_spec, r_spec, offsets, num_swb, &wgl);
+            let (code_l, code_r) = if rows.iter().flatten().any(|&b| b) {
+                apply_ms_short(l_spec, r_spec, &rows, offsets, &wgl)
+            } else {
+                (l_spec.to_vec(), r_spec.to_vec())
+            };
+            let pair_peak = code_l
+                .iter()
+                .chain(code_r.iter())
+                .fold(0.0f64, |m, &v| m.max(v.abs()));
+            left = quantize_channel_short_grouped(
+                &code_l,
+                self.fs_index,
+                sf_offset,
+                pair_peak,
+                wgl.clone(),
+            )?;
+            right =
+                quantize_channel_short_grouped(&code_r, self.fs_index, sf_offset, pair_peak, wgl)?;
+            ms_rows = rows;
         } else {
-            (
-                self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?,
-                self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?,
-            )
-        };
+            let mut ms_used = ms_decide(l_spec, r_spec, self.fs_index)?;
+            for (sfb, band) in is_bands.iter().enumerate() {
+                if band.is_some() {
+                    if let Some(m) = ms_used.get_mut(sfb) {
+                        *m = false;
+                    }
+                }
+            }
+            // A band either channel will noise-code is excluded
+            // from the M/S transform; a both-channels-noise band
+            // whose content correlates re-sets its ms_used bit,
+            // which per §4.6.13.3 signals the decoder to draw the
+            // *same* random vector for both channels (correlated
+            // noise) rather than an M/S de-matrix.
+            for (sfb, m) in ms_used.iter_mut().enumerate() {
+                let l_n = pns.l_noise.get(sfb).copied().unwrap_or(false);
+                let r_n = pns.r_noise.get(sfb).copied().unwrap_or(false);
+                if l_n || r_n {
+                    *m = pns.shared.get(sfb).copied().unwrap_or(false);
+                }
+            }
+            let ms_transform: Vec<bool> = ms_used
+                .iter()
+                .enumerate()
+                .map(|(sfb, &m)| {
+                    m && !pns.l_noise.get(sfb).copied().unwrap_or(false)
+                        && !pns.r_noise.get(sfb).copied().unwrap_or(false)
+                })
+                .collect();
+            let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
+                apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
+            } else {
+                (l_spec.to_vec(), r_spec.to_vec())
+            };
+            let pair_peak = code_l
+                .iter()
+                .chain(code_r.iter())
+                .fold(0.0f64, |m, &v| m.max(v.abs()));
+            left = self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?;
+            right =
+                self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?;
+            ms_rows = vec![ms_used];
+        }
         attach_tns(&mut left, tns_l);
         attach_tns(&mut right, tns_r);
 
         // §4.4.2.3: common_window = 1, one shared ics_info,
-        // then the two-bit ms_mask_present (+ mask when 1).
+        // then the two-bit ms_mask_present (+ mask when 1: one bit
+        // per (window group, sfb), group-major — Table 4.5).
         body_bits.write_bit(true);
         left.info.write(body_bits, 2, self.fs_index, true)?;
-        if !ms_used.is_empty() && ms_used.iter().all(|&b| b) {
+        let any_ms = ms_rows.iter().flatten().any(|&b| b);
+        let all_ms = !ms_rows.is_empty()
+            && ms_rows.iter().all(|row| !row.is_empty())
+            && ms_rows.iter().flatten().all(|&b| b);
+        if all_ms {
             body_bits.write_u32(2, 2); // all ones, no mask bits
-        } else if ms_used.iter().any(|&b| b) {
+        } else if any_ms {
             body_bits.write_u32(1, 2);
-            for &b in &ms_used {
+            for &b in ms_rows.iter().flatten() {
                 body_bits.write_bit(b);
             }
         } else {
@@ -1350,6 +1366,80 @@ fn apply_ms(
         }
     }
     Ok((code_l, code_r))
+}
+
+/// §4.6.8.1 per-`(window group, sfb)` M/S decision for an
+/// `EIGHT_SHORT_SEQUENCE` channel pair under the shared grouping
+/// `wgl` — the same energy-concentration criterion as [`ms_decide`],
+/// summed over every window of the group (the mask granularity the
+/// Table 4.5 `ms_used[g][sfb]` wire provides). `l_spec` / `r_spec`
+/// are window-major 8 × 128 buffers.
+fn ms_decide_short(
+    l_spec: &[f64],
+    r_spec: &[f64],
+    offsets: &[u16],
+    num_swb: usize,
+    wgl: &[u8],
+) -> Vec<Vec<bool>> {
+    let short_len = SHORT_WINDOW_LEN as usize;
+    let mut rows = Vec::with_capacity(wgl.len());
+    let mut win_base = 0usize;
+    for &len in wgl {
+        let mut row = Vec::with_capacity(num_swb);
+        for sfb in 0..num_swb {
+            let mut e_lr = 0.0f64;
+            let mut e_m = 0.0f64;
+            let mut e_s = 0.0f64;
+            for w in win_base..win_base + len as usize {
+                for k in offsets[sfb] as usize..offsets[sfb + 1] as usize {
+                    let (l, r) = (l_spec[w * short_len + k], r_spec[w * short_len + k]);
+                    e_lr += l * l + r * r;
+                    let m = 0.5 * (l + r);
+                    let s = 0.5 * (l - r);
+                    e_m += m * m;
+                    e_s += s * s;
+                }
+            }
+            row.push(e_lr > 0.0 && e_m.min(e_s) <= e_lr / 8.0);
+        }
+        rows.push(row);
+        win_base += len as usize;
+    }
+    rows
+}
+
+/// Forward M/S butterfly on the flagged `(group, sfb)` bands of a
+/// window-major short-sequence pair — the short-frame counterpart of
+/// [`apply_ms`], walking every window of a flagged group.
+fn apply_ms_short(
+    l_spec: &[f64],
+    r_spec: &[f64],
+    rows: &[Vec<bool>],
+    offsets: &[u16],
+    wgl: &[u8],
+) -> (Vec<f64>, Vec<f64>) {
+    let short_len = SHORT_WINDOW_LEN as usize;
+    let mut code_l = l_spec.to_vec();
+    let mut code_r = r_spec.to_vec();
+    let mut win_base = 0usize;
+    for (row, &len) in rows.iter().zip(wgl) {
+        for (sfb, &used) in row.iter().enumerate() {
+            if !used {
+                continue;
+            }
+            for w in win_base..win_base + len as usize {
+                for k in offsets[sfb] as usize..offsets[sfb + 1] as usize {
+                    let i = w * short_len + k;
+                    let m = 0.5 * (l_spec[i] + r_spec[i]);
+                    let s = 0.5 * (l_spec[i] - r_spec[i]);
+                    code_l[i] = m;
+                    code_r[i] = s;
+                }
+            }
+        }
+        win_base += len as usize;
+    }
+    (code_l, code_r)
 }
 
 /// §4.6.2 forward quantizer for one coefficient at scalefactor `sf`:
@@ -2467,6 +2557,83 @@ mod tests {
             l_burst > 20.0 * r_quiet,
             "left burst region not reconstructed: {l_burst:.0} vs {r_quiet:.0}"
         );
+    }
+
+    /// Short-frame M/S: identical (and phase-inverted) channels
+    /// flag every `(group, sfb)` cell, independent channels flag
+    /// almost nothing, and an identical-channel transient stream
+    /// decodes with L exactly equal to R (all-M/S ⇒ `s ≡ 0` ⇒ the
+    /// de-matrix reproduces one channel twice).
+    #[test]
+    fn cpe_short_frame_ms_coding() {
+        let fs_index = 4u8;
+        let short_len = SHORT_WINDOW_LEN as usize;
+        let offsets = short_window_offsets(fs_index).unwrap();
+        let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+        let mut spec = vec![0.0f64; 8 * short_len];
+        let mut seed = 0x515u32;
+        for v in spec.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = f64::from(seed >> 16) - 32768.0;
+        }
+        let inverted: Vec<f64> = spec.iter().map(|&v| -v).collect();
+        let wgl = vec![2u8, 3, 3];
+        let same = ms_decide_short(&spec, &spec, offsets, num_swb, &wgl);
+        assert!(same.iter().flatten().all(|&b| b), "identical pair all-M/S");
+        let anti = ms_decide_short(&spec, &inverted, offsets, num_swb, &wgl);
+        assert!(anti.iter().flatten().all(|&b| b), "inverted pair all-M/S");
+        let mut other = vec![0.0f64; 8 * short_len];
+        for v in other.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = f64::from(seed >> 16) - 32768.0;
+        }
+        let indep = ms_decide_short(&spec, &other, offsets, num_swb, &wgl);
+        let flagged = indep.iter().flatten().filter(|&&b| b).count();
+        let total = indep.iter().flatten().count();
+        assert!(
+            flagged * 4 < total,
+            "independent pair flagged {flagged}/{total}"
+        );
+        // apply ∘ decide on the identical pair zeroes the side chain.
+        let (code_l, code_r) = apply_ms_short(&spec, &spec, &same, offsets, &wgl);
+        assert_eq!(code_l, spec);
+        assert!(code_r.iter().all(|&v| v == 0.0));
+
+        // End to end: identical channels with a percussive burst
+        // (short frames engaged) decode to L == R exactly.
+        let n = 4 * FRAME_LEN;
+        let mut pcm = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f64;
+            let burst = (FRAME_LEN + 256..FRAME_LEN + 640).contains(&i);
+            let v = 500.0 * (0.07 * t).sin()
+                + if burst {
+                    18000.0 * (0.6 * t).sin()
+                } else {
+                    0.0
+                };
+            let s = v.round() as i16;
+            pcm.push(s);
+            pcm.push(s);
+        }
+        let mut enc = StreamEncoder::new(EncoderConfig {
+            sample_rate: 44_100,
+            channels: 2,
+            bitrate: 128_000,
+        })
+        .unwrap();
+        let stream = enc.encode_all(&pcm).unwrap();
+        let mut dec = crate::decode::StreamDecoder::new();
+        let frames = dec.decode_all(&stream).unwrap();
+        for (f, frame) in frames.iter().enumerate() {
+            for i in 0..(frame.pcm.len() / 2) {
+                assert_eq!(
+                    frame.pcm[2 * i],
+                    frame.pcm[2 * i + 1],
+                    "frame {f} sample {i}: identical channels must decode identical"
+                );
+            }
+        }
     }
 
     #[test]
