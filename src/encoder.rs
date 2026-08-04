@@ -223,7 +223,15 @@ pub struct EncoderConfig {
     /// Output sample rate in Hz. Must be one of the ISO/IEC 14496-3
     /// Table 1.18 rates expressible in an ADTS header (index 0..=12).
     pub sample_rate: u32,
-    /// Channel count: `1` (one SCE) or `2` (one CPE).
+    /// Channel count. Every count with a Table 1.19 default
+    /// `channelConfiguration` is accepted: `1` (SCE) / `2` (CPE) /
+    /// `3` (SCE + CPE) / `4` (SCE + CPE + SCE) / `5` (SCE + 2 CPE) /
+    /// `6` (5.1: SCE + 2 CPE + LFE) / `8` (7.1: SCE + 3 CPE + LFE).
+    /// `7` has no default configuration (a PCE-defined layout, out
+    /// of scope) and is rejected. Input PCM is interleaved in the
+    /// canonical [`crate::channel_map`] order the decoder emits
+    /// (5.1 = `L R C LFE Ls Rs`), and the encoder derives the
+    /// bitstream element order from the Table 1.19 layout.
     pub channels: u8,
     /// Target bitrate in bits/second. Drives the per-frame byte
     /// budget of the rate loop. The output is not strictly CBR — each
@@ -256,7 +264,46 @@ impl EncoderConfig {
         let bytes = (bits / 8) as usize;
         bytes.saturating_sub(ADTS_HEADER_BYTES_NO_CRC).max(16)
     }
+
+    /// The Table 1.19 default `channelConfiguration` for this channel
+    /// count (see [`EncoderConfig::channels`]).
+    fn channel_configuration(&self) -> Result<u8> {
+        match self.channels {
+            n @ 1..=6 => Ok(n),
+            8 => Ok(7),
+            _ => Err(Error::EncoderInvalidConfig),
+        }
+    }
 }
+
+/// One channel element of the §4.4.2.1 `raw_data_block()` plan, with
+/// element-order channel indices.
+#[derive(Debug, Clone, Copy)]
+enum ElementPlan {
+    Sce(usize),
+    Cpe(usize, usize),
+    Lfe(usize),
+}
+
+/// The Table 1.19 element sequence for a default
+/// `channelConfiguration`, indexing element-order channels.
+fn element_plan(channel_configuration: u8) -> Result<Vec<ElementPlan>> {
+    use ElementPlan::*;
+    Ok(match channel_configuration {
+        1 => vec![Sce(0)],
+        2 => vec![Cpe(0, 1)],
+        3 => vec![Sce(0), Cpe(1, 2)],
+        4 => vec![Sce(0), Cpe(1, 2), Sce(3)],
+        5 => vec![Sce(0), Cpe(1, 2), Cpe(3, 4)],
+        6 => vec![Sce(0), Cpe(1, 2), Cpe(3, 4), Lfe(5)],
+        7 => vec![Sce(0), Cpe(1, 2), Cpe(3, 4), Cpe(5, 6), Lfe(7)],
+        _ => return Err(Error::EncoderInvalidConfig),
+    })
+}
+
+/// §4.5.2.1.3: only the lowest 12 spectral coefficients of an LFE
+/// element may be non-zero.
+const LFE_MAX_LINES: usize = 12;
 
 /// A streaming AAC-LC encoder producing one ADTS frame per
 /// 1024-sample input hop.
@@ -271,9 +318,20 @@ impl EncoderConfig {
 pub struct StreamEncoder {
     config: EncoderConfig,
     fs_index: u8,
+    /// The Table 1.19 `channelConfiguration` derived from the channel
+    /// count (lands in the ADTS header and fixes the element plan).
+    channel_configuration: u8,
+    /// Canonical-input channel index feeding each *element-order*
+    /// channel slot — the inverse of the decoder's
+    /// [`crate::channel_map::reorder_permutation`], so encode ∘
+    /// decode is channel-identity.
+    element_src: Vec<usize>,
+    /// Element-order slots that belong to an LFE element (§4.5.2.1.3
+    /// restrictions apply: long-only analysis, no TNS, ≤ 12 lines).
+    lfe_slot: Vec<bool>,
     /// Per-channel previous input hop (the left half of the next
-    /// analysis window), [`FRAME_LEN`] samples each. Starts all-zero
-    /// (the priming frame).
+    /// analysis window), [`FRAME_LEN`] samples each, in *element
+    /// order*. Starts all-zero (the priming frame).
     history: Vec<Vec<f64>>,
     /// `window_sequence` of the previously emitted frame — drives
     /// the §4.6.11.3.2 block-switching state machine.
@@ -295,17 +353,38 @@ impl StreamEncoder {
     /// Build an encoder for `config`.
     ///
     /// Errors with [`Error::EncoderInvalidConfig`] when the sample
-    /// rate is not a Table 1.18 ADTS rate, the channel count is not
-    /// 1 or 2, or the bitrate is 0.
+    /// rate is not a Table 1.18 ADTS rate, the channel count has no
+    /// Table 1.19 default configuration (see
+    /// [`EncoderConfig::channels`]), or the bitrate is 0.
     pub fn new(config: EncoderConfig) -> Result<Self> {
         let fs_index = config.fs_index()?;
-        if !(1..=2).contains(&config.channels) || config.bitrate == 0 {
+        let channel_configuration = config.channel_configuration()?;
+        if config.bitrate == 0 {
             return Err(Error::EncoderInvalidConfig);
+        }
+        let ch = config.channels as usize;
+        // canonical[i] = element[perm[i]] on the decode side, so the
+        // element slot j sources canonical input channel i with
+        // perm[i] == j.
+        let perm = crate::channel_map::reorder_permutation(channel_configuration)
+            .ok_or(Error::EncoderInvalidConfig)?;
+        let mut element_src = vec![0usize; ch];
+        for (i, &j) in perm.iter().enumerate() {
+            element_src[j] = i;
+        }
+        let mut lfe_slot = vec![false; ch];
+        for elem in element_plan(channel_configuration)? {
+            if let ElementPlan::Lfe(slot) = elem {
+                lfe_slot[slot] = true;
+            }
         }
         Ok(Self {
             config,
             fs_index,
-            history: vec![vec![0.0; FRAME_LEN]; config.channels as usize],
+            channel_configuration,
+            element_src,
+            lfe_slot,
+            history: vec![vec![0.0; FRAME_LEN]; ch],
             prev_seq: WindowSequence::OnlyLong,
             short_pending: false,
             pns_enabled: false,
@@ -396,10 +475,16 @@ impl StreamEncoder {
         }
         // De-interleave onto the ±32768 axis the §4.6.11 output
         // contract uses (no rescaling — the decoder's PCM stage
-        // rounds these values back to i16 directly).
+        // rounds these values back to i16 directly), permuting the
+        // canonical input order into bitstream element order
+        // (`element_src` — the inverse of the decoder's Table 1.19
+        // output reorder).
         let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
-        for (i, &s) in interleaved.iter().enumerate() {
-            cur[i % ch][i / ch] = f64::from(s);
+        for (j, chan) in cur.iter_mut().enumerate() {
+            let src = self.element_src[j];
+            for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *slot = f64::from(interleaved[n * ch + src]);
+            }
         }
         let frame = self.encode_hop(&cur)?;
         self.history = cur;
@@ -450,11 +535,14 @@ impl StreamEncoder {
         // already active). A pending short from the previous hop
         // forces EIGHT_SHORT now; a short run with no continuation
         // exits through LONG_STOP.
+        // LFE channels neither trigger nor follow block switching —
+        // §4.5.2.1.3 fixes their window_sequence to ONLY_LONG.
         let transient = self
             .history
             .iter()
             .zip(cur.iter())
-            .any(|(h, c)| detect_transient(h, c));
+            .zip(self.lfe_slot.iter())
+            .any(|((h, c), &lfe)| !lfe && detect_transient(h, c));
         let seq = if self.short_pending {
             WindowSequence::EightShort
         } else if transient && self.prev_seq != WindowSequence::EightShort {
@@ -470,10 +558,19 @@ impl StreamEncoder {
         };
         self.short_pending = transient;
 
-        // Per-channel analysis transform for the chosen sequence.
+        // Per-channel analysis transform for the chosen sequence
+        // (LFE channels always analyze ONLY_LONG — their own window
+        // chain stays long/sine per §4.5.2.1.3, independent of the
+        // frame's switching state).
         let mut spectra: Vec<Vec<f64>> = Vec::with_capacity(ch);
-        for (hist, chan) in self.history.iter().zip(cur.iter()) {
-            spectra.push(analyze_channel(hist, chan, seq)?);
+        for ((hist, chan), &lfe) in self
+            .history
+            .iter()
+            .zip(cur.iter())
+            .zip(self.lfe_slot.iter())
+        {
+            let ch_seq = if lfe { WindowSequence::OnlyLong } else { seq };
+            spectra.push(analyze_channel(hist, chan, ch_seq)?);
         }
         self.prev_seq = seq;
 
@@ -491,12 +588,11 @@ impl StreamEncoder {
         };
         let mut tns: Vec<Option<TnsData>> = vec![None; ch];
         if self.tns_enabled {
-            for ((spec, slot), (hist, chan)) in spectra
-                .iter_mut()
-                .zip(tns.iter_mut())
-                .zip(self.history.iter().zip(cur.iter()))
-            {
-                let permit = tns_temporal_permits(hist, chan, seq);
+            for (j, (spec, slot)) in spectra.iter_mut().zip(tns.iter_mut()).enumerate() {
+                if self.lfe_slot[j] {
+                    continue; // §4.5.2.1.3: no TNS on an LFE element
+                }
+                let permit = tns_temporal_permits(&self.history[j], &cur[j], seq);
                 *slot = detect_and_apply_tns(spec, seq, max_sfb, self.fs_index, &permit)?;
             }
         }
@@ -554,7 +650,7 @@ impl StreamEncoder {
             protection_absent: true,
             profile: 1, // AAC LC: profile_ObjectType = AOT − 1 = 1
             sampling_frequency_index: self.fs_index,
-            channel_configuration: self.config.channels,
+            channel_configuration: self.channel_configuration,
             aac_frame_length: frame_len as u16,
             adts_buffer_fullness: 0x7FF, // VBR sentinel
             number_of_raw_data_blocks_in_frame: 1,
@@ -565,14 +661,15 @@ impl StreamEncoder {
         Ok(out)
     }
 
-    /// Assemble one `raw_data_block()` (SCE for mono, one
-    /// `common_window` CPE for stereo, then END) at the given
-    /// rate-loop scalefactor offset.
+    /// Assemble one `raw_data_block()` — the Table 1.19 element plan
+    /// for the configuration (SCE / `common_window` CPE / LFE
+    /// elements, then END) at the given rate-loop scalefactor offset.
     ///
     /// `tns` carries the per-channel §4.6.9 filter records decided
     /// once per hop (the spectra arrive already analysis-filtered);
     /// they land in each channel's `tns_data_present` / `tns_data`
-    /// wire slots.
+    /// wire slots. Element instance tags count up per element kind,
+    /// so the decoder's per-`(id, tag)` state slots stay distinct.
     fn assemble_raw_block(
         &self,
         seq: WindowSequence,
@@ -581,167 +678,255 @@ impl StreamEncoder {
         sf_offset: i32,
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
-        let mut body_bits = BitWriter::new();
-        // §4.6.13 PNS emission is opt-in (set_pns) and long-frame
-        // only. Mono grants a blanket per-band allowance (the
-        // noise-likeness test in quantize_group decides); a CPE
-        // derives per-band allowances and the §4.6.13.3 correlation
-        // flags below, before the M/S decision.
-        let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
-        let num_swb_long = NUM_SWB_LONG_WINDOW[self.fs_index as usize] as usize;
-        let quantize = |spec: &[f64],
-                        peak: f64,
-                        pns_bands: &[bool],
-                        is_bands: &[IsBand]|
-         -> Result<QuantizedChannel> {
-            if seq == WindowSequence::EightShort {
-                quantize_channel_short(spec, self.fs_index, sf_offset, peak)
-            } else {
-                quantize_channel(
-                    spec,
-                    seq,
-                    self.fs_index,
-                    sf_offset,
-                    peak,
-                    pns_bands,
-                    is_bands,
-                )
-            }
-        };
-        // Attach a channel's TNS record to its wire body.
-        let attach_tns = |chan: &mut QuantizedChannel, slot: &Option<TnsData>| {
-            if let Some(t) = slot {
-                chan.body.tns_data_present = true;
-                chan.body.tns_data = Some(t.clone());
-            }
-        };
-        match spectra {
-            [mono] => {
-                let peak = mono.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-                let pns_bands = if pns_long {
-                    vec![true; num_swb_long]
-                } else {
-                    Vec::new()
-                };
-                let mut chan = quantize(mono, peak, &pns_bands, &[])?;
-                attach_tns(&mut chan, &tns[0]);
-                asm.push_channel_header(IdSynEle::Sce, 0)?;
-                chan.body.write(&mut body_bits, 2, self.fs_index, false)?;
-                chan.spectral.write(
-                    &mut body_bits,
-                    &chan.info,
-                    &chan.body.section_data,
-                    self.fs_index,
-                )?;
-            }
-            [l_spec, r_spec] => {
-                // §4.6.8.2: per-band intensity decision first (opt-in,
-                // long frames) — an IS band is transmitted once via
-                // the left channel and must not also be M/S-coded
-                // (mutual exclusion; a set ms_used bit on an
-                // intensity band signals the §4.6.8.2.3 phase
-                // reversal, not an M/S de-matrix).
-                let is_bands: Vec<IsBand> = if self.is_enabled && seq != WindowSequence::EightShort
-                {
-                    is_decide(l_spec, r_spec, self.fs_index)?
-                } else {
-                    Vec::new()
-                };
-                // §4.6.13 per-band PNS decision on the original l/r
-                // spectra (a noise band must not be M/S-transformed —
-                // mutual exclusion, §4.6.13.5 — and IS wins where the
-                // two overlap).
-                let pns = if pns_long {
-                    pns_decide_pair(l_spec, r_spec, &is_bands, self.fs_index)?
-                } else {
-                    PairPns::default()
-                };
-                // §4.6.8.1: per-band M/S decision, then quantize the
-                // coding spectra (m/s on flagged bands, l/r
-                // elsewhere). Both coding channels share the pair's
-                // loudest peak for the masking spread, so the side
-                // channel's noise floor is judged against the pair,
-                // not against its own (often tiny) peak. Short frames
-                // code the channels independently (mask 0) for now.
-                let mut ms_used = if seq == WindowSequence::EightShort {
-                    vec![]
-                } else {
-                    ms_decide(l_spec, r_spec, self.fs_index)?
-                };
-                for (sfb, band) in is_bands.iter().enumerate() {
-                    if band.is_some() {
-                        if let Some(m) = ms_used.get_mut(sfb) {
-                            *m = false;
-                        }
-                    }
+        let plan = element_plan(self.channel_configuration)?;
+        let mut sce_tag = 0u8;
+        let mut cpe_tag = 0u8;
+        let mut lfe_tag = 0u8;
+        for elem in plan {
+            let mut body_bits = BitWriter::new();
+            match elem {
+                ElementPlan::Sce(ch) => {
+                    asm.push_channel_header(IdSynEle::Sce, sce_tag)?;
+                    sce_tag += 1;
+                    self.assemble_sce(&mut body_bits, &spectra[ch], &tns[ch], seq, sf_offset)?;
                 }
-                // A band either channel will noise-code is excluded
-                // from the M/S transform; a both-channels-noise band
-                // whose content correlates re-sets its ms_used bit,
-                // which per §4.6.13.3 signals the decoder to draw the
-                // *same* random vector for both channels (correlated
-                // noise) rather than an M/S de-matrix.
-                for (sfb, m) in ms_used.iter_mut().enumerate() {
-                    let l_n = pns.l_noise.get(sfb).copied().unwrap_or(false);
-                    let r_n = pns.r_noise.get(sfb).copied().unwrap_or(false);
-                    if l_n || r_n {
-                        *m = pns.shared.get(sfb).copied().unwrap_or(false);
-                    }
+                ElementPlan::Lfe(ch) => {
+                    asm.push_channel_header(IdSynEle::Lfe, lfe_tag)?;
+                    lfe_tag += 1;
+                    self.assemble_lfe(&mut body_bits, &spectra[ch], sf_offset)?;
                 }
-                let ms_transform: Vec<bool> = ms_used
-                    .iter()
-                    .enumerate()
-                    .map(|(sfb, &m)| {
-                        m && !pns.l_noise.get(sfb).copied().unwrap_or(false)
-                            && !pns.r_noise.get(sfb).copied().unwrap_or(false)
-                    })
-                    .collect();
-                let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
-                    apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
-                } else {
-                    (l_spec.to_vec(), r_spec.to_vec())
-                };
-                let pair_peak = code_l
-                    .iter()
-                    .chain(code_r.iter())
-                    .fold(0.0f64, |m, &v| m.max(v.abs()));
-                let mut left = quantize(&code_l, pair_peak, &pns.l_noise, &[])?;
-                let mut right = quantize(&code_r, pair_peak, &pns.r_noise, &is_bands)?;
-                attach_tns(&mut left, &tns[0]);
-                attach_tns(&mut right, &tns[1]);
-
-                asm.push_channel_header(IdSynEle::Cpe, 0)?;
-                // §4.4.2.3: common_window = 1, one shared ics_info,
-                // then the two-bit ms_mask_present (+ mask when 1).
-                body_bits.write_bit(true);
-                left.info.write(&mut body_bits, 2, self.fs_index, true)?;
-                if !ms_used.is_empty() && ms_used.iter().all(|&b| b) {
-                    body_bits.write_u32(2, 2); // all ones, no mask bits
-                } else if ms_used.iter().any(|&b| b) {
-                    body_bits.write_u32(1, 2);
-                    for &b in &ms_used {
-                        body_bits.write_bit(b);
-                    }
-                } else {
-                    body_bits.write_u32(0, 2);
-                }
-                for chan in [&left, &right] {
-                    chan.body
-                        .write_with_ics_info(&mut body_bits, &chan.info, 2, false)?;
-                    chan.spectral.write(
+                ElementPlan::Cpe(l, r) => {
+                    asm.push_channel_header(IdSynEle::Cpe, cpe_tag)?;
+                    cpe_tag += 1;
+                    self.assemble_cpe(
                         &mut body_bits,
-                        &chan.info,
-                        &chan.body.section_data,
-                        self.fs_index,
+                        &spectra[l],
+                        &spectra[r],
+                        &tns[l],
+                        &tns[r],
+                        seq,
+                        sf_offset,
                     )?;
                 }
             }
-            _ => return Err(Error::EncoderInvalidConfig),
+            let nbits = body_bits.bit_position();
+            asm.push_channel_body_bits(&body_bits.finish(), nbits)?;
         }
-        let nbits = body_bits.bit_position();
-        let body = body_bits.finish();
-        asm.push_channel_body_bits(&body, nbits)?;
         Ok(asm.push_end())
+    }
+
+    /// Quantize a spectrum for this frame: the grouped short-window
+    /// path for `EIGHT_SHORT`, the long path otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn quantize_seq(
+        &self,
+        spec: &[f64],
+        seq: WindowSequence,
+        sf_offset: i32,
+        peak: f64,
+        pns_bands: &[bool],
+        is_bands: &[IsBand],
+    ) -> Result<QuantizedChannel> {
+        if seq == WindowSequence::EightShort {
+            quantize_channel_short(spec, self.fs_index, sf_offset, peak)
+        } else {
+            quantize_channel(
+                spec,
+                seq,
+                self.fs_index,
+                sf_offset,
+                peak,
+                pns_bands,
+                is_bands,
+            )
+        }
+    }
+
+    /// One SCE body: quantize (with the mono blanket PNS allowance
+    /// when enabled on a long frame) and write
+    /// `individual_channel_stream(0)`.
+    fn assemble_sce(
+        &self,
+        body_bits: &mut BitWriter,
+        spec: &[f64],
+        tns: &Option<TnsData>,
+        seq: WindowSequence,
+        sf_offset: i32,
+    ) -> Result<()> {
+        // §4.6.13 PNS emission is opt-in (set_pns) and long-frame
+        // only; a lone channel grants a blanket per-band allowance
+        // (the noise-likeness test in quantize_group decides).
+        let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
+        let num_swb_long = NUM_SWB_LONG_WINDOW[self.fs_index as usize] as usize;
+        let peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let pns_bands = if pns_long {
+            vec![true; num_swb_long]
+        } else {
+            Vec::new()
+        };
+        let mut chan = self.quantize_seq(spec, seq, sf_offset, peak, &pns_bands, &[])?;
+        attach_tns(&mut chan, tns);
+        chan.body.write(body_bits, 2, self.fs_index, false)?;
+        chan.spectral.write(
+            body_bits,
+            &chan.info,
+            &chan.body.section_data,
+            self.fs_index,
+        )
+    }
+
+    /// One LFE body under the §4.5.2.1.3 restrictions: the element is
+    /// a plain `individual_channel_stream(0)`, always
+    /// `ONLY_LONG_SEQUENCE` with the sine window (the analysis stage
+    /// already ran this channel long), no TNS / PNS / prediction, and
+    /// only the lowest [`LFE_MAX_LINES`] spectral lines non-zero.
+    fn assemble_lfe(&self, body_bits: &mut BitWriter, spec: &[f64], sf_offset: i32) -> Result<()> {
+        let mut lfe_spec = spec.to_vec();
+        for c in lfe_spec[LFE_MAX_LINES..].iter_mut() {
+            *c = 0.0;
+        }
+        let peak = lfe_spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let chan = self.quantize_seq(
+            &lfe_spec,
+            WindowSequence::OnlyLong,
+            sf_offset,
+            peak,
+            &[],
+            &[],
+        )?;
+        chan.body.write(body_bits, 2, self.fs_index, false)?;
+        chan.spectral.write(
+            body_bits,
+            &chan.info,
+            &chan.body.section_data,
+            self.fs_index,
+        )
+    }
+
+    /// One `common_window` CPE body: the per-band IS / PNS / M/S
+    /// decisions, joint quantization on the pair peak, and the
+    /// shared-`ics_info` wire assembly.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_cpe(
+        &self,
+        body_bits: &mut BitWriter,
+        l_spec: &[f64],
+        r_spec: &[f64],
+        tns_l: &Option<TnsData>,
+        tns_r: &Option<TnsData>,
+        seq: WindowSequence,
+        sf_offset: i32,
+    ) -> Result<()> {
+        let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
+        // §4.6.8.2: per-band intensity decision first (opt-in,
+        // long frames) — an IS band is transmitted once via
+        // the left channel and must not also be M/S-coded
+        // (mutual exclusion; a set ms_used bit on an
+        // intensity band signals the §4.6.8.2.3 phase
+        // reversal, not an M/S de-matrix).
+        let is_bands: Vec<IsBand> = if self.is_enabled && seq != WindowSequence::EightShort {
+            is_decide(l_spec, r_spec, self.fs_index)?
+        } else {
+            Vec::new()
+        };
+        // §4.6.13 per-band PNS decision on the original l/r
+        // spectra (a noise band must not be M/S-transformed —
+        // mutual exclusion, §4.6.13.5 — and IS wins where the
+        // two overlap).
+        let pns = if pns_long {
+            pns_decide_pair(l_spec, r_spec, &is_bands, self.fs_index)?
+        } else {
+            PairPns::default()
+        };
+        // §4.6.8.1: per-band M/S decision, then quantize the
+        // coding spectra (m/s on flagged bands, l/r
+        // elsewhere). Both coding channels share the pair's
+        // loudest peak for the masking spread, so the side
+        // channel's noise floor is judged against the pair,
+        // not against its own (often tiny) peak. Short frames
+        // code the channels independently (mask 0) for now.
+        let mut ms_used = if seq == WindowSequence::EightShort {
+            vec![]
+        } else {
+            ms_decide(l_spec, r_spec, self.fs_index)?
+        };
+        for (sfb, band) in is_bands.iter().enumerate() {
+            if band.is_some() {
+                if let Some(m) = ms_used.get_mut(sfb) {
+                    *m = false;
+                }
+            }
+        }
+        // A band either channel will noise-code is excluded
+        // from the M/S transform; a both-channels-noise band
+        // whose content correlates re-sets its ms_used bit,
+        // which per §4.6.13.3 signals the decoder to draw the
+        // *same* random vector for both channels (correlated
+        // noise) rather than an M/S de-matrix.
+        for (sfb, m) in ms_used.iter_mut().enumerate() {
+            let l_n = pns.l_noise.get(sfb).copied().unwrap_or(false);
+            let r_n = pns.r_noise.get(sfb).copied().unwrap_or(false);
+            if l_n || r_n {
+                *m = pns.shared.get(sfb).copied().unwrap_or(false);
+            }
+        }
+        let ms_transform: Vec<bool> = ms_used
+            .iter()
+            .enumerate()
+            .map(|(sfb, &m)| {
+                m && !pns.l_noise.get(sfb).copied().unwrap_or(false)
+                    && !pns.r_noise.get(sfb).copied().unwrap_or(false)
+            })
+            .collect();
+        let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
+            apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
+        } else {
+            (l_spec.to_vec(), r_spec.to_vec())
+        };
+        let pair_peak = code_l
+            .iter()
+            .chain(code_r.iter())
+            .fold(0.0f64, |m, &v| m.max(v.abs()));
+        let mut left = self.quantize_seq(&code_l, seq, sf_offset, pair_peak, &pns.l_noise, &[])?;
+        let mut right =
+            self.quantize_seq(&code_r, seq, sf_offset, pair_peak, &pns.r_noise, &is_bands)?;
+        attach_tns(&mut left, tns_l);
+        attach_tns(&mut right, tns_r);
+
+        // §4.4.2.3: common_window = 1, one shared ics_info,
+        // then the two-bit ms_mask_present (+ mask when 1).
+        body_bits.write_bit(true);
+        left.info.write(body_bits, 2, self.fs_index, true)?;
+        if !ms_used.is_empty() && ms_used.iter().all(|&b| b) {
+            body_bits.write_u32(2, 2); // all ones, no mask bits
+        } else if ms_used.iter().any(|&b| b) {
+            body_bits.write_u32(1, 2);
+            for &b in &ms_used {
+                body_bits.write_bit(b);
+            }
+        } else {
+            body_bits.write_u32(0, 2);
+        }
+        for chan in [&left, &right] {
+            chan.body
+                .write_with_ics_info(body_bits, &chan.info, 2, false)?;
+            chan.spectral.write(
+                body_bits,
+                &chan.info,
+                &chan.body.section_data,
+                self.fs_index,
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Attach a channel's §4.6.9 TNS record to its wire body.
+fn attach_tns(chan: &mut QuantizedChannel, slot: &Option<TnsData>) {
+    if let Some(t) = slot {
+        chan.body.tns_data_present = true;
+        chan.body.tns_data = Some(t.clone());
     }
 }
 
@@ -1889,14 +2074,32 @@ mod tests {
             }),
             Err(Error::EncoderInvalidConfig)
         ));
-        assert!(matches!(
-            StreamEncoder::new(EncoderConfig {
-                sample_rate: 44_100,
-                channels: 3,
-                bitrate: 64_000,
-            }),
-            Err(Error::EncoderInvalidConfig)
-        ));
+        // Every channel count with a Table 1.19 default
+        // configuration builds; 0 / 7 / 9 have none and reject.
+        for ok in [3u8, 4, 5, 6, 8] {
+            assert!(
+                StreamEncoder::new(EncoderConfig {
+                    sample_rate: 44_100,
+                    channels: ok,
+                    bitrate: 64_000 * u32::from(ok),
+                })
+                .is_ok(),
+                "channels {ok}"
+            );
+        }
+        for bad in [0u8, 7, 9] {
+            assert!(
+                matches!(
+                    StreamEncoder::new(EncoderConfig {
+                        sample_rate: 44_100,
+                        channels: bad,
+                        bitrate: 64_000,
+                    }),
+                    Err(Error::EncoderInvalidConfig)
+                ),
+                "channels {bad}"
+            );
+        }
         assert!(matches!(
             StreamEncoder::new(EncoderConfig {
                 sample_rate: 44_100,

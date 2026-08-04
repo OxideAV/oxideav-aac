@@ -53,7 +53,11 @@ pub const DEFAULT_BITRATE_PER_CHANNEL: u32 = 64_000;
 /// * `sample_rate` (default 44 100) — must be an ISO/IEC 14496-3
 ///   Table 1.18 rate with a §4.5.4 long-window band table
 ///   (96 000 … 8 000 Hz).
-/// * `channels` (default 2) — 1 (SCE) or 2 (CPE).
+/// * `channels` (default 2) — any count with a Table 1.19 default
+///   `channelConfiguration`: 1, 2, 3, 4, 5, 6 (5.1) or 8 (7.1);
+///   input interleaved in the canonical [`crate::channel_map`]
+///   order the decoder emits. 7 has no default configuration and is
+///   rejected.
 /// * `bit_rate` (default 64 kbps × channels) — the rate-loop target.
 /// * `sample_format` — must be [`SampleFormat::S16`] (or unset).
 ///
@@ -70,9 +74,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             ));
         }
     }
-    if !(1..=2).contains(&channels) {
+    if !(1..=6).contains(&channels) && channels != 8 {
         return Err(Error::unsupported(
-            "oxideav-aac encoder supports 1 (SCE) or 2 (CPE) channels",
+            "oxideav-aac encoder supports the Table 1.19 default channel \
+             configurations: 1-6 or 8 channels",
         ));
     }
     let bitrate = params
@@ -260,7 +265,12 @@ mod tests {
 
     #[test]
     fn encoder_rejects_unsupported_shapes() {
-        assert!(make_encoder(&params(44_100, 6, None)).is_err());
+        // 7 channels has no Table 1.19 default configuration; 6
+        // (5.1) and 8 (7.1) do and build.
+        assert!(make_encoder(&params(44_100, 7, None)).is_err());
+        assert!(make_encoder(&params(44_100, 9, None)).is_err());
+        assert!(make_encoder(&params(44_100, 6, None)).is_ok());
+        assert!(make_encoder(&params(44_100, 8, None)).is_ok());
         assert!(make_encoder(&params(44_055, 1, None)).is_err());
         let mut p = params(44_100, 2, None);
         p.sample_format = Some(SampleFormat::F32);
