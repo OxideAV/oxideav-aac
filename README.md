@@ -30,14 +30,22 @@ selectable on every decode entry point.
 The crate also ships an **end-to-end AAC-LC encoder** (`encoder` /
 `codec_encoder`): PCM → §4.6.11.3.1 forward-MDCT analysis with
 §4.6.11.3.2 block switching (transient-driven
-`ONLY_LONG → LONG_START → EIGHT_SHORT → LONG_STOP`), the exact
-§4.6.2 inverse quantizer under a masking-spread psychoacoustics-lite
-model with a bidirectional rate loop, per-band §4.6.8.1 M/S joint
-stereo, and SCE / `common_window`-CPE ADTS assembly through the
-Phase-2 bit-exact wire writers. Every stream is round-tripped through
-the crate's own decoder (multitone 128 kbps at 0.016 err/sig RMS;
-staged-fixture transcodes at 0.0008–0.003); `register()` installs the
-encoder alongside the decoder under id `"aac"`.
+`ONLY_LONG → LONG_START → EIGHT_SHORT → LONG_STOP`, short frames
+grouped per §4.5.2.3.4 on the band-envelope similarity of adjacent
+windows), the exact §4.6.2 inverse quantizer under a masking-spread
+psychoacoustics-lite model with a bidirectional rate loop,
+measured-bit-cost codebook/section choice (a DP over section
+boundaries priced with the real tuple writer), per-band §4.6.8.1
+M/S joint stereo (long frames per sfb, short frames per
+`(window group, sfb)` under the pair's joint grouping), and
+**every Table 1.19 default channel layout** — 1–6 and 8 (7.1)
+channels as SCE / `common_window`-CPE / §4.5.2.1.3-conforming LFE
+element plans — assembled into ADTS through the Phase-2 bit-exact
+wire writers. Every stream is round-tripped through the crate's own
+decoder (multitone 128 kbps at 0.016 err/sig RMS; staged-fixture
+transcodes at 0.0008–0.003; multichannel layouts pinned with one
+distinct tone per speaker); `register()` installs the encoder
+alongside the decoder under id `"aac"`.
 
 ### Bitstream parsing
 
@@ -937,32 +945,56 @@ the EP section below).
   the §4.6.11.3.1 forward MDCT runs under the same composite windows
   the decoder synthesizes with (one 2048-point transform for long
   sequences, eight 256-point transforms at `448 + j·128` for short);
+  `EIGHT_SHORT` frames merge envelope-alike adjacent windows into
+  §4.5.2.3.4 window groups (one scalefactor/section track per group,
+  §4.5.2.3.5 interleaved transmission order; the emitted 7-bit mask
+  is pinned as the exact inverse of the decoder-side derivation);
   per-band scalefactors follow a masking-spread rule (band target
   magnitude `42·(peak_b/peak_frame)^½`, sub-step bands culled to
   `ZERO_HCB`) with the DPCM ±60 track threaded across window groups;
   a bidirectional rate loop (±4 scalefactor ladder + ±1..3 fine pass)
-  fits each frame to the bitrate-derived byte budget; codebooks are
-  the smallest Table 4.95 LAV fit with adjacent-section merging.
+  fits each frame to the bitrate-derived byte budget; codebooks and
+  sections come from a **measured-bit-cost dynamic program** (every
+  candidate same-class run priced at its `section_data()` header
+  overhead plus the cheapest Table 4.95 book, actual codeword +
+  sign + escape bits measured with the real tuple writer — pinned
+  never-larger than the classic smallest-LAV + merge rule).
   Stereo pairs code per-band §4.6.8.1 M/S (`m=(l+r)/2`, `s=(l−r)/2`
   where the transform concentrates band energy, emitted as
-  `ms_mask_present` 2 / 1+mask / 0) inside a `common_window` CPE.
+  `ms_mask_present` 2 / 1+mask / 0) inside a `common_window` CPE —
+  long frames per sfb, short frames per `(window group, sfb)` under
+  the pair's **joint** grouping (decided once on the pair envelope;
+  independent decisions would desync the shared `ics_info`).
+  **Every Table 1.19 default channel layout encodes** — 1–6 and 8
+  (7.1) channels: the element-plan `raw_data_block()` assembly (SCE
+  / `common_window` CPE / LFE with per-kind instance tags),
+  canonical-order input permuted by the exact inverse of the
+  decoder's §1.6.3.5 reorder, and §4.5.2.1.3-conforming LFE elements
+  (always ONLY_LONG / sine through the frame's block switching, no
+  TNS, only the lowest 12 spectral lines transmitted).
   Round-trips through the crate's own decoder: multitone 128 kbps at
   0.016 err/sig RMS, staged-fixture transcodes at 0.0008–0.003,
-  identical-channel stereo at 1.02× the mono stream size, and the
+  identical-channel stereo at 1.02× the mono stream size (short-run
+  identical channels decode L exactly equal to R), multichannel
+  layouts pinned with one distinct tone per speaker, and the
   wire-level window-sequence walk pins the exact
   `LongStart → EightShort → LongStop` pattern around a percussive
-  burst.
+  burst; a deterministic bit-flip/truncation battery covers the
+  multichannel and grouped-short streams.
 - **`codec_encoder`** — the frame-in / packet-out
   `oxideav_core::Encoder` adaptor (`make_encoder`, honouring
-  `sample_rate` / `channels` / `bit_rate`, default 64 kbps/channel);
-  registered alongside the decoder under id `"aac"`, and re-exported
-  as `encoder::make_encoder` per the workspace dual-API convention.
+  `sample_rate` / `channels` (1–6, 8) / `bit_rate`, default
+  64 kbps/channel); registered alongside the decoder under id
+  `"aac"`, and re-exported as `encoder::make_encoder` per the
+  workspace dual-API convention.
 
 ## Not yet supported
 
 - Encoder-side tool remainders — the end-to-end AAC-LC encoder (see
-  `encoder` below) covers block switching, M/S, the
-  scalefactor/quantizer rate loop, and opt-in §4.6.13 PNS emission
+  `encoder` below) covers block switching with §4.5.2.3.4 short-frame
+  grouping, M/S on both frame shapes, the scalefactor/quantizer rate
+  loop with measured-bit-cost codebook/section choice, every
+  Table 1.19 default channel layout, and opt-in §4.6.13 PNS emission
   (`StreamEncoder::set_pns` — off by default because a single-frame
   spectral statistic cannot tell true noise from noise-shaped
   deterministic content such as sweeps; default-on awaits a
@@ -976,15 +1008,12 @@ the EP section below).
   (`StreamEncoder::set_intensity_stereo` — correlated high bands
   transmitted once with codebook 15/14 + `is_pos` on the §4.6.8.1.4
   track; off by default because intensity coding discards the
-  pair's side information), but does not
-  yet emit pulse data, keeps M/S, PNS and IS long-frame-only
-  (CPE PNS emits the §4.6.13.3 `ms_used` correlated-noise
-  signalling — shared random vector — for both-channels-noise bands
-  correlating above 0.5), codes eight one-window
-  groups per `EIGHT_SHORT` frame (no `scale_factor_grouping`
-  merging), and supports 1–2 channels (no multichannel PCE-driven
-  layouts). Codebook choice is smallest-LAV-fits rather than
-  measured-bit-cost.
+  pair's side information), but does not yet emit pulse data, keeps
+  PNS and IS long-frame-only (CPE PNS emits the §4.6.13.3 `ms_used`
+  correlated-noise signalling — shared random vector — for
+  both-channels-noise bands correlating above 0.5), and has no
+  PCE-driven custom layouts (7-channel and beyond-7.1 shapes; the
+  Table 1.19 defaults 1–6 and 8 all encode).
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
   reconstruction, IPQF — see the "SSR gain control" section above),
@@ -1039,25 +1068,29 @@ the EP section below).
   third-party CCE-bearing conformance fixture would still be a welcome
   external cross-check.
 - Error-resilience remainders — the ER story is now wired end to end
-  for ER AAC LC (AOT 17) **and ER AAC LD (AOT 23)**: the ER
-  channel-element body (`ics_body::IcsBody::parse_er`) selects all
-  three §4.4.6 resilience branches, the `reordered_spectral_data()`
-  payload is decoded and encoded (`hcr_decode`), and the §4.4.2.3
-  Table 4.19 `er_raw_data_block()` driver
+  for ER AAC LC (AOT 17), **ER AAC LTP (AOT 19)** and ER AAC LD
+  (AOT 23): the ER channel-element body
+  (`ics_body::IcsBody::parse_er`) selects all three §4.4.6
+  resilience branches, the `reordered_spectral_data()` payload is
+  decoded and encoded (`hcr_decode`), and the §4.4.2.3 Table 4.19
+  `er_raw_data_block()` driver
   (`StreamDecoder::decode_er_raw_data_block`) walks the fixed
-  per-`channelConfiguration` element sequence for both AOTs —
-  reachable from LATM (the LOAS driver routes AOT-17/23 layers there
-  with the ASC's resilience triplet and the ASC-resolved §4.5.1.1
-  frame family). AOT 17 is pinned bit-identical to the equivalent
-  non-resilient decode of the same spectra (`aac-er-hcr-loas`);
-  AOT 23 is pinned by the staged LD fixtures (see the frame-length
-  families section above). **ER AAC scalable (AOT 20) now decodes end
-  to end** (see the scalable section above), and the §1.8 EP tool —
-  `ErrorProtectionSpecificConfig()`, SRCPC / RS / interleaving, the
-  `ep_frame()` codec and the LOAS `EPMuxElement` /
+  per-`channelConfiguration` element sequence for all three AOTs —
+  reachable from LATM (the LOAS driver routes AOT-17/19/23 layers
+  there with the ASC's resilience triplet and the ASC-resolved
+  §4.5.1.1 frame family). AOT 17 is pinned bit-identical to the
+  equivalent non-resilient decode of the same spectra
+  (`aac-er-hcr-loas`); AOT 19 — the §4.6.7 LTP tool over the
+  Table 4.19 walk (11-bit lag, `M = 0`, per-element `x_rec` history
+  across frames) — is pinned bit-identical to the equivalent AOT-4
+  decode with LTP active (SCE and pair-LTP CPE, plain and HCR
+  spectra); AOT 23 is pinned by the staged LD fixtures (see the
+  frame-length families section above). **ER AAC scalable (AOT 20)
+  now decodes end to end** (see the scalable section above), and the
+  §1.8 EP tool — `ErrorProtectionSpecificConfig()`, SRCPC / RS /
+  interleaving, the `ep_frame()` codec and the LOAS `EPMuxElement` /
   `EPAudioSyncStream` carrier — is implemented (see the EP section
-  above). Still open: ER AAC LTP (AOT 19 — the LTP state rules over
-  er_raw_data_block), the §4.5.2.4 Table 4.148/4.149 per-element
+  above). Still open: the §4.5.2.4 Table 4.148/4.149 per-element
   category *split* of the codec payloads themselves (reassembling an
   er_raw_data_block whose bits arrive as separate
   error-sensitivity-category instances under `epConfig == 1` /

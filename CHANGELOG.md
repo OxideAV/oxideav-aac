@@ -8,6 +8,49 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ER AAC LTP (AOT 19)** decodes end to end: the §4.4.2.3 Table 4.19
+  `er_raw_data_block()` walk and the LOAS/LATM ER routing now admit
+  AOT 19, running the §4.6.7 LTP tool on the Table 4.55 non-LD
+  `ltp_data()` branch (11-bit lag, `M = 0`) with per-element
+  reconstruction history threading across frames. Pinned
+  bit-identical to the equivalent AOT-4 `raw_data_block()` decode
+  (SCE and common-window CPE with the pair-LTP subtree, plain and
+  HCR spectra), to AOT 17 when LTP is absent, and end to end through
+  a two-sync-frame LOAS stream; the LD-family cross-check and the
+  AOT-20 rejection are pinned.
+- **Encoder: measured-bit-cost codebook + section optimization** — a
+  dynamic program over section boundaries prices every candidate run
+  at its `section_data()` header overhead plus the cheapest single
+  Table 4.95 book (1..=11, actual coded size measured with the real
+  tuple writer), replacing the smallest-LAV-fit + merge-equal-books
+  rule (pinned never-larger against it) and exploiting the
+  signed/unsigned sibling books and header-saving LAV upgrades.
+- **Encoder: §4.5.2.3.4 `scale_factor_grouping`** on `EIGHT_SHORT`
+  frames: adjacent windows with envelope-alike per-band energies
+  merge into shared window groups (one scalefactor / section track
+  per group, §4.5.2.3.5 interleaved transmission order); the emitted
+  mask is pinned as the exact inverse of the decoder-side
+  derivation. `common_window` CPEs decide the grouping ONCE on the
+  pair envelope and impose it on both channels (a divergent pair
+  would desync the shared `ics_info` wire — regression-pinned).
+- **Encoder: per-`(window group, sfb)` M/S on `EIGHT_SHORT` frames**
+  (`ms_decide_short` / `apply_ms_short`) — the Table 4.5
+  `ms_used[g][sfb]` granularity under the joint grouping; an
+  identical-channel transient stream decodes with L exactly equal
+  to R.
+- **Encoder: Table 1.19 multichannel layouts** — every channel count
+  with a default `channelConfiguration` (1–6 and 8 = 7.1) encodes:
+  the element-plan `raw_data_block()` assembly (SCE / common-window
+  CPE / LFE with per-kind instance tags), canonical-order input
+  permuted by the exact inverse of the decoder's §1.6.3.5 reorder,
+  and §4.5.2.1.3-conforming LFE elements (always ONLY_LONG / sine,
+  no TNS, only the lowest 12 spectral lines). Round-trips pin every
+  layout with one distinct tone per speaker plus an LFE band-limit
+  check; the registry encoder accepts the new counts.
+- A deterministic corruption battery over the new encoder paths
+  (bit-flip + truncation sweeps on stereo grouped-short, 5.1 and
+  7.1 streams): clean errors, never panics.
+
 - **Scalable AAC** (AOT 6) and **ER AAC scalable** (AOT 20), AAC-only
   combinations, end to end (`scalable`): the §4.4.2.2 Tables 4.13–4.18
   `aac_scalable_main_element()` / `aac_scalable_extension_element()`
