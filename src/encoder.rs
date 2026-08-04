@@ -30,7 +30,13 @@
 //!   marks the hop transient; the frame *before* the transient hop
 //!   becomes `LONG_START`, the transient hop's frame `EIGHT_SHORT`
 //!   (extended while transients continue), and the run exits through
-//!   `LONG_STOP`. All windows are the §4.6.11.3.2 sine shape.
+//!   `LONG_STOP`. All windows are the §4.6.11.3.2 sine shape. Within
+//!   an `EIGHT_SHORT` frame the §4.5.2.3.4 `scale_factor_grouping`
+//!   decision ([`decide_short_grouping`]) merges envelope-alike
+//!   adjacent windows into shared window groups (one scalefactor /
+//!   section track per group, §4.5.2.3.5 interleaved transmission
+//!   order) — the attack window's energy jump keeps it in its own
+//!   group.
 //! * **Analysis filterbank** — the §4.6.11.3.1 forward MDCT (the
 //!   transform whose windowed overlap-add against the decoder's IMDCT
 //!   is unity — the same [`crate::filterbank::forward_mdct`] the
@@ -1202,7 +1208,8 @@ struct GroupQuant {
 /// Quantize the `num_swb` scalefactor bands of one window group.
 ///
 /// `spec` is the group's coefficient buffer (1024 lines for a long
-/// sequence, 128 for a one-window short group); `offsets` the
+/// sequence, `window_group_length × 128` interleaved lines for a
+/// short group); `offsets` the
 /// matching §4.5.4 band-offset table. `prev_sf` threads the DPCM ±60
 /// clamp across groups in wire order — the §4.6.2.3.2 accumulator is
 /// a single track for the whole channel.
@@ -1551,20 +1558,21 @@ fn optimize_group_sections(
 }
 
 /// Wrap quantized groups + an `ics_info` into the wire record set.
-/// `offsets` is the sequence's §4.5.4 band-offset table; each
-/// group's buffer is bounded at its own length (the short-window
-/// tables run past one window's 128 lines).
+/// The per-group band ranges come from the §4.5.2.3.4
+/// `sect_sfb_offset` derivation, so grouped short-window buffers
+/// (band widths × `window_group_length`) resolve correctly.
 fn finish_channel(
     info: IcsInfo,
     groups: Vec<GroupQuant>,
-    offsets: &[u16],
+    fs_index: u8,
 ) -> Result<QuantizedChannel> {
     let (global_gain, abs) = scalefactor_track(&groups);
     let long = info.window_sequence != WindowSequence::EightShort;
+    let per_group_offsets = crate::spectral_data::sect_sfb_offset(&info, fs_index)?;
     let mut sections = Vec::with_capacity(groups.len());
     let mut sfb_cb = Vec::with_capacity(groups.len());
     let mut x_quant = Vec::with_capacity(groups.len());
-    for mut g in groups {
+    for (mut g, offsets) in groups.into_iter().zip(per_group_offsets.iter()) {
         let ranges: Vec<(usize, usize)> = (0..g.sfb_cb.len())
             .map(|sfb| {
                 (
@@ -1660,14 +1668,85 @@ fn quantize_channel(
         window_group_length: vec![1],
         num_swb: num_swb as u8,
     };
-    finish_channel(info, vec![group], offsets)
+    finish_channel(info, vec![group], fs_index)
+}
+
+/// Maximum mean per-band log-energy distance (natural log) between
+/// two adjacent short windows for the §4.5.2.3.4 grouping decision
+/// to merge them into one window group. `ln 4 ≈ 1.39` — the windows'
+/// band envelopes agree within ~6 dB on average.
+const GROUP_MERGE_LOG_DIST: f64 = 1.386;
+
+/// Energy floor (one squared unit coefficient) added to both sides
+/// of the grouping log-ratio so empty bands compare as equal instead
+/// of dividing by zero.
+const GROUP_MERGE_EPS: f64 = 1.0;
+
+/// §4.5.2.3.4 `scale_factor_grouping` decision for one channel's
+/// `EIGHT_SHORT_SEQUENCE` spectrum (8 × 128 window-major
+/// coefficients): merge adjacent windows whose per-band energy
+/// envelopes agree within [`GROUP_MERGE_LOG_DIST`] on average.
+///
+/// Grouped windows share one scalefactor / section track — the whole
+/// point of the tool (§4.6.2.3.2: "to achieve a most efficient
+/// coding, several subsequent windows... can be grouped") — so the
+/// merge criterion mirrors what sharing costs: windows with matching
+/// band envelopes lose nothing to a common scalefactor, while an
+/// attack window's jump keeps it in its own group. Returns the
+/// `window_group_length` vector (summing to 8).
+fn decide_short_grouping(spec: &[f64], offsets: &[u16], num_swb: usize) -> Vec<u8> {
+    let short_len = SHORT_WINDOW_LEN as usize;
+    let band_energy = |w: usize, sfb: usize| -> f64 {
+        let base = w * short_len;
+        spec[base + offsets[sfb] as usize..base + offsets[sfb + 1] as usize]
+            .iter()
+            .map(|&v| v * v)
+            .sum()
+    };
+    let mut lengths: Vec<u8> = vec![1];
+    for w in 1..8 {
+        let dist: f64 = (0..num_swb)
+            .map(|sfb| {
+                let a = band_energy(w - 1, sfb) + GROUP_MERGE_EPS;
+                let b = band_energy(w, sfb) + GROUP_MERGE_EPS;
+                (a / b).ln().abs()
+            })
+            .sum::<f64>()
+            / num_swb.max(1) as f64;
+        if dist <= GROUP_MERGE_LOG_DIST {
+            *lengths.last_mut().expect("non-empty") += 1;
+        } else {
+            lengths.push(1);
+        }
+    }
+    lengths
+}
+
+/// The 7-bit `scale_factor_grouping` mask for a `window_group_length`
+/// vector: bit `6 − (w − 1)` is set when window `w` (1..=7) stays in
+/// the previous window's group — the inverse of the §4.5.2.3.4
+/// derivation in [`crate::ics_info::derive_window_grouping`].
+fn grouping_mask(window_group_length: &[u8]) -> u8 {
+    let mut mask = 0u8;
+    let mut w = 0usize;
+    for &len in window_group_length {
+        for j in 0..len as usize {
+            if j > 0 {
+                mask |= 1 << (6 - (w - 1));
+            }
+            w += 1;
+        }
+    }
+    mask
 }
 
 /// Quantize one channel's `EIGHT_SHORT_SEQUENCE` spectrum (8 x 128
-/// window-major coefficients) into a complete record set. Each short
-/// window forms its own window group (`scale_factor_grouping = 0`) —
-/// the simplest conforming grouping, at the cost of eight
-/// scalefactor/section tracks per frame.
+/// window-major coefficients) into a complete record set. The
+/// §4.5.2.3.4 grouping decision ([`decide_short_grouping`]) merges
+/// envelope-alike adjacent windows into shared window groups — one
+/// scalefactor / section track per group instead of eight — and each
+/// group's coefficients are laid out in the §4.5.2.3.5 interleaved
+/// `(sfb, window, bin)` transmission order.
 fn quantize_channel_short(
     spec: &[f64],
     fs_index: u8,
@@ -1678,19 +1757,41 @@ fn quantize_channel_short(
     debug_assert_eq!(spec.len(), 8 * short_len);
     let offsets = short_window_offsets(fs_index)?;
     let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let window_group_length = decide_short_grouping(spec, offsets, num_swb);
+    let mask = grouping_mask(&window_group_length);
     let mut prev_sf: Option<i32> = None;
-    let mut groups = Vec::with_capacity(8);
-    for j in 0..8 {
-        let win = &spec[j * short_len..(j + 1) * short_len];
+    let mut groups = Vec::with_capacity(window_group_length.len());
+    let mut win_base = 0usize;
+    for &len in &window_group_length {
+        let wgl = len as usize;
+        // §4.5.2.3.5 interleave: for each band, the group's windows'
+        // band coefficients ride consecutively.
+        let mut buf = Vec::with_capacity(wgl * short_len);
+        for sfb in 0..num_swb {
+            let (s, e) = (offsets[sfb] as usize, offsets[sfb + 1] as usize);
+            for w in 0..wgl {
+                let base = (win_base + w) * short_len;
+                buf.extend_from_slice(&spec[base + s..base + e]);
+            }
+        }
+        // The group's sect_sfb_offset table: band widths × wgl.
+        let mut scaled = Vec::with_capacity(num_swb + 1);
+        let mut acc = 0u16;
+        scaled.push(0u16);
+        for sfb in 0..num_swb {
+            acc += (offsets[sfb + 1] - offsets[sfb]) * len as u16;
+            scaled.push(acc);
+        }
         groups.push(quantize_group(
-            win,
-            offsets,
+            &buf,
+            &scaled,
             num_swb,
             sf_offset,
             frame_peak,
             &mut prev_sf,
             &[], // PNS stays long-frame-only for now
         ));
+        win_base += wgl;
     }
     let info = IcsInfo {
         family: crate::swb_offset::FrameFamily::Lc1024,
@@ -1698,7 +1799,7 @@ fn quantize_channel_short(
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
         max_sfb: num_swb as u8,
-        scale_factor_grouping: Some(0),
+        scale_factor_grouping: Some(mask),
         predictor_data_present: false,
         predictor_data: None,
         ltp_data_present: false,
@@ -1706,11 +1807,11 @@ fn quantize_channel_short(
         ltp_data_present_pair: None,
         ltp_data_pair: None,
         num_windows: 8,
-        num_window_groups: 8,
-        window_group_length: vec![1; 8],
+        num_window_groups: window_group_length.len() as u8,
+        window_group_length,
         num_swb: num_swb as u8,
     };
-    finish_channel(info, groups, offsets)
+    finish_channel(info, groups, fs_index)
 }
 
 #[cfg(test)]
@@ -1956,6 +2057,92 @@ mod tests {
             let opt = measure_group(sections, books, buf, num_swb, fs_index);
             assert!(opt <= naive, "case {case}: opt {opt} > naive {naive}");
         }
+    }
+
+    /// [`decide_short_grouping`] merges alike windows and splits at
+    /// an attack; [`grouping_mask`] is the exact inverse of the
+    /// §4.5.2.3.4 mask derivation.
+    #[test]
+    fn short_grouping_decision_and_mask() {
+        let fs_index = 4u8;
+        let offsets = short_window_offsets(fs_index).unwrap();
+        let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+        let short_len = SHORT_WINDOW_LEN as usize;
+        // Eight identical windows: one group of 8, mask all-ones.
+        let mut spec = vec![0.0f64; 8 * short_len];
+        for w in 0..8 {
+            for k in 0..short_len {
+                spec[w * short_len + k] = 1000.0 * ((k as f64) * 0.37).sin();
+            }
+        }
+        assert_eq!(decide_short_grouping(&spec, offsets, num_swb), vec![8]);
+        assert_eq!(grouping_mask(&[8]), 0x7F);
+        // A 60 dB attack at window 3 splits the run there.
+        for k in 0..short_len {
+            for w in 3..8 {
+                spec[w * short_len + k] *= 1000.0;
+            }
+        }
+        let lengths = decide_short_grouping(&spec, offsets, num_swb);
+        assert_eq!(lengths, vec![3, 5]);
+        assert_eq!(grouping_mask(&lengths), 0b110_1111);
+        // No grouping at all round-trips to mask 0.
+        assert_eq!(grouping_mask(&[1; 8]), 0);
+        // Every mask agrees with the decoder-side derivation.
+        for lengths in [vec![8u8], vec![3, 5], vec![1; 8], vec![2, 1, 4, 1]] {
+            let mask = grouping_mask(&lengths);
+            let (_, n, derived, _) = crate::ics_info::derive_window_grouping(
+                WindowSequence::EightShort,
+                Some(mask),
+                fs_index as usize,
+            );
+            assert_eq!(derived, lengths);
+            assert_eq!(n as usize, lengths.len());
+        }
+    }
+
+    /// A grouped short channel's wire records round-trip through the
+    /// crate's own parsers: the ics_info grouping, the per-group
+    /// section spans, and the §4.5.2.3.5 interleaved spectrum come
+    /// back exactly.
+    #[test]
+    fn short_grouping_wire_roundtrip() {
+        use oxideav_core::bits::BitReader;
+        let fs_index = 4u8;
+        let short_len = SHORT_WINDOW_LEN as usize;
+        // Windows 0..3 carry pattern A, 3..8 a 40 dB louder pattern B
+        // (the grouping decision splits at the jump).
+        let mut spec = vec![0.0f64; 8 * short_len];
+        for w in 0..8 {
+            let (gain, phase) = if w < 3 {
+                (300.0, 0.31)
+            } else {
+                (30000.0, 0.11)
+            };
+            for k in 0..short_len {
+                spec[w * short_len + k] = gain * ((k as f64) * phase).sin();
+            }
+        }
+        let frame_peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+        let chan = quantize_channel_short(&spec, fs_index, 0, frame_peak).unwrap();
+        assert_eq!(chan.info.window_group_length, vec![3, 5]);
+
+        let mut bw = BitWriter::new();
+        chan.body.write(&mut bw, 2, fs_index, false).unwrap();
+        chan.spectral
+            .write(&mut bw, &chan.info, &chan.body.section_data, fs_index)
+            .unwrap();
+        let bytes = bw.finish();
+        let mut reader = BitReader::new(&bytes);
+        let body = IcsBody::parse(&mut reader, 2, fs_index, false).unwrap();
+        let ics = body.ics_info.as_ref().unwrap();
+        assert_eq!(ics.scale_factor_grouping, Some(0b110_1111));
+        assert_eq!(ics.num_window_groups, 2);
+        assert_eq!(ics.window_group_length, vec![3, 5]);
+        let spectral = SpectralData::parse(&mut reader, ics, &body.section_data, fs_index).unwrap();
+        assert_eq!(spectral, chan.spectral);
+        assert_eq!(body.section_data, chan.body.section_data);
+        assert_eq!(body.scale_factor_data, chan.body.scale_factor_data);
     }
 
     #[test]
