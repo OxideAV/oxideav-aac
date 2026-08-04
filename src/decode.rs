@@ -765,10 +765,17 @@ impl StreamDecoder {
     /// `reordered_spectral_data()` payload decoded by
     /// [`crate::hcr_decode::decode_reordered_spectral_data`].
     ///
-    /// Scope: the ER AAC LC object type (AOT 17). ER AAC LTP / scalable
-    /// / LD (AOTs 19 / 20 / 23) use LTP state, scalable layering or the
-    /// 480/512 transform family this entry point does not drive yet and
-    /// are rejected with [`Error::NotImplemented`]. The trailing
+    /// Scope: the ER AAC LC (AOT 17), ER AAC LTP (AOT 19) and ER AAC
+    /// LD (AOT 23) object types — the three §4.4.2.3 Table 4.19
+    /// payloads. ER AAC scalable (AOT 20) rides its own layered
+    /// `aac_scalable_main_element()` walk (see [`crate::scalable`])
+    /// and is rejected here with [`Error::NotImplemented`]. For
+    /// AOT 19 the §4.6.7 LTP tool is live: `ics_info()` carries the
+    /// Table 4.55 non-LD `ltp_data()` branch (11-bit lag, `M = 0`),
+    /// and the per-element [`crate::element_decode::ElementDecoder`]
+    /// slots persist the §4.6.7.3 `x_rec` reconstruction history
+    /// across frames exactly as the non-ER AOT-4 walk does. The
+    /// trailing
     /// `extension_payload()` loop is consumed permissively (ignored),
     /// matching the FIL handling of the non-ER walk; `epConfig` 2 / 3
     /// physical-payload preprocessing (§4.5.2.4) is out of scope (the
@@ -782,12 +789,16 @@ impl StreamDecoder {
         resilience: AacResilienceFlags,
         payload: &[u8],
     ) -> Result<DecodedFrame> {
-        // AOT 17 (ER AAC LC) and AOT 23 (ER AAC LD) share the
-        // Table 4.19 er_raw_data_block(); LD differs only in the
-        // 512/480-line frame family this decoder was configured with
-        // (§4.6.17) and its ltp_data() branch. The other ER GA types
-        // (19 scalable-LTP state / 20 scalable layering) stay out.
-        if aot != 17 && aot != 23 {
+        // AOT 17 (ER AAC LC), AOT 19 (ER AAC LTP) and AOT 23 (ER AAC
+        // LD) share the Table 4.19 er_raw_data_block(). LD differs in
+        // the 512/480-line frame family this decoder was configured
+        // with (§4.6.17) and its delta-coded ltp_data() branch; AOT 19
+        // adds the plain §4.6.7 LTP tool (Table 4.55 non-LD branch)
+        // whose per-element reconstruction history the decoder slots
+        // below already thread. ER AAC scalable (AOT 20) uses the
+        // layered aac_scalable_main_element() walk instead and stays
+        // out of this entry point.
+        if aot != 17 && aot != 19 && aot != 23 {
             return Err(Error::NotImplemented);
         }
         // An LD stream must run an LD family and vice versa — a
