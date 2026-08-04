@@ -60,9 +60,15 @@
 //!   step, the §4.6.2.3.3 quarter-step ladder ×2) until the assembled
 //!   frame fits the per-frame byte budget derived from the requested
 //!   bitrate.
-//! * **Codebook choice** — the smallest Table 4.95 codebook whose LAV
-//!   covers the band's max |q| (`1 / 3 / 5 / 7 / 9 / 11`); adjacent
-//!   bands with equal codebooks merge into one section.
+//! * **Codebook / section choice** — measured bit cost: a dynamic
+//!   program over section boundaries picks, for every candidate run
+//!   of same-class bands, the single Table 4.95 book (1..=11) whose
+//!   *actual* coded size — Huffman codewords + sign bits + escapes,
+//!   measured with the real tuple writer — plus the `section_data()`
+//!   header overhead is minimal (see [`optimize_group_sections`]).
+//!   This subsumes the classic smallest-LAV-fit + merge-equal-books
+//!   rule and additionally exploits the signed/unsigned sibling
+//!   books and header-saving LAV upgrades.
 //! * **Stereo** — a CPE with `common_window == 1` (one shared
 //!   `ics_info()`) and per-band §4.6.8.1 M/S coding: for each
 //!   scalefactor band the encoder forms `m = (l+r)/2`,
@@ -1369,30 +1375,210 @@ fn scalefactor_track(groups: &[GroupQuant]) -> (u8, AbsoluteScaleFactors) {
     (global_gain, AbsoluteScaleFactors { entries })
 }
 
-/// Merge one group's per-band codebooks into contiguous sections.
-fn build_sections(sfb_cb: &[u8]) -> Vec<Section> {
-    let mut sections: Vec<Section> = Vec::new();
-    for (sfb, &cb) in sfb_cb.iter().enumerate() {
-        match sections.last_mut() {
-            Some(s) if s.codebook == cb => s.end = (sfb + 1) as u8,
-            _ => sections.push(Section {
-                codebook: cb,
-                start: sfb as u8,
-                end: (sfb + 1) as u8,
-            }),
+/// Exact §4.6.3.3 wire cost, in bits, of coding one band's
+/// coefficient range with spectrum book `cb` — Huffman codewords +
+/// sign bits + escape sequences, measured by running the actual
+/// [`crate::spectral_data`] tuple writer into a scratch buffer.
+/// `None` when the book cannot carry the band (a magnitude beyond
+/// the book's Table 4.95 LAV; book 11 escapes up to `MAX_QUANT`).
+fn band_bits(cb: u8, coeffs: &[i32]) -> Option<u32> {
+    let row = crate::spectral_codebook::table_4_95(cb).ok()?;
+    let dim = row.dimension? as usize;
+    let mut bw = BitWriter::new();
+    let mut k = 0;
+    while k + dim <= coeffs.len() {
+        crate::spectral_data::write_tuple(&mut bw, cb, dim, &coeffs[k..k + dim]).ok()?;
+        k += dim;
+    }
+    if k != coeffs.len() {
+        return None; // band width not a whole number of tuples
+    }
+    Some(bw.bit_position() as u32)
+}
+
+/// The §4.4.2.7-adjacent `section_data()` header cost of one section
+/// spanning `len` bands: 4 bits `sect_cb` plus the `sect_len_incr`
+/// escape run (5-bit fields / escape 31 for long sequences, 3-bit /
+/// escape 7 for `EIGHT_SHORT`).
+fn section_header_bits(len: u32, long: bool) -> u32 {
+    let (esc, w) = if long { (31, 5) } else { (7, 3) };
+    4 + w * (len / esc + 1)
+}
+
+/// A band's sectioning class — sections may only span bands of one
+/// class (the special codebooks are semantic, not a coding choice,
+/// and a `ZERO_HCB` band folded into a spectrum section would owe a
+/// scalefactor the track never assigned).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum BandClass {
+    /// `ZERO_HCB` — no spectrum, no scalefactor.
+    Zero,
+    /// `NOISE_HCB` / intensity books — the codebook is fixed by the
+    /// tool decision; adjacent equal books merge.
+    Fixed(u8),
+    /// Spectrum bands (provisional book 1..=11) — the section book
+    /// is a free choice among every book that covers the run.
+    Spectral,
+}
+
+/// Choose one window group's sections + codebooks by measured bit
+/// cost (§4.6.3.1 leaves both entirely to the encoder).
+///
+/// Dynamic program over section boundaries: for every candidate run
+/// of same-class bands the cost is the [`section_header_bits`]
+/// overhead plus — for spectral runs — the cheapest single Table
+/// 4.95 book (1..=11, measured per band via [`band_bits`], covering
+/// the whole run) summed over the run's bands. This subsumes the
+/// classic "smallest LAV fit + merge equal books" rule and beats it
+/// wherever a signed/unsigned sibling book codes the actual
+/// distribution cheaper, or one step up in LAV lets two sections
+/// merge for less than the saved header.
+///
+/// `ranges` maps each band to its coefficient range inside the
+/// group's (interleaved) buffer; `sfb_cb` carries the per-band class
+/// in (provisional books on spectral bands) and the chosen books
+/// out.
+fn optimize_group_sections(
+    x_quant: &[i32],
+    ranges: &[(usize, usize)],
+    sfb_cb: &mut [u8],
+    long: bool,
+) -> Result<Vec<Section>> {
+    let n = sfb_cb.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let class: Vec<BandClass> = sfb_cb
+        .iter()
+        .map(|&cb| match cb {
+            ZERO_HCB => BandClass::Zero,
+            NOISE_HCB | INTENSITY_HCB | INTENSITY_HCB2 => BandClass::Fixed(cb),
+            _ => BandClass::Spectral,
+        })
+        .collect();
+    // Per-band cost under each spectrum book (None = book can't
+    // carry the band).
+    let books: [u8; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    let cost: Vec<[Option<u32>; 11]> = (0..n)
+        .map(|b| {
+            let mut row = [None; 11];
+            if class[b] == BandClass::Spectral {
+                let (s, e) = ranges[b];
+                for (i, &cb) in books.iter().enumerate() {
+                    row[i] = band_bits(cb, &x_quant[s..e]);
+                }
+            }
+            row
+        })
+        .collect();
+
+    // dp[b] = (bits, cut, book) for the cheapest sectioning of bands
+    // 0..b, where `cut` is the start of the final section and `book`
+    // its codebook.
+    let mut dp: Vec<(u64, usize, u8)> = vec![(u64::MAX, 0, 0); n + 1];
+    dp[0] = (0, 0, 0);
+    for b in 1..=n {
+        for a in (0..b).rev() {
+            // The run a..b must be one class (and one fixed book).
+            if class[a] != class[b - 1] {
+                break;
+            }
+            let header = u64::from(section_header_bits((b - a) as u32, long));
+            let run = match class[a] {
+                BandClass::Zero => Some((0u8, 0u64)),
+                BandClass::Fixed(cb) => {
+                    if sfb_cb[a..b].iter().any(|&c| c != cb) {
+                        None // e.g. mixed intensity phases
+                    } else {
+                        Some((cb, 0))
+                    }
+                }
+                BandClass::Spectral => {
+                    let mut best: Option<(u8, u64)> = None;
+                    for (i, &cb) in books.iter().enumerate() {
+                        let mut sum = 0u64;
+                        let mut ok = true;
+                        for c in cost[a..b].iter() {
+                            match c[i] {
+                                Some(bits) => sum += u64::from(bits),
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok && best.map(|(_, s)| sum < s).unwrap_or(true) {
+                            best = Some((cb, sum));
+                        }
+                    }
+                    best
+                }
+            };
+            let Some((book, run_bits)) = run else {
+                continue;
+            };
+            let total = dp[a].0.saturating_add(header + run_bits);
+            if total < dp[b].0 {
+                dp[b] = (total, a, book);
+            }
         }
     }
-    sections
+    if dp[n].0 == u64::MAX {
+        return Err(Error::SpectralDataEncodeInvalid);
+    }
+
+    // Walk the cuts back into sections and stamp the chosen books.
+    let mut bounds = Vec::new();
+    let mut b = n;
+    while b > 0 {
+        let (_, a, book) = dp[b];
+        bounds.push((a, b, book));
+        b = a;
+    }
+    bounds.reverse();
+    let mut sections = Vec::with_capacity(bounds.len());
+    for (a, b, book) in bounds {
+        for cb in sfb_cb[a..b].iter_mut() {
+            *cb = book;
+        }
+        sections.push(Section {
+            codebook: book,
+            start: a as u8,
+            end: b as u8,
+        });
+    }
+    Ok(sections)
 }
 
 /// Wrap quantized groups + an `ics_info` into the wire record set.
-fn finish_channel(info: IcsInfo, groups: Vec<GroupQuant>) -> Result<QuantizedChannel> {
+/// `offsets` is the sequence's §4.5.4 band-offset table; each
+/// group's buffer is bounded at its own length (the short-window
+/// tables run past one window's 128 lines).
+fn finish_channel(
+    info: IcsInfo,
+    groups: Vec<GroupQuant>,
+    offsets: &[u16],
+) -> Result<QuantizedChannel> {
     let (global_gain, abs) = scalefactor_track(&groups);
+    let long = info.window_sequence != WindowSequence::EightShort;
     let mut sections = Vec::with_capacity(groups.len());
     let mut sfb_cb = Vec::with_capacity(groups.len());
     let mut x_quant = Vec::with_capacity(groups.len());
-    for g in groups {
-        sections.push(build_sections(&g.sfb_cb));
+    for mut g in groups {
+        let ranges: Vec<(usize, usize)> = (0..g.sfb_cb.len())
+            .map(|sfb| {
+                (
+                    (offsets[sfb] as usize).min(g.x_quant.len()),
+                    (offsets[sfb + 1] as usize).min(g.x_quant.len()),
+                )
+            })
+            .collect();
+        sections.push(optimize_group_sections(
+            &g.x_quant,
+            &ranges,
+            &mut g.sfb_cb,
+            long,
+        )?);
         sfb_cb.push(g.sfb_cb);
         x_quant.push(g.x_quant);
     }
@@ -1474,7 +1660,7 @@ fn quantize_channel(
         window_group_length: vec![1],
         num_swb: num_swb as u8,
     };
-    finish_channel(info, vec![group])
+    finish_channel(info, vec![group], offsets)
 }
 
 /// Quantize one channel's `EIGHT_SHORT_SEQUENCE` spectrum (8 x 128
@@ -1524,7 +1710,7 @@ fn quantize_channel_short(
         window_group_length: vec![1; 8],
         num_swb: num_swb as u8,
     };
-    finish_channel(info, groups)
+    finish_channel(info, groups, offsets)
 }
 
 #[cfg(test)]
@@ -1618,6 +1804,158 @@ mod tests {
             }),
             Err(Error::EncoderInvalidConfig)
         ));
+    }
+
+    /// Deterministic band fill for the sectioning tests.
+    fn fill_band(buf: &mut [i32], range: (usize, usize), max: i32, seed: &mut u32) {
+        for slot in buf[range.0..range.1].iter_mut() {
+            *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *slot = ((*seed >> 8) % (2 * max + 1) as u32) as i32 - max;
+        }
+    }
+
+    /// Total wire bits of one long group under given sections /
+    /// books: `section_data()` + `spectral_data()`, measured with
+    /// the real writers.
+    fn measure_group(
+        sections: Vec<Section>,
+        sfb_cb: Vec<u8>,
+        x_quant: Vec<i32>,
+        num_swb: usize,
+        fs_index: u8,
+    ) -> u64 {
+        let info = IcsInfo {
+            family: crate::swb_offset::FrameFamily::Lc1024,
+            ics_reserved_bit: false,
+            window_sequence: WindowSequence::OnlyLong,
+            window_shape: WindowShape::Sine,
+            max_sfb: num_swb as u8,
+            scale_factor_grouping: None,
+            predictor_data_present: false,
+            predictor_data: None,
+            ltp_data_present: false,
+            ltp_data: None,
+            ltp_data_present_pair: None,
+            ltp_data_pair: None,
+            num_windows: 1,
+            num_window_groups: 1,
+            window_group_length: vec![1],
+            num_swb: num_swb as u8,
+        };
+        let sd = SectionData {
+            sections: vec![sections],
+            sfb_cb: vec![sfb_cb],
+        };
+        let spectral = SpectralData {
+            x_quant: vec![x_quant],
+        };
+        let mut bw = BitWriter::new();
+        sd.write(&mut bw, WindowSequence::OnlyLong, num_swb as u8)
+            .unwrap();
+        spectral.write(&mut bw, &info, &sd, fs_index).unwrap();
+        bw.bit_position()
+    }
+
+    /// [`band_bits`] agrees with the real `spectral_data()` writer:
+    /// a one-section stream's spectral bits equal the summed band
+    /// costs.
+    #[test]
+    fn band_bits_matches_wire_writer() {
+        let fs_index = 4u8;
+        let offsets = long_window_offsets(fs_index).unwrap();
+        let mut buf = vec![0i32; FRAME_LEN];
+        let mut seed = 0xB17u32;
+        for sfb in 0..6 {
+            fill_band(
+                &mut buf,
+                (offsets[sfb] as usize, offsets[sfb + 1] as usize),
+                7,
+                &mut seed,
+            );
+        }
+        for cb in [7u8, 8, 9, 10, 11] {
+            let per_band: u32 = (0..6)
+                .map(|sfb| {
+                    band_bits(cb, &buf[offsets[sfb] as usize..offsets[sfb + 1] as usize]).unwrap()
+                })
+                .sum();
+            let sections = vec![Section {
+                codebook: cb,
+                start: 0,
+                end: 6,
+            }];
+            let wire = measure_group(sections.clone(), vec![cb; 6], buf.clone(), 6, fs_index);
+            let header = u64::from(section_header_bits(6, true));
+            assert_eq!(wire, header + u64::from(per_band), "cb {cb}");
+        }
+        // A signed book rejects magnitudes past its LAV; the quad
+        // books reject a pair-only width mismatch never (widths are
+        // multiples of 4), but LAV 1 caps at |1|.
+        assert!(band_bits(1, &[2, 0, 0, 0]).is_none());
+        assert!(band_bits(3, &[3, 0, 0, 0]).is_none());
+    }
+
+    /// The measured-cost DP never codes a group larger than the
+    /// classic smallest-LAV + merge-equal-books sectioning, over a
+    /// spread of band shapes (zero runs, alternating magnitudes,
+    /// escape bands).
+    #[test]
+    fn optimizer_never_loses_to_naive_sections() {
+        let fs_index = 4u8;
+        let offsets = long_window_offsets(fs_index).unwrap();
+        let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+        for (case, seed0) in [(0u32, 1u32), (1, 0xACE), (2, 0x5EED), (3, 77)] {
+            let mut buf = vec![0i32; FRAME_LEN];
+            let mut seed = seed0;
+            for sfb in 0..num_swb {
+                let range = (offsets[sfb] as usize, offsets[sfb + 1] as usize);
+                let max = match case {
+                    0 => [0, 1, 1, 2, 0, 0, 4, 7, 1][sfb % 9],
+                    1 => [1, 12, 1, 30, 0, 2][sfb % 6],
+                    2 => (sfb as i32) % 5,
+                    _ => [7, 7, 0, 0, 0, 12, 1, 1][sfb % 8],
+                };
+                if max > 0 {
+                    fill_band(&mut buf, range, max, &mut seed);
+                }
+            }
+            // Provisional per-band books (the DP input).
+            let provisional: Vec<u8> = (0..num_swb)
+                .map(|sfb| {
+                    let band = &buf[offsets[sfb] as usize..offsets[sfb + 1] as usize];
+                    codebook_for(band.iter().map(|&v| v.abs()).max().unwrap_or(0))
+                })
+                .collect();
+            // Naive: keep the smallest-LAV books, merge equal runs.
+            let mut naive_sections: Vec<Section> = Vec::new();
+            for (sfb, &cb) in provisional.iter().enumerate() {
+                match naive_sections.last_mut() {
+                    Some(s) if s.codebook == cb => s.end = (sfb + 1) as u8,
+                    _ => naive_sections.push(Section {
+                        codebook: cb,
+                        start: sfb as u8,
+                        end: (sfb + 1) as u8,
+                    }),
+                }
+            }
+            let naive = measure_group(
+                naive_sections,
+                provisional.clone(),
+                buf.clone(),
+                num_swb,
+                fs_index,
+            );
+            // Optimized.
+            let ranges: Vec<(usize, usize)> = (0..num_swb)
+                .map(|sfb| (offsets[sfb] as usize, offsets[sfb + 1] as usize))
+                .collect();
+            let mut books = provisional;
+            let sections = optimize_group_sections(&buf, &ranges, &mut books, true).unwrap();
+            // Every chosen book covers its bands (the writer would
+            // reject otherwise) and the wire is never larger.
+            let opt = measure_group(sections, books, buf, num_swb, fs_index);
+            assert!(opt <= naive, "case {case}: opt {opt} > naive {naive}");
+        }
     }
 
     #[test]
