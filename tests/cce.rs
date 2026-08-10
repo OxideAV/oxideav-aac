@@ -201,9 +201,10 @@ fn cce_with_split_cpe_lists_round_trips() {
 
     // Spot-check the §4.6.8.3.3 cc_gain on the transmitted list
     // (raw = -2: with the sign bit, cc_sign = 1 - 2*(0) = 1, gain =
-    // -2>>1 = -1 => cc_scale^-1).
+    // -2>>1 = -1 => cc_scale^(−(−1)) = cc_scale under the
+    // conformance-settled negated exponent).
     let g = cce.gains.cc_gain(1, 0, 0).unwrap();
-    let expect = oxideav_aac::cce::CC_SCALE_TABLE[1].powi(-1);
+    let expect = oxideav_aac::cce::CC_SCALE_TABLE[1];
     assert!((g - expect).abs() < 1e-12, "cc_gain={g} expect={expect}");
 }
 

@@ -53,7 +53,8 @@
 //! ## Reconstruction
 //!
 //! [`CouplingGains::cc_gain`] applies the §4.6.8.3.3 `couple_channel()`
-//! scaling: `cc_gain = cc_sign · cc_scale^gain`, with `cc_scale` from
+//! scaling: `cc_gain = cc_sign · cc_scale^(−gain)` (conformance-settled
+//! exponent sign — see [`CouplingGains::cc_gain`]), with `cc_scale` from
 //! Table 4.154 ([`CC_SCALE_TABLE`]) and the §4.6.8.3.3 `gain_element_sign`
 //! in-phase / out-of-phase split (`cc_sign = 1 − 2·(g & 1)`, `gain =
 //! g >> 1`). The first coupled target (`list_index == 0`) is not
@@ -410,10 +411,26 @@ impl CouplingGains {
     /// (`0` = the implicit natural-scaling target → `cc_gain == 1.0`;
     /// `1 ..= num_gain_element_lists - 1` index [`Self::lists`]).
     ///
-    /// Returns `cc_gain = cc_sign · cc_scale^gain`, where (per
+    /// Returns `cc_gain = cc_sign · cc_scale^(−gain)`, where (per
     /// `gain_element_sign`):
     /// * sign set: `cc_sign = 1 − 2·(g & 1)`, `gain = g >> 1`;
     /// * sign clear: `cc_sign = 1`, `gain = g`.
+    ///
+    /// The **negated** exponent is the conformance-settled reading of
+    /// the §4.6.8.3.3 `cc_scale^gain_element` expression. All three
+    /// staged editions print a positive exponent, but the ISO/IEC
+    /// 14496-26 `am05_*` vectors (the only normative CCE bitstreams;
+    /// every AU carries `common_gain_element = −1` lists) reconstruct
+    /// their reference waveforms only with `cc_scale^(−ge)` — with the
+    /// printed positive exponent every coupled target channel misses by
+    /// ~1e-1 err/sig, with the negated form all six channels land at
+    /// ~1e-4. This resolves the question
+    /// `docs/audio/aac/cce-gain-sign-split.md` §4 left open (a
+    /// black-box validator had measured the negated exponent; the
+    /// conformance corpus now confirms it as the normative wire
+    /// convention). The §3 ruling of that document (sign split on the
+    /// DPCM delta, `ZERO_HCB` guard, unsigned `common_gain_element`)
+    /// is unaffected.
     pub fn cc_gain(&self, list_index: usize, g: usize, sfb: usize) -> Result<f64> {
         if list_index == 0 {
             // The first coupled target's gains are not transmitted; the
@@ -434,7 +451,7 @@ impl CouplingGains {
         } else {
             (1.0, raw)
         };
-        Ok(cc_sign * self.cc_scale.powi(gain))
+        Ok(cc_sign * self.cc_scale.powi(-gain))
     }
 
     /// §4.6.8.3.3 `couple_channel(source_spectrum, dest_spectrum,
@@ -453,7 +470,7 @@ impl CouplingGains {
     ///           dest[g][b][sfb][i] += cc_gain(idx,g,sfb) * source[g][b][sfb][i];
     /// ```
     ///
-    /// `cc_gain` per band is [`Self::cc_gain`] (`cc_sign · cc_scale^gain`);
+    /// `cc_gain` per band is [`Self::cc_gain`] (`cc_sign · cc_scale^(−gain)`);
     /// the implicit list 0 (`list_index == 0`) couples in natural scaling
     /// (`cc_gain == 1`) onto every non-`ZERO_HCB` band.
     ///
@@ -783,8 +800,8 @@ mod tests {
         assert_eq!(gains.cc_gain(0, 0, 0).unwrap(), 1.0);
     }
 
-    /// `cc_gain` applies `cc_scale^gain` for a common-gain list with the
-    /// sign bit clear.
+    /// `cc_gain` applies `cc_scale^(−gain)` (conformance-settled
+    /// exponent sign) for a common-gain list with the sign bit clear.
     #[test]
     fn cc_gain_common_no_sign() {
         let gains = CouplingGains {
@@ -792,8 +809,8 @@ mod tests {
             gain_element_sign: false,
             lists: vec![GainList::Common(3)],
         };
-        // gain = 3, cc_sign = 1 => 2^3 = 8.
-        assert!((gains.cc_gain(1, 0, 0).unwrap() - 8.0).abs() < 1e-12);
+        // gain = 3, cc_sign = 1 => 2^-3 = 1/8.
+        assert!((gains.cc_gain(1, 0, 0).unwrap() - 0.125).abs() < 1e-12);
     }
 
     /// With the sign bit set, the LSB of the gain element selects the
@@ -805,8 +822,8 @@ mod tests {
             gain_element_sign: true,
             lists: vec![GainList::Common(7)],
         };
-        // raw = 7 (0b111): cc_sign = 1 - 2*(1) = -1, gain = 3 => -8.
-        assert!((gains.cc_gain(1, 0, 0).unwrap() + 8.0).abs() < 1e-12);
+        // raw = 7 (0b111): cc_sign = 1 - 2*(1) = -1, gain = 3 => -2^-3.
+        assert!((gains.cc_gain(1, 0, 0).unwrap() + 0.125).abs() < 1e-12);
     }
 
     /// A dependently switched per-band DPCM list round-trips through
@@ -884,19 +901,20 @@ mod tests {
         assert_eq!(&dest[4..8], &[10.0, 10.0, 10.0, 10.0]);
     }
 
-    /// `couple_channel` applies a non-unity common gain (`cc_scale^gain`)
-    /// onto every coupled band.
+    /// `couple_channel` applies a non-unity common gain
+    /// (`cc_scale^(−gain)`) onto every coupled band.
     #[test]
     fn couple_channel_common_gain_scales() {
         let offsets = [0u16, 4];
         let sfb_cb = vec![vec![2u8]];
         let wgl = [1u8];
-        // gain element +1, sign clear, scale index 3 (cc_scale = 2) ⇒
-        // cc_gain = 2^1 = 2.
+        // gain element −1, sign clear, scale index 3 (cc_scale = 2) ⇒
+        // cc_gain = 2^(−(−1)) = 2 (the am05 conformance vectors carry
+        // exactly this −1 common gain).
         let gains = CouplingGains {
             cc_scale: 2.0,
             gain_element_sign: false,
-            lists: vec![GainList::Common(1)],
+            lists: vec![GainList::Common(-1)],
         };
         let source = vec![1.0f64, 2.0, 3.0, 4.0];
         let mut dest = vec![0.0f64; 4];
@@ -934,11 +952,12 @@ mod tests {
         let offsets = [0u16, 2, 4];
         let sfb_cb = vec![vec![2u8, 2u8]];
         let wgl = [1u8];
-        // Absolute gains: band0 = 0 (cc_gain 1), band1 = 1 (cc_gain 2).
+        // Absolute gains: band0 = 0 (cc_gain 1), band1 = −1 (cc_gain 2
+        // under the conformance-settled negated exponent).
         let gains = CouplingGains {
             cc_scale: 2.0,
             gain_element_sign: false,
-            lists: vec![GainList::Dpcm(vec![vec![0i32, 1i32]])],
+            lists: vec![GainList::Dpcm(vec![vec![0i32, -1i32]])],
         };
         let source = vec![3.0f64, 3.0, 3.0, 3.0];
         let mut dest = vec![0.0f64; 4];

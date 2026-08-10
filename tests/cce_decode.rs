@@ -270,7 +270,9 @@ fn cce_gain_list_scales_second_target() {
     let gains = CouplingGains {
         cc_scale: 2.0,
         gain_element_sign: false,
-        lists: vec![GainList::Common(1)], // cc_gain = 2^1 = 2
+        // cc_gain = 2^(−(−1)) = 2 (conformance-settled negated
+        // exponent; the am05 vectors carry the same −1 form).
+        lists: vec![GainList::Common(-1)],
     };
 
     let mut fa = FrameAssembler::new();
