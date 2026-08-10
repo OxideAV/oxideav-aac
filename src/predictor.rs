@@ -54,9 +54,14 @@
 //! carried out").
 //!
 //! Per §4.6.6 the predicted value `x_est` is rounded to a 16-bit float
-//! before use, and the six saved state variables `r0, r1, COR1, COR2,
-//! VAR1, VAR2` are stored as truncated 16-bit floats; both are realised
-//! with [`flt_round_inf`].
+//! before use ([`flt_round_inf`]), the six saved state variables `r0,
+//! r1, COR1, COR2, VAR1, VAR2` are stored as *truncated* 16-msb floats
+//! ([`flt_trunc`]), and the `b / VAR_m` ratio is quantized through the
+//! §4.6.6.3.2.4 `make_inv_tables()` lookup pair (7-bit-mantissa
+//! nearest-even reciprocal). All three fixed-precision forms are
+//! transcribed from the printed listings; the ISO/IEC 14496-26
+//! `am05_*` conformance vectors (AAC Main with long prediction runs)
+//! are the empirical anchor.
 
 use crate::ics_info::{IcsInfo, PredictorData, WindowSequence, PRED_SFB_MAX};
 use crate::swb_offset::long_window_offsets;
@@ -109,6 +114,75 @@ pub fn flt_round_inf(pf: f32) -> f32 {
     result
 }
 
+/// §4.6.6.3.2.2 — truncate a single-precision float to its 16 most
+/// significant storage bits (a 7-bit mantissa), the storage format of
+/// the six saved predictor state variables ("saved as *truncated*
+/// IEEE floating-point numbers" — truncation, not rounding).
+#[inline]
+pub fn flt_trunc(pf: f32) -> f32 {
+    f32::from_bits(pf.to_bits() & 0xffff_0000)
+}
+
+/// §4.6.6.3.2.4 `flt_round_even()` — round to an 8-bit mantissa,
+/// nearest-even, via the printed `frexp`-based listing. Used when
+/// building the `b / VAR` inverse tables.
+fn flt_round_even(pf: f32) -> f32 {
+    if pf == 0.0 {
+        return 0.0;
+    }
+    // frexp: pf = mant · 2^exp with mant in [0.5, 1).
+    let bits = pf.to_bits();
+    let biased = ((bits >> 23) & 0xff) as i32;
+    let exp = biased - 126;
+    let scale = 2f32.powi(8 - exp);
+    let tmp = pf * scale;
+    let mut a = tmp as i64;
+    if (tmp - a as f32) >= 0.5 {
+        a += 1;
+    }
+    if (tmp - a as f32) == 0.5 {
+        a &= -2;
+    }
+    a as f32 / scale
+}
+
+/// §4.6.6.3.2.4 `make_inv_tables()` — the two lookup tables through
+/// which the `b / VAR_m` ratio is computed: `MNT_TABLE[m]` holds
+/// `flt_round_even(b / (1.m))` for each 7-bit mantissa prefix, and
+/// `EXP_TABLE[e]` holds `1 / 2^(e-127)` for exponent fields whose
+/// value exceeds 1.0 (zero otherwise, exactly as the printed listing
+/// guards it). `b_over_var` composes them at the state's stored
+/// (truncated) precision.
+fn mnt_table(i: usize) -> f32 {
+    let f = f32::from_bits(0x3f80_0000 + ((i as u32) << 16));
+    flt_round_even(B / f)
+}
+
+fn exp_table(i: usize) -> f32 {
+    let f = f32::from_bits((i as u32) << 23);
+    if f > 1.0 {
+        1.0 / f
+    } else {
+        0.0
+    }
+}
+
+/// `b / VAR` computed via the §4.6.6.3.2.4 table pair, keyed by the
+/// truncated state's 7 mantissa msbs and its exponent field.
+#[inline]
+fn b_over_var(var: f32) -> f32 {
+    let bits = var.to_bits();
+    let mant7 = ((bits >> 16) & 0x7f) as usize;
+    let exp = ((bits >> 23) & 0xff) as usize;
+    MNT_TABLE[mant7] * EXP_TABLE[exp]
+}
+
+/// Precomputed §4.6.6.3.2.4 tables (see [`b_over_var`]).
+static MNT_TABLE: std::sync::LazyLock<[f32; 128]> =
+    std::sync::LazyLock::new(|| core::array::from_fn(mnt_table));
+static EXP_TABLE: std::sync::LazyLock<[f32; 256]> =
+    std::sync::LazyLock::new(|| core::array::from_fn(exp_table));
+
 /// State of one second-order backward-adaptive lattice predictor
 /// (§4.6.6.3.2.1), i.e. one MDCT line.
 ///
@@ -157,11 +231,15 @@ impl Predictor {
         *self = Self::new();
     }
 
-    /// `k_m(n) = COR_m(n-1) / VAR_m(n-1)` for `m = 1, 2`
-    /// (§4.6.6.3.2.1). `VAR_m` is initialised to `1` and only ever grows
-    /// by non-negative variance contributions, so it never reaches `0`.
+    /// `b · k_m(n) = COR_m(n-1) · (b / VAR_m(n-1))` for `m = 1, 2`
+    /// (§4.6.6.3.2.1), with the `b / VAR` factor quantized through the
+    /// §4.6.6.3.2.4 table pair — the normative fixed-precision form
+    /// (`VAR_m` is initialised to `1` and never decays to `0`).
     fn coefficients(&self) -> (f32, f32) {
-        (self.cor1 / self.var1, self.cor2 / self.var2)
+        (
+            self.cor1 * b_over_var(self.var1),
+            self.cor2 * b_over_var(self.var2),
+        )
     }
 
     /// §4.6.6.3.2.1 `predict()` — form the estimate `x_est(n)` from the
@@ -173,9 +251,9 @@ impl Predictor {
     /// `r_q,1(n-1) = r1`. The result is rounded to a 16-bit float per
     /// §4.6.6.3.2.2 before use.
     pub fn predict(&self) -> f32 {
-        let (k1, k2) = self.coefficients();
-        let x_est1 = B * k1 * self.r0;
-        let x_est2 = B * k2 * self.r1;
+        let (bk1, bk2) = self.coefficients();
+        let x_est1 = bk1 * self.r0;
+        let x_est2 = bk2 * self.r1;
         flt_round_inf(x_est1 + x_est2)
     }
 
@@ -200,8 +278,9 @@ impl Predictor {
     pub fn update(&mut self, x_rec: f32) {
         // Only element 1's coefficient enters the lattice register
         // update / second-element error; k2 only affects the estimate
-        // (computed in `predict`).
-        let k1 = self.cor1 / self.var1;
+        // (computed in `predict`). `b·k1` uses the same §4.6.6.3.2.4
+        // table-quantized `b / VAR` factor as the estimate path.
+        let bk1 = self.cor1 * b_over_var(self.var1);
 
         // Element 1: e_q,0(n) = r_q,0(n) = x_rec(n).
         let e0 = x_rec;
@@ -209,7 +288,7 @@ impl Predictor {
         let r1_prev = self.r1;
 
         // x_est,1(n) = b·k1·r_q,0(n-1); e_q,1(n) = e_q,0(n) − x_est,1(n).
-        let x_est1 = B * k1 * r0_prev;
+        let x_est1 = bk1 * r0_prev;
         let e1 = e0 - x_est1;
 
         // Adapt element 1: COR1, VAR1 use r_q,0(n-1) and e_q,0(n).
@@ -222,16 +301,19 @@ impl Predictor {
 
         // New lattice registers.
         // r_q,1(n) = a·(r_q,0(n-1) − b·k1(n)·e_q,0(n)).
-        let r1_new = A * (r0_prev - B * k1 * e0);
+        let r1_new = A * (r0_prev - bk1 * e0);
         // r_q,0(n) = a·x_rec(n).
         let r0_new = A * x_rec;
 
-        self.r0 = flt_round_inf(r0_new);
-        self.r1 = flt_round_inf(r1_new);
-        self.cor1 = flt_round_inf(cor1);
-        self.cor2 = flt_round_inf(cor2);
-        self.var1 = flt_round_inf(var1);
-        self.var2 = flt_round_inf(var2);
+        // §4.6.6.3.2.2: the six saved state variables are stored as
+        // *truncated* 16-msb floats (truncation, not the round-to-
+        // infinity used for x_est).
+        self.r0 = flt_trunc(r0_new);
+        self.r1 = flt_trunc(r1_new);
+        self.cor1 = flt_trunc(cor1);
+        self.cor2 = flt_trunc(cor2);
+        self.var1 = flt_trunc(var1);
+        self.var2 = flt_trunc(var2);
     }
 }
 
@@ -380,13 +462,22 @@ impl PredictorBank {
                 .iter_mut()
                 .zip(spec[fc..lc].iter_mut())
             {
-                let x_est = p.predict();
+                // §13.3.2.2 (ISO/IEC 13818-7): "The predicted value
+                // xest will be rounded to a 16-bit floating point
+                // representation prior to being used in ANY
+                // calculation" — the rounding applies to x_est
+                // itself, not to the x_est + y_rec sum. Rounding the
+                // sum instead leaves a small persistent bias on
+                // predicted bands (measured against the ISO/IEC
+                // 14496-26 am05_48 vector's reference waveform: the
+                // prediction-bearing channel pair decodes ~5e-3
+                // err/sig with the sum-rounding form and ~1e-4 with
+                // this one).
+                let x_est = flt_round_inf(p.predict());
                 let y_rec = *y as f32;
                 let x_rec = if active {
                     modified = true;
-                    // x_rec = x_est + y_rec, truncated to 16-bit float
-                    // before being stored / fed back (§4.6.6.3.2.2).
-                    flt_round_inf(x_est + y_rec)
+                    x_est + y_rec
                 } else {
                     y_rec
                 };
