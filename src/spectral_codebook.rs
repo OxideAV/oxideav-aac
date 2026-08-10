@@ -486,23 +486,28 @@ pub fn derive_sign_bits(codebook: u8, tuple: &[i32]) -> Result<Vec<bool>> {
 ///
 /// The decoded absolute magnitude is `2^(N + 4) + escape_word`.
 ///
-/// `prefix_len` must be in `0..=9` so the magnitude does not exceed
-/// [`MAX_QUANT`]. `escape_word` must fit `(N + 4)` bits.
+/// `prefix_len` must be in `0..=24`. §4.6.2 caps the *encoder-side*
+/// magnitude at [`MAX_QUANT`] (8191, i.e. `N ≤ 8`), but the decode
+/// side deliberately accepts larger escape codes: the normative
+/// ISO/IEC 14496-26 ER AAC LD conformance vectors transmit escapes
+/// far past the cap (`er_ad1103np_22_ep0` AU 508 carries magnitude
+/// 9283 at `N == 9`; `er_ad1103np_24_ep0` AU 1551 carries 783 966 at
+/// `N == 15`), and their reference waveforms require the value to be
+/// decoded, not rejected. The `> 24` bound keeps a hostile all-ones
+/// prefix run from consuming unbounded input (and the u32 magnitude
+/// in `i32` range) while admitting every observed conformance
+/// magnitude with headroom. `escape_word` must fit `(N + 4)` bits.
 /// Out-of-range arguments surface as
 /// [`Error::SpectralCodebookEscOutOfRange`].
 pub fn decode_esc_value(prefix_len: u32, escape_word: u32) -> Result<u32> {
-    if prefix_len > 9 {
+    if prefix_len > 24 {
         return Err(Error::SpectralCodebookEscOutOfRange);
     }
     let word_bits = prefix_len + 4;
     if escape_word >= (1u32 << word_bits) {
         return Err(Error::SpectralCodebookEscOutOfRange);
     }
-    let value = (1u32 << word_bits) + escape_word;
-    if value as i32 > MAX_QUANT {
-        return Err(Error::SpectralCodebookEscOutOfRange);
-    }
-    Ok(value)
+    Ok((1u32 << word_bits) + escape_word)
 }
 
 /// Inverse of [`decode_esc_value`]: given an absolute magnitude

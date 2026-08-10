@@ -460,14 +460,18 @@ pub(crate) fn read_and_apply_signs(
 /// Read one `hcod_esc_y` / `hcod_esc_z` escape sequence per
 /// §4.6.3.3: an `escape_prefix` of `N` ones, a zero
 /// `escape_separator`, and an `(N + 4)`-bit `escape_word`, decoding
-/// to `2^(N+4) + escape_word`. §4.6.1.3 caps the magnitude at
-/// `MAX_QUANT`, bounding `N ≤ 8`; a prefix run past `N == 9` cannot
-/// decode in range and is rejected without consuming further bits.
+/// to `2^(N+4) + escape_word`. §4.6.2 caps the *encoded* magnitude
+/// at `MAX_QUANT` (`N ≤ 8`), but the decoder accepts up to `N == 24`
+/// — the ISO/IEC 14496-26 ER AAC LD conformance vectors transmit
+/// escapes up to `N == 15` (magnitude 783 966) whose reference
+/// waveforms require the decoded value (see
+/// [`crate::spectral_codebook::decode_esc_value`]); a longer prefix
+/// run is rejected without consuming further bits.
 pub(crate) fn read_escape_sequence(reader: &mut BitReader<'_>) -> Result<u32> {
     let mut prefix_len = 0u32;
     while reader.read_bit().map_err(|_| Error::UnexpectedEnd)? {
         prefix_len += 1;
-        if prefix_len > 9 {
+        if prefix_len > 24 {
             return Err(Error::SpectralCodebookEscOutOfRange);
         }
     }
@@ -858,10 +862,11 @@ mod tests {
     }
 
     #[test]
-    fn escape_prefix_run_past_9_rejected() {
-        // 10 ones cannot start a conforming escape_sequence (the
-        // decoded magnitude would exceed MAX_QUANT).
-        let mut reader = BitReader::new(&[0xff, 0xff, 0xff]);
+    fn escape_prefix_run_past_24_rejected() {
+        // A run of >24 ones exceeds the decoder-side tolerance bound
+        // (the ISO conformance vectors reach N == 15; the cap guards
+        // hostile all-ones input).
+        let mut reader = BitReader::new(&[0xff, 0xff, 0xff, 0xff]);
         assert!(matches!(
             read_escape_sequence(&mut reader),
             Err(Error::SpectralCodebookEscOutOfRange)

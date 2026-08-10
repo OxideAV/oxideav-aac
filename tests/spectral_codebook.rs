@@ -504,8 +504,11 @@ fn encode_esc_value_rejects_overflow() {
 
 #[test]
 fn decode_esc_value_rejects_prefix_len_overflow() {
+    // The decoder-side bound is N <= 24 (a hostile all-ones run must
+    // still terminate and the magnitude stay in i32 range); N == 25
+    // rejects.
     assert_eq!(
-        decode_esc_value(10, 0).unwrap_err(),
+        decode_esc_value(25, 0).unwrap_err(),
         Error::SpectralCodebookEscOutOfRange
     );
 }
@@ -525,10 +528,18 @@ fn decode_esc_value_rejects_escape_word_overflow() {
 }
 
 #[test]
-fn decode_esc_value_rejects_magnitudes_above_max_quant() {
-    // prefix_len = 9 → 2^13 = 8192, which exceeds MAX_QUANT (8191).
+fn decode_esc_value_accepts_magnitudes_above_max_quant() {
+    // §4.6.2's 8191 cap binds the encoder, not the decoder: the
+    // ISO/IEC 14496-26 ER AAC LD conformance vectors transmit N == 9
+    // escapes (er_ad1103np_22_ep0 AU 508 carries magnitude 9283 =
+    // 2^13 + 1091) and their reference waveforms decode them.
+    assert_eq!(decode_esc_value(9, 0).unwrap(), 8192);
+    assert_eq!(decode_esc_value(9, 1091).unwrap(), 9283);
+    // er_ad1103np_24_ep0 AU 1551: N = 15, word = 259678 -> 783966.
+    assert_eq!(decode_esc_value(15, 259_678).unwrap(), 783_966);
+    // The encoder-side inverse still refuses to emit them.
     assert_eq!(
-        decode_esc_value(9, 0).unwrap_err(),
+        encode_esc_value(8192).unwrap_err(),
         Error::SpectralCodebookEscOutOfRange
     );
 }
