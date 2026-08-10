@@ -379,9 +379,10 @@ fn ltp_long_roundtrips() {
         window_group_length: vec![1],
         num_swb: 49,
     };
-    // Bits: 1 + 2 + 1 + 6 + 1 + 11 + 3 + 20 = 45.
+    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (nested ltp_data_present) + 11 + 3
+    // + 20 = 46.
     let bits = roundtrip(&info, 4, 4, false);
-    assert_eq!(bits, 45);
+    assert_eq!(bits, 46);
 }
 
 #[test]
@@ -412,9 +413,10 @@ fn ltp_long_caps_at_max_ltp_long_sfb_roundtrips() {
         window_group_length: vec![1],
         num_swb: 49,
     };
-    // Bits: 1 + 2 + 1 + 6 + 1 + 11 + 3 + 40 = 65.
+    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (nested ltp_data_present) + 11 + 3
+    // + 40 = 66.
     let bits = roundtrip(&info, 4, 4, false);
-    assert_eq!(bits, 65);
+    assert_eq!(bits, 66);
 }
 
 #[test]
@@ -483,9 +485,10 @@ fn ltp_er_aac_ld_with_lag_update_roundtrips() {
         window_group_length: vec![1],
         num_swb: 49,
     };
-    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (lag_update=1) + 10 + 3 + 15 = 40.
+    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (nested ltp_data_present) + 1
+    // (lag_update=1) + 10 + 3 + 15 = 41.
     let bits = roundtrip(&info, 23, 4, false);
-    assert_eq!(bits, 40);
+    assert_eq!(bits, 41);
 }
 
 #[test]
@@ -514,9 +517,10 @@ fn ltp_er_aac_ld_without_lag_update_roundtrips() {
         window_group_length: vec![1],
         num_swb: 49,
     };
-    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (lag_update=0, no lag) + 3 + 8 = 23.
+    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (nested ltp_data_present) + 1
+    // (lag_update=0, no lag) + 3 + 8 = 24.
     let bits = roundtrip(&info, 23, 4, false);
-    assert_eq!(bits, 23);
+    assert_eq!(bits, 24);
 }
 
 #[test]
@@ -554,9 +558,10 @@ fn ltp_common_window_paired_roundtrips() {
         window_group_length: vec![1],
         num_swb: 49,
     };
-    // Bits: 1 + 2 + 1 + 6 + 1 + (11+3+5) + 1 (pair bit) + (11+3+5) = 50.
+    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (nested ltp_data_present) + (11+3+5)
+    // + 1 (pair bit) + (11+3+5) = 51.
     let bits = roundtrip(&info, 4, 4, true);
-    assert_eq!(bits, 50);
+    assert_eq!(bits, 51);
 }
 
 #[test]
@@ -587,9 +592,10 @@ fn ltp_common_window_pair_absent_roundtrips() {
         window_group_length: vec![1],
         num_swb: 49,
     };
-    // Bits: 1 + 2 + 1 + 6 + 1 + (11+3+5) + 1 = 31.
+    // Bits: 1 + 2 + 1 + 6 + 1 + 1 (nested ltp_data_present) + (11+3+5)
+    // + 1 = 32.
     let bits = roundtrip(&info, 4, 4, true);
-    assert_eq!(bits, 31);
+    assert_eq!(bits, 32);
 }
 
 // ---- Encoder rejection branches ----

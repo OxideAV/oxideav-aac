@@ -220,6 +220,7 @@ fn ltp_branch_aot4_long_sequence() {
     bw.write_u32(0, 1);
     bw.write_u32(20, 6);
     bw.write_bit(true); // predictor_data_present
+    bw.write_bit(true); // Table 4.6 nested ltp_data_present
                         // ltp_data() — non-LD branch
     bw.write_u32(0x123, 11); // ltp_lag
     bw.write_u32(5, 3); // ltp_coef
@@ -325,6 +326,7 @@ fn common_window_reads_second_ltp_present_flag_and_body() {
     bw.write_u32(0, 1);
     bw.write_u32(8, 6);
     bw.write_bit(true); // predictor_data_present
+    bw.write_bit(true); // Table 4.6 nested ltp_data_present
                         // first ltp_data
     bw.write_u32(0x111, 11);
     bw.write_u32(1, 3);
@@ -360,7 +362,8 @@ fn common_window_with_pair_ltp_absent_still_reads_flag() {
     bw.write_u32(0, 2);
     bw.write_u32(0, 1);
     bw.write_u32(8, 6);
-    bw.write_bit(true);
+    bw.write_bit(true); // predictor_data_present
+    bw.write_bit(true); // Table 4.6 nested ltp_data_present
     bw.write_u32(0x000, 11);
     bw.write_u32(0, 3);
     for _ in 0..8 {

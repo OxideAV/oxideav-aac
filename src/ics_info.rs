@@ -486,14 +486,23 @@ impl IcsInfo {
                         prediction_used,
                     });
                 } else {
-                    // LTP / other GA AOTs.
-                    ltp_data_present = true;
-                    ltp_data = Some(parse_ltp_data(
-                        reader,
-                        audio_object_type,
-                        window_sequence,
-                        max_sfb,
-                    )?);
+                    // LTP / other GA AOTs — Table 4.6 nests a
+                    // dedicated `ltp_data_present` bit inside the
+                    // `predictor_data_present` branch, so an AU can
+                    // signal the branch with the channel's own LTP
+                    // off (e.g. only the common_window pair bit
+                    // follows). Corpus-confirmed by the ISO/IEC
+                    // 14496-26 `er_ad1000*`/`er_ad1103*` LD vectors,
+                    // which desynchronise without this bit.
+                    ltp_data_present = read_bit(reader)?;
+                    if ltp_data_present {
+                        ltp_data = Some(parse_ltp_data(
+                            reader,
+                            audio_object_type,
+                            window_sequence,
+                            max_sfb,
+                        )?);
+                    }
                     if common_window {
                         let pair_flag = read_bit(reader)?;
                         ltp_data_present_pair = Some(pair_flag);
@@ -698,18 +707,25 @@ impl IcsInfo {
                         writer.write_bit(b);
                     }
                 } else {
-                    // LTP / non-Main branch.
-                    if self.predictor_data.is_some() || !self.ltp_data_present {
+                    // LTP / non-Main branch — Table 4.6 nests a
+                    // dedicated `ltp_data_present` bit (mirror of the
+                    // parse side).
+                    if self.predictor_data.is_some() {
                         return Err(Error::IcsInfoEncodeInvalid);
                     }
-                    let ltp = self.ltp_data.as_ref().ok_or(Error::IcsInfoEncodeInvalid)?;
-                    write_ltp_data(
-                        writer,
-                        ltp,
-                        audio_object_type,
-                        self.window_sequence,
-                        self.max_sfb,
-                    )?;
+                    writer.write_bit(self.ltp_data_present);
+                    if self.ltp_data_present {
+                        let ltp = self.ltp_data.as_ref().ok_or(Error::IcsInfoEncodeInvalid)?;
+                        write_ltp_data(
+                            writer,
+                            ltp,
+                            audio_object_type,
+                            self.window_sequence,
+                            self.max_sfb,
+                        )?;
+                    } else if self.ltp_data.is_some() {
+                        return Err(Error::IcsInfoEncodeInvalid);
+                    }
                     if common_window {
                         let pair_flag = self
                             .ltp_data_present_pair
