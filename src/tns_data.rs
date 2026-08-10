@@ -97,6 +97,7 @@
 use oxideav_core::bits::{BitReader, BitWriter};
 
 use crate::ics_info::WindowSequence;
+use crate::swb_offset::FrameFamily;
 use crate::{Error, Result};
 
 /// One TNS noise-shaping filter inside a single transform window.
@@ -198,6 +199,34 @@ pub fn field_widths(seq: WindowSequence) -> (u32, u32, u32) {
     }
 }
 
+/// `(n_filt_bits, length_bits, order_bits)` triple for the given
+/// frame family and `window_sequence`.
+///
+/// For the ER AAC LD families (§4.6.17, 512/480-line long-only
+/// frames) the normative ISO/IEC 14496-26 conformance bitstreams
+/// transmit the *reduced* Table 4.155 column — `n_filt` in **1 bit**
+/// — even though the literal table keying (window size ≠ 128) selects
+/// the 2-bit column. The resolution is corpus-empirical: across all
+/// 173 `er_ad*_ep0` conformance vectors, every TNS-bearing access
+/// unit parses with the 1-bit width and the 2-bit reading
+/// desynchronises `spectral_data()` (792 hard failures of 2 017 TNS
+/// records). `length` / `order` take the rest of the same reduced
+/// column (4 / 3 bits); the corpus never transmits either field
+/// (`n_filt == 0` throughout), so those two widths follow the only
+/// hypothesis with a consistent selection mechanism. See
+/// `docs/audio/aac/er-ld-tns-divergence.md` §0 (resolution of issue
+/// #292).
+///
+/// Every non-LD family keeps the literal Table 4.155 dispatch of
+/// [`field_widths`].
+pub fn field_widths_family(family: FrameFamily, seq: WindowSequence) -> (u32, u32, u32) {
+    if family.is_ld() {
+        (N_FILT_BITS_SHORT, LENGTH_BITS_SHORT, ORDER_BITS_SHORT)
+    } else {
+        field_widths(seq)
+    }
+}
+
 /// `num_windows` for the given `window_sequence` per §4.5.2.3.4:
 /// `8` for `EIGHT_SHORT_SEQUENCE`, `1` otherwise.
 pub fn num_windows(seq: WindowSequence) -> usize {
@@ -233,7 +262,23 @@ impl TnsData {
     /// by its field width — but the check guards round-trip
     /// invariants for hostile inputs).
     pub fn parse(reader: &mut BitReader<'_>, window_sequence: WindowSequence) -> Result<Self> {
-        let (n_filt_bits, length_bits, order_bits) = field_widths(window_sequence);
+        Self::parse_family(reader, FrameFamily::Lc1024, window_sequence)
+    }
+
+    /// [`TnsData::parse`] under an explicit §4.5.1.1 frame family.
+    ///
+    /// The family selects the per-window field widths via
+    /// [`field_widths_family`]: the ER AAC LD families read the
+    /// reduced 1 / 4 / 3-bit column (the corpus-resolved AOT-23 wire,
+    /// `docs/audio/aac/er-ld-tns-divergence.md` §0), every other
+    /// family follows the literal Table 4.155 `window_sequence`
+    /// dispatch.
+    pub fn parse_family(
+        reader: &mut BitReader<'_>,
+        family: FrameFamily,
+        window_sequence: WindowSequence,
+    ) -> Result<Self> {
+        let (n_filt_bits, length_bits, order_bits) = field_widths_family(family, window_sequence);
         let nw = num_windows(window_sequence);
         let mut windows = Vec::with_capacity(nw);
         for _ in 0..nw {
@@ -296,7 +341,21 @@ impl TnsData {
     ///   transmitted on the wire and a non-default value would not
     ///   round-trip).
     pub fn write(&self, writer: &mut BitWriter, window_sequence: WindowSequence) -> Result<()> {
-        let (n_filt_bits, length_bits, order_bits) = field_widths(window_sequence);
+        self.write_family(writer, FrameFamily::Lc1024, window_sequence)
+    }
+
+    /// [`TnsData::write`] under an explicit §4.5.1.1 frame family —
+    /// the bit-exact inverse of [`TnsData::parse_family`]. The LD
+    /// families emit the reduced 1 / 4 / 3-bit widths, capping
+    /// `filters.len()` at 1, `length` at 15 and `order` at 7 per
+    /// window.
+    pub fn write_family(
+        &self,
+        writer: &mut BitWriter,
+        family: FrameFamily,
+        window_sequence: WindowSequence,
+    ) -> Result<()> {
+        let (n_filt_bits, length_bits, order_bits) = field_widths_family(family, window_sequence);
         let nw = num_windows(window_sequence);
         if self.windows.len() != nw {
             return Err(Error::TnsDataEncodeInvalid);

@@ -726,11 +726,13 @@ impl IcsBody {
             return Err(Error::PulseDataEncodeInvalid);
         }
 
-        // tns_data_present + body.
+        // tns_data_present + body (family-aware widths — the LD
+        // families emit the reduced 1 / 4 / 3-bit column, mirroring
+        // the parse side).
         writer.write_bit(self.tns_data_present);
         if self.tns_data_present {
             let td = self.tns_data.as_ref().ok_or(Error::TnsDataEncodeInvalid)?;
-            td.write(writer, ics_info.window_sequence)?;
+            td.write_family(writer, ics_info.family, ics_info.window_sequence)?;
         } else if self.tns_data.is_some() {
             return Err(Error::TnsDataEncodeInvalid);
         }
@@ -795,7 +797,16 @@ fn parse_tools(
 
     let tns_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
     let tns_data = if tns_data_present {
-        Some(TnsData::parse(reader, ics_info.window_sequence)?)
+        // Family-aware widths: the ER AAC LD families read the
+        // reduced 1 / 4 / 3-bit Table 4.155 column (the
+        // corpus-resolved AOT-23 wire — see
+        // docs/audio/aac/er-ld-tns-divergence.md §0); everything
+        // else takes the literal window_sequence dispatch.
+        Some(TnsData::parse_family(
+            reader,
+            ics_info.family,
+            ics_info.window_sequence,
+        )?)
     } else {
         None
     };
