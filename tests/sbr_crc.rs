@@ -183,8 +183,7 @@ fn write_minimal_sce_sbr(w: &mut BitWriter, bands: &HiLoTables) {
 /// type, the optional 10-bit CRC, the SBR side info, and the Table
 /// 4.62 `bs_fill_bits` byte alignment. Returns the payload bytes.
 fn build_sbr_fil_payload(with_crc: bool, corrupt_crc: bool) -> Vec<u8> {
-    // The SBR payload bits (bs_header_flag .. end of sbr_data) — the
-    // exact §4.4.2.8.1 coverage region when a CRC is present.
+    // The SBR payload bits (bs_header_flag .. end of sbr_data).
     let bands = header_bands();
     let mut sw = BitWriter::new();
     sw.write_bit(true); // bs_header_flag
@@ -193,15 +192,10 @@ fn build_sbr_fil_payload(with_crc: bool, corrupt_crc: bool) -> Vec<u8> {
     let sbr_bits = sw.bit_position();
     let sbr_bytes = sw.finish();
 
-    let mut crc = sbr_crc(&sbr_bytes, 0, sbr_bits);
-    if corrupt_crc {
-        crc ^= 0x001;
-    }
-
     let mut w = BitWriter::new();
     if with_crc {
         w.write_u32(0b1110, 4); // EXT_SBR_DATA_CRC
-        w.write_u32(u32::from(crc), 10); // bs_sbr_crc_bits
+        w.write_u32(0, 10); // bs_sbr_crc_bits placeholder
     } else {
         w.write_u32(0b1101, 4); // EXT_SBR_DATA
     }
@@ -209,7 +203,20 @@ fn build_sbr_fil_payload(with_crc: bool, corrupt_crc: bool) -> Vec<u8> {
         w.write_bit(sbr_bytes[(i / 8) as usize] & (0x80 >> (i % 8)) != 0);
     }
     w.align_to_byte_zero(); // bs_fill_bits
-    w.finish()
+    let mut body = w.finish();
+    if with_crc {
+        // §4.5.2.8.1 coverage: every bit after the CRC field to the
+        // end of the fill payload, *including* bs_fill_bits (the
+        // region the ISO/IEC 14496-26 type-14 vectors verify).
+        let total_bits = (body.len() * 8) as u64;
+        let mut crc = sbr_crc(&body, 14, total_bits);
+        if corrupt_crc {
+            crc ^= 0x001;
+        }
+        body[0] = (body[0] & 0xf0) | ((crc >> 6) as u8 & 0x0f);
+        body[1] = ((crc << 2) as u8) | (body[1] & 0x03);
+    }
+    body
 }
 
 /// Assemble one raw data block: [SCE core, FIL(SBR), END]. Returns

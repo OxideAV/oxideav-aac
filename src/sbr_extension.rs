@@ -140,11 +140,80 @@ impl SbrExtensionData {
         // Non-scalable core ⇒ sbr_layer == SBR_NOT_SCALABLE, so the
         // bs_header_flag is always present (Table 4.62 Note 1).
         let header_present = read_flag(reader)?;
+        Self::finish(
+            reader,
+            id_aac,
+            crc,
+            start,
+            region_start,
+            header_present,
+            prev_header,
+            fs_sbr,
+            cnt,
+        )
+    }
+
+    /// [`SbrExtensionData::parse`] for a caller that has already
+    /// consumed the `extension_type` nibble, the optional 10-bit CRC
+    /// field, **and** a set `bs_header_flag` (the pre-header probe in
+    /// [`crate::extension_payload::ExtensionPayload::parse_with_sbr`]).
+    /// `nibble_start` is the bit position of the `extension_type`
+    /// nibble, from which the CRC coverage region and the Table 4.62
+    /// `num_sbr_bits` accounting are reconstructed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_after_prefix(
+        reader: &mut BitReader<'_>,
+        id_aac: IdSynEle,
+        crc: Option<u16>,
+        nibble_start: u64,
+        fs_sbr: u32,
+        cnt: Option<u32>,
+        prev_header: Option<SbrHeader>,
+    ) -> Result<Self> {
+        let start = nibble_start + 4;
+        let region_start = start
+            + if crc.is_some() {
+                u64::from(SBR_CRC_BITS)
+            } else {
+                0
+            };
+        Self::finish(
+            reader,
+            id_aac,
+            crc,
+            start,
+            region_start,
+            true,
+            prev_header,
+            fs_sbr,
+            cnt,
+        )
+    }
+
+    /// Shared tail of the two parse entries: `sbr_header()` (when
+    /// present), band derivation, `sbr_data()`, and the Table 4.62
+    /// `bs_fill_bits` alignment.
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        reader: &mut BitReader<'_>,
+        id_aac: IdSynEle,
+        crc: Option<u16>,
+        start: u64,
+        region_start: u64,
+        header_present: bool,
+        prev_header: Option<SbrHeader>,
+        fs_sbr: u32,
+        cnt: Option<u32>,
+    ) -> Result<Self> {
         let header = if header_present {
             SbrHeader::parse(reader)?
         } else {
-            // Reuse the previous transmitted header; a stream that opens
-            // with a header-less SBR payload is ill-formed.
+            // Reuse the previous transmitted header. A stream that
+            // opens with header-less SBR payloads is the §4.5.2.8.1
+            // "upsampling and delay adjustment only" state — the
+            // parse_with_sbr caller intercepts that case before
+            // reaching here, so a missing header at this point is a
+            // caller-contract violation.
             prev_header.ok_or(Error::SbrFreqBandInvalid)?
         };
 
@@ -165,6 +234,7 @@ impl SbrExtensionData {
         // accounts for the extension_type nibble the caller already read;
         // when cnt is known, consume the trailing bs_fill_bits so the
         // reader lands on the next extension_payload element.
+        let mut crc_end = region_end;
         if let Some(cnt) = cnt {
             let total = u64::from(cnt) * 8;
             let consumed = num_sbr_bits + 4; // + the extension_type nibble
@@ -175,11 +245,23 @@ impl SbrExtensionData {
             if align > 0 {
                 read(reader, align as u32)?;
             }
+            // §4.5.2.8.1: "The checksum shall be calculated covering
+            // the whole SBR data range including possible
+            // bs_fill_bits" — the coverage extends past the end of
+            // sbr_data() through the alignment padding to the end of
+            // the fill payload. Confirmed against the ISO/IEC
+            // 14496-26 `al_sbr_*` type-14 vectors, whose
+            // header-bearing payloads carry non-zero bs_fill_bits and
+            // only verify over the padded region.
+            // (`start` is 4 bits past the extension_type nibble; the
+            // grouping avoids u64 underflow when a caller parses a
+            // nibble-less buffer from position 0.)
+            crc_end = start + (total - 4);
         }
 
         Ok(SbrExtensionData {
             crc,
-            crc_region: crc.map(|_| (region_start, region_end)),
+            crc_region: crc.map(|_| (region_start, crc_end)),
             header_present,
             header,
             element,
@@ -187,9 +269,10 @@ impl SbrExtensionData {
         })
     }
 
-    /// Verify the `bs_sbr_crc_bits` checksum against the §4.4.2.8.1
-    /// coverage region (every payload bit after the CRC field up to
-    /// the end of `sbr_data()`, before `bs_fill_bits`).
+    /// Verify the `bs_sbr_crc_bits` checksum against the §4.5.2.8.1
+    /// coverage region (every payload bit after the CRC field to the
+    /// end of the fill payload — "the whole SBR data range including
+    /// possible bs_fill_bits").
     ///
     /// `data` must be the same byte buffer the parsing [`BitReader`]
     /// was constructed over ([`Self::crc_region`] holds absolute bit

@@ -175,20 +175,31 @@ fn rewrite_sbr_to_crc(data: &[u8]) -> Vec<u8> {
                     };
                     assert!(ext.crc.is_none(), "source SBR is the type-13 form");
                     prev_header = Some(ext.header);
-                    // Coverage region: the num_sbr_bits after the type
-                    // nibble (no CRC on the type-13 wire).
+                    // Rebuild the payload with a CRC placeholder, then
+                    // compute the checksum over the §4.5.2.8.1 coverage
+                    // region — every bit after the CRC field to the end
+                    // of the fill payload, *including* the re-derived
+                    // bs_fill_bits (the coverage the ISO/IEC 14496-26
+                    // type-14 vectors verify; see aac-crc-regions.md
+                    // §1.6 and the sbr_extension.rs region note) — and
+                    // patch it in.
                     let sbr_start = body_start + 4;
                     let sbr_end = sbr_start + ext.num_sbr_bits;
-                    let crc = sbr_crc(payload, sbr_start, sbr_end);
                     let mut w = BitWriter::new();
                     w.write_u32(0b1110, 4); // EXT_SBR_DATA_CRC
-                    w.write_u32(u32::from(crc), 10); // bs_sbr_crc_bits
+                    w.write_u32(0, 10); // bs_sbr_crc_bits placeholder
                     for i in sbr_start..sbr_end {
                         let bit = payload[(i / 8) as usize] & (0x80 >> (i % 8)) != 0;
                         w.write_bit(bit);
                     }
                     w.align_to_byte_zero(); // bs_fill_bits
-                    fa.push_fill(&w.finish()).unwrap();
+                    let mut body = w.finish();
+                    let total_bits = (body.len() * 8) as u64;
+                    let crc = sbr_crc(&body, 14, total_bits);
+                    // Patch bs_sbr_crc_bits (bits 4..14 of the body).
+                    body[0] = (body[0] & 0xf0) | ((crc >> 6) as u8 & 0x0f);
+                    body[1] = ((crc << 2) as u8) | (body[1] & 0x03);
+                    fa.push_fill(&body).unwrap();
                 }
                 Element::Data { .. } | Element::ProgramConfig(_) => {
                     panic!("unexpected DSE/PCE in source fixture")

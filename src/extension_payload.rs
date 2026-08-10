@@ -223,6 +223,29 @@ pub enum ExtensionPayloadOrSbr {
     /// `EXT_SBR_DATA_CRC`). Boxed because the SBR side-info element is
     /// much larger than the other variants.
     Sbr(Box<crate::sbr_extension::SbrExtensionData>),
+    /// An SBR payload received **before any `sbr_header()`** — the
+    /// stream opens with `bs_header_flag == 0` payloads and no header
+    /// has been threaded yet. Per ISO/IEC 14496-3:2009 §4.5.2.8.1
+    /// ("As long as no SBR header part is present, the SBR decoder
+    /// performs upsampling and delay adjustment only") the `sbr_data()`
+    /// body cannot be parsed (its band tables come from the missing
+    /// header), so the payload is skipped whole; the caller should run
+    /// the §4.6.18.5 pure-upsampling path for the covered element. The
+    /// ISO/IEC 14496-26 `al_sbr_{e,i}_32_*` conformance vectors open
+    /// this way.
+    ///
+    /// `crc` / `crc_region` carry the `EXT_SBR_DATA_CRC` checksum and
+    /// its covered bit range (everything after the 10-bit CRC field up
+    /// to the end of the fill payload, per the §4.5.2.8.1 coverage
+    /// statement — with no parsed `sbr_data()` the `bs_fill_bits`
+    /// boundary is unknowable, and the whole-payload region is the
+    /// normative coverage); `None` for the plain `EXT_SBR_DATA` type.
+    SbrPreHeader {
+        /// Transmitted `bs_sbr_crc_bits`, when the CRC variant.
+        crc: Option<u16>,
+        /// Covered `[start, end)` bit range in the parse buffer.
+        crc_region: Option<(u64, u64)>,
+    },
 }
 
 /// Parsed `dynamic_range_info()` body (Table 4.52). All fields are
@@ -373,6 +396,7 @@ impl ExtensionPayload {
         if cnt == 0 {
             return Err(Error::ExtensionPayloadInvalid);
         }
+        let nibble_start = reader.bit_position();
         let raw = read_u8(reader, EXTENSION_TYPE_BITS)?;
         let ty = ExtensionType::from_bits_allow_sbr(raw)?;
         match ty {
@@ -385,6 +409,45 @@ impl ExtensionPayload {
             )?)),
             ExtensionType::SbrData | ExtensionType::SbrDataCrc => {
                 let crc_flag = ty == ExtensionType::SbrDataCrc;
+                if prev_header.is_none() {
+                    // Peek the CRC field + bs_header_flag without
+                    // committing: a header-less payload before the
+                    // first sbr_header() cannot be parsed (§4.5.2.8.1
+                    // — upsampling and delay adjustment only), so the
+                    // payload is skipped whole with its CRC surfaced.
+                    let crc = if crc_flag {
+                        Some(reader.read_u32(10).map_err(|_| Error::UnexpectedEnd)? as u16)
+                    } else {
+                        None
+                    };
+                    let region_start = reader.bit_position();
+                    let header_flag = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+                    if !header_flag {
+                        let end = nibble_start + u64::from(cnt) * 8;
+                        let mut pos = reader.bit_position();
+                        while pos < end {
+                            let step = (end - pos).min(32) as u32;
+                            reader.read_u32(step).map_err(|_| Error::UnexpectedEnd)?;
+                            pos += u64::from(step);
+                        }
+                        return Ok(ExtensionPayloadOrSbr::SbrPreHeader {
+                            crc,
+                            crc_region: crc.map(|_| (region_start, end)),
+                        });
+                    }
+                    // A header is present after all: re-parse through
+                    // the normal path from the header flag onward.
+                    let sbr = crate::sbr_extension::SbrExtensionData::parse_after_prefix(
+                        reader,
+                        id_aac,
+                        crc,
+                        nibble_start,
+                        fs_sbr,
+                        Some(cnt),
+                        None,
+                    )?;
+                    return Ok(ExtensionPayloadOrSbr::Sbr(Box::new(sbr)));
+                }
                 let sbr = crate::sbr_extension::SbrExtensionData::parse(
                     reader,
                     id_aac,

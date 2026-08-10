@@ -626,6 +626,21 @@ impl StreamDecoder {
                             result = Some(ext);
                             remaining = 0;
                         }
+                        ExtensionPayloadOrSbr::SbrPreHeader { crc, crc_region } => {
+                            // §4.5.2.8.1: SBR payloads before the first
+                            // sbr_header() — verify the CRC over the
+                            // whole-payload region, then run upsampling
+                            // and delay adjustment only (the None SBR
+                            // slot below selects the §4.6.18.5 pure
+                            // upsampling path). No header is threaded.
+                            if let (Some(crc), Some((s, e))) = (crc, crc_region) {
+                                if crate::adts_crc::sbr_crc(payload, s, e) != crc {
+                                    return Err(Error::SbrCrcMismatch);
+                                }
+                            }
+                            self.sbr_active = true;
+                            remaining = 0;
+                        }
                     }
                 }
             }
