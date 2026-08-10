@@ -8,6 +8,68 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ISO/IEC 14496-26 conformance harness**
+  (`tests/iso_14496_26_conformance.rs`) — decodes the normative ER AAC
+  LD (`er_ad1000*` / `er_ad1103*` / `er_ad1103np*`, 15 vectors ×
+  5 rates), CCE (`am05_*`, 12 rates, 1 370 coupling elements), and
+  SBR-CRC (`al_sbr_{e,i}_32_{1,2}`, 1 600 type-14 payloads) corpus
+  members end to end against their reference waveforms. Gated on
+  `OXIDEAV_ISO_14496_26_DIR` (skip-if-absent; the ISO-copyright corpus
+  is never committed — sourcing/checksum recipe in
+  `docs/audio/aac/iso-14496-26-conformance.md`). Results: 47 003 of
+  47 004 LD access units decode (the one residual is the corpus's own
+  unexplained `er_ad1103_22_ep0` AU 367); LD-512 PCM is reference-
+  exact (err/sig ≈ 4.4e-5), LD-480 non-TNS/non-PNS PCM ≈ 1.3e-4; all
+  six `am05_48` output channels land at ≈ 1e-4; all 1 600 SBR CRCs
+  verify.
+- **SBR pre-header payloads** (§4.5.2.8.1): a stream that opens with
+  `bs_header_flag == 0` SBR payloads before any `sbr_header()` no
+  longer errors — the payload is skipped whole (CRC still verified on
+  the type-14 form) and the decoder runs the §4.6.18.5 pure
+  upsampling path, exactly the "upsampling and delay adjustment only"
+  state the spec prescribes. The `al_sbr_*` conformance vectors open
+  this way.
+
+### Fixed
+
+- **`ics_info()` nested `ltp_data_present` bit** (Table 4.6): for
+  non-Main object types the `predictor_data_present` branch carries
+  its own `ltp_data_present` bit before `ltp_data()`; the parser and
+  writer previously conflated the two flags, desynchronising every
+  prediction-bearing AU (the bug broke ~30–45 % of the ER AAC LD
+  conformance corpus; all writer paths emit the corrected wire).
+- **ER AAC LD `tns_data()` field widths** (issue #292,
+  `docs/audio/aac/er-ld-tns-divergence.md` §0): the LD families now
+  read the corpus-resolved reduced Table 4.155 column — `n_filt` in
+  1 bit, `length`/`order` in 4/3 — via the new family-aware
+  `TnsData::parse_family` / `write_family` (`field_widths_family`).
+  The literal 2/6/5 reading hard-fails 792 of the corpus's 2 017
+  TNS-bearing AUs; the 1/4/3 wire decodes them all.
+- **CCE gain exponent** — `cc_gain = cc_sign · cc_scale^(−ge)`: the
+  negated exponent is confirmed by the `am05_*` conformance vectors
+  (the printed positive exponent misses every coupled target by
+  ~1e-1 err/sig; the negated form lands all channels at ~1e-4),
+  settling the question `docs/audio/aac/cce-gain-sign-split.md` §4
+  recorded from a black-box measurement.
+- **AAC Main predictor arithmetic** (13818-7 §13.3.2): `x_est` is now
+  rounded *before* the `x_est + y_rec` add, the six state variables
+  are stored as *truncated* 16-msb floats, and `b / VAR` goes through
+  the §13.3.2.4 `make_inv_tables()` lookup quantization — the am05
+  prediction runs previously drifted ~5e-3 on predicted bands and are
+  now reference-exact.
+- **SBR CRC coverage region** (§4.5.2.8.1): `bs_sbr_crc_bits` covers
+  every bit after the CRC field to the end of the fill payload
+  **including `bs_fill_bits`** — the conformance vectors' header-
+  bearing payloads (4 alignment bits) only verify over the padded
+  region. The staged `he-aac-v1-sbrcrc-adts` fixture was regenerated
+  under the corrected coverage.
+- **Spectral escape decoding**: the decoder now accepts escape
+  prefixes up to `N == 24` (magnitudes past the §4.6.2 encoder-side
+  8191 cap) — the LD conformance vectors transmit `N == 9` and
+  `N == 15` escapes (magnitudes 9 283 and 783 966) whose reference
+  waveforms require the decoded value. The encoder-side cap is
+  unchanged.
+
 - **ER AAC LTP (AOT 19)** decodes end to end: the §4.4.2.3 Table 4.19
   `er_raw_data_block()` walk and the LOAS/LATM ER routing now admit
   AOT 19, running the §4.6.7 LTP tool on the Table 4.55 non-LD

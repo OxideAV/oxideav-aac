@@ -47,6 +47,38 @@ transcodes at 0.0008–0.003; multichannel layouts pinned with one
 distinct tone per speaker); `register()` installs the encoder
 alongside the decoder under id `"aac"`.
 
+### ISO/IEC 14496-26 conformance (normative corpus)
+
+`tests/iso_14496_26_conformance.rs` decodes members of the normative
+MPEG-4 Audio conformance corpus end to end against their reference
+waveforms (corpus located via `OXIDEAV_ISO_14496_26_DIR`,
+skip-if-absent; sourcing, per-member checksums and the member-level
+fetch recipe are in `docs/audio/aac/iso-14496-26-conformance.md` — the
+ISO-copyright bitstreams are never committed). Measured state:
+
+* **ER AAC LD** — 15 vectors across 22.05/24/32/44.1/48 kHz at both
+  frame lengths: **47 003 / 47 004 access units decode** (the single
+  residual is `er_ad1103_22_ep0` AU 367, which the staged corpus
+  screen records as failing under every width hypothesis). PCM: the
+  LD-512 `er_ad1000*` family is reference-exact at err/sig ≈ 4.4e-5;
+  the LD-480 `er_ad1103np*` family lands at ≈ 1.3e-4 outside its
+  TNS/PNS access units (PNS noise phase is generator-defined; the
+  deployed LD TNS record is a still-untraced extra-spec wire — see
+  "Not yet supported"). The 32 kHz members pin the §4.5.4
+  Tables 4.144/4.145 band tables end to end.
+* **CCE** — the twelve `am05_*` vectors (AAC Main + one
+  `coupling_channel_element()` in every access unit): **1 370 / 1 370
+  AUs decode**, and all six `am05_48` output channels match their
+  per-speaker references at ≈ 1e-4 err/sig — pinning the CCE gain
+  path (conformance-settled `cc_scale^(−ge)` exponent), the §4.6.6
+  Main-profile predictor at its normative fixed-precision arithmetic,
+  M/S + intensity + TNS interplay, and the §8.5.2.2 PCE reorder.
+* **SBR-CRC** — the four `al_sbr_{e,i}_32_*` vectors (the corpus's
+  only `EXT_SBR_DATA_CRC` carriers): **1 600 / 1 600 payload CRCs
+  verify** during a full decode, including the §4.5.2.8.1 pre-header
+  prefix (upsampling-only state) and the whole-payload coverage
+  region (`bs_fill_bits` included).
+
 ### Bitstream parsing
 
 - **ADTS fixed header** (`adts`) — ISO/IEC 13818-7 §1.A.2: sync,
@@ -990,6 +1022,21 @@ the EP section below).
 
 ## Not yet supported
 
+- **The deployed ER AAC LD `tns_data()` filter record.** The
+  ISO/IEC 14496-26 LD conformance bitstreams transmit an
+  extra-spec TNS record: the corpus-resolved 1-bit-`n_filt` reading
+  (`docs/audio/aac/er-ld-tns-divergence.md` §0, implemented here)
+  reconciles the *structure* — every AU parses to its boundary — but
+  the reference waveforms show the record carries a real
+  variable-length filter (per-AU record lengths ≈ 19–61 bits, in
+  3-bit increments) whose layout matches no Table 4.54/4.155
+  reading (a grammar search over length 4/6 × order 3/5 × 1–2
+  filters × optional direction/compress fields, decoded *and*
+  applied, reconciles none of it). TNS-bearing LD AUs (~6 % of the
+  `er_ad1103*` family) therefore decode with wrong PCM until a
+  behavioural trace of the deployed record lands; the conformance
+  harness masks them (and bounds the LTP-setup vectors coarsely,
+  since LD LTP history includes those AUs).
 - Encoder-side tool remainders — the end-to-end AAC-LC encoder (see
   `encoder` below) covers block switching with §4.5.2.3.4 short-frame
   grouping, M/S on both frame shapes, the scalefactor/quantizer rate
