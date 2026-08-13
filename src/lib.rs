@@ -407,6 +407,12 @@ pub mod adts_crc;
 pub mod asc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod bsac_arith;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod bsac_tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod cce;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
