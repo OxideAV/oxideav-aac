@@ -75,6 +75,19 @@
 //!   This subsumes the classic smallest-LAV-fit + merge-equal-books
 //!   rule and additionally exploits the signed/unsigned sibling
 //!   books and header-saving LAV upgrades.
+//! * **Pulse escape (§4.4.6.3, measured)** — a long-frame band whose
+//!   few outlier lines force it onto a large-LAV book or into
+//!   §4.6.3.3 escape sequences is also priced with a Table 4.7
+//!   `pulse_data()` variant: up to four outliers are reduced toward
+//!   zero to the magnitude floor of the rest of the band (4-bit
+//!   `amp` reach) and the `(offset, amp)` chain rides the pulse
+//!   record ([`extract_pulse_candidate`] picks the best-saving band
+//!   by per-band measured cost). The decoder's §4.6.3.3 fix-up
+//!   restores the *identical* quantized spectrum before
+//!   dequantization, so the choice is purely a noiseless-coding one
+//!   and is settled end-to-end by [`channel_wire_bits`] — the
+//!   variant is kept only when the whole channel stream measures
+//!   smaller.
 //! * **Stereo** — a CPE with `common_window == 1` (one shared
 //!   `ics_info()`) and per-band §4.6.8.1 M/S coding: for each
 //!   scalefactor band the encoder forms `m = (l+r)/2`,
@@ -147,6 +160,7 @@ use crate::ics_body::IcsBody;
 use crate::ics_info::{
     IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
 };
+use crate::pulse_data::{Pulse, PulseData, MAX_PULSES};
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
 use crate::scale_factor_data::{
     differentiate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET,
@@ -1867,6 +1881,7 @@ fn finish_channel(
     info: IcsInfo,
     groups: Vec<GroupQuant>,
     fs_index: u8,
+    pulse_data: Option<PulseData>,
 ) -> Result<QuantizedChannel> {
     let (global_gain, abs) = scalefactor_track(&groups);
     let long = info.window_sequence != WindowSequence::EightShort;
@@ -1898,8 +1913,8 @@ fn finish_channel(
         ics_info: Some(info.clone()),
         section_data: SectionData { sections, sfb_cb },
         scale_factor_data,
-        pulse_data_present: false,
-        pulse_data: None,
+        pulse_data_present: pulse_data.is_some(),
+        pulse_data,
         tns_data_present: false,
         tns_data: None,
         gain_control_data_present: false,
@@ -1916,6 +1931,160 @@ fn finish_channel(
     })
 }
 
+/// Exact wire size, in bits, of one channel's
+/// `individual_channel_stream()` — the [`IcsBody`] side info
+/// (sections, scalefactors, pulse / TNS dispatch) plus the
+/// `spectral_data()` payload — measured by running the real writers
+/// into a scratch buffer. Used to settle encoder tool decisions
+/// (pulse escape) by measured cost, the same philosophy as
+/// [`optimize_group_sections`].
+fn channel_wire_bits(chan: &QuantizedChannel, fs_index: u8) -> Result<u64> {
+    let mut bw = BitWriter::new();
+    chan.body.write(&mut bw, 2, fs_index, false)?;
+    chan.spectral
+        .write(&mut bw, &chan.info, &chan.body.section_data, fs_index)?;
+    Ok(bw.bit_position())
+}
+
+/// Wire cost, in bits, of one Table 4.7 pulse record carrying `n`
+/// pulses: 2-bit `number_pulse` + 6-bit `pulse_start_sfb` + 9 bits
+/// per `(offset, amp)` entry (the `pulse_data_present` dispatch bit
+/// itself is paid on both variants).
+fn pulse_record_bits(n: usize) -> u64 {
+    8 + 9 * n as u64
+}
+
+/// §4.4.6.3 / Table 4.7 pulse-escape candidate for one long-frame
+/// quantized spectrum.
+///
+/// The pulse tool pays off when a band's few outlier lines force the
+/// whole band (and through sectioning, its neighbours) onto a large-
+/// LAV codebook or into §4.6.3.3 escape sequences: transmitting the
+/// outliers' excess as `(offset, amp)` fix-ups lets the residual
+/// band code on the book the *rest* of its lines need. The decoder's
+/// §4.6.3.3 reconstruction ([`crate::swb_offset::apply_pulse_data`],
+/// `x_quant[k] ±= amp` on the transmitted sign) restores the exact
+/// original quantized values, so the choice is purely one of
+/// noiseless-coding cost.
+///
+/// Candidate search, per spectrum-coded band (`ZERO_HCB` bands
+/// transmit no scalefactor and `NOISE_HCB` / intensity bands no
+/// coefficients — excluded): for every outlier count `j` in
+/// `1..=`[`MAX_PULSES`], reduce the band's `j` largest-magnitude
+/// lines to the magnitude floor set by its `(j+1)`-th largest
+/// (clamped to the 4-bit `amp` reach, keeping the residual >= 1 so
+/// the transmitted sign survives), price the reduced band at its
+/// cheapest Table 4.95 book via [`band_bits`] plus the
+/// [`pulse_record_bits`] overhead, and keep the best-measuring `j`.
+/// The best band across the spectrum wins (Table 4.7's single
+/// `pulse_start_sfb` + 5-bit offset deltas make one band the
+/// realistic carrier; cross-band chains are almost never
+/// addressable). Pulses must ascend with in-band gaps <= 31 and the
+/// first offset within 31 of the band start.
+///
+/// Returns the pulse record and the reduced spectrum, or `None` when
+/// no band measures a saving. The caller re-prices the whole channel
+/// with [`channel_wire_bits`] (capturing section-merge effects) and
+/// keeps the variant only when the full stream measures smaller.
+fn extract_pulse_candidate(
+    x_quant: &[i32],
+    sfb_cb: &[u8],
+    offsets: &[u16],
+) -> Option<(PulseData, Vec<i32>)> {
+    // (measured saving, carrier sfb, [(line index, amp)]).
+    #[allow(clippy::type_complexity)]
+    let mut best: Option<(i64, usize, Vec<(usize, i32)>)> = None;
+    for sfb in 0..sfb_cb.len().min(offsets.len().saturating_sub(1)).min(64) {
+        match sfb_cb[sfb] {
+            ZERO_HCB | NOISE_HCB | INTENSITY_HCB | INTENSITY_HCB2 => continue,
+            _ => {}
+        }
+        let (s, e) = (
+            offsets[sfb] as usize,
+            (offsets[sfb + 1] as usize).min(x_quant.len()),
+        );
+        if e <= s {
+            continue;
+        }
+        let band = &x_quant[s..e];
+        // Baseline: the band's cheapest book as-is.
+        let Some(base_cost) = cheapest_band_bits(band) else {
+            continue;
+        };
+        // Magnitude-descending line order.
+        let mut by_mag: Vec<usize> = (0..band.len()).collect();
+        by_mag.sort_by_key(|&i| std::cmp::Reverse(band[i].abs()));
+        for j in 1..=MAX_PULSES.min(band.len().saturating_sub(1)) {
+            let floor = band[by_mag[j]].abs().max(1);
+            // The j selected lines, ascending, with their amp.
+            let mut lines: Vec<(usize, i32)> = by_mag[..j]
+                .iter()
+                .map(|&i| (i, (band[i].abs() - floor).min(15)))
+                .filter(|&(_, amp)| amp >= 1)
+                .collect();
+            if lines.len() < j {
+                continue; // an outlier is out of amp reach parity with the floor
+            }
+            lines.sort_by_key(|&(i, _)| i);
+            // Table 4.7 addressability.
+            if lines[0].0 > 0x1f {
+                continue;
+            }
+            if lines.windows(2).any(|w| w[1].0 - w[0].0 > 0x1f) {
+                continue;
+            }
+            let mut reduced = band.to_vec();
+            for &(i, amp) in &lines {
+                if reduced[i] > 0 {
+                    reduced[i] -= amp;
+                } else {
+                    reduced[i] += amp;
+                }
+            }
+            let Some(cost) = cheapest_band_bits(&reduced) else {
+                continue;
+            };
+            let saving = i64::from(base_cost) - i64::from(cost) - pulse_record_bits(j) as i64;
+            if saving > 0 && best.as_ref().map(|(bs, _, _)| saving > *bs).unwrap_or(true) {
+                best = Some((
+                    saving,
+                    sfb,
+                    lines.iter().map(|&(i, amp)| (s + i, amp)).collect(),
+                ));
+            }
+        }
+    }
+    let (_, start_sfb, lines) = best?;
+    let mut reduced = x_quant.to_vec();
+    let mut pulses = Vec::with_capacity(lines.len());
+    let mut prev_k = offsets[start_sfb] as usize;
+    for &(k, amp) in &lines {
+        pulses.push(Pulse {
+            offset: (k - prev_k) as u8,
+            amp: amp as u8,
+        });
+        prev_k = k;
+        if reduced[k] > 0 {
+            reduced[k] -= amp;
+        } else {
+            reduced[k] += amp;
+        }
+    }
+    Some((
+        PulseData {
+            pulse_start_sfb: start_sfb as u8,
+            pulses,
+        },
+        reduced,
+    ))
+}
+
+/// Cheapest single Table 4.95 book cost for one band's coefficients
+/// (books 1..=11 via [`band_bits`]).
+fn cheapest_band_bits(coeffs: &[i32]) -> Option<u32> {
+    (1u8..=11).filter_map(|cb| band_bits(cb, coeffs)).min()
+}
+
 /// Quantize one channel's 1024-line long-sequence spectrum into a
 /// complete `individual_channel_stream()` record set. `seq` must be
 /// one of the three long sequences (it lands in the `ics_info`);
@@ -1924,7 +2093,11 @@ fn finish_channel(
 /// CPE. `pns_bands` grants the per-band §4.6.13 allowance (empty =
 /// PNS off); a non-empty `is_bands` (the right channel of an
 /// intensity-coding CPE) rewrites the selected bands into §4.6.8.2
-/// intensity records after quantization.
+/// intensity records after quantization. When the spectrum carries
+/// escape-magnitude lines, a §4.4.6.3 `pulse_data()` variant is
+/// priced against the plain coding and kept if it measures smaller
+/// (the decode-side §4.6.3.3 fix-up restores the identical quantized
+/// spectrum, so the choice never changes the reconstruction).
 #[allow(clippy::too_many_arguments)]
 fn quantize_channel(
     spec: &[f64],
@@ -1952,6 +2125,7 @@ fn quantize_channel(
     if !is_bands.is_empty() {
         apply_is_overrides(&mut group, is_bands, offsets);
     }
+    let pulse_candidate = extract_pulse_candidate(&group.x_quant, &group.sfb_cb, offsets);
     let info = IcsInfo {
         family: crate::swb_offset::FrameFamily::Lc1024,
         ics_reserved_bit: false,
@@ -1970,7 +2144,46 @@ fn quantize_channel(
         window_group_length: vec![1],
         num_swb: num_swb as u8,
     };
-    finish_channel(info, vec![group], fs_index)
+    // Measured pulse decision: price the reduced-spectrum +
+    // pulse_data() variant against the plain coding with the real
+    // writers and keep the smaller stream.
+    if let Some((pd, reduced)) = pulse_candidate {
+        let mut pulsed_group = GroupQuant {
+            x_quant: reduced,
+            sfb_cb: group.sfb_cb.clone(),
+            sfs: group.sfs.clone(),
+            noise: group.noise.clone(),
+            is_pos: group.is_pos.clone(),
+        };
+        // Re-derive the reduced bands' provisional books (the DP
+        // re-decides anyway; this keeps the class metadata honest).
+        for sfb in 0..pulsed_group.sfb_cb.len() {
+            match pulsed_group.sfb_cb[sfb] {
+                ZERO_HCB | NOISE_HCB | INTENSITY_HCB | INTENSITY_HCB2 => continue,
+                _ => {}
+            }
+            let (s, e) = (
+                offsets[sfb] as usize,
+                (offsets[sfb + 1] as usize).min(pulsed_group.x_quant.len()),
+            );
+            let band_max = pulsed_group.x_quant[s..e]
+                .iter()
+                .map(|q| q.abs())
+                .max()
+                .unwrap_or(0);
+            if band_max > 0 {
+                pulsed_group.sfb_cb[sfb] = codebook_for(band_max);
+            }
+        }
+        let plain = finish_channel(info.clone(), vec![group], fs_index, None)?;
+        let pulsed = finish_channel(info, vec![pulsed_group], fs_index, Some(pd))?;
+        return if channel_wire_bits(&pulsed, fs_index)? < channel_wire_bits(&plain, fs_index)? {
+            Ok(pulsed)
+        } else {
+            Ok(plain)
+        };
+    }
+    finish_channel(info, vec![group], fs_index, None)
 }
 
 /// Maximum mean per-band log-energy distance (natural log) between
@@ -2130,7 +2343,8 @@ fn quantize_channel_short_grouped(
         window_group_length,
         num_swb: num_swb as u8,
     };
-    finish_channel(info, groups, fs_index)
+    // §4.4.6.3: pulse_data is illegal on EIGHT_SHORT_SEQUENCE.
+    finish_channel(info, groups, fs_index, None)
 }
 
 #[cfg(test)]
@@ -2654,6 +2868,124 @@ mod tests {
         assert_eq!(
             h0.aac_frame_length as usize + h1.aac_frame_length as usize,
             stream.len()
+        );
+    }
+
+    /// [`extract_pulse_candidate`] on a band with outlier lines: the
+    /// reduced spectrum plus the §4.6.3.3 fix-up
+    /// ([`crate::swb_offset::apply_pulse_data`]) restores the exact
+    /// original quantized values, and the measured per-band saving
+    /// is real (the reduced band's cheapest book costs at least the
+    /// pulse record less).
+    #[test]
+    fn pulse_candidate_reduction_is_exactly_invertible() {
+        let fs_index = 3u8; // 48 kHz
+        let offsets = long_window_offsets(fs_index).unwrap();
+        let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+        let mut x_quant = vec![0i32; FRAME_LEN];
+        let mut sfb_cb = vec![ZERO_HCB; num_swb];
+        // Band 29 (32 lines at 48 kHz): a dense small-magnitude
+        // spectrum with two outliers (one negative) — the outliers
+        // alone force the whole band onto the ESC book.
+        let (s, e) = (offsets[29] as usize, offsets[30] as usize);
+        for (k, slot) in x_quant.iter_mut().enumerate().take(e).skip(s) {
+            *slot = 1 - ((k as i32) & 2);
+        }
+        x_quant[s + 1] = 17;
+        x_quant[s + 5] = -19;
+        sfb_cb[29] = codebook_for(19);
+        let (pd, reduced) =
+            extract_pulse_candidate(&x_quant, &sfb_cb, offsets).expect("outliers must qualify");
+        assert_eq!(pd.pulse_start_sfb, 29);
+        assert_eq!(pd.pulses.len(), 2);
+        // The residual codes without the outliers' book demand
+        // (amp reach is 15, so 17 → 2 and −19 → −4, signs kept).
+        assert_eq!(reduced[s + 1], 2);
+        assert_eq!(reduced[s + 5], -4);
+        // Decode-side fix-up restores the original spectrum exactly.
+        let mut restored = reduced.clone();
+        crate::swb_offset::apply_pulse_data(&mut restored, fs_index, &pd).unwrap();
+        assert_eq!(restored, x_quant);
+        // The candidate's saving is real end to end.
+        let plain_bits = cheapest_band_bits(&x_quant[s..e]).unwrap() as u64;
+        let pulsed_bits =
+            cheapest_band_bits(&reduced[s..e]).unwrap() as u64 + pulse_record_bits(pd.pulses.len());
+        assert!(
+            pulsed_bits < plain_bits,
+            "pulsed {pulsed_bits} vs plain {plain_bits}"
+        );
+    }
+
+    /// A spectrum-wide no-outlier profile yields no candidate, and a
+    /// candidate that does not measure smaller is dropped by the
+    /// [`quantize_channel`] decision (the emitted stream stays
+    /// pulse-free on flat content).
+    #[test]
+    fn pulse_candidate_requires_a_measured_win() {
+        let fs_index = 3u8;
+        let offsets = long_window_offsets(fs_index).unwrap();
+        let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+        // Flat band: every line the same magnitude — no outlier.
+        let mut x_quant = vec![0i32; FRAME_LEN];
+        let mut sfb_cb = vec![ZERO_HCB; num_swb];
+        let (s, e) = (offsets[10] as usize, offsets[11] as usize);
+        x_quant[s..e].fill(3);
+        sfb_cb[10] = codebook_for(3);
+        assert!(extract_pulse_candidate(&x_quant, &sfb_cb, offsets).is_none());
+    }
+
+    /// End-to-end pulse emission through [`quantize_channel`]: a
+    /// long-frame spectrum whose loud band carries one outlier line
+    /// over a low floor selects the pulse variant, the wire record
+    /// round-trips, and the §4.6.3.3 fix-up on the transmitted
+    /// spectrum reproduces the pulse-free quantization exactly (the
+    /// reconstruction is bit-identical by construction).
+    #[test]
+    fn quantize_channel_emits_measured_pulse_data() {
+        let fs_index = 3u8; // 48 kHz
+        let offsets = long_window_offsets(fs_index).unwrap();
+        // Craft a spectrum: wide band 29 carries a moderate peak
+        // (the frame peak lives in band 20 so band 29's masking
+        // target lands near the escape threshold) plus a dense low
+        // floor across the band.
+        let mut spec = vec![0.0f64; FRAME_LEN];
+        let (s29, e29) = (offsets[29] as usize, offsets[30] as usize);
+        spec[offsets[20] as usize] = 1.0; // frame peak, own band
+        spec[s29 + 3] = 0.17; // the outlier line
+        for (k, slot) in spec.iter_mut().enumerate().take(e29).skip(s29) {
+            if k != s29 + 3 {
+                *slot = 0.0095; // the band floor
+            }
+        }
+        let chan =
+            quantize_channel(&spec, WindowSequence::OnlyLong, fs_index, 0, 1.0, &[], &[]).unwrap();
+        let plain = quantize_group(
+            &spec,
+            offsets,
+            NUM_SWB_LONG_WINDOW[fs_index as usize] as usize,
+            0,
+            1.0,
+            &mut None,
+            &[],
+        );
+        assert!(
+            chan.body.pulse_data_present,
+            "outlier-over-floor band must select the pulse variant"
+        );
+        let pd = chan.body.pulse_data.as_ref().unwrap();
+        assert!((1..=MAX_PULSES).contains(&pd.pulses.len()));
+        // The transmitted spectrum restores to the plain quantization.
+        let mut restored = chan.spectral.x_quant[0].clone();
+        crate::swb_offset::apply_pulse_data(&mut restored, fs_index, pd).unwrap();
+        assert_eq!(restored, plain.x_quant);
+        // And the pulse variant is the smaller stream.
+        let plain_chan = {
+            let info = chan.info.clone();
+            finish_channel(info, vec![plain], fs_index, None).unwrap()
+        };
+        assert!(
+            channel_wire_bits(&chan, fs_index).unwrap()
+                < channel_wire_bits(&plain_chan, fs_index).unwrap()
         );
     }
 }

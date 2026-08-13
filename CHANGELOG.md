@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder pulse escape** (§4.4.6.3 / Table 4.7): long frames now
+  price a `pulse_data()` variant whenever a band's few outlier lines
+  force it onto a large-LAV codebook or into §4.6.3.3 escape
+  sequences — up to four outliers are reduced toward zero to the
+  rest-of-band magnitude floor (4-bit `amp` reach) and transmitted as
+  `(offset, amp)` fix-ups, with the candidate picked by per-band
+  measured cost and the variant kept only when the whole channel
+  stream measures smaller (`channel_wire_bits`, the same
+  measured-bit-cost philosophy as the section/codebook DP). The
+  decode-side §4.6.3.3 reconstruction restores the *identical*
+  quantized spectrum, so the tool is purely a noiseless-coding win —
+  pinned by an exact-inversion unit test and an end-to-end
+  round-trip whose crafted outlier-over-floor signal emits pulse
+  records on 15 of 17 frames (`tests/encoder_pulse.rs`).
+
 - **ISO/IEC 14496-26 conformance harness**
   (`tests/iso_14496_26_conformance.rs`) — decodes the normative ER AAC
   LD (`er_ad1000*` / `er_ad1103*` / `er_ad1103np*`, 15 vectors ×

@@ -990,7 +990,11 @@ the EP section below).
   candidate same-class run priced at its `section_data()` header
   overhead plus the cheapest Table 4.95 book, actual codeword +
   sign + escape bits measured with the real tuple writer — pinned
-  never-larger than the classic smallest-LAV + merge rule).
+  never-larger than the classic smallest-LAV + merge rule), and
+  long frames additionally price a §4.4.6.3 `pulse_data()` variant
+  (band outliers reduced to the rest-of-band floor, restored
+  bit-exactly by the decoder's §4.6.3.3 fix-up; kept only when the
+  measured channel stream is smaller).
   Stereo pairs code per-band §4.6.8.1 M/S (`m=(l+r)/2`, `s=(l−r)/2`
   where the transform concentrates band energy, emitted as
   `ms_mask_present` 2 / 1+mask / 0) inside a `common_window` CPE —
@@ -1055,7 +1059,10 @@ the EP section below).
   (`StreamEncoder::set_intensity_stereo` — correlated high bands
   transmitted once with codebook 15/14 + `is_pos` on the §4.6.8.1.4
   track; off by default because intensity coding discards the
-  pair's side information), but does not yet emit pulse data, keeps
+  pair's side information) and measured §4.4.6.3 `pulse_data()`
+  emission (long-frame outlier-over-floor bands, kept only when the
+  whole channel stream prices smaller; the decode-side fix-up
+  restores the identical quantized spectrum), keeps
   PNS and IS long-frame-only (CPE PNS emits the §4.6.13.3 `ms_used`
   correlated-noise signalling — shared random vector — for
   both-channels-noise bands correlating above 0.5), and has no
