@@ -1024,6 +1024,69 @@ the EP section below).
   `"aac"`, and re-exported as `encoder::make_encoder` per the
   workspace dual-API convention.
 
+### ER BSAC (AOT 22) — noiseless-coder bring-up (§4.4.2.6 / §4.5.2.6 / §4.6.4)
+
+The Bit-Sliced Arithmetic Coding decoder roster is implemented and
+its front half is **conformance-pinned against the ISO/IEC 14496-26
+`er_bs*` corpus**; the spectral bit-slice probability *selection*
+of the deployed encoder diverges from the printed spec and is the
+component still open (see below):
+
+- **Numeric tables** (`bsac_tables`) — Tables 4.A.31–4.A.77
+  transcribed from the staged spec PDF: the `cband_si_type`
+  parameter matrix, the scalefactor / `cband_si` / stereo / PNS
+  cumulative-frequency models, the Table 4.A.34 context-position
+  map, the Table 4.A.35/36 `min_p0`/`max_p0` budget clamps, and the
+  22 spectral probability tables with the printed alias scheme
+  resolved. (The 2001 and 2009 editions print *different* alias
+  schemes — tables 11–22 onto 9/10 alternating with sub-MSB zero
+  rows from 7/8 in 2009, everything onto 10 with zero rows from 8
+  in 2001 — plus one conflicting cell in table 7; both were
+  transcribed and tested.)
+- **Arithmetic decoder** (`bsac_arith`) — the §4.5.2.6.2.7.4
+  procedure exactly as listed (`decode_symbol` over 14-bit cumfreq
+  models, binary `decode_bit`, the `half[]` renorm schedule, 30-bit
+  init, zero-stuffing segment reader), round-tripped against a
+  spec-inverse test encoder over every model.
+- **Layer geometry** (`bsac_layer`) — the §4.5.2.6.2.4/5 roster:
+  base sub-layer split, per-layer coding-band / spectral / sfb
+  coverage (the literal `end_sfb = sfb + 1` one-band lookahead,
+  corpus-confirmed), `layer_si_maxlen`, the rate-anchored
+  `layer_bit_offset` derivation with the overflow/underflow
+  redistribution, and the SBA `terminal_layer` marks.
+- **Block decode + reconstruction** (`bsac_decode`) — the
+  `bsac_header()` / `general_header()` raw-bit parse, the full
+  layer walk (side info, first-pass spectra, the
+  `bsac_lower_spectra()` refinement, budget carry between layers),
+  bit-slice reassembly with interleaved sign decode, and the AAC
+  back end (§4.6.2 dequant, group de-interleave, §4.6.8 stereo
+  hooks, §4.6.9 TNS, §4.6.11 filterbank) behind a persistent
+  `BsacDecoder`.
+- **What the corpus pins** (`tests/bsac_bringup.rs`, corpus-gated):
+  on `er_bs01_48_ep0` the silent access units decode
+  **sample-exact** against the reference waveform (headers, layer
+  roster, arithmetic side-info decode all in sync), and on content
+  frames a TDAC oracle (the §4.6.11 perfect-reconstruction
+  property recovers each frame's exact transmitted spectrum from
+  the reference PCM) confirms the decoded `cband_si` MSB plane and
+  scalefactor gains match the deployed encoder precisely.
+- **The open divergence**: the §4.6.4.2.3 spectral-bit probability
+  selection as printed decodes the wrong sliced bits partway into
+  the first coding band (both editions' alias readings, several
+  structural variants, and every printed row under every position
+  mapping tried were tested against the oracle truth). A
+  constraint solver over the real stream proves a consistent
+  context→p0 dictionary *exists* — the symbol order, sign
+  interleave and context classes are right — but its values match
+  no printed row (the all-zero-context position demands
+  `p0 ∈ {0x3700..=0x3a00}`; every plausible row prints `0x3b00+`
+  there). A clean-room behavioural trace of the deployed p0
+  selection (or the corrigendum text) is the standing docs ask;
+  `tests/bsac_bringup.rs` carries the divergence locator and the
+  solver instrument, and `tests/iso_14496_26_conformance.rs`
+  reports the structural decode rate (618/703 AUs on
+  `er_bs01_48_ep0`) without asserting PCM until the rule lands.
+
 ## Not yet supported
 
 - **The deployed ER AAC LD `tns_data()` filter record.** The
@@ -1121,6 +1184,18 @@ the EP section below).
   filterbank-linearity identity on writer-assembled CCE streams; a
   third-party CCE-bearing conformance fixture would still be a welcome
   external cross-check.
+- **ER BSAC (AOT 22) PCM** — the noiseless-coder front half
+  (headers, layer geometry, arithmetic side-info decode) is
+  conformance-pinned, but the deployed encoder's spectral bit-slice
+  probability selection diverges from every reading of the printed
+  §4.6.4.2.3 / Table 4.A.34 selection (see the BSAC section above),
+  so reconstructed PCM does not yet match the reference waveforms.
+  Also out of scope until then: SBA-mode segment scheduling
+  (`sba_mode == 1`), BSAC LTP, BSAC PNS (the noise-energy PCM
+  conventions need a working spectral decode to pin), the
+  `zero_code` extended part (channel / SBR / MPEG-Surround
+  extensions), and the §4.5.2.6.1 multi-ES `bsac_payload()`
+  large-step-layer reassembly (the `er_bs02`-style carriage).
 - Error-resilience remainders — the ER story is now wired end to end
   for ER AAC LC (AOT 17), **ER AAC LTP (AOT 19)** and ER AAC LD
   (AOT 23): the ER channel-element body

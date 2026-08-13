@@ -802,6 +802,12 @@ const PROB_TABLES: [ProbTable; 10] = [
 fn resolve_table(cband_si: u8) -> (usize, u8) {
     debug_assert!((1..=22).contains(&cband_si));
     let plane = CBAND_SI_MSB_PLANE[cband_si as usize];
+    // 2009 alias scheme. NOTE: the 2001 edition prints a different
+    // scheme (tables 11..=22 all onto table 10, and the sub-MSB
+    // zero rows of 9/10 onto table 8) — both readings were tested
+    // against the 14496-26 conformance streams and neither matches
+    // the deployed encoder's selection; see the crate README's
+    // BSAC divergence note.
     let base = match cband_si {
         1..=10 => cband_si,
         11 | 13 => 9,

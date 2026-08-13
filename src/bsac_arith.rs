@@ -137,6 +137,11 @@ impl ArithDecoder {
         est
     }
 
+    /// The renormalization shift the next decode will consume.
+    pub fn pending_est(&self) -> u32 {
+        self.est_cw_len
+    }
+
     /// §4.5.2.6.2.7.4 `decode_symbol()`: general arithmetic decode
     /// over a cumulative-frequency model (14-bit fixed point,
     /// strictly decreasing, last entry 0). Returns

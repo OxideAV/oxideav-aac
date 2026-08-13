@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ER BSAC (AOT 22) decoder bring-up** (§4.4.2.6 / §4.5.2.6 /
+  §4.6.4): `bsac_tables` (Tables 4.A.31–4.A.77 transcription with
+  integrity + anchor tests; both editions' alias schemes examined),
+  `bsac_arith` (the §4.5.2.6.2.7.4 arithmetic decoder, round-tripped
+  against a spec-inverse test encoder), `bsac_layer` (the
+  §4.5.2.6.2.4/5 fine-grain layer roster), and `bsac_decode` (the
+  full `bsac_raw_data_block()` walk — headers, side info, bit-slice
+  spectra with interleaved signs, budget carry — plus the AAC back
+  end into a persistent `BsacDecoder`). Conformance status against
+  the ISO/IEC 14496-26 `er_bs*` corpus: silent AUs decode
+  sample-exact and the side-info layer is TDAC-oracle-pinned
+  (decoded `cband_si` planes and scalefactor gains match the
+  deployed encoder), but the deployed spectral bit-slice
+  probability *selection* diverges from every reading of the
+  printed §4.6.4.2.3 selection — `tests/bsac_bringup.rs` carries
+  the oracle, the divergence locator and a constraint-solver
+  instrument proving a consistent context→p0 dictionary exists
+  (values matching no printed row); PCM assertions stay off until
+  the deployed rule is traced.
+
 - **Encoder pulse escape** (§4.4.6.3 / Table 4.7): long frames now
   price a `pulse_data()` variant whenever a band's few outlier lines
   force it onto a large-LAV codebook or into §4.6.3.3 escape

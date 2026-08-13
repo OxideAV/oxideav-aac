@@ -685,3 +685,71 @@ fn sbr_crc_type14_vectors_decode_with_crc_enforced() {
     sbr_crc_vector("al_sbr_i_32_1", 1);
     sbr_crc_vector("al_sbr_i_32_2", 2);
 }
+
+// ---------------------------------------------------------------------------
+// 4. ER BSAC (AOT 22) — structural decode + divergence report.
+// ---------------------------------------------------------------------------
+
+/// Decode one `er_bs*_ep0.mp4` vector AU-by-AU through the BSAC
+/// decoder and report the structural decode rate and the PCM
+/// distance to the top-layer reference waveform.
+///
+/// REPORTING ONLY for now: the header / layer-geometry / side-info
+/// decode is conformance-pinned (see `tests/bsac_bringup.rs` — the
+/// silent-AU exactness and the TDAC-oracle si consistency), but the
+/// spectral bit-slice probability *selection* of the deployed
+/// encoder diverges from every reading of the printed §4.6.4.2.3 /
+/// Table 4.A.34 selection tried so far (both the 2009 and 2001
+/// alias schemes), so the reconstructed PCM does not yet match the
+/// reference. The bring-up probes in `tests/bsac_bringup.rs`
+/// localize the divergence; the deployed selection rule is the
+/// standing docs ask.
+fn bsac_vector(stem: &str, wav_name: &str) {
+    use oxideav_aac::bsac_decode::BsacDecoder;
+
+    let Some(m4a) = load_vector(&format!("compressedMp4/{stem}.mp4")) else {
+        return;
+    };
+    let asc_bytes = mp4_asc(&m4a).expect("esds AudioSpecificConfig");
+    let (asc, _) = AudioSpecificConfig::parse(&asc_bytes).expect("ASC parses");
+    assert_eq!(asc.aot, 22, "{stem}: AOT 22 expected");
+    let fs = asc.sample_rate;
+    let fs_index = asc.sampling_frequency_index;
+    let nch = asc.channel_configuration as usize;
+    let samples = mp4_samples(&m4a).expect("mp4 sample table");
+
+    let mut dec = BsacDecoder::new(fs, fs_index, nch).expect("decoder builds");
+    let mut ours: Vec<f64> = Vec::new();
+    let mut decoded = 0usize;
+    for &(off, len) in samples.iter() {
+        let au = &m4a[off..off + len];
+        match dec.decode_frame(au) {
+            Ok(pcm) => {
+                ours.extend(pcm.iter().map(|&s| f64::from(s)));
+                decoded += 1;
+            }
+            Err(_) => ours.extend(std::iter::repeat(0.0).take(1024 * nch)),
+        }
+    }
+    eprintln!(
+        "{stem}: {decoded}/{} AUs structurally decoded",
+        samples.len()
+    );
+
+    let Some(dir) = corpus_dir() else { return };
+    let wav_path = dir.join(format!("referencesWav/{wav_name}.wav"));
+    let Some((reference, ref_ch)) = read_wav(&wav_path) else {
+        eprintln!("skip: {wav_name}.wav not present");
+        return;
+    };
+    assert_eq!(ref_ch, nch, "{stem}: reference channel count");
+    let (lag, ratios) = rms_ratios(&ours, &reference, nch, 4096);
+    eprintln!(
+        "{stem}: lag {lag}, per-channel err/sig {ratios:?} (divergence pending, see bsac_bringup)"
+    );
+}
+
+#[test]
+fn bsac_er_bs01_48_structural_report() {
+    bsac_vector("er_bs01_48_ep0", "er_bs01_48_lay48");
+}

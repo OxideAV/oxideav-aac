@@ -410,6 +410,12 @@ pub mod asc;
 pub mod bsac_arith;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod bsac_decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod bsac_layer;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bsac_tables;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

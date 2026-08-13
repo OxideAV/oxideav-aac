@@ -752,6 +752,24 @@ pub enum Error {
     /// (Table 4.62, `num_sbr_bits − 10` bits before `bs_fill_bits`).
     /// The SBR side info is corrupt.
     SbrCrcMismatch,
+
+    /// A `bsac_header()` / `general_header()` field is out of its
+    /// legal range (ISO/IEC 14496-3:2009 §4.5.2.6.2.2.4/5): a
+    /// `cband_si_type` past Table 4.A.31, a `max_sfb` past the
+    /// §4.5.4 band table, a zero base-layer coverage, or a
+    /// `frame_length` too small for the headers.
+    BsacInvalidHeader,
+
+    /// The arithmetic-decoded BSAC side information violates a
+    /// normative bound (§4.6.4.5 "bit_error_is_generated"): a
+    /// `cband_si` above the Table 4.A.31 largest value, or a
+    /// stereo / noise decision outside its model.
+    BsacBitError,
+
+    /// The `bsac_raw_data_block()` uses a tool this decoder does
+    /// not implement yet (long-term prediction, or the extended
+    /// part's channel / SBR / SAC extensions).
+    BsacUnsupportedTool,
 }
 
 impl core::fmt::Display for Error {
@@ -1199,6 +1217,24 @@ impl core::fmt::Display for Error {
                 write!(
                     f,
                     "SBR bs_sbr_crc_bits mismatch: recomputed §4.4.2.8.1 CRC-10 disagrees with the transmitted value"
+                )
+            }
+            Error::BsacInvalidHeader => {
+                write!(
+                    f,
+                    "bsac_header()/general_header() field out of range (§4.5.2.6.2.2.4)"
+                )
+            }
+            Error::BsacBitError => {
+                write!(
+                    f,
+                    "BSAC arithmetic side info violates a normative bound (§4.6.4.5 bit error)"
+                )
+            }
+            Error::BsacUnsupportedTool => {
+                write!(
+                    f,
+                    "bsac_raw_data_block() uses a tool this decoder does not implement (LTP / extended part)"
                 )
             }
         }
