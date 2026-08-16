@@ -403,16 +403,18 @@ carry the default 1024-line family):
   other binary decodes 480-line streams on the wrong 512-line
   frequency grid — probed and documented in the fixture notes).
   Staged fixtures: `aac-ld-512-writer-loas`, `aac-ld-480-writer-loas`.
-- **Known ecosystem divergence — LD TNS wire (docs ask pending)**:
-  the one available LD encoder binary emits TNS side info that is not
-  parseable under the literal Table 4.54 / Table 4.155 field widths
-  (its TNS-bearing AUs overrun their spectral payload), and the two
-  deployed black-box decoders do not even agree with each other on
-  such streams (one decodes them, the other drops those frames), nor
-  does either round-trip a spec-literal no-op TNS record. This crate
-  keeps the spec-literal reading; a clean-room trace of the deployed
-  LD `tns_data()` layout (or the corrigendum / original amendment
-  text) is the standing docs ask.
+- **LD TNS wire — RESOLVED against the conformance corpus**: the
+  divergence between the literal Table 4.54 / Table 4.155 field
+  widths and the deployed LD TNS wire was settled by the ISO/IEC
+  14496-26 screen recorded in `docs/audio/aac/er-ld-tns-divergence.md`
+  §0 — the normative LD wire transmits `n_filt` in **1 bit** (the
+  reduced Table 4.155 column; the literal 2-bit keying hard-fails 792
+  of the corpus's 2 017 TNS-bearing AUs). The LD families read the
+  1 / 4 / 3 column via `TnsData::parse_family` / `write_family`;
+  because the corpus never transmits a `length` / `order` field
+  (`n_filt == 0` throughout, so 4 / 3 vs 6 / 5 is undetermined), the
+  §0.6 configurability recommendation is kept via the explicit-width
+  `TnsData::parse_widths` / `write_widths` entry points.
 - An SBR payload on a 960-line or LD stream is rejected before its
   body is parsed (`Error::SbrUnsupportedFrameFamily`) — the §4.6.18
   tool here is defined over the 1024-line core, and the §4.6.19 LD

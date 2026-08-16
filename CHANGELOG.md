@@ -57,6 +57,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   exact (err/sig ≈ 4.4e-5), LD-480 non-TNS/non-PNS PCM ≈ 1.3e-4; all
   six `am05_48` output channels land at ≈ 1e-4; all 1 600 SBR CRCs
   verify.
+- **`TnsData::parse_widths` / `write_widths`** — explicit
+  `(n_filt_bits, length_bits, order_bits)` entry points (each width
+  `1..=8`), the configurability hook
+  `docs/audio/aac/er-ld-tns-divergence.md` §0.6 recommends: the LD
+  `n_filt` width is corpus-settled at 1 bit but `length` / `order`
+  are only *preferred* at 4 / 3 (the conformance corpus transmits
+  `n_filt == 0` in every LD TNS record, so 4 / 3 vs 6 / 5 is
+  physically undiscriminated). `parse_family` / `write_family` now
+  delegate to them; a caller with evidence for a mixed wire (e.g.
+  1 / 6 / 5) can drive the explicit form directly.
+- **SBR-CRC `bs_fill_bits` coverage pins**
+  (`tests/sbr_crc.rs`): flipping a trailing `bs_fill_bits` bit of an
+  `EXT_SBR_DATA_CRC` payload trips `Error::SbrCrcMismatch` (the
+  §4.5.2.8.1 whole-payload region the ISO/IEC 14496-26 type-14
+  vectors confirmed; the narrower Table 4.62 region would decode it
+  silently), while the same flip through the type-13 path decodes
+  byte-identically — pinning the gate provenance.
 - **SBR pre-header payloads** (§4.5.2.8.1): a stream that opens with
   `bs_header_flag == 0` SBR payloads before any `sbr_header()` no
   longer errors — the payload is skipped whole (CRC still verified on

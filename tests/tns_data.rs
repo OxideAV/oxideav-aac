@@ -737,3 +737,100 @@ fn back_to_back_tns_blocks_roundtrip() {
     assert_eq!(br.bit_position(), total_bits);
     assert_eq!(parsed2, td2);
 }
+
+// ----------------------------------------------------------------------------
+// Explicit-width entry points (er-ld-tns-divergence.md §0.6 hook)
+// ----------------------------------------------------------------------------
+
+/// `parse_widths` / `write_widths` under the corpus-undetermined
+/// alternative LD hypothesis `1 / 6 / 5` round-trip bit-exactly —
+/// the configurability `docs/audio/aac/er-ld-tns-divergence.md` §0.6
+/// recommends while the corpus (`n_filt == 0` in every LD TNS
+/// record) cannot discriminate `length` / `order` widths.
+#[test]
+fn explicit_width_roundtrip_1_6_5() {
+    let widths = (1u32, 6u32, 5u32);
+    // length 40 and order 11 overflow the default LD 4/3-bit caps but
+    // fit 6/5 — exactly the records only this hypothesis can carry.
+    let td = TnsData {
+        windows: vec![TnsWindow {
+            coef_res: true,
+            filters: vec![filter(
+                40,
+                11,
+                false,
+                false,
+                &[1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3],
+            )],
+        }],
+    };
+    let mut bw = BitWriter::new();
+    td.write_widths(&mut bw, widths, WindowSequence::OnlyLong)
+        .unwrap();
+    let total_bits = bw.bit_position();
+    let buf = bw.finish();
+    let mut br = BitReader::new(&buf);
+    let parsed = TnsData::parse_widths(&mut br, widths, WindowSequence::OnlyLong).unwrap();
+    assert_eq!(br.bit_position(), total_bits);
+    assert_eq!(parsed, td);
+
+    // The same record must be rejected by the default LD widths (the
+    // 4-bit length / 3-bit order caps).
+    let mut bw = BitWriter::new();
+    assert_eq!(
+        td.write_widths(&mut bw, (1, 4, 3), WindowSequence::OnlyLong),
+        Err(Error::TnsDataEncodeInvalid)
+    );
+}
+
+/// The family dispatch is exactly the explicit-width call with
+/// [`field_widths`]-style triples: a wire written by `write_widths`
+/// with the reduced `1 / 4 / 3` column parses identically through
+/// `parse_family` under an LD family.
+#[test]
+fn family_dispatch_equals_explicit_widths() {
+    use oxideav_aac::swb_offset::FrameFamily;
+    let td = TnsData {
+        windows: vec![TnsWindow {
+            coef_res: false,
+            filters: vec![filter(10, 2, false, false, &[2, 5])],
+        }],
+    };
+    let mut bw = BitWriter::new();
+    td.write_widths(&mut bw, (1, 4, 3), WindowSequence::OnlyLong)
+        .unwrap();
+    let buf_explicit = bw.finish();
+
+    let mut bw = BitWriter::new();
+    td.write_family(&mut bw, FrameFamily::Ld512, WindowSequence::OnlyLong)
+        .unwrap();
+    assert_eq!(bw.finish(), buf_explicit, "identical wire");
+
+    let mut br = BitReader::new(&buf_explicit);
+    let parsed =
+        TnsData::parse_family(&mut br, FrameFamily::Ld480, WindowSequence::OnlyLong).unwrap();
+    assert_eq!(parsed, td);
+}
+
+/// Width triples outside `1..=8` are caller-configuration errors,
+/// rejected up front on both directions.
+#[test]
+fn invalid_explicit_widths_rejected() {
+    let td = TnsData {
+        windows: vec![empty_long_window()],
+    };
+    for bad in [(0u32, 4u32, 3u32), (9, 4, 3), (1, 0, 3), (1, 4, 9)] {
+        let mut bw = BitWriter::new();
+        assert_eq!(
+            td.write_widths(&mut bw, bad, WindowSequence::OnlyLong),
+            Err(Error::TnsDataEncodeInvalid),
+            "write {bad:?}"
+        );
+        let mut br = BitReader::new(&[0u8; 8]);
+        assert_eq!(
+            TnsData::parse_widths(&mut br, bad, WindowSequence::OnlyLong),
+            Err(Error::TnsDataEncodeInvalid),
+            "parse {bad:?}"
+        );
+    }
+}

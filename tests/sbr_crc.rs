@@ -273,6 +273,54 @@ fn corrupt_covered_sbr_bit_is_rejected() {
     assert!(matches!(decode(&payload), Err(Error::SbrCrcMismatch)));
 }
 
+/// The §4.5.2.8.1 coverage region includes the trailing
+/// `bs_fill_bits`: flipping one of the alignment bits after the end of
+/// `sbr_data()` must trip the CRC gate. This pins the whole-payload
+/// coverage the ISO/IEC 14496-26 type-14 vectors confirmed (the
+/// narrower Table 4.62 region — up to the end of `sbr_data()` only —
+/// would decode this corruption silently); the
+/// `he-aac-v1-sbrcrc-adts` docs fixture is staged under the same
+/// region.
+#[test]
+fn corrupt_bs_fill_bit_is_rejected() {
+    // Recompute the SBR bit count the payload builder used, to locate
+    // the trailing bs_fill_bits inside the fill body.
+    let bands = header_bands();
+    let mut sw = BitWriter::new();
+    sw.write_bit(true); // bs_header_flag
+    write_header(&mut sw);
+    write_minimal_sce_sbr(&mut sw, &bands);
+    let used = 4 + 10 + sw.bit_position(); // ext type + CRC + SBR bits
+    assert!(
+        used % 8 != 0,
+        "recipe must leave bs_fill_bits to exercise the covered tail"
+    );
+    let fil = build_sbr_fil_payload(true, false);
+    let total_bits = (fil.len() * 8) as u64;
+    assert!(total_bits > used, "alignment bits must exist");
+    let (mut payload, fil_body_bit) = build_block(&fil);
+    // The last bit of the fill body is a bs_fill_bits bit.
+    let bit = fil_body_bit + total_bits - 1;
+    payload[(bit / 8) as usize] ^= 0x80 >> (bit % 8);
+    assert!(matches!(decode(&payload), Err(Error::SbrCrcMismatch)));
+}
+
+/// The same trailing-fill-bit flip through the type-13 (CRC-less)
+/// path must decode byte-identically — nothing verifies the fill
+/// bits there, pinning that the rejection above is the CRC gate.
+#[test]
+fn crcless_type13_payload_ignores_fill_bit_corruption() {
+    let fil = build_sbr_fil_payload(false, false);
+    let total_bits = (fil.len() * 8) as u64;
+    let (base, _) = build_block(&fil);
+    let (mut tweaked, fil_body_bit) = build_block(&fil);
+    let bit = fil_body_bit + total_bits - 1;
+    tweaked[(bit / 8) as usize] ^= 0x80 >> (bit % 8);
+    let a = decode(&base).unwrap();
+    let b = decode(&tweaked).unwrap();
+    assert_eq!(a.pcm, b.pcm, "bs_fill_bits must not affect reconstruction");
+}
+
 /// Deterministic mutation battery over the type-14 SBR block: the
 /// side-info parse runs before the CRC comparison, so every mutated
 /// payload must decode or error cleanly — never panic.

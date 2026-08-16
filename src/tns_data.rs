@@ -278,7 +278,37 @@ impl TnsData {
         family: FrameFamily,
         window_sequence: WindowSequence,
     ) -> Result<Self> {
-        let (n_filt_bits, length_bits, order_bits) = field_widths_family(family, window_sequence);
+        Self::parse_widths(
+            reader,
+            field_widths_family(family, window_sequence),
+            window_sequence,
+        )
+    }
+
+    /// [`TnsData::parse`] under an **explicit**
+    /// `(n_filt_bits, length_bits, order_bits)` width triple.
+    ///
+    /// This is the configurability hook
+    /// `docs/audio/aac/er-ld-tns-divergence.md` §0.6 recommends: the
+    /// LD `n_filt` width is corpus-settled at 1 bit, but the LD
+    /// `length` / `order` widths are only *preferred* at 4 / 3 (the
+    /// rest of the reduced Table 4.155 column) — the ISO/IEC 14496-26
+    /// corpus transmits `n_filt == 0` in every LD TNS record, so it
+    /// cannot discriminate 4 / 3 from 6 / 5. A caller confronted with
+    /// evidence for a mixed wire (e.g. 1 / 6 / 5) can drive this entry
+    /// point directly instead of forking [`Self::parse_family`]'s
+    /// dispatch. Each width must be `1..=8`
+    /// ([`Error::TnsDataEncodeInvalid`] otherwise — the widths are
+    /// caller configuration, not wire data).
+    pub fn parse_widths(
+        reader: &mut BitReader<'_>,
+        widths: (u32, u32, u32),
+        window_sequence: WindowSequence,
+    ) -> Result<Self> {
+        let (n_filt_bits, length_bits, order_bits) = widths;
+        if !widths_valid(widths) {
+            return Err(Error::TnsDataEncodeInvalid);
+        }
         let nw = num_windows(window_sequence);
         let mut windows = Vec::with_capacity(nw);
         for _ in 0..nw {
@@ -355,7 +385,28 @@ impl TnsData {
         family: FrameFamily,
         window_sequence: WindowSequence,
     ) -> Result<()> {
-        let (n_filt_bits, length_bits, order_bits) = field_widths_family(family, window_sequence);
+        self.write_widths(
+            writer,
+            field_widths_family(family, window_sequence),
+            window_sequence,
+        )
+    }
+
+    /// [`TnsData::write`] under an **explicit**
+    /// `(n_filt_bits, length_bits, order_bits)` width triple — the
+    /// bit-exact inverse of [`TnsData::parse_widths`] (see there for
+    /// why the widths are caller-configurable). Field caps derive from
+    /// the given widths; each width must be `1..=8`.
+    pub fn write_widths(
+        &self,
+        writer: &mut BitWriter,
+        widths: (u32, u32, u32),
+        window_sequence: WindowSequence,
+    ) -> Result<()> {
+        let (n_filt_bits, length_bits, order_bits) = widths;
+        if !widths_valid(widths) {
+            return Err(Error::TnsDataEncodeInvalid);
+        }
         let nw = num_windows(window_sequence);
         if self.windows.len() != nw {
             return Err(Error::TnsDataEncodeInvalid);
@@ -413,6 +464,14 @@ impl TnsData {
         }
         Ok(())
     }
+}
+
+/// A caller-supplied width triple is sane when every field fits the
+/// `u8`-backed record (`1..=8` bits).
+fn widths_valid((n_filt_bits, length_bits, order_bits): (u32, u32, u32)) -> bool {
+    (1..=8).contains(&n_filt_bits)
+        && (1..=8).contains(&length_bits)
+        && (1..=8).contains(&order_bits)
 }
 
 fn read_u8(reader: &mut BitReader<'_>, n: u32) -> Result<u8> {
