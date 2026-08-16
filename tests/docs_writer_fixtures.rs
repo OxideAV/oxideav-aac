@@ -556,11 +556,9 @@ fn cce_fixture_recipe_decodes_and_couples() {
 #[test]
 fn cce_stream_mutations_never_panic() {
     let stream = build_cce_stream(true);
-    let mut lane = 0u32;
-    for pos in (0..stream.len()).step_by(41) {
+    for (lane, pos) in (0..stream.len()).step_by(41).enumerate() {
         let mut bad = stream.clone();
         bad[pos] ^= 0x80 >> (lane % 8);
-        lane += 1;
         let _ = StreamDecoder::new().decode_all(&bad);
     }
     for len in (0..stream.len()).step_by(97) {
