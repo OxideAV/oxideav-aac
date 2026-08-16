@@ -67,6 +67,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   physically undiscriminated). `parse_family` / `write_family` now
   delegate to them; a caller with evidence for a mixed wire (e.g.
   1 / 6 / 5) can drive the explicit form directly.
+- **CCE stream corruption battery**
+  (`tests/docs_writer_fixtures.rs::cce_stream_mutations_never_panic`):
+  strided bit flips across every bit lane and truncations of the
+  writer-assembled CCE fixture stream must decode or error cleanly —
+  never panic — closing the one writer fixture that had no hostile-
+  input battery.
 - **SBR-CRC `bs_fill_bits` coverage pins**
   (`tests/sbr_crc.rs`): flipping a trailing `bs_fill_bits` bit of an
   `EXT_SBR_DATA_CRC` payload trips `Error::SbrCrcMismatch` (the

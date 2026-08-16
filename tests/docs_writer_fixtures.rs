@@ -545,6 +545,31 @@ fn cce_fixture_recipe_decodes_and_couples() {
     );
 }
 
+/// Deterministic corruption battery over the writer-assembled CCE
+/// stream — the Table 4.8 coupling header / gain-list parse and the
+/// two-pass CCE application must error cleanly on hostile input,
+/// never panic. Strided (the 9-frame 3-channel decode is ~500× the
+/// cost of the family fixtures' mono frames, so the flips walk every
+/// bit lane on a 41-byte stride instead of every byte — battery kept
+/// CI-sized while still crossing all nine frames and all three CCE
+/// shapes).
+#[test]
+fn cce_stream_mutations_never_panic() {
+    let stream = build_cce_stream(true);
+    let mut lane = 0u32;
+    for pos in (0..stream.len()).step_by(41) {
+        let mut bad = stream.clone();
+        bad[pos] ^= 0x80 >> (lane % 8);
+        lane += 1;
+        let _ = StreamDecoder::new().decode_all(&bad);
+    }
+    for len in (0..stream.len()).step_by(97) {
+        let _ = StreamDecoder::new().decode_all(&stream[..len]);
+    }
+    // The clean stream still decodes after the battery.
+    assert_eq!(StreamDecoder::new().decode_all(&stream).unwrap().len(), 9);
+}
+
 // ==================================================================
 // HCR fixture — aac-er-hcr-loas
 // ==================================================================
