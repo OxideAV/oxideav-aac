@@ -53,12 +53,18 @@
 //! ## Reconstruction
 //!
 //! [`CouplingGains::cc_gain`] applies the §4.6.8.3.3 `couple_channel()`
-//! scaling: `cc_gain = cc_sign · cc_scale^(−gain)` (conformance-settled
-//! exponent sign — see [`CouplingGains::cc_gain`]), with `cc_scale` from
-//! Table 4.154 ([`CC_SCALE_TABLE`]) and the §4.6.8.3.3 `gain_element_sign`
-//! in-phase / out-of-phase split (`cc_sign = 1 − 2·(g & 1)`, `gain =
-//! g >> 1`). The first coupled target (`list_index == 0`) is not
-//! transmitted: its gains are all `0`, i.e. the CCE is added in its
+//! scaling: `cc_gain = cc_sign · cc_scale^(−gain_element)`
+//! (conformance-settled exponent sign — see [`CouplingGains::cc_gain`]),
+//! with `cc_scale` from Table 4.154 ([`CC_SCALE_TABLE`]) and — when
+//! `gain_element_sign == 1` — the in-phase / out-of-phase split taken
+//! off **each transmitted DPCM delta** (`cc_sign = 1 − 2·(dpcm & 1)`,
+//! accumulator fed with `dpcm >> 1`), per the ISO/IEC 14496-3:2001 /
+//! 13818-7:2004 `couple_channel()` text as ruled in
+//! `docs/audio/aac/cce-gain-sign-split.md` §3. A `common_gain_element`
+//! is **never** sign-split (`cc_sign = 1` forced in that branch — so an
+//! independently switched CCE, which must use common gains only, always
+//! couples in phase). The first coupled target (`list_index == 0`) is
+//! not transmitted: its gains are all `0`, i.e. the CCE is added in its
 //! natural scaling (`cc_gain == 1`).
 //!
 //! ## Provenance
@@ -258,19 +264,38 @@ impl CouplingHeader {
     }
 }
 
+/// One decoded per-band coupling gain of a `dpcm_gain_element` list —
+/// the §4.6.8.3.3 (2001 / 13818-7:2004) `couple_channel()` gain-decode
+/// output for one `(g, sfb)`: the `cc_sign` out-of-phase flag split off
+/// the transmitted DPCM delta, and the accumulated `gain_element`
+/// exponent (see `docs/audio/aac/cce-gain-sign-split.md` §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DpcmGain {
+    /// `cc_sign == −1` (out-of-phase coupling) for this band. Set from
+    /// the delta LSB (`dpcm & 1`) when `gain_element_sign == 1`; always
+    /// `false` when the sign bit is clear.
+    pub negative: bool,
+    /// The accumulated `gain_element[g][sfb]` exponent —
+    /// `a += dpcm >> 1` under `gain_element_sign == 1`, `a += dpcm`
+    /// otherwise.
+    pub gain: i32,
+}
+
 /// The decoded gain list for one coupled target (Table 4.8 trailing
 /// loop, one `c`). Either a single `common_gain_element` applied to
-/// every band, or a per-`(g, sfb)` `dpcm_gain_element` list whose forward
-/// running sum (`a += dpcm`) yields the absolute `gain_element[g][sfb]`.
+/// every band, or a per-`(g, sfb)` `dpcm_gain_element` list decoded by
+/// the §4.6.8.3.3 forward running sum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GainList {
     /// `cge == 1`: one `common_gain_element` reused over every window
-    /// group and scalefactor band (§4.6.8.3.3).
+    /// group and scalefactor band (§4.6.8.3.3). Never sign-split — the
+    /// 2001 / 13818-7 text forces `cc_sign = 1` in this branch.
     Common(i32),
-    /// `cge == 0`: the per-band absolute gain grid, indexed
+    /// `cge == 0`: the per-band decoded gain grid, indexed
     /// `gains[g][sfb]`. Only the non-`ZERO_HCB` bands are transmitted;
-    /// `ZERO_HCB` bands hold the running accumulator value (no add).
-    Dpcm(Vec<Vec<i32>>),
+    /// `ZERO_HCB` bands hold the running accumulator value with an
+    /// in-phase sign (no delta is read there).
+    Dpcm(Vec<Vec<DpcmGain>>),
 }
 
 /// The whole trailing gain-list block of a CCE (Table 4.8), one
@@ -282,8 +307,11 @@ pub enum GainList {
 pub struct CouplingGains {
     /// The `gain_element_scale`-selected `cc_scale` from Table 4.154.
     pub cc_scale: f64,
-    /// `gain_element_sign` (carried so [`Self::cc_gain`] can apply the
-    /// in-phase / out-of-phase split).
+    /// `gain_element_sign` from the coupling header (informational —
+    /// the in-phase / out-of-phase split is resolved per band at parse
+    /// time into [`DpcmGain::negative`], per the
+    /// `docs/audio/aac/cce-gain-sign-split.md` §3 ruling; the writer
+    /// keys off the [`CouplingHeader`] it is handed).
     pub gain_element_sign: bool,
     /// The transmitted gain lists, in `c = 1 ..= num_gain_element_lists`
     /// order (`lists[0]` is the `c == 1` list).
@@ -329,19 +357,44 @@ impl CouplingGains {
                 if header.ind_sw_cce_flag {
                     return Err(Error::CceInvalid);
                 }
+                // §4.6.8.3.3 (2001 / 13818-7:2004) gain-decode loop —
+                // under `gain_element_sign` the out-of-phase flag is
+                // split off **each transmitted delta** (`cc_sign =
+                // 1 − 2·(dpcm & 1)`) and the accumulator is fed with
+                // the remaining magnitude (`a += dpcm >> 1`, arithmetic
+                // shift); with the sign bit clear the delta accumulates
+                // whole. Ruled in
+                // `docs/audio/aac/cce-gain-sign-split.md` §3 (the
+                // 14496-3:2009 fragment that splits the *accumulated*
+                // value is an editorial defect of that edition).
                 let mut acc: i32 = 0;
-                let mut grid = vec![vec![0i32; max_sfb]; num_window_groups];
+                let mut grid = vec![vec![DpcmGain::default(); max_sfb]; num_window_groups];
                 for (g, row) in grid.iter_mut().enumerate() {
                     let cb_row = sfb_cb.get(g).ok_or(Error::CceInvalid)?;
                     for (sfb, cell) in row.iter_mut().enumerate() {
                         let cb = *cb_row.get(sfb).ok_or(Error::CceInvalid)?;
                         if cb != ZERO_HCB {
-                            acc += i32::from(hcod_sf_decode(reader)?);
-                            *cell = acc;
+                            let dpcm = i32::from(hcod_sf_decode(reader)?);
+                            if header.gain_element_sign {
+                                acc += dpcm >> 1;
+                                *cell = DpcmGain {
+                                    negative: (dpcm & 1) != 0,
+                                    gain: acc,
+                                };
+                            } else {
+                                acc += dpcm;
+                                *cell = DpcmGain {
+                                    negative: false,
+                                    gain: acc,
+                                };
+                            }
                         } else {
                             // ZERO_HCB band carries the running value but
                             // contributes no coupling (cc_gain unused).
-                            *cell = acc;
+                            *cell = DpcmGain {
+                                negative: false,
+                                gain: acc,
+                            };
                         }
                     }
                 }
@@ -384,18 +437,34 @@ impl CouplingGains {
                     }
                     // common_gain_element_present[c] = 0
                     writer.write_bit(false);
+                    // Exact inverse of the §4.6.8.3.3 gain-decode loop:
+                    // under `gain_element_sign` each delta packs the
+                    // out-of-phase flag into its LSB
+                    // (`dpcm = ((gain − prev) << 1) | negative`, which
+                    // `dpcm >> 1` / `dpcm & 1` recover for every signed
+                    // delta); with the sign bit clear the delta is the
+                    // plain gain difference and an out-of-phase band is
+                    // unrepresentable (rejected).
                     let mut prev: i32 = 0;
                     for (g, row) in grid.iter().enumerate() {
                         let cb_row = sfb_cb.get(g).ok_or(Error::CceInvalid)?;
-                        for (sfb, &abs) in row.iter().enumerate() {
+                        for (sfb, cell) in row.iter().enumerate() {
                             let cb = *cb_row.get(sfb).ok_or(Error::CceInvalid)?;
                             if cb != ZERO_HCB {
-                                let dpcm =
-                                    i8::try_from(abs - prev).map_err(|_| Error::CceInvalid)?;
+                                let delta = cell.gain - prev;
+                                let dpcm = if header.gain_element_sign {
+                                    (delta << 1) | i32::from(cell.negative)
+                                } else {
+                                    if cell.negative {
+                                        return Err(Error::CceInvalid);
+                                    }
+                                    delta
+                                };
+                                let dpcm = i8::try_from(dpcm).map_err(|_| Error::CceInvalid)?;
                                 let (len, cw) = hcod_sf_encode(dpcm)?;
                                 writer.write_u32(cw, u32::from(len));
+                                prev = cell.gain;
                             }
-                            prev = abs;
                         }
                     }
                 }
@@ -411,10 +480,15 @@ impl CouplingGains {
     /// (`0` = the implicit natural-scaling target → `cc_gain == 1.0`;
     /// `1 ..= num_gain_element_lists - 1` index [`Self::lists`]).
     ///
-    /// Returns `cc_gain = cc_sign · cc_scale^(−gain)`, where (per
-    /// `gain_element_sign`):
-    /// * sign set: `cc_sign = 1 − 2·(g & 1)`, `gain = g >> 1`;
-    /// * sign clear: `cc_sign = 1`, `gain = g`.
+    /// Returns `cc_gain = cc_sign · cc_scale^(−gain_element)`:
+    /// * for a [`GainList::Dpcm`] band, `cc_sign` and `gain_element`
+    ///   are the per-band values the parse loop split off the DPCM
+    ///   deltas (`docs/audio/aac/cce-gain-sign-split.md` §3 — the
+    ///   2001 / 13818-7:2004 `couple_channel()` gain decode);
+    /// * for a [`GainList::Common`] list, `cc_sign = 1` always — the
+    ///   ruled text never sign-splits a `common_gain_element`, so an
+    ///   independently switched CCE (common gains only) couples in
+    ///   phase regardless of `gain_element_sign`.
     ///
     /// The **negated** exponent is the conformance-settled reading of
     /// the §4.6.8.3.3 `cc_scale^gain_element` expression. All three
@@ -428,9 +502,9 @@ impl CouplingGains {
     /// `docs/audio/aac/cce-gain-sign-split.md` §4 left open (a
     /// black-box validator had measured the negated exponent; the
     /// conformance corpus now confirms it as the normative wire
-    /// convention). The §3 ruling of that document (sign split on the
-    /// DPCM delta, `ZERO_HCB` guard, unsigned `common_gain_element`)
-    /// is unaffected.
+    /// convention). The §3 sign-split ruling is orthogonal (the
+    /// corpus's `gain_element_sign` is always 0) and is implemented in
+    /// the parse loop.
     pub fn cc_gain(&self, list_index: usize, g: usize, sfb: usize) -> Result<f64> {
         if list_index == 0 {
             // The first coupled target's gains are not transmitted; the
@@ -438,18 +512,15 @@ impl CouplingGains {
             return Ok(1.0);
         }
         let list = self.lists.get(list_index - 1).ok_or(Error::CceInvalid)?;
-        let raw = match list {
-            GainList::Common(common) => *common,
-            GainList::Dpcm(grid) => *grid
-                .get(g)
-                .and_then(|row| row.get(sfb))
-                .ok_or(Error::CceInvalid)?,
-        };
-        let (cc_sign, gain) = if self.gain_element_sign {
-            let sign = 1.0 - 2.0 * f64::from(raw & 0x1);
-            (sign, raw >> 1)
-        } else {
-            (1.0, raw)
+        let (cc_sign, gain) = match list {
+            GainList::Common(common) => (1.0, *common),
+            GainList::Dpcm(grid) => {
+                let cell = grid
+                    .get(g)
+                    .and_then(|row| row.get(sfb))
+                    .ok_or(Error::CceInvalid)?;
+                (if cell.negative { -1.0 } else { 1.0 }, cell.gain)
+            }
         };
         Ok(cc_sign * self.cc_scale.powi(-gain))
     }
@@ -813,17 +884,183 @@ mod tests {
         assert!((gains.cc_gain(1, 0, 0).unwrap() - 0.125).abs() < 1e-12);
     }
 
-    /// With the sign bit set, the LSB of the gain element selects the
-    /// out-of-phase sign and the value is right-shifted.
+    /// A `common_gain_element` is never sign-split, even when the
+    /// header's `gain_element_sign` is set — the 2001 / 13818-7:2004
+    /// `couple_channel()` forces `cc_sign = 1` in the common branch
+    /// (`docs/audio/aac/cce-gain-sign-split.md` §3), which also makes
+    /// every independently switched CCE couple in phase.
     #[test]
-    fn cc_gain_common_with_sign() {
+    fn cc_gain_common_never_sign_split() {
         let gains = CouplingGains {
             cc_scale: 2.0,
             gain_element_sign: true,
-            lists: vec![GainList::Common(7)],
+            lists: vec![GainList::Common(3)],
         };
-        // raw = 7 (0b111): cc_sign = 1 - 2*(1) = -1, gain = 3 => -2^-3.
-        assert!((gains.cc_gain(1, 0, 0).unwrap() + 0.125).abs() < 1e-12);
+        // gain_element = 3, cc_sign = +1 => +2^-3, not a split raw
+        // value.
+        assert!((gains.cc_gain(1, 0, 0).unwrap() - 0.125).abs() < 1e-12);
+    }
+
+    /// The sign-split DPCM decode takes `cc_sign` from each **delta**
+    /// LSB and accumulates `dpcm >> 1` (§3 ruling): the worked
+    /// `[3, 3]` sequence from `cce-gain-sign-split.md` §2.2 must land
+    /// at `{−cc_scale^−1, −cc_scale^−2}` under the negated exponent
+    /// (per-band signs both negative, exponents 1 then 2) — not the
+    /// `{−1, +3}` split of the 2009 fragment-A misprint.
+    #[test]
+    fn cc_gain_dpcm_delta_split() {
+        let sfb_cb = vec![vec![2u8, 2u8]];
+        let header = CouplingHeader {
+            ind_sw_cce_flag: false,
+            num_coupled_elements: 1,
+            targets: vec![
+                CoupledTarget {
+                    is_cpe: false,
+                    tag_select: 0,
+                    cc_l: false,
+                    cc_r: false,
+                },
+                CoupledTarget {
+                    is_cpe: false,
+                    tag_select: 1,
+                    cc_l: false,
+                    cc_r: false,
+                },
+            ],
+            cc_domain: false,
+            gain_element_sign: true,
+            gain_element_scale: 3, // cc_scale = 2
+            num_gain_element_lists: 2,
+        };
+        // Transmit the deltas [3, 3] directly.
+        let mut writer = BitWriter::new();
+        writer.write_bit(false); // common_gain_element_present = 0
+        for _ in 0..2 {
+            let (len, cw) = hcod_sf_encode(3).unwrap();
+            writer.write_u32(cw, u32::from(len));
+        }
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        let gains = CouplingGains::parse(&mut reader, &header, 1, 2, &sfb_cb).unwrap();
+        // delta 3 => negative (3 & 1), a += 1 twice => gains 1, 2.
+        assert_eq!(
+            gains.lists,
+            vec![GainList::Dpcm(vec![vec![
+                DpcmGain {
+                    negative: true,
+                    gain: 1
+                },
+                DpcmGain {
+                    negative: true,
+                    gain: 2
+                },
+            ]])]
+        );
+        assert!((gains.cc_gain(1, 0, 0).unwrap() + 0.5).abs() < 1e-12);
+        assert!((gains.cc_gain(1, 0, 1).unwrap() + 0.25).abs() < 1e-12);
+    }
+
+    /// The sign-split writer is the exact inverse of the parse loop,
+    /// including negative deltas (arithmetic-shift packing) and an
+    /// interior `ZERO_HCB` skip.
+    #[test]
+    fn dpcm_sign_split_round_trips() {
+        let sfb_cb = vec![vec![2u8, ZERO_HCB, 4u8, 4u8]];
+        let header = CouplingHeader {
+            ind_sw_cce_flag: false,
+            num_coupled_elements: 1,
+            targets: vec![
+                CoupledTarget {
+                    is_cpe: false,
+                    tag_select: 0,
+                    cc_l: false,
+                    cc_r: false,
+                },
+                CoupledTarget {
+                    is_cpe: false,
+                    tag_select: 1,
+                    cc_l: false,
+                    cc_r: false,
+                },
+            ],
+            cc_domain: false,
+            gain_element_sign: true,
+            gain_element_scale: 1,
+            num_gain_element_lists: 2,
+        };
+        let grid = vec![vec![
+            DpcmGain {
+                negative: true,
+                gain: -2,
+            },
+            // ZERO_HCB carry cell (not transmitted).
+            DpcmGain {
+                negative: false,
+                gain: -2,
+            },
+            DpcmGain {
+                negative: false,
+                gain: 1,
+            },
+            DpcmGain {
+                negative: true,
+                gain: 1,
+            },
+        ]];
+        let gains = CouplingGains {
+            cc_scale: CC_SCALE_TABLE[1],
+            gain_element_sign: true,
+            lists: vec![GainList::Dpcm(grid.clone())],
+        };
+        let mut writer = BitWriter::new();
+        gains.write(&mut writer, &header, &sfb_cb).unwrap();
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        let parsed = CouplingGains::parse(&mut reader, &header, 1, 4, &sfb_cb).unwrap();
+        assert_eq!(parsed.lists, vec![GainList::Dpcm(grid)]);
+    }
+
+    /// An out-of-phase band under a clear `gain_element_sign` is
+    /// unrepresentable on the wire and must be rejected by the writer,
+    /// not silently dropped.
+    #[test]
+    fn write_rejects_negative_band_without_sign_bit() {
+        let sfb_cb = vec![vec![2u8]];
+        let header = CouplingHeader {
+            ind_sw_cce_flag: false,
+            num_coupled_elements: 1,
+            targets: vec![
+                CoupledTarget {
+                    is_cpe: false,
+                    tag_select: 0,
+                    cc_l: false,
+                    cc_r: false,
+                },
+                CoupledTarget {
+                    is_cpe: false,
+                    tag_select: 1,
+                    cc_l: false,
+                    cc_r: false,
+                },
+            ],
+            cc_domain: false,
+            gain_element_sign: false,
+            gain_element_scale: 0,
+            num_gain_element_lists: 2,
+        };
+        let gains = CouplingGains {
+            cc_scale: CC_SCALE_TABLE[0],
+            gain_element_sign: false,
+            lists: vec![GainList::Dpcm(vec![vec![DpcmGain {
+                negative: true,
+                gain: 0,
+            }]])],
+        };
+        let mut writer = BitWriter::new();
+        assert_eq!(
+            gains.write(&mut writer, &header, &sfb_cb),
+            Err(Error::CceInvalid)
+        );
     }
 
     /// A dependently switched per-band DPCM list round-trips through
@@ -857,7 +1094,20 @@ mod tests {
         };
         // Absolute gains: band0 = +2 (dpcm +2), band1 carries acc (2,
         // not transmitted), band2 = +5 (dpcm +3).
-        let grid = vec![vec![2i32, 2i32, 5i32]];
+        let grid = vec![vec![
+            DpcmGain {
+                negative: false,
+                gain: 2,
+            },
+            DpcmGain {
+                negative: false,
+                gain: 2,
+            },
+            DpcmGain {
+                negative: false,
+                gain: 5,
+            },
+        ]];
         let gains = CouplingGains {
             cc_scale: CC_SCALE_TABLE[0],
             gain_element_sign: false,
@@ -957,7 +1207,16 @@ mod tests {
         let gains = CouplingGains {
             cc_scale: 2.0,
             gain_element_sign: false,
-            lists: vec![GainList::Dpcm(vec![vec![0i32, -1i32]])],
+            lists: vec![GainList::Dpcm(vec![vec![
+                DpcmGain {
+                    negative: false,
+                    gain: 0,
+                },
+                DpcmGain {
+                    negative: false,
+                    gain: -1,
+                },
+            ]])],
         };
         let source = vec![3.0f64, 3.0, 3.0, 3.0];
         let mut dest = vec![0.0f64; 4];

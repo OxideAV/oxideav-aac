@@ -199,12 +199,14 @@ fn cce_with_split_cpe_lists_round_trips() {
     assert_eq!(cce.gains.lists, gains.lists);
     assert_eq!(reader.bit_position(), bits_written);
 
-    // Spot-check the §4.6.8.3.3 cc_gain on the transmitted list
-    // (raw = -2: with the sign bit, cc_sign = 1 - 2*(0) = 1, gain =
-    // -2>>1 = -1 => cc_scale^(−(−1)) = cc_scale under the
-    // conformance-settled negated exponent).
+    // Spot-check the §4.6.8.3.3 cc_gain on the transmitted list: a
+    // common_gain_element is never sign-split
+    // (docs/audio/aac/cce-gain-sign-split.md §3), so gain_element = −2
+    // with cc_sign = +1 gives cc_scale^(−(−2)) = cc_scale² under the
+    // conformance-settled negated exponent — even though the header's
+    // gain_element_sign bit is set.
     let g = cce.gains.cc_gain(1, 0, 0).unwrap();
-    let expect = oxideav_aac::cce::CC_SCALE_TABLE[1];
+    let expect = oxideav_aac::cce::CC_SCALE_TABLE[1].powi(2);
     assert!((g - expect).abs() < 1e-12, "cc_gain={g} expect={expect}");
 }
 

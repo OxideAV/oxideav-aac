@@ -86,6 +86,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   ~1e-1 err/sig; the negated form lands all channels at ~1e-4),
   settling the question `docs/audio/aac/cce-gain-sign-split.md` §4
   recorded from a black-box measurement.
+- **CCE `gain_element_sign` split** — the coupling gain decode now
+  follows the ISO/IEC 14496-3:2001 / 13818-7:2004 `couple_channel()`
+  text as ruled in `docs/audio/aac/cce-gain-sign-split.md` §3: the
+  out-of-phase `cc_sign` is split off **each transmitted dpcm delta**
+  (`1 − 2·(dpcm & 1)`) with the accumulator fed by `dpcm >> 1`, and a
+  `common_gain_element` is **never** sign-split (so an independently
+  switched CCE always couples in phase). The previous behaviour — the
+  14496-3:2009 fragment that splits the *accumulated* value at
+  coupling time, an editorial defect of that edition (its own
+  surviving second fragment implements the 2001 reading) — changed
+  both sign and magnitude from the second transmitted band onward and
+  also sign-split common gains. `GainList::Dpcm` now carries per-band
+  `DpcmGain { negative, gain }` cells resolved at parse time; the
+  writer packs the exact inverse (`((gain − prev) << 1) | negative`)
+  and rejects an out-of-phase band under a clear sign bit. The
+  `aac-cce-writer-assembled` docs fixture's `expected.wav` is
+  restaged under the ruling (`input.aac` is byte-identical — the wire
+  is unchanged, only its decode). Conformance is unaffected: the
+  `am05_*` vectors all transmit `gain_element_sign == 0`.
 - **AAC Main predictor arithmetic** (13818-7 §13.3.2): `x_est` is now
   rounded *before* the `x_est + y_rec` add, the six state variables
   are stored as *truncated* 16-msb floats, and `b / VAR` goes through

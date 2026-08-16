@@ -309,15 +309,18 @@ ISO-copyright bitstreams are never committed). Measured state:
   writer-assembled CCE fixture cycling all three coupling shapes
   (dpcm + sign split / ind-switched / shared natural, both domains,
   PCE-declared `valid_cc_elements`) is staged in the docs corpus
-  (`aac-cce-writer-assembled`). Note: the two staged spec editions
-  disagree on the `gain_element_sign` split placement (13818-7:2004
-  splits each dpcm delta pre-accumulation; the self-consistent
-  14496-3:2009 fragment — implemented here — splits the accumulated
-  value, and that PDF page prints two conflicting fragments), and a
-  black-box validator applies `cc_scale^(−gain)` with no split,
-  matching *neither* text on transmitted lists while agreeing ≤ 1.2%
-  on natural-scaling lists; a genuine conformance vector or
-  corrigendum text is the standing ask.
+  (`aac-cce-writer-assembled`). The two long-standing §4.6.8.3.3
+  wire questions are both settled: the **exponent** is negated —
+  `cc_gain = cc_sign · cc_scale^(−gain_element)` — confirmed by the
+  ISO/IEC 14496-26 `am05_*` conformance vectors (all three editions
+  print the positive exponent, which misses every coupled target by
+  ~1e-1 err/sig), and the **`gain_element_sign` split** follows the
+  2001 / 13818-7:2004 `couple_channel()` text as ruled in
+  `docs/audio/aac/cce-gain-sign-split.md` §3 — `cc_sign` off **each
+  transmitted dpcm delta** (`1 − 2·(dpcm & 1)`), accumulator fed with
+  `dpcm >> 1`, and a `common_gain_element` **never** sign-split (the
+  14496-3:2009 page prints two conflicting fragments; its
+  accumulated-value variant is an editorial defect of that edition).
 - **Frequency-domain prediction** (`predictor`) — §4.6.6 MPEG-2
   backward-adaptive intra-channel predictor for the AAC **Main** object
   type (AOT 1). A bank of second-order lattice predictors (one per MDCT

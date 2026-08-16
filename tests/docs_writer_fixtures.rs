@@ -34,7 +34,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_aac::adts::AdtsHeader;
-use oxideav_aac::cce::{CoupledTarget, CouplingGains, CouplingHeader, GainList};
+use oxideav_aac::cce::{CoupledTarget, CouplingGains, CouplingHeader, DpcmGain, GainList};
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::gain_control_data::{GainAdjust, GainBand, GainControlData, GainWindow};
 use oxideav_aac::hcr_decode::encode_reordered_spectral_data;
@@ -325,8 +325,38 @@ fn wrap_adts_frames(payloads: &[Vec<u8>], profile: u8, channel_configuration: u8
 /// the fixtures doc. Targets are always [SCE tag 0, CPE tag 0].
 fn cce_variants() -> Vec<(CouplingHeader, CouplingGains)> {
     // Embedded-SCE band layout: [1, 3, 0, 5, 7, 2] (see build) — one
-    // ZERO_HCB band exercises the gain-list skip.
-    let dpcm_grid = vec![vec![0, 1, 1, 2, 2, 1]];
+    // ZERO_HCB band exercises the gain-list skip. The grid is the
+    // §4.6.8.3.3 (2001 / 13818-7:2004) delta-split decode of the wire
+    // deltas [0, 1, (skip), 1, 0, −1] under `gain_element_sign == 1`
+    // (`docs/audio/aac/cce-gain-sign-split.md` §3): per-band `cc_sign`
+    // off each delta LSB, accumulator fed with `dpcm >> 1`.
+    let dpcm_grid = vec![vec![
+        DpcmGain {
+            negative: false,
+            gain: 0,
+        },
+        DpcmGain {
+            negative: true,
+            gain: 0,
+        },
+        // ZERO_HCB carry cell (band 2, not transmitted).
+        DpcmGain {
+            negative: false,
+            gain: 0,
+        },
+        DpcmGain {
+            negative: true,
+            gain: 0,
+        },
+        DpcmGain {
+            negative: false,
+            gain: 0,
+        },
+        DpcmGain {
+            negative: true,
+            gain: -1,
+        },
+    ]];
     vec![
         // A: dependently switched, before-TNS domain, SCE natural +
         // CPE with both channels coupled (cc_l && cc_r → one common
