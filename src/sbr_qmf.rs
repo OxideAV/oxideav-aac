@@ -11,6 +11,10 @@
 //!   dual-rate output of the SBR tool).
 //! * [`DownsampledSynthesisQmf`] — §4.6.18.4.3 / Figure 4.44: the
 //!   32-channel variant that keeps the output at the core rate.
+//! * [`EncoderAnalysisQmf`] — Annex 4.B.18.2 / Figure 4.B.16: the
+//!   encoder-side 64-band analysis of the full-rate input (the SBR
+//!   encoder's front end; its slots line up with the decoder's
+//!   32-band analysis of the downsampled core signal).
 //!
 //! The low-power SBR tool (§4.6.18.8) replaces the complex banks with
 //! real-valued ones (§4.6.18.8.2):
@@ -356,6 +360,89 @@ impl AnalysisQmf {
             *wk = acc;
         }
         Ok(w)
+    }
+}
+
+/// Annex 4.B.18.2 / Figure 4.B.16 — the 64-band complex **encoder**
+/// analysis QMF bank.
+///
+/// The SBR encoder analyses the full-rate input signal (at the SBR
+/// rate, twice the core rate) into 64 complex subbands, one 64-sample
+/// slot at a time. It is the full-band twin of [`AnalysisQmf`]: the
+/// same 640-tap prototype `c[n]` is used at every tap (not every
+/// second one), the polyphase sum runs over 128 elements, and the
+/// modulation is `exp(i·π/128·(k + 0.5)·(2n + 1))` (no factor two).
+/// One slot here covers the same time span as one slot of the decoder's
+/// 32-band bank over the downsampled core signal, so slot `l` of this
+/// bank lines up with slot `l` of the decoder's `W` for the same
+/// audio — the property the §4.B.18.4 envelope estimator relies on.
+#[derive(Debug, Clone)]
+pub struct EncoderAnalysisQmf {
+    /// The Figure 4.B.16 input history `x` (640 samples; a higher
+    /// index is an older sample).
+    x: Vec<f64>,
+    /// Precomputed modulation matrix
+    /// `exp(i·π/128·(k + 0.5)·(2n + 1))`, row-major `[k][n]`.
+    m: Vec<Complex>,
+}
+
+impl Default for EncoderAnalysisQmf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EncoderAnalysisQmf {
+    /// A fresh 64-band analysis bank with an all-zero history.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut m = Vec::with_capacity(64 * 128);
+        for k in 0..64 {
+            for n in 0..128 {
+                let arg = core::f64::consts::PI / 128.0 * (k as f64 + 0.5) * (2.0 * n as f64 + 1.0);
+                m.push(Complex::new(arg.cos(), arg.sin()));
+            }
+        }
+        EncoderAnalysisQmf {
+            x: vec![0.0; 640],
+            m,
+        }
+    }
+
+    /// Run one Figure 4.B.16 loop: shift in 64 new time samples
+    /// (oldest first within `samples`) and return the 64 complex
+    /// subband samples `X[k]` of this slot.
+    pub fn push_slot(&mut self, samples: &[f64]) -> Result<[Complex; 64]> {
+        if samples.len() != 64 {
+            return Err(Error::SbrQmfInvalid);
+        }
+        // Shift by 64 (discarding the oldest 64) and store the new
+        // samples in positions 0..=63, newest at index 0.
+        self.x.copy_within(0..576, 64);
+        for (n, s) in samples.iter().enumerate() {
+            self.x[63 - n] = *s;
+        }
+        // Z[n] = x[n] · c[n]; u[n] = Σ_{j=0..=4} Z[n + 128j].
+        let mut u = [0.0f64; 128];
+        for (n, un) in u.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for j in 0..5 {
+                let idx = n + j * 128;
+                acc += self.x[idx] * QMF_WINDOW[idx];
+            }
+            *un = acc;
+        }
+        // X[k] = Σ_n u[n] · exp(i·π/128·(k + 0.5)(2n + 1)).
+        let mut out = [Complex::default(); 64];
+        for (k, xk) in out.iter_mut().enumerate() {
+            let row = &self.m[k * 128..(k + 1) * 128];
+            let mut acc = Complex::default();
+            for (n, cell) in row.iter().enumerate() {
+                acc += *cell * u[n];
+            }
+            *xk = acc;
+        }
+        Ok(out)
     }
 }
 
@@ -1001,5 +1088,93 @@ mod tests {
                 assert!((ws[k] - (wa[k] + wb[k])).abs() < 1e-9);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod encoder_analysis_tests {
+    use super::*;
+
+    /// The 64-band encoder bank and the decoder's 32-band bank must
+    /// agree in scale and slot alignment: a sine analysed at the full
+    /// rate by the 64-band bank, and its 2:1 decimated twin analysed
+    /// by the 32-band bank, land in the same subband with the same
+    /// steady-state magnitude (the §4.B.18.4 envelope estimate is
+    /// compared against the decoder's own `E_curr` on that footing).
+    #[test]
+    fn encoder_bank_matches_decoder_bank_scale_and_band() {
+        let mut enc = EncoderAnalysisQmf::new();
+        let mut dec = AnalysisQmf::new();
+        // 3.5 QMF bands up at the full rate: band 3 of both banks.
+        let f_full = 3.5 / 128.0; // cycles per full-rate sample
+        let n_slots = 40;
+        let mut e_mag = 0.0f64;
+        let mut d_mag = 0.0f64;
+        let mut e_other = 0.0f64;
+        for l in 0..n_slots {
+            let full: Vec<f64> = (0..64)
+                .map(|i| {
+                    let t = (l * 64 + i) as f64;
+                    1000.0 * (2.0 * core::f64::consts::PI * f_full * t).sin()
+                })
+                .collect();
+            // Decimated twin: every second full-rate sample. The
+            // input is band-limited far below the half rate, so the
+            // decimation is alias-free.
+            let half: Vec<f64> = full.iter().step_by(2).copied().collect();
+            let x = enc.push_slot(&full).unwrap();
+            let w = dec.push_slot(&half).unwrap();
+            if l >= 20 {
+                e_mag += x[3].norm_sqr();
+                d_mag += w[3].norm_sqr();
+                for (k, c) in x.iter().enumerate() {
+                    if k != 3 && k != 2 && k != 4 {
+                        e_other += c.norm_sqr();
+                    }
+                }
+            }
+        }
+        assert!(e_mag > 0.0 && d_mag > 0.0);
+        let ratio = e_mag / d_mag;
+        assert!(
+            (ratio - 1.0).abs() < 0.02,
+            "energy scale mismatch between the banks: {ratio}"
+        );
+        // Out-of-band leakage far below the tone.
+        assert!(e_other < e_mag * 1e-3, "leakage {e_other} vs {e_mag}");
+    }
+
+    /// A tone in the upper half of the spectrum (bands ≥ 32) is only
+    /// visible to the 64-band bank — the decoder's core bank cannot
+    /// see above the core Nyquist. Pins the band index mapping
+    /// `k = f / (fs/128)` for the high half.
+    #[test]
+    fn encoder_bank_resolves_high_half_bands() {
+        let mut enc = EncoderAnalysisQmf::new();
+        let f_full = 45.5 / 128.0;
+        let mut peak_band = 0usize;
+        let mut peak = 0.0;
+        for l in 0..30 {
+            let full: Vec<f64> = (0..64)
+                .map(|i| {
+                    let t = (l * 64 + i) as f64;
+                    (2.0 * core::f64::consts::PI * f_full * t).cos()
+                })
+                .collect();
+            let x = enc.push_slot(&full).unwrap();
+            if l == 29 {
+                for (k, c) in x.iter().enumerate() {
+                    if c.norm_sqr() > peak {
+                        peak = c.norm_sqr();
+                        peak_band = k;
+                    }
+                }
+            }
+        }
+        assert_eq!(peak_band, 45);
+        assert!(matches!(
+            enc.push_slot(&[0.0; 32]),
+            Err(Error::SbrQmfInvalid)
+        ));
     }
 }
