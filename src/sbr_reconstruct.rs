@@ -107,7 +107,13 @@ fn low_to_high(bands: &HiLoTables, k: usize) -> usize {
 /// Map a reference-envelope band array `prev` (at resolution
 /// `prev_high`) onto the current envelope's band `k` (at resolution
 /// `cur_high`), per the §4.6.18.3.5 `i(k)` relation.
-fn ref_band(bands: &HiLoTables, prev: &[i32], cur_high: bool, prev_high: bool, k: usize) -> i32 {
+pub(crate) fn ref_band(
+    bands: &HiLoTables,
+    prev: &[i32],
+    cur_high: bool,
+    prev_high: bool,
+    k: usize,
+) -> i32 {
     let idx = if cur_high == prev_high {
         k
     } else if cur_high {

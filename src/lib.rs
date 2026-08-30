@@ -532,6 +532,7 @@ pub mod sbr_element;
 #[doc(hidden)]
 pub mod sbr_env_adjust;
 // internal — exposed for tests/fuzz; not part of the stable API
+pub mod sbr_encoder;
 #[doc(hidden)]
 pub mod sbr_envelope;
 // internal — exposed for tests/fuzz; not part of the stable API
