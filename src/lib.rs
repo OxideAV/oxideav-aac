@@ -571,6 +571,9 @@ pub mod sbr_reconstruct;
 #[doc(hidden)]
 pub mod sbr_time_grid;
 // internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod sbr_writer;
+// internal — exposed for tests/fuzz; not part of the stable API
 pub mod scalable;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
