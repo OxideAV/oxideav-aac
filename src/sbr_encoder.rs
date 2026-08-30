@@ -71,6 +71,7 @@ use crate::sbr_grid::{FrameClass, SbrDtdf, SbrGrid, SbrInvf};
 use crate::sbr_header::SbrHeader;
 use crate::sbr_hf_gen::{build_patches, Patches};
 use crate::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+use crate::sbr_limiter::limiter_table;
 use crate::sbr_qmf::Complex;
 use crate::sbr_reconstruct::{ref_band, EnvelopeScalefactors, NoiseScalefactors};
 use crate::sbr_time_grid::derive_time_grid;
@@ -134,6 +135,19 @@ pub struct SbrEncoderConfig {
     /// `bs_coupling` for a channel pair (§4.B.18.4 / §4.B.18.6 joint
     /// level + balance coding). Ignored for a single channel.
     pub coupling: bool,
+    /// `bs_interpol_freq` (Table 4.110): `true` maps the envelope
+    /// energy onto every QMF subband of a band and lets the decoder's
+    /// §4.6.18.7.5 limiter cap each subband's gain at 3 dB above the
+    /// limiter-band average; `false` matches the *band* energy with
+    /// one gain per band, preserving the copied source's shape inside
+    /// it. The second reproduces band energies exactly even when the
+    /// patch source is far more peaked than the original (a tonal low
+    /// band under a dense high band), where the per-subband gains
+    /// would be limited away.
+    pub interpol_freq: bool,
+    /// `bs_limiter_gains` (Table 4.109): 0 = −3 dB, 1 = 0 dB,
+    /// 2 = 3 dB, 3 = no limit.
+    pub limiter_gains: u8,
 }
 
 impl SbrEncoderConfig {
@@ -160,20 +174,24 @@ impl SbrEncoderConfig {
             amp_res: true,
             crc: false,
             header_interval: 8,
-            add_harmonic: false,
+            add_harmonic: true,
             variable_borders: true,
             coupling: false,
+            interpol_freq: crate::sbr_header::DEFAULT_INTERPOL_FREQ,
+            limiter_gains: crate::sbr_header::DEFAULT_LIMITER_GAINS,
         })
     }
 
     /// The `sbr_header()` this configuration transmits. The extra
     /// blocks are only emitted when a field departs from its Table
-    /// 4.63 default; the limiter / interpolation / smoothing fields
-    /// stay at their defaults.
+    /// 4.63 default; the limiter-band and smoothing fields stay at
+    /// their defaults.
     pub fn header(&self) -> SbrHeader {
         let header_extra_1 = self.freq_scale != crate::sbr_header::DEFAULT_FREQ_SCALE
             || self.alter_scale != crate::sbr_header::DEFAULT_ALTER_SCALE
             || self.noise_bands != crate::sbr_header::DEFAULT_NOISE_BANDS;
+        let header_extra_2 = self.interpol_freq != crate::sbr_header::DEFAULT_INTERPOL_FREQ
+            || self.limiter_gains != crate::sbr_header::DEFAULT_LIMITER_GAINS;
         SbrHeader {
             amp_res: self.amp_res,
             start_freq: self.start_freq,
@@ -181,13 +199,13 @@ impl SbrEncoderConfig {
             xover_band: self.xover_band,
             reserved: 0,
             header_extra_1,
-            header_extra_2: false,
+            header_extra_2,
             freq_scale: self.freq_scale,
             alter_scale: self.alter_scale,
             noise_bands: self.noise_bands,
             limiter_bands: crate::sbr_header::DEFAULT_LIMITER_BANDS,
-            limiter_gains: crate::sbr_header::DEFAULT_LIMITER_GAINS,
-            interpol_freq: crate::sbr_header::DEFAULT_INTERPOL_FREQ,
+            limiter_gains: self.limiter_gains.min(3),
+            interpol_freq: self.interpol_freq,
             smoothing_mode: crate::sbr_header::DEFAULT_SMOOTHING_MODE,
         }
     }
@@ -284,6 +302,8 @@ pub struct SbrEncoder {
     header: SbrHeader,
     bands: HiLoTables,
     patches: Patches,
+    /// `fTableLim` — the decoder's limiter bands for this header.
+    f_table_lim: Vec<i32>,
     frames: u64,
     ch: Vec<ChannelState>,
 }
@@ -394,11 +414,13 @@ impl SbrEncoder {
         let f_master = master_table(k0v, k2v, header.freq_scale, header.alter_scale)?;
         let bands = HiLoTables::derive(&f_master, header.xover_band, header.noise_bands)?;
         let patches = build_patches(&f_master, k0v, bands.k_x, bands.m, cfg.fs_sbr)?;
+        let f_table_lim = limiter_table(&bands, &patches.borders(bands.k_x), header.limiter_bands)?;
         Ok(SbrEncoder {
             cfg,
             header,
             bands,
             patches,
+            f_table_lim,
             frames: 0,
             ch: vec![ChannelState::default(); cfg.channels],
         })
@@ -576,6 +598,91 @@ impl SbrEncoder {
             .collect()
     }
 
+    /// Analysis-by-synthesis of the decoder's §4.6.18.7.5 limiter over
+    /// columns `[c0, c1)`: per noise band, the fraction of the target
+    /// energy that the copied source cannot deliver once each
+    /// subband's gain is capped at `limGain` above its limiter band's
+    /// average gain (`G_max = √(ΣE_orig / ΣE_curr) · limGain`).
+    ///
+    /// `E_orig` is taken as the decoder will map it — the envelope
+    /// band mean spread over the band's subbands (`bs_interpol_freq =
+    /// 1`), or the same value with one gain per envelope band
+    /// (`bs_interpol_freq = 0`, where only the band's total matters);
+    /// `E_curr` is the energy of each subband's patch source.
+    fn limiter_deficit(
+        &self,
+        x: &[[Complex; 64]],
+        c0: usize,
+        c1: usize,
+        harm: &[bool],
+    ) -> Vec<f64> {
+        let kx = self.bands.k_x as usize;
+        let k_end = (self.bands.k_x + self.bands.m) as usize;
+        let span = (c1 - c0).max(1) as f64;
+        let energy =
+            |k: usize| -> f64 { x[c0..c1].iter().map(|col| col[k].norm_sqr()).sum::<f64>() / span };
+        // Per-subband target (envelope-band mean) and source energies.
+        let mut e_orig = vec![0.0f64; 64];
+        let mut e_curr = vec![0.0f64; 64];
+        for w in self.bands.f_table_high.windows(2) {
+            let (lo, hi) = (w[0] as usize, w[1] as usize);
+            let mean = (lo..hi).map(energy).sum::<f64>() / (hi - lo) as f64;
+            let src_mean =
+                (lo..hi).map(|k| energy(self.source_band(k))).sum::<f64>() / (hi - lo) as f64;
+            for k in lo..hi {
+                e_orig[k] = mean;
+                e_curr[k] = if self.cfg.interpol_freq {
+                    energy(self.source_band(k))
+                } else {
+                    src_mean
+                };
+            }
+        }
+        // Delivered energy per subband under the limiter cap.
+        let lim_gain_sq =
+            crate::sbr_env_adjust::LIM_GAIN[usize::from(self.header.limiter_gains)].powi(2);
+        let mut delivered = vec![0.0f64; 64];
+        for w in self.f_table_lim.windows(2) {
+            let lo = (w[0] as usize).max(kx);
+            let hi = (w[1] as usize).min(k_end);
+            if hi <= lo {
+                continue;
+            }
+            let num: f64 = 1e-12 + e_orig[lo..hi].iter().sum::<f64>();
+            let den: f64 = 1e-12 + e_curr[lo..hi].iter().sum::<f64>();
+            let g_max_sq = (num / den) * lim_gain_sq;
+            for k in lo..hi {
+                let g_sq = e_orig[k] / (1e-12 + e_curr[k]);
+                delivered[k] = e_curr[k] * g_sq.min(g_max_sq);
+            }
+        }
+        // A band carrying a bs_add_harmonic sinusoid is delivered
+        // coherently — it contributes no deficit.
+        if !harm.is_empty() {
+            for (p, &flag) in harm.iter().enumerate() {
+                if flag {
+                    let lo = self.bands.f_table_high[p] as usize;
+                    let hi = self.bands.f_table_high[p + 1] as usize;
+                    delivered[lo..hi].copy_from_slice(&e_orig[lo..hi]);
+                }
+            }
+        }
+        self.bands
+            .f_table_noise
+            .windows(2)
+            .map(|w| {
+                let (lo, hi) = (w[0] as usize, w[1] as usize);
+                let target: f64 = e_orig[lo..hi].iter().sum();
+                let got: f64 = delivered[lo..hi].iter().sum();
+                if target <= 0.0 {
+                    0.0
+                } else {
+                    (1.0 - got / target).max(0.0)
+                }
+            })
+            .collect()
+    }
+
     /// Noise floors `Q`, inverse-filtering modes and add-harmonic
     /// flags (§4.B.18.5) for the noise-floor spans `t_q`.
     fn estimate_noise(
@@ -621,9 +728,59 @@ impl SbrEncoder {
                 3
             };
         }
+        // §4.B.18.5 last paragraph: a strong tonal component the HF
+        // generator cannot deliver is coded as a sinusoid
+        // (bs_add_harmonic) — the coherent injection reproduces a
+        // peaked band without the broadband leak a huge noise floor
+        // would spray into its neighbours. Detector: the original
+        // band is tonal-dominant, clearly peaked above the frame's
+        // median band level, and its patch source carries no
+        // comparable tone. Only expressible when the frame's last
+        // envelope uses the high-resolution table (the flags index
+        // NHigh bands).
+        let mut harm = Vec::new();
+        if self.cfg.add_harmonic && *freq_res.last().unwrap_or(&false) {
+            let n_high = self.bands.n_high();
+            let mut level: Vec<f64> = Vec::with_capacity(n_high);
+            let mut tone: Vec<(f64, f64)> = Vec::with_capacity(n_high);
+            for p in 0..n_high {
+                let kl = self.bands.f_table_high[p] as usize;
+                let kh = self.bands.f_table_high[p + 1] as usize;
+                let orig = band_tonality(x, kl, kh, frame_c0, frame_c1);
+                let mut src = Tonality::default();
+                for k in kl..kh {
+                    let t = tonality(x, self.source_band(k), frame_c0, frame_c1);
+                    src.total += t.total;
+                    src.noise += t.noise;
+                }
+                level.push(orig.total / (kh - kl) as f64);
+                tone.push((
+                    orig.tonal() / (orig.noise + 1e-9),
+                    src.tonal() / (src.noise + 1e-9),
+                ));
+            }
+            let mut sorted = level.clone();
+            sorted.sort_by(f64::total_cmp);
+            let median = sorted[sorted.len() / 2];
+            harm = (0..n_high)
+                .map(|p| {
+                    let kl = self.bands.f_table_high[p] as usize;
+                    let kh = self.bands.f_table_high[p + 1] as usize;
+                    let (o_ratio, s_ratio) = tone[p];
+                    level[p] > 64.0 * (kh - kl) as f64
+                        && level[p] > 4.0 * median
+                        && o_ratio > 5.0
+                        && s_ratio < o_ratio / 2.0
+                })
+                .collect();
+            if !harm.iter().any(|&f| f) {
+                harm.clear();
+            }
+        }
         for l in 0..t_q.len() - 1 {
             let c0 = RATE * t_q[l] as usize + T_HF_ADJ;
             let c1 = RATE * t_q[l + 1] as usize + T_HF_ADJ;
+            let deficit = self.limiter_deficit(x, c0, c1, &harm);
             let mut row = Vec::with_capacity(nq);
             for n in 0..nq {
                 let kl = self.bands.f_table_noise[n] as usize;
@@ -642,39 +799,19 @@ impl SbrEncoder {
                 } else {
                     r_o
                 };
-                let qv = if r_o > r_s_eff {
+                let q_ton = if r_o > r_s_eff {
                     (r_o - r_s_eff) / (1.0 + r_s_eff)
                 } else {
                     0.0
                 };
-                row.push(qv.clamp(2f64.powi(-24), 64.0));
+                // Energy the decoder's limiter will refuse to deliver
+                // through the copied source must come from the noise
+                // floor instead: noise fraction Q/(1+Q) ≥ deficit.
+                let d = deficit[n].clamp(0.0, 0.98);
+                let q_def = d / (1.0 - d);
+                row.push(q_ton.max(q_def).clamp(2f64.powi(-24), 64.0));
             }
             q.push(row);
-        }
-        // Add-harmonic: a strongly tonal original band (≥ 10 dB
-        // tonal-to-noise) whose copy is essentially noise, on the
-        // high-resolution table; only honoured when the frame's last
-        // envelope is high-resolution (the flags index NHigh bands).
-        let mut harm = Vec::new();
-        if self.cfg.add_harmonic && *freq_res.last().unwrap_or(&false) {
-            harm = vec![false; self.bands.n_high()];
-            for (p, flag) in harm.iter_mut().enumerate() {
-                let kl = self.bands.f_table_high[p] as usize;
-                let kh = self.bands.f_table_high[p + 1] as usize;
-                let orig = band_tonality(x, kl, kh, frame_c0, frame_c1);
-                let mut src = Tonality::default();
-                for k in kl..kh {
-                    let t = tonality(x, self.source_band(k), frame_c0, frame_c1);
-                    src.total += t.total;
-                    src.noise += t.noise;
-                }
-                let o_ratio = orig.tonal() / (orig.noise + 1e-9);
-                let s_ratio = src.tonal() / (src.noise + 1e-9);
-                *flag = orig.total > 64.0 * (kh - kl) as f64 && o_ratio > 10.0 && s_ratio < 2.0;
-            }
-            if !harm.iter().any(|&f| f) {
-                harm.clear();
-            }
         }
         (q, invf, harm)
     }
@@ -693,8 +830,17 @@ impl SbrEncoder {
         let energy = self.estimate_envelopes(x, &grid, &tg.t_e);
         let (q, invf_mode, harm) = self.estimate_noise(x, &tg.t_q, &tg.t_e, &grid.freq_res);
 
-        let eq_target = quantise_envelopes(&energy, eff_amp);
         let qq_target = quantise_noise(&q);
+        let mut comp_energy = energy.clone();
+        compensate_noise_loss(
+            &mut comp_energy,
+            &qq_target,
+            &tg.t_e,
+            &tg.t_q,
+            &grid.freq_res,
+            &self.bands,
+        );
+        let eq_target = quantise_envelopes(&comp_energy, eff_amp);
 
         let prev_env = if reset {
             None
@@ -830,7 +976,6 @@ impl SbrEncoder {
             e_level.push(lv);
             e_bal.push(bv);
         }
-        let eq_level = quantise_envelopes(&e_level, eff_amp);
         let pan_q = crate::sbr_dequant::pan_offset(true) as i32; // panOffset(1) = 12
         let mut q_level = Vec::with_capacity(q_l.len());
         let mut q_bal = Vec::with_capacity(q_l.len());
@@ -846,6 +991,16 @@ impl SbrEncoder {
             q_bal.push(bv);
         }
         let qq_level = quantise_noise(&q_level);
+        let mut comp_level = e_level.clone();
+        compensate_noise_loss(
+            &mut comp_level,
+            &qq_level,
+            &tg.t_e,
+            &tg.t_q,
+            &grid.freq_res,
+            &self.bands,
+        );
+        let eq_level = quantise_envelopes(&comp_level, eff_amp);
 
         let force_freq_first = header_sent || reset;
         let mut out_ch = Vec::with_capacity(2);
@@ -1065,6 +1220,52 @@ fn variable_grid(s: usize, lead: u8) -> SbrGrid {
             rel_bord_1: vec![],
             pointer: l_a + 1,
             amp_res_override: false,
+        }
+    }
+}
+
+/// Pre-compensate the envelope energies for the noise path's synthesis
+/// loss. The §4.6.18.7.6 assembly injects the noise component as
+/// independent complex values (Table 4.A.91); unlike the
+/// analysis-coherent patched signal, only about half of that nominal
+/// `|X|²` survives the real-output synthesis bank (the non-analytic
+/// half cancels — measured on this crate's own filterbank pair). A
+/// band reconstructed with noise fraction `f = Q/(1+Q)` therefore
+/// lands at `(1 − f) + f/2` of its envelope value; scaling the
+/// transmitted envelope by the inverse `(1 + Q)/(1 + Q/2)` restores
+/// the band energy the decoder actually delivers.
+fn compensate_noise_loss(
+    energy: &mut [Vec<f64>],
+    qq: &[Vec<i32>],
+    t_e: &[i32],
+    t_q: &[i32],
+    freq_res: &[bool],
+    bands: &HiLoTables,
+) {
+    for (l, row) in energy.iter_mut().enumerate() {
+        // The noise floor whose span contains this envelope's middle.
+        let mid = (t_e[l] + t_e[l + 1]) / 2;
+        let mut fl = 0usize;
+        for i in 0..t_q.len() - 1 {
+            if mid >= t_q[i] && mid < t_q[i + 1] {
+                fl = i;
+            }
+        }
+        let table = if freq_res[l] {
+            &bands.f_table_high
+        } else {
+            &bands.f_table_low
+        };
+        for (p, e) in row.iter_mut().enumerate() {
+            let centre = (table[p] + table[p + 1]) / 2;
+            let mut nb = 0usize;
+            for i in 0..bands.f_table_noise.len() - 1 {
+                if centre >= bands.f_table_noise[i] && centre < bands.f_table_noise[i + 1] {
+                    nb = i;
+                }
+            }
+            let q = 2f64.powi(6 - qq[fl].get(nb).copied().unwrap_or(30));
+            *e *= (1.0 + q) / (1.0 + q / 2.0);
         }
     }
 }
@@ -1381,10 +1582,22 @@ mod tests {
             .unwrap();
         let e = frame.reports[0].energy[0][p];
         let eq = frame.reports[0].eq[0][p];
-        // Single-envelope FIXFIX → 1.5 dB steps (a = 2).
-        let e_orig = 64.0 * 2f64.powf(f64::from(eq) / 2.0);
+        // Single-envelope FIXFIX → 1.5 dB steps (a = 2). The wire
+        // value carries the noise-path compensation on top of the
+        // estimate: undo it from the coded noise floor before
+        // comparing.
+        let centre = (b.f_table_high[p] + b.f_table_high[p + 1]) / 2;
+        let nb = (0..b.n_q())
+            .find(|&n| b.f_table_noise[n] <= centre && centre < b.f_table_noise[n + 1])
+            .unwrap();
+        let qdec = 2f64.powi(6 - frame.reports[0].qq[0][nb]);
+        let comp = (1.0 + qdec) / (1.0 + qdec / 2.0);
+        let e_orig = 64.0 * 2f64.powf(f64::from(eq) / 2.0) / comp;
         let db = 10.0 * (e_orig / e).log10();
-        assert!(db.abs() < 1.6, "envelope error {db} dB (E {e}, E_Q {eq})");
+        assert!(
+            db.abs() < 1.6,
+            "envelope error {db} dB (E {e}, E_Q {eq}, comp {comp})"
+        );
         // Reparse through the decoder-side walker.
         let mut r = BitReader::new(&frame.payload);
         r.read_u32(4).unwrap();

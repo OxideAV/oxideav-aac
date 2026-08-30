@@ -405,6 +405,7 @@ use oxideav_core::RuntimeContext;
 pub mod adts;
 pub mod adts_crc;
 pub mod asc;
+pub mod asc_writer;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod bsac_arith;
@@ -439,6 +440,7 @@ pub mod dequant;
 #[doc(hidden)]
 pub mod element_decode;
 pub mod encoder;
+pub mod he_aac_encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod encoder_tns;

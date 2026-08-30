@@ -503,7 +503,7 @@ impl StreamEncoder {
                 *slot = f64::from(interleaved[n * ch + src]);
             }
         }
-        let frame = self.encode_hop(&cur)?;
+        let frame = self.encode_hop(&cur, &[])?;
         self.history = cur;
         Ok(frame)
     }
@@ -513,8 +513,36 @@ impl StreamEncoder {
     pub fn finish(&mut self) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
         let zeros: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
-        let frame = self.encode_hop(&zeros)?;
+        let frame = self.encode_hop(&zeros, &[])?;
         self.history = zeros;
+        Ok(frame)
+    }
+
+    /// [`StreamEncoder::encode_frame`] with `extension_payload()` fill
+    /// elements interleaved into the `raw_data_block()`: `fills[i]` is
+    /// emitted as a `fill_element()` immediately after the `i`-th
+    /// element of the Table 1.19 plan (an empty entry emits nothing).
+    /// The fill bytes are charged against the frame's byte budget so
+    /// the rate loop leaves room for them. This is how the HE-AAC
+    /// encoder attaches its SBR payload to each SCE / CPE.
+    pub(crate) fn encode_frame_with_fills(
+        &mut self,
+        interleaved: &[i16],
+        fills: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
+        let ch = self.config.channels as usize;
+        if interleaved.len() > FRAME_LEN * ch || interleaved.len() % ch != 0 {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
+        for (j, chan) in cur.iter_mut().enumerate() {
+            let src = self.element_src[j];
+            for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *slot = f64::from(interleaved[n * ch + src]);
+            }
+        }
+        let frame = self.encode_hop(&cur, fills)?;
+        self.history = cur;
         Ok(frame)
     }
 
@@ -542,7 +570,7 @@ impl StreamEncoder {
 
     /// Window `[history | cur]`, transform, quantize under the rate
     /// loop, and wrap the raw data block in an ADTS header.
-    fn encode_hop(&mut self, cur: &[Vec<f64>]) -> Result<Vec<u8>> {
+    fn encode_hop(&mut self, cur: &[Vec<f64>], fills: &[Vec<u8>]) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
 
         // §4.6.11.3.2 block-switching state machine. A transient in
@@ -620,19 +648,30 @@ impl StreamEncoder {
         // fits, refine (spend the remaining budget on precision) as
         // long as the finer frame still fits, down to
         // `-MAX_REFINE_OFFSET`.
-        let budget = self.config.frame_budget_bytes();
+        // Fill elements are charged up front: 3-bit id + 4-bit count
+        // (+ 8-bit esc_count from 15 bytes) + payload, rounded up.
+        let fill_bytes: usize = fills
+            .iter()
+            .filter(|f| !f.is_empty())
+            .map(|f| f.len() + if f.len() >= 15 { 2 } else { 1 })
+            .sum();
+        let budget = self
+            .config
+            .frame_budget_bytes()
+            .saturating_sub(fill_bytes)
+            .max(16);
         let mut sf_offset = 0i32;
-        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset)?;
+        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
         let mut iterations = 0usize;
         if raw_block.len() > budget {
             while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
                 sf_offset += 4;
-                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset)?;
+                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
                 iterations += 1;
             }
         } else {
             while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4)?;
+                let finer = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, fills)?;
                 if finer.len() > budget {
                     break;
                 }
@@ -647,7 +686,7 @@ impl StreamEncoder {
         // once). Try the intermediate offsets, finest first.
         if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
             for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine)?;
+                let cand = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine, fills)?;
                 if cand.len() <= budget {
                     raw_block = cand;
                     break;
@@ -693,13 +732,14 @@ impl StreamEncoder {
         spectra: &[Vec<f64>],
         tns: &[Option<TnsData>],
         sf_offset: i32,
+        fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
         let plan = element_plan(self.channel_configuration)?;
         let mut sce_tag = 0u8;
         let mut cpe_tag = 0u8;
         let mut lfe_tag = 0u8;
-        for elem in plan {
+        for (i, elem) in plan.into_iter().enumerate() {
             let mut body_bits = BitWriter::new();
             match elem {
                 ElementPlan::Sce(ch) => {
@@ -728,6 +768,9 @@ impl StreamEncoder {
             }
             let nbits = body_bits.bit_position();
             asm.push_channel_body_bits(&body_bits.finish(), nbits)?;
+            if let Some(fill) = fills.get(i).filter(|f| !f.is_empty()) {
+                asm.push_fill(fill)?;
+            }
         }
         Ok(asm.push_end())
     }
