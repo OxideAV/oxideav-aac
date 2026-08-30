@@ -46,6 +46,14 @@ decoder (multitone 128 kbps at 0.016 err/sig RMS; staged-fixture
 transcodes at 0.0008–0.003; multichannel layouts pinned with one
 distinct tone per speaker); `register()` installs the encoder
 alongside the decoder under id `"aac"`.
+On top of the LC encoder the crate now ships an **HE-AAC v1 (SBR)
+encoder** (`he_aac_encoder` / `sbr_encoder`): a crossover-cut
+downsampler feeds the LC core at half rate while the Annex 4.B.18
+parameter estimator writes one `EXT_SBR_DATA(_CRC)` fill payload per
+frame — implicit ADTS signalling plus both explicit
+`AudioSpecificConfig` forms and a LOAS/LATM writer; the registry
+factory selects the profile from an SBR-signalling extradata ASC
+(`make_he_aac_encoder` is the direct path).
 
 ### ISO/IEC 14496-26 conformance (normative corpus)
 
@@ -1029,6 +1037,58 @@ the EP section below).
   `"aac"`, and re-exported as `encoder::make_encoder` per the
   workspace dual-API convention.
 
+### HE-AAC v1 (SBR) encoder — Annex 4.B.18 over the §4.6.18 decoder
+
+- **`sbr_qmf::EncoderAnalysisQmf`** — the Figure 4.B.16 64-band
+  complex encoder analysis bank (full-tap prototype, 128-element
+  polyphase sum), pinned scale- and slot-aligned against the
+  decoder's 32-band bank on decimated twins.
+- **`sbr_writer`** — the forward SBR bitstream: `sbr_header()`, all
+  four `sbr_grid()` frame classes, dtdf / invf / envelope / noise
+  with the Annex 4.A.6.1 codebook lookup (inverse of
+  `sbr_huff_dec`), sinusoidal coding, both `sbr_channel_pair_element`
+  coupling layouts, and the whole `extension_payload()` body as
+  `EXT_SBR_DATA` or `EXT_SBR_DATA_CRC` (10-bit `G10` over the padded
+  §4.5.2.8.1 region). Every writer round-trips bit-exactly through
+  the crate's decode-side parsers.
+- **`sbr_encoder`** — Annex 4.B.18 written forward: transient-driven
+  grid election (FIXFIX 1/2/4; FIXVAR / VARFIX attack borders with
+  `bs_pointer = lA` and cross-frame border continuity), §4.B.18.4
+  envelope energies, §4.B.18.6 quantisers, §4.B.18.7 time/frequency
+  delta election closed-loop over the decoder's own §4.6.18.3.5
+  reconstruction (LAV-clamped, header frames freq-forced for random
+  access), and coupled level/balance coding. The noise floor and
+  `bs_invf_mode` come from a forward-prediction tonality contrast
+  between each band and its Figure 4.48 patch source, **plus an
+  analysis-by-synthesis of the decoder's §4.6.18.7.5 limiter**: energy
+  the capped gains cannot deliver through the copy is re-routed to
+  the noise floor, peaked tonal bands the patch cannot supply become
+  `bs_add_harmonic` sinusoids (default-on detector), and envelopes
+  pre-compensate the injected-noise path's measured half-energy
+  synthesis loss.
+- **`he_aac_encoder`** — the Figure 4.B.15 chain: crossover-cut FIR
+  downsampler → half-rate LC core, group-delay-aligned continuous
+  analysis ring sliced per frame (the decoder's `tHFGen`/`tHFAdj`
+  column alignment), SBR payload charged inside the frame budget and
+  emitted as the fill element after its SCE/CPE — implicit §4.5.2.8.1
+  ADTS signalling. Explicit signalling ships too: `asc_writer` (the
+  backward-compatible `syncExtensionType 0x2b7` trailer **and** the
+  hierarchical AOT-5 form, both reparsed by the crate's ASC parser)
+  and `latm_writer` (LOAS `AudioSyncStream` frames at
+  `audioMuxVersion = 1` so the length-prefixed ASC keeps the trailer
+  probe unambiguous).
+- Validation: encode → the crate's own SBR decoder measures
+  2.8–3.4 dB mean per-envelope-band energy error on an adversarial
+  multitone+noise synthetic (HF total within 0.4 dB), 0.9 dB HF
+  ratio on staged-fixture PCM transcodes, 22–43 dB low-band SNR;
+  the reference decoder **binary** (skip-if-absent) decodes every
+  stream without diagnostics at the doubled rate and its PCM agrees
+  with this crate's decoder to **0.00 dB mean per-QMF-band energy**;
+  LOAS-wrapped output decodes identically to the ADTS path.
+- Registry: `codec_encoder::make_he_aac_encoder`, and `make_encoder`
+  dispatches on an SBR-signalling extradata `AudioSpecificConfig`
+  (output params advertise the backward-compatible ASC).
+
 ### ER BSAC (AOT 22) — noiseless-coder bring-up (§4.4.2.6 / §4.5.2.6 / §4.6.4)
 
 The Bit-Sliced Arithmetic Coding decoder roster is implemented and
@@ -1133,9 +1193,16 @@ component still open (see below):
   restores the identical quantized spectrum), keeps
   PNS and IS long-frame-only (CPE PNS emits the §4.6.13.3 `ms_used`
   correlated-noise signalling — shared random vector — for
-  both-channels-noise bands correlating above 0.5), and has no
-  PCE-driven custom layouts (7-channel and beyond-7.1 shapes; the
-  Table 1.19 defaults 1–6 and 8 all encode).
+  both-channels-noise bands correlating above 0.5). The **HE-AAC v1
+  (SBR) encoder is implemented end to end** (see its section above:
+  analysis bank, grid/envelope/noise estimation, coupling, CRC
+  payloads, implicit + explicit signalling, LOAS carriage, registry
+  profile). Still open on the encode side: PCE-driven custom layouts
+  (7-channel and beyond-7.1 shapes; the Table 1.19 defaults 1–6 and
+  8 all encode), a PS (HE-AAC v2) encoder (the decoder-side subpart-8
+  tool is complete and would be its oracle), and SBR VARVAR grids
+  with more than three envelopes (the current transient path elects
+  FIXVAR / VARFIX with a four-envelope FIXFIX fallback).
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
   reconstruction, IPQF — see the "SSR gain control" section above),

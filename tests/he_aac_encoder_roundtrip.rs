@@ -291,3 +291,32 @@ fn fixture_pcm_transcodes_to_he_aac() {
         m.hf_energy_ratio_db
     );
 }
+
+/// Explicit-signalling carriage: the HE-AAC ADTS output wrapped into
+/// LOAS/LATM with the backward-compatible ASC decodes through the
+/// crate's LOAS driver at the full rate.
+#[test]
+fn loas_wrapped_he_aac_decodes_at_full_rate() {
+    let pcm = synthetic(1.0, 44_100, 2);
+    let mut enc = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+    let adts = enc.encode_all(&pcm).unwrap();
+    let asc = enc.audio_specific_config(false);
+    let mut wtr = oxideav_aac::latm_writer::LoasWriter::new(asc, 37, 8).unwrap();
+    let loas = wtr.wrap_adts_stream(&adts).unwrap();
+
+    let mut dec = oxideav_aac::latm::LoasDecoder::new();
+    let frames = dec.decode_all(&loas).expect("LOAS decode");
+    assert!(!frames.is_empty());
+    assert!(frames.iter().all(|f| f.sample_rate == 44_100));
+    assert!(frames.iter().all(|f| f.channels == 2));
+    let latm_pcm: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+
+    // Identical to the ADTS decode path.
+    let mut adts_dec = StreamDecoder::new();
+    let adts_frames = adts_dec.decode_all(&adts).unwrap();
+    let adts_pcm: Vec<i16> = adts_frames
+        .iter()
+        .flat_map(|f| f.pcm.iter().copied())
+        .collect();
+    assert_eq!(latm_pcm, adts_pcm);
+}

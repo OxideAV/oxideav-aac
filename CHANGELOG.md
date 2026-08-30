@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **HE-AAC v1 (SBR) encoder** (Annex 4.B.18 written forward over the
+  crate's normative §4.6.18 decoder): the Figure 4.B.16 64-band
+  encoder analysis QMF bank (`sbr_qmf::EncoderAnalysisQmf`, pinned
+  scale/slot-aligned against the decoder's bank); the forward SBR
+  bitstream writer (`sbr_writer` — header, all four grid classes,
+  envelope/noise Huffman emission, both coupling layouts,
+  `EXT_SBR_DATA`/`EXT_SBR_DATA_CRC` payload builder with the
+  §4.5.2.8.1 G10 checksum, bit-exact round trips through the
+  decode-side parsers); the parameter estimator (`sbr_encoder` —
+  transient-driven grid election with FIXVAR/VARFIX attack borders,
+  §4.B.18.4 envelope energies, §4.B.18.6 quantisers, closed-loop
+  §4.B.18.7 delta election over the decoder's own reconstruction,
+  tonality-contrast noise floor + `bs_invf_mode`, an
+  analysis-by-synthesis of the decoder's §4.6.18.7.5 limiter feeding
+  the noise floor, default-on `bs_add_harmonic` sinusoid detection,
+  and envelope pre-compensation for the injected-noise path's
+  measured synthesis loss); and the full-chain `he_aac_encoder`
+  (crossover-cut FIR downsampler → half-rate AAC-LC core with the SBR
+  fill element charged inside the frame budget, implicit ADTS
+  signalling). Explicit signalling: `asc_writer`
+  (backward-compatible 0x2b7 trailer and hierarchical AOT-5
+  `AudioSpecificConfig` forms) and `latm_writer` (LOAS
+  `AudioSyncStream` writer at `audioMuxVersion = 1`). Registry:
+  `codec_encoder::make_he_aac_encoder` plus extradata-ASC profile
+  dispatch in `make_encoder`. Validated by round trips through the
+  crate's own SBR decoder (per-envelope-band energy error measured),
+  by the reference decoder binary as a black box (0.00 dB mean
+  per-QMF-band agreement with this crate's decode), and by
+  LOAS-vs-ADTS decode identity.
+
 - **ER BSAC (AOT 22) decoder bring-up** (§4.4.2.6 / §4.5.2.6 /
   §4.6.4): `bsac_tables` (Tables 4.A.31–4.A.77 transcription with
   integrity + anchor tests; both editions' alias schemes examined),
