@@ -475,6 +475,7 @@ pub mod intensity_stereo;
 #[doc(hidden)]
 pub mod ipqf;
 pub mod latm;
+pub mod latm_writer;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ltp;
