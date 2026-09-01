@@ -518,6 +518,9 @@ pub mod ps_map;
 pub mod ps_stereo;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod ps_writer;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod pulse_data;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
