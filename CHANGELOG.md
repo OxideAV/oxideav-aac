@@ -6,6 +6,100 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-aac/compare/v0.1.6...v0.1.7) - 2026-08-30
+
+### Fixed
+
+- writer-assembled CCE / HCR / SSR docs-fixture recipes + oracles
+- pin the two staged CRC-form docs fixtures to their in-code rewrites
+
+### Other
+
+- HE-AAC stream damage battery + header-frame random access
+- clippy 1.98: needless_late_init in gain_control / sbr_freq_bands
+- HE-AAC v1 encoder section, encoder-remainders truth, LOAS decode-identity pin
+- HE-AAC v1 profile on the registry factory
+- LOAS/LATM writer + black-box reference-decoder validation
+- HE-AAC v1 (AAC-LC + SBR) streaming encoder, ASC writer, delivery-aware noise model
+- Annex 4.B.18 parameter estimation, quantisation and closed-loop delta coding
+- forward SBR bitstream writer (Tables 4.62-4.74) + CRC payload builder
+- Annex 4.B.18.2 64-band encoder analysis QMF bank
+- fix explicit-counter-loop lint in the CCE battery
+- CCE fixture corruption battery (strided, CI-sized)
+- explicit-width entry points + sbr-crc bs_fill_bits coverage pins
+- gain_element_sign split follows the ruled 2001/13818-7 delta split (4.6.8.3.3)
+- layer geometry + full block decode + conformance bring-up (4.5.2.6 / 4.6.4)
+- 4.A.5 numeric tables + 4.5.2.6.2.7 arithmetic decoder
+- measured pulse_data() emission (4.4.6.3)
+- README + CHANGELOG for the r439 ISO-conformance campaign
+- ISO/IEC 14496-26 conformance harness (ER-LD / CCE / SBR-CRC)
+- normative 13818-7 13.3.2 fixed-precision arithmetic
+- conformance-settled negated gain exponent
+- pre-header upsample-only state + whole-payload CRC coverage
+- decoder-side escape magnitudes past the 8191 encoder cap
+- corpus-resolved ER AAC LD field widths (issue #292)
+- read the Table 4.6 nested ltp_data_present bit
+- README + CHANGELOG for the r437 ER-LTP and encoder-depth subsystems
+- corruption battery over the r437 encoder paths
+- per-(group, sfb) M/S coding on EIGHT_SHORT frames
+- joint scale_factor_grouping for common_window CPEs
+- Table 1.19 multichannel layouts (3.0 / 4.0 / 5.0 / 5.1 / 7.1)
+- §4.5.2.3.4 scale_factor_grouping on EIGHT_SHORT frames
+- measured-bit-cost codebook + section optimization
+- ER AAC LTP (AOT 19) decodes end to end
+- README + CHANGELOG for the r418 scalable + EP-tool subsystems; fixture staging hooks
+- §1.8.2.2 ep_frame() codec + EPMuxElement / EPAudioSyncStream transport
+- §1.8.4.6 SRCPC + §1.8.4.3 header block codes + §1.8.4.7 shortened Reed-Solomon
+- §1.8.2.1 ErrorProtectionSpecificConfig + §1.8.4.2 pre-defined-set expansion, wired into the ASC
+- ER AAC scalable (AOT 20) resilience wire + LATM/LOAS layer-stack transport
+- scalable per-tool layering + deterministic corruption battery
+- §4.4.2.2 ASME/ASEE syntax + §4.5.2.2.4 AAC-only layer-combination decode
+- per-family frame lengths in the decoder rate contracts
+- if-let over single-arm match (clippy)
+- rebuild the per-stream decoder when a mid-stream StreamMuxConfig changes the frame family
+- writer-assembled LOAS fixtures for the 960/512/480 families, black-box-corroborated geometry; SBR family gate pre-parse; corrupt-input pulse guard
+- §4.5.1.1 family through the stream decoders — LATM-installed 960/LD geometry, Table 4.19 er_raw_data_block() for AOT 23, LD LTP lag repeat (M = N/2), SBR family gate
+- thread the §4.5.1.1 frame-length family through ics_info, the numeric chain, TNS caps and the filterbank (960/120 + LD 512/480 windows, §4.6.17.2.3 low-overlap)
+- §4.5.1.1 frame-length families — 960/120 bracketed columns + LD 512/480 (Tables 4.129–4.147)
+- doc(hidden) the internal surface — stable API is the documented entry points
+- rate-contract comments cover the downsampled SBR mode
+- README + CHANGELOG for the r412 downsampled + low-power SBR modes
+- deterministic mutation battery over the four SBR decode modes
+- PS + downsampled composition gated on the HE-AAC v2 fixture
+- §4.6.18.8 low-power mode end to end, fixture-gated
+- §4.6.18.8 low-power mode in the envelope adjuster
+- §4.6.18.8.3/8.5 low-power aliasing detection + reduction math
+- §4.6.18.8.2 real-valued low-power QMF filterbanks
+- ASC-driven + option-driven downsampled-SBR selection
+- downsampled-SBR selection on the stream decoder, fixture-gated
+- §4.6.18.4.3 downsampled output mode on the frame driver
+- deterministic mutation batteries over the CRC decode paths
+- README + CHANGELOG for the r409 CRC verification and fixture staging
+- render multi-raw-data-block ADTS frames as consecutive time blocks
+- verify ADTS error_check() and SBR bs_sbr_crc_bits end to end
+- §4.4.2.3 er_raw_data_block() driver for ER AAC LC — fixed element walk, HCR spectra, LATM routing
+- §4.6.16.3.4 reordered_spectral_data() payload codec — length-free decode + writing-scheme encoder
+- SSR §4.6.12 end-to-end + CCE application status refresh
+- apply §4.6.8.3.3 coupling onto SCE/CPE targets — two-pass block walk, cc_domain injection, ind-switched time coupling
+- wire the §4.6.12 pipeline into the decode driver for AOT 3
+- §4.6.12.1 front-half filterbank — spectrum→PQF-band de-interleave, even-band reversal, per-band 256/32-line IMDCTs
+- Table 1.19 config-7 default 7.1 mapping — rank-sorted canonical order
+- §8.5.2.2 PCE-driven speaker mapping — config-0 layouts land canonically
+- 5.1 multichannel PCM validation against the staged MP4 fixture
+- ISO/IEC 14496-3:2001 §4.6.7.3 short-window LTP synthesis — pinned math, explicit origin
+- §4.6.13 CPE PNS — correlated-noise ms_used signalling on channel pairs
+- §4.6.8.2 intensity-stereo emission — correlated high bands as is_pos records
+- §4.6.9 TNS emission — Levinson-Durbin decision + wire-exact analysis filtering
+- add CI / crates.io / docs.rs / MIT-license badges
+- §4.6.13 PNS emission (opt-in) — noise bands as NOISE_HCB energies
+- fixture transcode validation + README — document the encode chain
+- §4.6.11.3.2 block switching — EIGHT_SHORT on transients
+- §4.6.8.1 M/S joint-stereo coding in the CPE path
+- runtime Encoder registration — AAC id 'aac' encodes via the registry
+- end-to-end AAC-LC encoder — PCM to decoder-round-tripped ADTS
+- AdtsHeader::write — byte-exact fixed+variable header serialiser
+- ISO/IEC 14496-3:2001 Table 4.55 short-window LTP syntax
+
 ### Added
 
 - **HE-AAC v1 (SBR) encoder** (Annex 4.B.18 written forward over the
