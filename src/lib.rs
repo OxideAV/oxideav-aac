@@ -494,6 +494,9 @@ pub mod pns;
 pub mod predictor;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
+pub mod ps_analysis;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ps_data;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
