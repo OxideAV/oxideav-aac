@@ -1,0 +1,33 @@
+[package]
+name = "oxideav-aac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: the fuzz harness resolves its dependencies on its own,
+# outside the umbrella workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-aac]
+path = ".."
+
+[[bin]]
+name = "ps_data_roundtrip"
+path = "fuzz_targets/ps_data_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ps_encoder_frame"
+path = "fuzz_targets/ps_encoder_frame.rs"
+test = false
+doc = false
+bench = false

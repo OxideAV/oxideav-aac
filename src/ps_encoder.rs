@@ -126,14 +126,20 @@ impl Default for PsEncoderConfig {
 }
 
 impl PsEncoderConfig {
-    /// The Table 8.9 header block this configuration transmits.
+    /// The Table 8.9 header block this configuration transmits, in
+    /// the parser's canonical form (a disabled kind's mode is 0 — the
+    /// field is not on the wire).
     #[must_use]
     pub fn ps_config(&self) -> PsConfig {
         PsConfig {
             enable_iid: true,
             iid_mode: self.bands.mode() + if self.fine_iid { 3 } else { 0 },
             enable_icc: self.icc,
-            icc_mode: self.bands.mode() + if self.phase { 3 } else { 0 },
+            icc_mode: if self.icc {
+                self.bands.mode() + if self.phase { 3 } else { 0 }
+            } else {
+                0
+            },
             enable_ext: self.phase,
         }
     }
@@ -738,6 +744,42 @@ mod tests {
             let re = (h & 0xFFFF) as f64 / 65535.0 - 0.5;
             let im = ((h >> 16) & 0xFFFF) as f64 / 65535.0 - 0.5;
             Complex::new(re * 1000.0, im * 1000.0)
+        }
+    }
+
+    /// The transmitted configuration is the parser's canonical form
+    /// for every option combination (a disabled ICC carries mode 0).
+    #[test]
+    fn ps_config_is_canonical() {
+        for bands in [PsBands::Ten, PsBands::Twenty, PsBands::ThirtyFour] {
+            for fine in [false, true] {
+                for icc in [false, true] {
+                    for phase in [false, true] {
+                        let cfg = PsEncoderConfig {
+                            bands,
+                            fine_iid: fine,
+                            icc,
+                            phase,
+                            ..PsEncoderConfig::default()
+                        };
+                        let c = cfg.ps_config();
+                        assert_eq!(c.nr_iid_par(), bands.count());
+                        assert_eq!(c.iid_quant_fine(), fine);
+                        assert_eq!(c.nr_icc_par(), if icc { bands.count() } else { 0 });
+                        assert_eq!(c.icc_mode >= 3, icc && phase);
+                        assert_eq!(c.enable_ext, phase);
+                        if !icc {
+                            assert_eq!(c.icc_mode, 0);
+                        }
+                        let mut enc = PsEncoder::new(cfg).unwrap();
+                        let x = frame(noise(1));
+                        let fr = enc.encode_frame(&x, &x).unwrap();
+                        let mut rd = BitReader::new(&fr.payload);
+                        let back = PsData::parse(&mut rd, None).unwrap().unwrap();
+                        assert_eq!(back.config, c);
+                    }
+                }
+            }
         }
     }
 

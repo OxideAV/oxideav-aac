@@ -274,6 +274,13 @@ impl PsData {
                 num_bits_left -= 2;
                 if id == 0 {
                     // ps_extension(0): optional IPD/OPD + reserved bit.
+                    // A repeated id-0 block (not something a conformant
+                    // stream carries) re-reads every field, so the
+                    // element reflects the last block only.
+                    ipd_dt.clear();
+                    ipd_deltas.clear();
+                    opd_dt.clear();
+                    opd_deltas.clear();
                     let start = reader.bit_position();
                     enable_ipdopd = read_flag(reader)?;
                     if enable_ipdopd {
@@ -650,6 +657,54 @@ mod tests {
         let ps = PsData::parse(&mut r, None).unwrap().unwrap();
         let mut st = PsIndexState::default();
         assert!(matches!(ps.resolve(&mut st), Err(Error::PsDataInvalid)));
+    }
+
+    /// Two `ps_extension_id == 0` blocks inside one extension layer:
+    /// the second re-reads the fields, so a trailing
+    /// `enable_ipdopd = 0` leaves no stale rows from the first.
+    #[test]
+    fn repeated_extension_block_reflects_the_last() {
+        let mut w = BitWriter::new();
+        w.write_bit(true); // header
+        w.write_bit(true); // enable_iid
+        w.write_u32(0, 3); // iid_mode 0 → 5 phase pars
+        w.write_bit(false); // enable_icc
+        w.write_bit(true); // enable_ext
+        w.write_bit(false); // FIX
+        w.write_u32(1, 2); // num_env = 1
+        w.write_bit(false); // iid_dt
+        for _ in 0..10 {
+            w.write_bit(false);
+        }
+        let mut body = BitWriter::new();
+        // Block 1: id 0, enable_ipdopd = 1, one envelope of zero
+        // deltas (`1` codewords), reserved.
+        body.write_u32(0, 2);
+        body.write_bit(true);
+        body.write_bit(false);
+        for _ in 0..5 {
+            body.write_bit(true);
+        }
+        body.write_bit(false);
+        for _ in 0..5 {
+            body.write_bit(true);
+        }
+        body.write_bit(false);
+        // Block 2: id 0, enable_ipdopd = 0, reserved.
+        body.write_u32(0, 2);
+        body.write_bit(false);
+        body.write_bit(false);
+        let bytes_body = body.finish();
+        w.write_u32(bytes_body.len() as u32, 4);
+        for &b in &bytes_body {
+            w.write_u32(u32::from(b), 8);
+        }
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let ps = PsData::parse(&mut r, None).unwrap().unwrap();
+        assert!(!ps.enable_ipdopd);
+        assert!(ps.ipd_dt.is_empty() && ps.ipd_deltas.is_empty());
+        assert!(ps.opd_dt.is_empty() && ps.opd_deltas.is_empty());
     }
 
     /// VAR_BORDERS carries 5-bit border positions; the extension
