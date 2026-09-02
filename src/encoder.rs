@@ -160,6 +160,7 @@ use crate::ics_body::IcsBody;
 use crate::ics_info::{
     IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
 };
+use crate::pce::{ElementSelect, Pce};
 use crate::pulse_data::{Pulse, PulseData, MAX_PULSES};
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
 use crate::scale_factor_data::{
@@ -177,6 +178,7 @@ use crate::tns_data::TnsData;
 use crate::{Error, Result};
 
 use oxideav_core::bits::BitWriter;
+use oxideav_core::ChannelPosition;
 
 /// Historical direct-factory endpoint (the crate convention's
 /// `<crate>::encoder::make_encoder` path) — re-exported from
@@ -244,11 +246,15 @@ pub struct EncoderConfig {
     /// `channelConfiguration` is accepted: `1` (SCE) / `2` (CPE) /
     /// `3` (SCE + CPE) / `4` (SCE + CPE + SCE) / `5` (SCE + 2 CPE) /
     /// `6` (5.1: SCE + 2 CPE + LFE) / `8` (7.1: SCE + 3 CPE + LFE).
-    /// `7` has no default configuration (a PCE-defined layout, out
-    /// of scope) and is rejected. Input PCM is interleaved in the
-    /// canonical [`crate::channel_map`] order the decoder emits
-    /// (5.1 = `L R C LFE Ls Rs`), and the encoder derives the
-    /// bitstream element order from the Table 1.19 layout.
+    /// `7` has no default configuration and is rejected by
+    /// [`StreamEncoder::new`] — any other speaker set (6.1, 7.0,
+    /// side+back 7.1, 2.1, …) goes through
+    /// [`StreamEncoder::with_layout`], which describes it with a
+    /// `program_config_element()` (`channelConfiguration = 0`).
+    /// Input PCM is interleaved in the canonical
+    /// [`crate::channel_map`] order the decoder emits (5.1 =
+    /// `L R C LFE Ls Rs`), and the encoder derives the bitstream
+    /// element order from the Table 1.19 layout (or the PCE).
     pub channels: u8,
     /// Target bitrate in bits/second. Drives the per-frame byte
     /// budget of the rate loop. The output is not strictly CBR — each
@@ -318,6 +324,174 @@ fn element_plan(channel_configuration: u8) -> Result<Vec<ElementPlan>> {
     })
 }
 
+/// A PCE-described layout: the `program_config_element()` (without
+/// its `sampling_frequency_index`), the element plan in bitstream
+/// order, and per element-order slot the canonical input channel it
+/// sources.
+struct PceLayout {
+    pce: Pce,
+    plan: Vec<ElementPlan>,
+    element_src: Vec<usize>,
+}
+
+/// Build the §8.5.2.2 PCE for a set of speaker positions and the
+/// element plan that carries them.
+///
+/// The positions must be distinct, each on the canonical WAVE/BS.775
+/// rank list this crate's [`crate::channel_map`] reorders to (no
+/// height channels), and form pairs the PCE lists can express:
+///
+/// * front — a centre SCE first, then the inner `Lc/Rc` pair (only
+///   together with `L/R`), then the `L/R` pair — the "centre outwards"
+///   rule the decoder's assignment reads;
+/// * `Ls/Rs` — in the *side* list when `Lb/Rb` or `Cs` are present,
+///   else as the sole *back* pair (the 5.1-style surround pair the
+///   Table 1.19 mapping also calls side);
+/// * back — the `Lb/Rb` pair (needs `Ls/Rs` or `Cs` alongside: the
+///   §8.5.2.2 reading of a lone back pair is the side pair), then a
+///   `Cs` SCE;
+/// * one LFE.
+///
+/// Instance tags count up per element kind in bitstream order — the
+/// same counters the frame assembler uses.
+fn pce_layout(positions: &[ChannelPosition]) -> Result<PceLayout> {
+    use ChannelPosition::*;
+    let mut ranked: Vec<(usize, ChannelPosition)> = positions
+        .iter()
+        .map(|&p| {
+            crate::channel_map::canonical_rank(p)
+                .map(|r| (r, p))
+                .ok_or(Error::EncoderInvalidConfig)
+        })
+        .collect::<Result<_>>()?;
+    ranked.sort_by_key(|&(r, _)| r);
+    if ranked.windows(2).any(|w| w[0].0 == w[1].0) || ranked.is_empty() {
+        return Err(Error::EncoderInvalidConfig);
+    }
+    let canonical: Vec<ChannelPosition> = ranked.iter().map(|&(_, p)| p).collect();
+    let has = |p: ChannelPosition| canonical.contains(&p);
+    let index = |p: ChannelPosition| canonical.iter().position(|&q| q == p).unwrap();
+
+    // Bitstream-order elements: (list, is_cpe, positions).
+    #[derive(Clone, Copy, PartialEq)]
+    enum List {
+        Front,
+        Side,
+        Back,
+        Lfe,
+    }
+    let mut elements: Vec<(List, Vec<ChannelPosition>)> = Vec::new();
+    if has(FrontCenter) {
+        elements.push((List::Front, vec![FrontCenter]));
+    }
+    let inner = has(FrontLeftOfCenter) || has(FrontRightOfCenter);
+    let outer = has(FrontLeft) || has(FrontRight);
+    if (has(FrontLeftOfCenter) != has(FrontRightOfCenter))
+        || (has(FrontLeft) != has(FrontRight))
+        || (inner && !outer)
+    {
+        return Err(Error::EncoderInvalidConfig);
+    }
+    if inner {
+        elements.push((List::Front, vec![FrontLeftOfCenter, FrontRightOfCenter]));
+    }
+    if outer {
+        elements.push((List::Front, vec![FrontLeft, FrontRight]));
+    }
+    if has(SideLeft) != has(SideRight) || has(BackLeft) != has(BackRight) {
+        return Err(Error::EncoderInvalidConfig);
+    }
+    let side = has(SideLeft);
+    let back = has(BackLeft);
+    let back_center = has(BackCenter);
+    if back && !side && !back_center {
+        return Err(Error::EncoderInvalidConfig);
+    }
+    if side {
+        let list = if back || back_center {
+            List::Side
+        } else {
+            List::Back
+        };
+        elements.push((list, vec![SideLeft, SideRight]));
+    }
+    if back {
+        elements.push((List::Back, vec![BackLeft, BackRight]));
+    }
+    if back_center {
+        elements.push((List::Back, vec![BackCenter]));
+    }
+    if has(LowFrequency) {
+        elements.push((List::Lfe, vec![LowFrequency]));
+    }
+
+    let mut pce = Pce {
+        element_instance_tag: 0,
+        object_type: 1, // AAC LC
+        sampling_frequency_index: 0,
+        front_elements: Vec::new(),
+        side_elements: Vec::new(),
+        back_elements: Vec::new(),
+        lfe_element_tag_selects: Vec::new(),
+        assoc_data_tag_selects: Vec::new(),
+        valid_cc_elements: Vec::new(),
+        mono_mixdown_element_number: None,
+        stereo_mixdown_element_number: None,
+        matrix_mixdown: None,
+        comment_field: Vec::new(),
+    };
+    let mut plan = Vec::with_capacity(elements.len());
+    let mut element_src = Vec::with_capacity(canonical.len());
+    let (mut sce_tag, mut cpe_tag) = (0u8, 0u8);
+    for (list, pos) in &elements {
+        let slot = element_src.len();
+        match (list, pos.as_slice()) {
+            (List::Lfe, [p]) => {
+                pce.lfe_element_tag_selects.push(0);
+                plan.push(ElementPlan::Lfe(slot));
+                element_src.push(index(*p));
+            }
+            (_, [p]) => {
+                let sel = ElementSelect {
+                    is_cpe: false,
+                    tag_select: sce_tag,
+                };
+                sce_tag += 1;
+                match list {
+                    List::Front => pce.front_elements.push(sel),
+                    _ => pce.back_elements.push(sel),
+                }
+                plan.push(ElementPlan::Sce(slot));
+                element_src.push(index(*p));
+            }
+            (_, [l, r]) => {
+                let sel = ElementSelect {
+                    is_cpe: true,
+                    tag_select: cpe_tag,
+                };
+                cpe_tag += 1;
+                match list {
+                    List::Front => pce.front_elements.push(sel),
+                    List::Side => pce.side_elements.push(sel),
+                    _ => pce.back_elements.push(sel),
+                }
+                plan.push(ElementPlan::Cpe(slot, slot + 1));
+                element_src.push(index(*l));
+                element_src.push(index(*r));
+            }
+            _ => return Err(Error::EncoderInvalidConfig),
+        }
+    }
+    if element_src.len() != canonical.len() {
+        return Err(Error::EncoderInvalidConfig);
+    }
+    Ok(PceLayout {
+        pce,
+        plan,
+        element_src,
+    })
+}
+
 /// §4.5.2.1.3: only the lowest 12 spectral coefficients of an LFE
 /// element may be non-zero.
 const LFE_MAX_LINES: usize = 12;
@@ -336,12 +510,19 @@ pub struct StreamEncoder {
     config: EncoderConfig,
     fs_index: u8,
     /// The Table 1.19 `channelConfiguration` derived from the channel
-    /// count (lands in the ADTS header and fixes the element plan).
+    /// count (lands in the ADTS header and fixes the element plan), or
+    /// `0` for a PCE-described layout.
     channel_configuration: u8,
+    /// The `program_config_element()` of a PCE-described layout,
+    /// written at the head of every `raw_data_block()`.
+    program_config: Option<Pce>,
+    /// The element sequence of every frame (Table 1.19, or the PCE's
+    /// lists in bitstream order).
+    plan: Vec<ElementPlan>,
     /// Canonical-input channel index feeding each *element-order*
     /// channel slot — the inverse of the decoder's
-    /// [`crate::channel_map::reorder_permutation`], so encode ∘
-    /// decode is channel-identity.
+    /// [`crate::channel_map::reorder_permutation`] (or of the PCE's
+    /// §8.5.2.2 assignment), so encode ∘ decode is channel-identity.
     element_src: Vec<usize>,
     /// Element-order slots that belong to an LFE element (§4.5.2.1.3
     /// restrictions apply: long-only analysis, no TNS, ≤ 12 lines).
@@ -389,9 +570,60 @@ impl StreamEncoder {
         for (i, &j) in perm.iter().enumerate() {
             element_src[j] = i;
         }
+        let plan = element_plan(channel_configuration)?;
+        Self::build(
+            config,
+            fs_index,
+            channel_configuration,
+            None,
+            plan,
+            element_src,
+        )
+    }
+
+    /// Build an encoder for a speaker set with no Table 1.19 default
+    /// (or any set, described explicitly): every `raw_data_block()`
+    /// opens with a §8.5.2.2 `program_config_element()` and the ADTS
+    /// header carries `channelConfiguration = 0`.
+    ///
+    /// `positions` is the set of speakers (any order; distinct; on the
+    /// canonical [`crate::channel_map`] rank list — no height
+    /// channels). The input PCM is interleaved in canonical order (the
+    /// positions sorted by rank: `L R C LFE Lb Rb Lc Rc Cs Ls Rs`), the
+    /// order the decoder's PCE reorder emits. `config.channels` must
+    /// equal `positions.len()`. Sets the PCE lists cannot express —
+    /// an unpaired `L`, `Lc/Rc` without `L/R`, `Lb/Rb` without `Ls/Rs`
+    /// or `Cs` (a lone back pair reads as the side pair), more than
+    /// one LFE — are rejected with [`Error::EncoderInvalidConfig`].
+    pub fn with_layout(config: EncoderConfig, positions: &[ChannelPosition]) -> Result<Self> {
+        let fs_index = config.fs_index()?;
+        if config.bitrate == 0 || usize::from(config.channels) != positions.len() {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut layout = pce_layout(positions)?;
+        layout.pce.sampling_frequency_index = fs_index;
+        Self::build(
+            config,
+            fs_index,
+            0,
+            Some(layout.pce),
+            layout.plan,
+            layout.element_src,
+        )
+    }
+
+    fn build(
+        config: EncoderConfig,
+        fs_index: u8,
+        channel_configuration: u8,
+        program_config: Option<Pce>,
+        plan: Vec<ElementPlan>,
+        element_src: Vec<usize>,
+    ) -> Result<Self> {
+        let ch = config.channels as usize;
         let mut lfe_slot = vec![false; ch];
-        for elem in element_plan(channel_configuration)? {
-            if let ElementPlan::Lfe(slot) = elem {
+        for elem in &plan {
+            if let ElementPlan::Lfe(slot) = *elem {
                 lfe_slot[slot] = true;
             }
         }
@@ -399,6 +631,8 @@ impl StreamEncoder {
             config,
             fs_index,
             channel_configuration,
+            program_config,
+            plan,
             element_src,
             lfe_slot,
             history: vec![vec![0.0; FRAME_LEN]; ch],
@@ -408,6 +642,12 @@ impl StreamEncoder {
             tns_enabled: true,
             is_enabled: false,
         })
+    }
+
+    /// The `program_config_element()` of a PCE-described layout
+    /// (`None` for a Table 1.19 default configuration).
+    pub fn program_config(&self) -> Option<&Pce> {
+        self.program_config.as_ref()
     }
 
     /// Enable / disable §4.6.13 PNS emission (default **off**).
@@ -735,11 +975,13 @@ impl StreamEncoder {
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
-        let plan = element_plan(self.channel_configuration)?;
+        if let Some(pce) = &self.program_config {
+            asm.push_pce(pce)?;
+        }
         let mut sce_tag = 0u8;
         let mut cpe_tag = 0u8;
         let mut lfe_tag = 0u8;
-        for (i, elem) in plan.into_iter().enumerate() {
+        for (i, elem) in self.plan.iter().copied().enumerate() {
             let mut body_bits = BitWriter::new();
             match elem {
                 ElementPlan::Sce(ch) => {

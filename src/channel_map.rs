@@ -201,7 +201,7 @@ pub enum PceElementKind {
 /// WAVE_FORMAT_EXTENSIBLE / BS.775 speaker-mask bit order this crate's
 /// default-config reorder already targets. Lower rank interleaves
 /// first.
-fn canonical_rank(pos: ChannelPosition) -> Option<usize> {
+pub(crate) fn canonical_rank(pos: ChannelPosition) -> Option<usize> {
     use ChannelPosition::*;
     Some(match pos {
         FrontLeft => 0,

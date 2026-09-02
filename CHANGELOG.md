@@ -25,6 +25,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   a PS-signalling extradata ASC
 - `fuzz/` sub-crate with `ps_data_roundtrip` and `ps_encoder_frame`
   targets + the Fuzz workflow shim
+- `StreamEncoder::with_layout`: PCE-described speaker sets
+  (`channelConfiguration = 0`, §8.5.2.2 lists, PCE in every
+  `raw_data_block()`), `program_config()` accessor; `make_encoder`
+  routes a named non-default `channel_layout` and the 7-channel count
+  (6.1) through it
 - `sbr_encoder`: VARVAR grids — a late onset after a variable lead
   keeps a two-slot attack envelope by extending the trailing border,
   and two onsets in one frame elect the §4.B.18.3 five-envelope grid

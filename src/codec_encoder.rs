@@ -50,7 +50,8 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    ChannelLayout, CodecId, CodecParameters, Encoder, Error, Frame, Packet, Result, SampleFormat,
+    TimeBase,
 };
 
 use crate::codec_decoder::CODEC_ID_STR;
@@ -72,8 +73,15 @@ pub const DEFAULT_BITRATE_PER_CHANNEL: u32 = 64_000;
 /// * `channels` (default 2) — any count with a Table 1.19 default
 ///   `channelConfiguration`: 1, 2, 3, 4, 5, 6 (5.1) or 8 (7.1);
 ///   input interleaved in the canonical [`crate::channel_map`]
-///   order the decoder emits. 7 has no default configuration and is
-///   rejected.
+///   order the decoder emits. 7 channels default to the core 6.1
+///   layout through a PCE.
+/// * `channel_layout` — a named [`oxideav_core::ChannelLayout`]
+///   whose speaker set is not a Table 1.19 default (2.1, quad, 4.1,
+///   6.x, 7.0, side+back 7.1, …) selects the PCE-described
+///   (`channelConfiguration = 0`) encoder
+///   ([`StreamEncoder::with_layout`]); a default set keeps its
+///   Table 1.19 configuration. `DiscreteN` carries no speakers and
+///   falls back to the count rule.
 /// * `bit_rate` (default 64 kbps × channels) — the rate-loop target.
 /// * `sample_format` — must be [`SampleFormat::S16`] (or unset).
 ///
@@ -138,10 +146,24 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
         // A plain AAC ASC: fall through to the LC encoder.
     }
-    if !(1..=6).contains(&channels) && channels != 8 {
+    // A named non-default speaker set (or the 7-channel count with no
+    // Table 1.19 default) goes through a PCE-described layout.
+    let positions: Option<Vec<oxideav_core::ChannelPosition>> = match params.channel_layout {
+        Some(l) if !l.positions().is_empty() => {
+            if usize::from(channels) != l.positions().len() {
+                return Err(Error::invalid(
+                    "oxideav-aac encoder: channel_layout disagrees with channels",
+                ));
+            }
+            (!is_default_speaker_set(l.positions())).then(|| l.positions_owned())
+        }
+        _ if channels == 7 => Some(ChannelLayout::Surround61.positions_owned()),
+        _ => None,
+    };
+    if positions.is_none() && !(1..=6).contains(&channels) && channels != 8 {
         return Err(Error::unsupported(
             "oxideav-aac encoder supports the Table 1.19 default channel \
-             configurations: 1-6 or 8 channels",
+             configurations (1-6, 8 channels) or a named channel_layout",
         ));
     }
     let bitrate = params
@@ -153,8 +175,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         channels: channels as u8,
         bitrate,
     };
-    let stream = StreamEncoder::new(config)
-        .map_err(|e| Error::invalid(format!("oxideav-aac encoder config: {e}")))?;
+    let stream = match &positions {
+        Some(p) => StreamEncoder::with_layout(config, p),
+        None => StreamEncoder::new(config),
+    }
+    .map_err(|e| Error::invalid(format!("oxideav-aac encoder config: {e}")))?;
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
@@ -172,6 +197,41 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         samples_emitted: 0,
         flushed: false,
     }))
+}
+
+/// Whether a speaker set is one of the Table 1.19 default
+/// configurations this crate encodes with a plain
+/// `channelConfiguration` (1–6 and the 7.1 value 7).
+fn is_default_speaker_set(positions: &[oxideav_core::ChannelPosition]) -> bool {
+    use oxideav_core::ChannelPosition::*;
+    let defaults: [&[oxideav_core::ChannelPosition]; 7] = [
+        &[FrontCenter],
+        &[FrontLeft, FrontRight],
+        &[FrontLeft, FrontRight, FrontCenter],
+        &[FrontLeft, FrontRight, FrontCenter, BackCenter],
+        &[FrontLeft, FrontRight, FrontCenter, SideLeft, SideRight],
+        &[
+            FrontLeft,
+            FrontRight,
+            FrontCenter,
+            LowFrequency,
+            SideLeft,
+            SideRight,
+        ],
+        &[
+            FrontLeft,
+            FrontRight,
+            FrontCenter,
+            LowFrequency,
+            FrontLeftOfCenter,
+            FrontRightOfCenter,
+            SideLeft,
+            SideRight,
+        ],
+    ];
+    defaults
+        .iter()
+        .any(|d| d.len() == positions.len() && d.iter().all(|p| positions.contains(p)))
 }
 
 /// Build a boxed HE-AAC v1 [`Encoder`]: AAC-LC core at half rate plus
@@ -559,9 +619,10 @@ mod tests {
 
     #[test]
     fn encoder_rejects_unsupported_shapes() {
-        // 7 channels has no Table 1.19 default configuration; 6
-        // (5.1) and 8 (7.1) do and build.
-        assert!(make_encoder(&params(44_100, 7, None)).is_err());
+        // 7 channels has no Table 1.19 default configuration and
+        // builds as a PCE-described 6.1 layout; 6 (5.1) and 8 (7.1)
+        // build on their defaults; 9 without a layout has nothing.
+        assert!(make_encoder(&params(44_100, 7, None)).is_ok());
         assert!(make_encoder(&params(44_100, 9, None)).is_err());
         assert!(make_encoder(&params(44_100, 6, None)).is_ok());
         assert!(make_encoder(&params(44_100, 8, None)).is_ok());
@@ -569,6 +630,49 @@ mod tests {
         let mut p = params(44_100, 2, None);
         p.sample_format = Some(SampleFormat::F32);
         assert!(make_encoder(&p).is_err());
+    }
+
+    /// A named non-default layout (and the bare 7-channel count)
+    /// selects the PCE-described encoder; a default set keeps its
+    /// Table 1.19 configuration; a disagreeing count is rejected.
+    #[test]
+    fn channel_layout_selects_pce_layouts() {
+        let stream_of = |mut enc: Box<dyn Encoder>, ch: usize| -> Vec<u8> {
+            enc.send_frame(&tone_frame(2 * FRAME_LEN, ch)).unwrap();
+            enc.flush().unwrap();
+            let mut out = Vec::new();
+            while let Ok(p) = enc.receive_packet() {
+                out.extend_from_slice(&p.data);
+            }
+            out
+        };
+        let mut p = params(48_000, 7, None);
+        let bytes = stream_of(make_encoder(&p).unwrap(), 7);
+        let (h, _) = crate::adts::AdtsHeader::parse(&bytes).unwrap();
+        assert_eq!(h.channel_configuration, 0);
+        let frames = crate::decode::StreamDecoder::new()
+            .decode_all(&bytes)
+            .unwrap();
+        assert!(frames.iter().all(|f| f.channels == 7));
+
+        p.channel_layout = Some(ChannelLayout::Surround71);
+        p.channels = Some(8);
+        let bytes = stream_of(make_encoder(&p).unwrap(), 8);
+        let (h, _) = crate::adts::AdtsHeader::parse(&bytes).unwrap();
+        assert_eq!(h.channel_configuration, 0);
+        // The Table 1.19 5.1 set keeps channelConfiguration 6.
+        p.channel_layout = Some(ChannelLayout::Surround51);
+        p.channels = Some(6);
+        let bytes = stream_of(make_encoder(&p).unwrap(), 6);
+        let (h, _) = crate::adts::AdtsHeader::parse(&bytes).unwrap();
+        assert_eq!(h.channel_configuration, 6);
+        // Count / layout disagreement.
+        p.channels = Some(5);
+        assert!(make_encoder(&p).is_err());
+        // DiscreteN falls back to the count rule (9 → unsupported).
+        let mut d = params(48_000, 9, None);
+        d.channel_layout = Some(ChannelLayout::DiscreteN(9));
+        assert!(make_encoder(&d).is_err());
     }
 
     #[test]

@@ -1037,6 +1037,29 @@ the EP section below).
   `"aac"`, and re-exported as `encoder::make_encoder` per the
   workspace dual-API convention.
 
+### PCE-described layouts (`channelConfiguration = 0`) in the encoder
+
+- **`StreamEncoder::with_layout`** — any distinct speaker set on the
+  canonical WAVE/BS.775 rank list becomes a §8.5.2.2
+  `program_config_element()` (front list centre-outwards with the
+  inner `Lc/Rc` pair before `L/R`; `Ls/Rs` in the side list when a
+  back pair or `Cs` is present, else as the sole back pair — the
+  Table 1.19 5.1 reading; `Lb/Rb` then `Cs` in the back list; one
+  LFE), instance tags counting per element kind in bitstream order,
+  written at the head of every `raw_data_block()` under an ADTS
+  `channelConfiguration = 0`. The input stays in canonical order —
+  the order the decoder's PCE reorder emits — so encode ∘ decode is
+  channel-identity: 2.1 / quad / 4.1 / 6.0 / 6.1 / 7.0 / side+back
+  7.1 / an 11-speaker cinema set all round-trip at ≈ 0.01 err/sig
+  per channel through the crate's decoder, and the reference decoder
+  binary accepts the streams at their channel counts. Sets the lists
+  cannot express (an unpaired `L`, `Lc/Rc` without `L/R`, `Lb/Rb`
+  alone — a lone back pair reads as the side pair) are rejected.
+- Registry: `make_encoder` sends a named non-default
+  `CodecParameters::channel_layout` (and the bare 7-channel count,
+  as 6.1) through the PCE path; default sets keep their Table 1.19
+  configuration.
+
 ### HE-AAC v1 (SBR) encoder — Annex 4.B.18 over the §4.6.18 decoder
 
 - **`sbr_qmf::EncoderAnalysisQmf`** — the Figure 4.B.16 64-band
@@ -1271,11 +1294,18 @@ component still open (see below):
   banks, grid/envelope/noise estimation, coupling, CRC payloads, the
   Annex 8.C.6 stereo parameter estimation and `ps_data()` writer,
   implicit + explicit signalling, LOAS carriage, registry profiles).
-  Still open on the encode side: PCE-driven custom layouts
-  (7-channel and beyond-7.1 shapes; the Table 1.19 defaults 1–6 and
-  8 all encode); the SBR grid election now spans all four frame
-  classes (VARVAR up to five envelopes for late and double onsets),
-  leaving only three-onset frames to the single-attack fallback.
+  Custom speaker sets encode through a §8.5.2.2
+  `program_config_element()` (`StreamEncoder::with_layout`,
+  `channelConfiguration = 0`: 2.1, quad, 4.1, 6.x, 7.0, side+back
+  7.1, cinema sets with both front pairs and a rear centre — every
+  set the PCE lists and the decoder's speaker assignment can
+  express; a lone `Lb/Rb` pair, an unpaired `L`, or `Lc/Rc` without
+  `L/R` are rejected up front), the PCE opening every
+  `raw_data_block()`; the registry maps a named non-default
+  `channel_layout` (and the bare 7-channel count, as 6.1) onto it.
+  The SBR grid election spans all four frame classes (VARVAR up to
+  five envelopes for late and double onsets), leaving only
+  three-onset frames to the single-attack fallback.
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
   reconstruction, IPQF — see the "SSR gain control" section above),
