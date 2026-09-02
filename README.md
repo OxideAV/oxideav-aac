@@ -1168,8 +1168,10 @@ the EP section below).
   configuration (20 bands, coarse grid, Ra) at ~1.7 kbps of PS side
   info; every band count × grid × phase-layer combination under
   2 dB / 0.12; a hard left→right switch re-appears within 4 slots of
-  the audio; LOAS wrapping with either v2 ASC decodes identically to
-  ADTS as stereo. The reference decoder **binary** (skip-if-absent)
+  the audio; the phase layer reproduces an eight-sample inter-channel
+  delay's per-band IPD to **0.13 rad** mean (0.83 rad on the
+  phase-less Ra control); LOAS wrapping with either v2 ASC decodes
+  identically to ADTS as stereo. The reference decoder **binary** (skip-if-absent)
   decodes every stream without diagnostics as stereo at the doubled
   rate, its long-term per-band IID agreeing with this crate's
   decoder to **0.2–0.5 dB mean**. Pure tones expose the parametric

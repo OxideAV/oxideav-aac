@@ -524,3 +524,80 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
         assert!(d_src < 3.0, "{name}: image vs source {d_src} dB");
     }
 }
+
+/// The phase layer end to end: a right channel that is the left
+/// delayed by eight samples carries a frequency-proportional
+/// inter-channel phase difference (`2π·f·τ`, within ±π across the
+/// IPD bands). With `phase` enabled the decoded pair reproduces the
+/// per-band IPD of the source (the §8.6.4.6.3.2 rotation, sign
+/// conventions and the Table 8.31 grid all in the loop); the
+/// default Ra path, which carries no phase, leaves the decoded IPD
+/// near zero and serves as the control.
+#[test]
+fn phase_layer_reproduces_the_inter_channel_phase() {
+    let fs = 44_100u32;
+    let n = (1.5 * f64::from(fs)) as usize;
+    let tau = 8usize;
+    // Broadband multi-sine "noise" up to ~4 kHz (the phase bands and
+    // a bit above), fully shared between the channels.
+    let mut seed = 0x0f1e_2d3cu32;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(seed >> 8) / f64::from(1u32 << 24)
+    };
+    let comps: Vec<(f64, f64)> = (0..160)
+        .map(|i| (60.0 + 25.0 * i as f64 + rnd() * 20.0, rnd() * std::f64::consts::TAU))
+        .collect();
+    let mono = |i: usize| -> f64 {
+        let t = i as f64 / f64::from(fs);
+        comps
+            .iter()
+            .map(|&(f, ph)| (2.0 * std::f64::consts::PI * f * t + ph).sin())
+            .sum::<f64>()
+            * 800.0
+    };
+    let mut pcm = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        let l = mono(i + tau);
+        let r = mono(i);
+        pcm.push(l.clamp(-32768.0, 32767.0) as i16);
+        pcm.push(r.clamp(-32768.0, 32767.0) as i16);
+    }
+    let src = cues_of(&pcm, 20);
+    let mut errors = Vec::new();
+    for phase in [false, true] {
+        let cfg = HeAacConfig {
+            ps: PsEncoderConfig {
+                phase,
+                ..PsEncoderConfig::default()
+            },
+            ..HeAacConfig::new_v2(fs, 40_000)
+        };
+        let (_enc, rt) = round_trip(&pcm, cfg);
+        let m = rt.aligned.len().min(pcm.len());
+        let out = cues_of(&rt.aligned[..m], 20);
+        // Bands 1..=10 carry IPD/OPD (band 0's hybrid channel sits
+        // below the lowest component); skip the warm-up frames.
+        let nf = src.len().min(out.len());
+        let (mut sum, mut count) = (0.0, 0usize);
+        for f in 3..nf - 2 {
+            for b in 1..=10 {
+                let x = &src[f][b];
+                let y = &out[f][b];
+                if x.icc_magnitude() < 0.8 {
+                    continue;
+                }
+                let d = (x.ipd() - y.ipd()).rem_euclid(std::f64::consts::TAU);
+                let d = d.min(std::f64::consts::TAU - d);
+                sum += d;
+                count += 1;
+            }
+        }
+        let mean = sum / count.max(1) as f64;
+        eprintln!("phase={phase}: mean |ΔIPD| {mean:.3} rad over {count} band-frames");
+        errors.push(mean);
+    }
+    let (without, with) = (errors[0], errors[1]);
+    assert!(with < 0.5, "phase layer IPD error {with} rad");
+    assert!(with * 2.0 < without, "phase layer no better than none: {with} vs {without}");
+}
