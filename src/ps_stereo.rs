@@ -45,19 +45,19 @@ use crate::sbr_qmf::Complex;
 use crate::{Error, Result};
 
 /// Table 8.25 — default IID quantization grid, dB, index −7..7.
-const IID_DB_COARSE: [f64; 15] = [
+pub const IID_DB_COARSE: [f64; 15] = [
     -25.0, -18.0, -14.0, -10.0, -7.0, -4.0, -2.0, 0.0, 2.0, 4.0, 7.0, 10.0, 14.0, 18.0, 25.0,
 ];
 
 /// Table 8.26 — fine IID quantization grid, dB, index −15..15.
-const IID_DB_FINE: [f64; 31] = [
+pub const IID_DB_FINE: [f64; 31] = [
     -50.0, -45.0, -40.0, -35.0, -30.0, -25.0, -22.0, -19.0, -16.0, -13.0, -10.0, -8.0, -6.0, -4.0,
     -2.0, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 13.0, 16.0, 19.0, 22.0, 25.0, 30.0, 35.0, 40.0, 45.0,
     50.0,
 ];
 
 /// Table 8.28 — ICC quantization grid `ρ`.
-const ICC_RHO: [f64; 8] = [1.0, 0.937, 0.84118, 0.60092, 0.36764, 0.0, -0.589, -1.0];
+pub const ICC_RHO: [f64; 8] = [1.0, 0.937, 0.84118, 0.60092, 0.36764, 0.0, -0.589, -1.0];
 
 /// One stereo band's mixing coefficients.
 type H4 = [Complex; 4]; // h11, h12, h21, h22

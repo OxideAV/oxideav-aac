@@ -504,6 +504,7 @@ pub mod ps_decoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ps_decorr;
+pub mod ps_encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod ps_huffman;
