@@ -1089,6 +1089,73 @@ the EP section below).
   dispatches on an SBR-signalling extradata `AudioSpecificConfig`
   (output params advertise the backward-compatible ASC).
 
+### HE-AAC v2 (parametric stereo) encoder — Annex 8.C.6 over the §8.6.4 decoder
+
+- **`ps_analysis`** — the stereo front end: both input channels
+  through the decoder's own §8.6.4.3 hybrid filterbank (71 / 91
+  sub-subbands) on the Annex 8.A.3 `Xinput` framing, and the Annex
+  8.C.6.2 band excitations `e_l / e_r / e_R / e_O` over the Table
+  8.C.2 / 8.C.3 summation ranges (10-band ranges folded through
+  Table 8.45) — pinned against the decoder's Table 8.48/8.49 `b(k)`
+  maps (every range inside one band, no conjugate channels).
+- **`ps_encoder`** — parameter positions (§8.6.4.4): FIX_BORDERS
+  with 1 / 2 / 4 envelopes elected by quarter-frame cue variation
+  beyond its own estimation noise (`6.1/√N` dB, `1/√N` coherence,
+  three sigma), VAR_BORDERS `[t−1, t, 31]` on an attack whose stereo
+  cues change, the four-bit `num_env = 0` hold for a repeated set,
+  and cross-frame smoothing of narrow-band excitations. IID / ICC /
+  IPD / OPD from the excitations (real coherence for mixing
+  procedure Ra — the cross-correlation the decoder's output
+  reproduces — magnitude coherence for the phase layer's Rb, phases
+  only where coherence ≥ 0.6), quantised on Tables 8.25 / 8.26,
+  8.28 and 8.31; per-row time-versus-frequency differential coding
+  by measured Annex 8.B codebook bits (header frames
+  frequency-forced on envelope 0 for random access, phase deltas
+  modulo 8), with the decoder's own `PsData::resolve` run against a
+  mirrored index state to assert every frame lands on the intended
+  indices.
+- **`ps_writer`** — the forward `ps_data()` (Tables 8.9–8.14): header
+  block, Table 8.29 inversion, VAR borders, Huffman-coded rows on
+  the ten codebooks (inverse of `ps_huff_dec`), and the byte-counted
+  extension layer sized so fewer than eight fill bits follow it.
+  Every element reparses bit-exactly through the crate's parser
+  (all IID × ICC modes, both frame classes, the phase layer, the
+  hold element).
+- **`he_aac_encoder`** (HE-AAC v2 mode) — a stereo input coded as one
+  SCE plus `ps_data()` under `EXTENSION_ID_PS` in the SBR payload:
+  the Annex 8.C.6.1 downmix formed in the QMF domain with a per-band
+  `√((e_l + e_r)/(2·e_m))` gain (capped +12 dB, interpolated across
+  the hop) restoring the pair energy the decoder's energy-preserving
+  mixing expects, re-synthesised through the §4.6.18.4.2 bank into
+  the mono v1 path; the 576-sample QMF pair delay + FIR delay + a
+  32-sample pad make the stereo→mono lag exactly 10 columns so the
+  PS encoder sees the decoder's `Xinput` slots for each frame's core
+  block. Implicit ADTS signalling (`channel_configuration = 1`);
+  `asc_writer::he_aac_v2_asc` writes both §1.6.6 forms (the `0x2b7` +
+  `0x548` `psPresentFlag` trailer, 49 bits, and hierarchical AOT 29,
+  25 bits) and `latm_writer` carries either.
+- Validation (own subpart-8 decoder as oracle, band-wise multi-sine
+  stereo with per-region pan and coherence): per-frame per-band IID
+  within **1.5 dB mean** and ICC within **0.11** on the default
+  configuration (20 bands, coarse grid, Ra) at ~1.7 kbps of PS side
+  info; every band count × grid × phase-layer combination under
+  2 dB / 0.12; a hard left→right switch re-appears within 4 slots of
+  the audio; LOAS wrapping with either v2 ASC decodes identically to
+  ADTS as stereo. The reference decoder **binary** (skip-if-absent)
+  decodes every stream without diagnostics as stereo at the doubled
+  rate, its long-term per-band IID agreeing with this crate's
+  decoder to **0.2–0.5 dB mean**. Pure tones expose the parametric
+  model's own limit (an all-pass de-correlator turns a sinusoid into
+  a phase-shifted copy), not the encoder's.
+- Registry: `codec_encoder::make_he_aac_v2_encoder`, and
+  `make_encoder` dispatches on a PS-signalling extradata ASC (AOT 29
+  or `psPresentFlag`).
+- Fuzz: `fuzz/` carries `ps_data_roundtrip` (parse → write → reparse
+  identity + build-first recipes) and `ps_encoder_frame` (arbitrary,
+  non-finite QMF input through the encoder and back through the
+  parser); the first run found and fixed a parser quirk (a repeated
+  `ps_extension_id = 0` block left stale phase rows).
+
 ### ER BSAC (AOT 22) — noiseless-coder bring-up (§4.4.2.6 / §4.5.2.6 / §4.6.4)
 
 The Bit-Sliced Arithmetic Coding decoder roster is implemented and
@@ -1194,15 +1261,16 @@ component still open (see below):
   PNS and IS long-frame-only (CPE PNS emits the §4.6.13.3 `ms_used`
   correlated-noise signalling — shared random vector — for
   both-channels-noise bands correlating above 0.5). The **HE-AAC v1
-  (SBR) encoder is implemented end to end** (see its section above:
-  analysis bank, grid/envelope/noise estimation, coupling, CRC
-  payloads, implicit + explicit signalling, LOAS carriage, registry
-  profile). Still open on the encode side: PCE-driven custom layouts
+  (SBR) encoder and the HE-AAC v2 (parametric stereo) encoder are
+  implemented end to end** (see their sections above: analysis
+  banks, grid/envelope/noise estimation, coupling, CRC payloads, the
+  Annex 8.C.6 stereo parameter estimation and `ps_data()` writer,
+  implicit + explicit signalling, LOAS carriage, registry profiles).
+  Still open on the encode side: PCE-driven custom layouts
   (7-channel and beyond-7.1 shapes; the Table 1.19 defaults 1–6 and
-  8 all encode), a PS (HE-AAC v2) encoder (the decoder-side subpart-8
-  tool is complete and would be its oracle), and SBR VARVAR grids
-  with more than three envelopes (the current transient path elects
-  FIXVAR / VARFIX with a four-envelope FIXFIX fallback).
+  8 all encode), and SBR VARVAR grids with more than three
+  envelopes (the current transient path elects FIXVAR / VARFIX with
+  a four-envelope FIXFIX fallback).
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
   reconstruction, IPQF — see the "SSR gain control" section above),

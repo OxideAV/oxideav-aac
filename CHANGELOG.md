@@ -6,6 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- HE-AAC v2 (parametric stereo) encoder: `ps_analysis` (Annex 8.C.6.2
+  stereo hybrid analysis + band excitations on the Table 8.C.2/8.C.3
+  ranges), `ps_encoder` (FIX/VAR parameter positions, IID/ICC/IPD/OPD
+  estimation and Table 8.25/8.26/8.28/8.31 quantisation,
+  measured-bit time/frequency differential coding closed-loop over
+  `PsData::resolve`), `ps_writer` (forward `ps_data()`, Tables
+  8.9–8.14, inverse of the parser), and the `HeAacConfig::parametric_stereo`
+  mode of `he_aac_encoder` (QMF-domain energy-preserving downmix,
+  `EXTENSION_ID_PS` carriage via `SbrEncoder::encode_frame_with_extension`,
+  column-exact stereo/mono alignment)
+- `asc_writer::he_aac_v2_asc` (backward-compatible `psPresentFlag`
+  trailer and hierarchical AOT-29 forms) + `asc_bits`;
+  `HeAacEncoder::audio_specific_config_bits`
+- `codec_encoder::make_he_aac_v2_encoder`; `make_encoder` dispatches on
+  a PS-signalling extradata ASC
+- `fuzz/` sub-crate with `ps_data_roundtrip` and `ps_encoder_frame`
+  targets + the Fuzz workflow shim
+
+### Fixed
+
+- `ps_data`: a repeated `ps_extension_id = 0` block re-reads every
+  field instead of leaving the first block's phase rows behind
+  (fuzz-found)
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-aac/compare/v0.1.6...v0.1.7) - 2026-08-30
 
 ### Fixed
