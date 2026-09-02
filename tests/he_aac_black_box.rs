@@ -190,3 +190,104 @@ fn reference_binary_decodes_our_he_aac_like_our_decoder() {
         assert!(worst < 3.0, "{name}: worst band delta {worst} dB");
     }
 }
+
+/// Two bursts per frame — a click train whose onsets fall inside one
+/// SBR frame — drive the encoder's five-envelope VARVAR grids; the
+/// reference decoder binary must accept every such frame without
+/// diagnostics and agree with this crate's decoder on the per-band
+/// energies (the grids are exercised in both directions of the
+/// frame-class alphabet, so a border the decoders derived differently
+/// would show up as a level disagreement).
+#[test]
+fn reference_binary_accepts_double_onset_varvar_frames() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skip: no ffmpeg binary on PATH");
+        return;
+    };
+    let dir = scratch_dir();
+    let fs_out = 44_100u32;
+    let n = (1.5 * f64::from(fs_out)) as usize;
+    let mut seed = 0x1357_9bdfu32;
+    let mut pcm = Vec::with_capacity(n);
+    for i in 0..n {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = f64::from(seed >> 8) / f64::from(1u32 << 24) - 0.5;
+        let t = i as f64 / f64::from(fs_out);
+        // A soft bed, plus 256-sample bursts of bright noise starting
+        // at hop offsets 400 and 1300 (nominal slots ≈ 6 and 20 −
+        // the second lands in the next frame's lead region on some
+        // frames, so VARFIX / VARVAR leads are exercised too).
+        let off = i % HE_FRAME_LEN;
+        let burst = (400..656).contains(&off) || (1300..1556).contains(&off);
+        let v = 300.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+            + if burst {
+                noise * 24_000.0
+            } else {
+                noise * 60.0
+            };
+        pcm.push(v.clamp(-32768.0, 32767.0) as i16);
+    }
+    let mut enc = HeAacEncoder::new(HeAacConfig::new(fs_out, 1, 40_000)).unwrap();
+    let mut stream = Vec::new();
+    let mut classes = [0usize; 4];
+    let mut five = 0usize;
+    for chunk in pcm.chunks(HE_FRAME_LEN) {
+        stream.extend_from_slice(&enc.encode_frame(chunk).unwrap());
+        let g = &enc.last_sbr_frame().unwrap().element.channels[0].grid;
+        classes[g.frame_class.to_bits() as usize] += 1;
+        if g.num_env == 5 {
+            five += 1;
+        }
+    }
+    stream.extend_from_slice(&enc.finish().unwrap());
+    eprintln!(
+        "frame classes FIXFIX/FIXVAR/VARFIX/VARVAR = {classes:?}, five-envelope frames {five}"
+    );
+    assert!(classes[3] > 0, "no VARVAR frame elected");
+    assert!(five > 0, "no five-envelope frame");
+
+    let aac = dir.join("double_onset.aac");
+    let wav = dir.join("double_onset.wav");
+    fs::write(&aac, &stream).unwrap();
+    let _ = fs::remove_file(&wav);
+    let out = Command::new(ff)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&aac)
+        .arg(&wav)
+        .output()
+        .expect("run reference decoder");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "reference decoder diagnostics: {stderr}"
+    );
+    let (ref_pcm, ref_ch, ref_rate) = read_wav(&wav).expect("reference WAV");
+    assert_eq!(ref_rate, fs_out);
+
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).expect("own decode");
+    let ours: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+    let e_ref = band_energies(&ref_pcm, ref_ch, 0);
+    let e_ours = band_energies(&ours, 1, 0);
+    let k_end = usize::min((enc.sbr().bands().k_x + enc.sbr().bands().m) as usize, 64);
+    let floor = e_ours.iter().cloned().fold(0.0, f64::max) * 1e-5;
+    let (mut mean, mut worst, mut count) = (0.0f64, 0.0f64, 0usize);
+    for k in 1..k_end {
+        if e_ours[k] < floor {
+            continue;
+        }
+        let db = (10.0 * (e_ref[k] / e_ours[k]).log10()).abs();
+        worst = worst.max(db);
+        mean += db;
+        count += 1;
+    }
+    mean /= count.max(1) as f64;
+    eprintln!("double onset: {count} bands, mean |Δ| {mean:.2} dB, worst {worst:.2} dB");
+    assert!(mean < 1.0, "mean band delta {mean} dB");
+    assert!(worst < 3.0, "worst band delta {worst} dB");
+}

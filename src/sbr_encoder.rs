@@ -542,16 +542,16 @@ impl SbrEncoder {
             }
         }
         let peak = e.iter().cloned().fold(0.0f64, f64::max);
-        // Attack: a slot at least 8× the mean of the preceding four
-        // and carrying a non-negligible share of the frame's peak.
-        let mut attack: Option<usize> = None;
-        for s in 4..NUM_TIME_SLOTS {
+        // Attacks: a slot at least 8× the mean of the preceding four
+        // and carrying a non-negligible share of the frame's peak;
+        // a second onset at least four slots after the first.
+        let is_attack = |s: usize| {
             let prev = e[s - 4..s].iter().sum::<f64>() / 4.0;
-            if e[s] > 8.0 * prev + 1e-9 && e[s] > 0.1 * peak && e[s] > 64.0 {
-                attack = Some(s);
-                break;
-            }
-        }
+            e[s] > 8.0 * prev + 1e-9 && e[s] > 0.1 * peak && e[s] > 64.0
+        };
+        let attack: Option<usize> = (4..NUM_TIME_SLOTS).find(|&s| is_attack(s));
+        let second: Option<usize> =
+            attack.and_then(|s1| (s1 + 4..NUM_TIME_SLOTS).find(|&s| is_attack(s)));
         let transient = attack.is_some();
 
         // The leading border must meet the previous trailing one; a
@@ -560,7 +560,17 @@ impl SbrEncoder {
         let lead = (t_e_last_prev - NUM_TIME_SLOTS as i32).clamp(0, 3) as u8;
 
         let grid = match attack {
-            Some(s) if self.cfg.variable_borders => variable_grid(s, lead),
+            Some(s) if self.cfg.variable_borders => {
+                // Two onsets: one VARVAR grid with an envelope on
+                // each (§4.B.18.3 allows five); a late onset after a
+                // variable lead: VARVAR with the trailing border
+                // pushed past its envelope; otherwise the FIXVAR /
+                // VARFIX single-attack grids.
+                second
+                    .and_then(|s2| double_attack_grid(s, s2, lead))
+                    .or_else(|| late_attack_varvar(s, lead))
+                    .unwrap_or_else(|| variable_grid(s, lead))
+            }
             Some(_) if lead == 0 => fixfix_grid(4, false),
             Some(_) => varfix_plain(lead, 4),
             None => {
@@ -1113,6 +1123,150 @@ impl SbrEncoder {
     }
 }
 
+/// Split an even span `n ≥ 2` into explicit relative-border segments,
+/// each even in `2..=8` (the `2·bs_rel_bord + 2` alphabet).
+fn even_segments(n: i32) -> Vec<i32> {
+    let mut segs = Vec::new();
+    let mut left = n;
+    while left > 0 {
+        let l = left.min(8);
+        segs.push(l);
+        left -= l;
+    }
+    segs
+}
+
+/// Raw `bs_rel_bord_*` values for even segment lengths.
+fn raw_rel(segs: &[i32]) -> Vec<u8> {
+    segs.iter().map(|&l| ((l - 2) / 2) as u8).collect()
+}
+
+/// The attack border with the lead's parity (so the leading-relative
+/// segments are even), at least two slots after the lead.
+fn aligned_attack(s: usize, lead: u8) -> i32 {
+    let lead_i = i32::from(lead);
+    let s = s as i32;
+    let sp = s - ((s - lead_i).rem_euclid(2));
+    sp.max(lead_i + 2)
+}
+
+/// One onset late in the frame (`sp ≥ 14`) after a variable lead:
+/// VARFIX could only truncate its envelope at the nominal frame end,
+/// so this VARVAR grid keeps the leading-relative borders up to a
+/// two-slot attack envelope and extends the trailing border past it
+/// (the implicit segment is the one-slot tail). `None` when the
+/// onset is not late, or the grid would not fit.
+fn late_attack_varvar(s: usize, lead: u8) -> Option<SbrGrid> {
+    if lead == 0 {
+        return None;
+    }
+    let sp = aligned_attack(s, lead);
+    if sp + 2 < NUM_TIME_SLOTS as i32 {
+        return None;
+    }
+    let t = sp + 3;
+    if t > NUM_TIME_SLOTS as i32 + 3 {
+        return None;
+    }
+    let mut segs = even_segments(sp - i32::from(lead));
+    let l_a = segs.len() as u32;
+    segs.push(2);
+    let num_env = segs.len() + 1;
+    if num_env > crate::sbr_grid::SBR_MAX_NUM_ENV || segs.len() > 3 {
+        return None;
+    }
+    Some(SbrGrid {
+        frame_class: FrameClass::VarVar,
+        num_env,
+        num_noise: 2,
+        freq_res: vec![false; num_env],
+        var_bord_0: lead,
+        var_bord_1: (t - NUM_TIME_SLOTS as i32) as u8,
+        rel_bord_0: raw_rel(&segs),
+        rel_bord_1: vec![],
+        pointer: num_env as u32 + 1 - l_a,
+        amp_res_override: false,
+    })
+}
+
+/// Two onsets `s1 < s2` in one frame: a VARVAR grid with a two-slot
+/// envelope starting on each (§4.B.18.3's five-envelope allowance).
+///
+/// Arrangement A puts the first attack on the leading-relative side
+/// (one even segment before its envelope) and the second on the
+/// trailing-relative side behind an even tail (`≥ 2`, reaching at
+/// least the nominal frame end), the implicit segment between the
+/// two envelopes absorbing any parity. When the first onset is more
+/// than one explicit segment from the lead, arrangement G spends two
+/// leading segments on it and ends the frame on the second attack
+/// envelope (`bs_num_rel_*` are 2-bit fields, so each side carries at
+/// most three explicit segments). `lA` marks the first attack.
+/// `None` when neither arrangement fits.
+fn double_attack_grid(s1: usize, s2: usize, lead: u8) -> Option<SbrGrid> {
+    let n = NUM_TIME_SLOTS as i32;
+    let lead_i = i32::from(lead);
+    let sp2 = s2 as i32;
+    // Tail after the second envelope: even, ≥ 2, reaching the nominal
+    // frame end, and the trailing border within `+3`.
+    let mut tail = (n - (sp2 + 2)).max(2);
+    tail += tail % 2;
+    let t = sp2 + 2 + tail;
+    if tail > 8 || t > n + 3 {
+        return None;
+    }
+    let var_bord_1 = (t - n) as u8;
+
+    // A: first attack leading-relative.
+    let sp1 = aligned_attack(s1, lead);
+    if sp1 - lead_i <= 8 && sp2 >= sp1 + 3 {
+        let rel_0 = vec![sp1 - lead_i, 2];
+        let rel_1 = vec![tail, 2];
+        let num_env = rel_0.len() + rel_1.len() + 1;
+        return Some(SbrGrid {
+            frame_class: FrameClass::VarVar,
+            num_env,
+            num_noise: 2,
+            freq_res: vec![false; num_env],
+            var_bord_0: lead,
+            var_bord_1,
+            rel_bord_0: raw_rel(&rel_0),
+            rel_bord_1: raw_rel(&rel_1),
+            // lA = envelope index of the first attack = 1.
+            pointer: num_env as u32,
+            amp_res_override: false,
+        });
+    }
+
+    // G: the first onset is more than one explicit segment from the
+    // lead — two leading segments, the first attack envelope, the
+    // implicit middle, and the second attack envelope ending on the
+    // trailing border (no tail: needs `sp2 ≥ 14`).
+    let sp2_t = sp2 + 2;
+    if sp2_t < n || sp2 < sp1 + 3 {
+        return None;
+    }
+    let mut rel_0 = even_segments(sp1 - lead_i);
+    if rel_0.len() != 2 {
+        return None;
+    }
+    rel_0.push(2);
+    let rel_1 = vec![2];
+    let num_env = rel_0.len() + rel_1.len() + 1;
+    Some(SbrGrid {
+        frame_class: FrameClass::VarVar,
+        num_env,
+        num_noise: 2,
+        freq_res: vec![false; num_env],
+        var_bord_0: lead,
+        var_bord_1: (sp2_t - n) as u8,
+        rel_bord_0: raw_rel(&rel_0),
+        rel_bord_1: raw_rel(&rel_1),
+        // lA = envelope index of the first attack = 2.
+        pointer: num_env as u32 + 1 - 2,
+        amp_res_override: false,
+    })
+}
+
 /// A FIXFIX grid with `num_env` envelopes at one resolution.
 fn fixfix_grid(num_env: usize, high: bool) -> SbrGrid {
     SbrGrid {
@@ -1640,6 +1794,170 @@ mod tests {
         assert!(ch2.dtdf.df_env[0]);
         assert!(ch2.envelope.data[0].iter().all(|&d| d == 0));
         assert_eq!(frame2.reports[0].eq, frame.reports[0].eq);
+    }
+
+    /// Every late-onset / variable-lead combination and every onset
+    /// pair the builders accept yields a grid the decoder derives
+    /// (borders strictly increasing inside `[0, 24]`), with two-slot
+    /// attack envelopes starting on the onsets (the first at most one
+    /// slot early), `lA` on the first attack, the noise floors split
+    /// there, and a bit-exact `sbr_grid()` round trip.
+    #[test]
+    fn varvar_builders_are_decodable_and_land_on_the_onsets() {
+        use crate::sbr_time_grid::derive_time_grid;
+        let round_trip = |g: &SbrGrid| {
+            let mut w = oxideav_core::bits::BitWriter::new();
+            crate::sbr_writer::write_grid(&mut w, g).unwrap_or_else(|e| panic!("{e:?}: {g:?}"));
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            let back = SbrGrid::parse(&mut r).unwrap();
+            assert_eq!(&back, g);
+        };
+        // Late onsets after a variable lead.
+        let mut late = 0;
+        for lead in 1..=3u8 {
+            for s in 4..NUM_TIME_SLOTS {
+                let Some(g) = late_attack_varvar(s, lead) else {
+                    assert!(aligned_attack(s, lead) + 2 < NUM_TIME_SLOTS as i32);
+                    continue;
+                };
+                late += 1;
+                assert_eq!(g.frame_class, FrameClass::VarVar);
+                let tg = derive_time_grid(&g, NUM_TIME_SLOTS as i32).unwrap();
+                assert_eq!(tg.t_e[0], i32::from(lead));
+                let sp = aligned_attack(s, lead);
+                let l_a = tg.l_a as usize;
+                assert_eq!(tg.t_e[l_a], sp, "{lead} {s} {:?}", tg.t_e);
+                assert_eq!(tg.t_e[l_a + 1], sp + 2);
+                assert_eq!(tg.t_q[1], sp);
+                assert!(tg.t_e.windows(2).all(|w| w[1] > w[0]));
+                assert!(*tg.t_e.last().unwrap() <= NUM_TIME_SLOTS as i32 + 3);
+                round_trip(&g);
+            }
+        }
+        // lead 1: s = 15; lead 2: s = 14 / 15; lead 3: s = 15.
+        assert_eq!(late, 4, "{late} late grids");
+        // Onset pairs.
+        let mut pairs = 0;
+        let mut built = 0;
+        for lead in 0..=3u8 {
+            for s1 in 4..NUM_TIME_SLOTS {
+                for s2 in s1 + 4..NUM_TIME_SLOTS {
+                    pairs += 1;
+                    let Some(g) = double_attack_grid(s1, s2, lead) else {
+                        continue;
+                    };
+                    built += 1;
+                    assert_eq!(g.frame_class, FrameClass::VarVar);
+                    assert!(g.num_env <= 5);
+                    let tg = derive_time_grid(&g, NUM_TIME_SLOTS as i32).unwrap();
+                    assert!(tg.t_e.windows(2).all(|w| w[1] > w[0]), "{:?}", tg.t_e);
+                    assert_eq!(tg.t_e[0], i32::from(lead));
+                    let last = *tg.t_e.last().unwrap();
+                    assert!((NUM_TIME_SLOTS as i32..=NUM_TIME_SLOTS as i32 + 3).contains(&last));
+                    // First attack envelope: starts on the lead-parity
+                    // aligned onset, two slots long; lA points at it.
+                    let l_a = tg.l_a as usize;
+                    let start = tg.t_e[l_a];
+                    assert!(
+                        start == s1 as i32
+                            || start == s1 as i32 - 1
+                            || start == aligned_attack(s1, lead),
+                        "lead {lead} s1 {s1} s2 {s2}: {:?}",
+                        tg.t_e
+                    );
+                    assert_eq!(tg.t_e[l_a + 1], start + 2);
+                    assert_eq!(tg.t_q[1], start);
+                    // Second attack envelope exact.
+                    let p2 = tg
+                        .t_e
+                        .iter()
+                        .position(|&b| b == s2 as i32)
+                        .unwrap_or_else(|| panic!("lead {lead} s1 {s1} s2 {s2}: {:?}", tg.t_e));
+                    assert_eq!(tg.t_e[p2 + 1], s2 as i32 + 2);
+                    round_trip(&g);
+                }
+            }
+        }
+        assert!(
+            built * 10 >= pairs * 8,
+            "{built} of {pairs} pairs representable"
+        );
+    }
+
+    /// Two onsets inside one frame become a five-envelope VARVAR grid
+    /// with an envelope on each; both pre-attack envelopes are far
+    /// quieter than their attack envelopes, the payload reparses, and
+    /// the next frame's leading border meets the trailing one.
+    #[test]
+    fn two_onsets_elect_a_five_envelope_varvar_grid() {
+        let cfg = SbrEncoderConfig::new(44_100, 1, 6_000.0, 16_000.0).unwrap();
+        let mut enc = SbrEncoder::new(cfg).unwrap();
+        // Bursts (two slots each) from nominal slots 4 and 12 — far
+        // enough apart for the first one's filterbank ringing to have
+        // decayed below the onset detector's 8× threshold.
+        let burst = |slot: usize| -> (usize, usize) {
+            let c0 = 10 + 2 + 2 * slot;
+            (c0 * 64, (c0 + 4) * 64)
+        };
+        let (a0, a1) = burst(4);
+        let (b0, b1) = burst(12);
+        let cols = analyse(
+            move |t| {
+                if (a0..a1).contains(&t) || (b0..b1).contains(&t) {
+                    tone(40.5, 3000.0)(t)
+                } else {
+                    0.0
+                }
+            },
+            SBR_ENC_COLS,
+        );
+        let frame = enc.encode_frame(&[&cols]).unwrap();
+        let rep = &frame.reports[0];
+        assert!(rep.transient);
+        let ch = &frame.element.channels[0];
+        assert_eq!(ch.grid.frame_class, FrameClass::VarVar, "{:?}", ch.grid);
+        assert_eq!(ch.grid.num_env, 5, "{:?}", rep.t_e);
+        // Borders [lead, sp1, sp1+2, sp2, sp2+2, trail]: two-slot
+        // envelopes on both onsets (the analysis group delay moves
+        // them a slot or two after the input onsets).
+        let t_e = &rep.t_e;
+        assert_eq!(t_e.len(), 6);
+        assert_eq!(t_e[2] - t_e[1], 2, "{t_e:?}");
+        assert_eq!(t_e[4] - t_e[3], 2, "{t_e:?}");
+        assert!(
+            (4..=6).contains(&t_e[1]) && (12..=14).contains(&t_e[3]),
+            "{t_e:?}"
+        );
+        // The two attack envelopes hold the frame's two largest
+        // per-slot energies, each well above the envelope before it
+        // (the 640-tap analysis prototype rings for a few slots, so
+        // the gap envelope is not silent).
+        let e: Vec<f64> = rep.energy.iter().map(|v| v.iter().sum()).collect();
+        assert!(
+            e[1] > 5.0 * e[0].max(1.0) && e[3] > 5.0 * e[2],
+            "energies {e:?} borders {t_e:?}"
+        );
+        let mut order: Vec<usize> = (0..e.len()).collect();
+        order.sort_by(|&a, &b| e[b].partial_cmp(&e[a]).unwrap());
+        assert!(
+            order[..2].contains(&1) && order[..2].contains(&3),
+            "energies {e:?}"
+        );
+        let mut r = BitReader::new(&frame.payload);
+        r.read_u32(4).unwrap();
+        let parsed = SbrExtensionData::parse(
+            &mut r,
+            IdSynEle::Sce,
+            false,
+            44_100,
+            Some(frame.payload.len() as u32),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.element, frame.element);
+        let frame2 = enc.encode_frame(&[&cols]).unwrap();
+        assert_eq!(frame2.reports[0].t_e[0], rep.t_e[rep.t_e.len() - 1] - 16);
     }
 
     /// An attack in the SBR range mid-frame elects a variable grid

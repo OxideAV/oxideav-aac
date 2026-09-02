@@ -25,6 +25,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   a PS-signalling extradata ASC
 - `fuzz/` sub-crate with `ps_data_roundtrip` and `ps_encoder_frame`
   targets + the Fuzz workflow shim
+- `sbr_encoder`: VARVAR grids — a late onset after a variable lead
+  keeps a two-slot attack envelope by extending the trailing border,
+  and two onsets in one frame elect the §4.B.18.3 five-envelope grid
+  (arrangements A / G within the 2-bit `bs_num_rel_*` counts, `lA` on
+  the first onset); black-box pinned through the reference decoder
 
 ### Fixed
 

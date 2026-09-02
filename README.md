@@ -1053,7 +1053,12 @@ the EP section below).
   the crate's decode-side parsers.
 - **`sbr_encoder`** — Annex 4.B.18 written forward: transient-driven
   grid election (FIXFIX 1/2/4; FIXVAR / VARFIX attack borders with
-  `bs_pointer = lA` and cross-frame border continuity), §4.B.18.4
+  `bs_pointer = lA` and cross-frame border continuity; VARVAR for a
+  late onset after a variable lead — the trailing border pushed past
+  a full two-slot attack envelope — and for two onsets in one frame,
+  the §4.B.18.3 five-envelope grid with an envelope on each, `lA` on
+  the first, both `bs_num_rel_*` sides within their 2-bit counts),
+  §4.B.18.4
   envelope energies, §4.B.18.6 quantisers, §4.B.18.7 time/frequency
   delta election closed-loop over the decoder's own §4.6.18.3.5
   reconstruction (LAV-clamped, header frames freq-forced for random
@@ -1268,9 +1273,9 @@ component still open (see below):
   implicit + explicit signalling, LOAS carriage, registry profiles).
   Still open on the encode side: PCE-driven custom layouts
   (7-channel and beyond-7.1 shapes; the Table 1.19 defaults 1–6 and
-  8 all encode), and SBR VARVAR grids with more than three
-  envelopes (the current transient path elects FIXVAR / VARFIX with
-  a four-envelope FIXFIX fallback).
+  8 all encode); the SBR grid election now spans all four frame
+  classes (VARVAR up to five envelopes for late and double onsets),
+  leaving only three-onset frames to the single-attack fallback.
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
   reconstruction, IPQF — see the "SSR gain control" section above),
