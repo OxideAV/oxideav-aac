@@ -25,7 +25,7 @@
 //!   overlap-flush frame; subsequent `receive_packet` calls drain
 //!   those then return [`Error::Eof`].
 //!
-//! ## HE-AAC v1 profile
+//! ## HE-AAC v1 / v2 profiles
 //!
 //! When `params.extradata` carries an `AudioSpecificConfig` that
 //! signals SBR (hierarchical `audioObjectType = 5`, or the
@@ -33,8 +33,12 @@
 //! factory builds the [`crate::he_aac_encoder::HeAacEncoder`]
 //! instead: `sample_rate` is then the SBR *output* rate (its half
 //! becomes the ADTS core rate), the hop is 2048 samples, and every
-//! packet is one implicit-SBR ADTS frame. [`make_he_aac_encoder`]
-//! selects the profile directly without an ASC.
+//! packet is one implicit-SBR ADTS frame. An ASC that also signals
+//! parametric stereo (`audioObjectType = 29`, or the `0x548`
+//! `psPresentFlag` trailer) selects HE-AAC v2: a stereo input coded
+//! as one SCE plus `ps_data()`. [`make_he_aac_encoder`] and
+//! [`make_he_aac_v2_encoder`] select the profiles directly without
+//! an ASC.
 //!
 //! ## Registration
 //!
@@ -99,6 +103,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             .trailing_sbr_probe
             .as_ref()
             .is_some_and(|p| p.sbr_present_flag);
+        let probe_ps = asc
+            .trailing_sbr_probe
+            .as_ref()
+            .is_some_and(|p| p.ps_present_flag == Some(true));
         if asc.sbr_present || probe_sbr {
             let out_rate = asc
                 .extension_sample_rate
@@ -115,6 +123,14 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             }
             let mut p = params.clone();
             p.sample_rate = Some(out_rate);
+            if asc.ps_present || probe_ps {
+                // HE-AAC v2: the ASC's channelConfiguration (1) is the
+                // core; the input is stereo.
+                if p.channels.is_none() {
+                    p.channels = Some(2);
+                }
+                return make_he_aac_v2_encoder(&p);
+            }
             if p.channels.is_none() {
                 p.channels = Some(asc.channel_configuration.max(1).into());
             }
@@ -217,6 +233,69 @@ pub fn make_he_aac_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>
 /// Default HE-AAC target bitrate per channel (bits/second): 32 kbps —
 /// the operating point the SBR tool is built for.
 pub const DEFAULT_HE_BITRATE_PER_CHANNEL: u32 = 32_000;
+
+/// Default HE-AAC v2 total bitrate (bits/second): 32 kbps for the
+/// stereo pair — the mono core + SBR + PS operating point the
+/// parametric stereo tool is built for.
+pub const DEFAULT_HE_V2_BITRATE: u32 = 32_000;
+
+/// Build a boxed HE-AAC v2 [`Encoder`]: a stereo input coded as one
+/// half-rate AAC-LC SCE plus the SBR tool plus the Annex 8.A
+/// parametric stereo tool, emitting implicit-signalling ADTS packets
+/// (`channel_configuration = 1` with `EXTENSION_ID_PS` in the SBR
+/// payload).
+///
+/// Honoured parameters:
+///
+/// * `sample_rate` (default 44 100) — the SBR **output** rate; its
+///   half must be a Table 1.18 ADTS rate (so 16 000 … 96 000 Hz).
+/// * `channels` — must be 2 (or unset).
+/// * `bit_rate` (default 32 kbps) — the total target for the pair.
+/// * `sample_format` — must be [`SampleFormat::S16`] (or unset).
+///
+/// Packets carry 2048 stereo samples of the output rate each; the
+/// advertised extradata is the backward-compatible HE-AAC v2 ASC
+/// (`sbrPresentFlag` + `psPresentFlag`).
+pub fn make_he_aac_v2_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let sample_rate = params.sample_rate.unwrap_or(44_100);
+    let channels = params.channels.unwrap_or(2);
+    if let Some(fmt) = params.sample_format {
+        if fmt != SampleFormat::S16 {
+            return Err(Error::unsupported(
+                "oxideav-aac encoder accepts interleaved S16 input only",
+            ));
+        }
+    }
+    if channels != 2 {
+        return Err(Error::unsupported(
+            "oxideav-aac HE-AAC v2 encoder codes a stereo input",
+        ));
+    }
+    let bitrate = params
+        .bit_rate
+        .map(|b| b.min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(DEFAULT_HE_V2_BITRATE);
+    let stream = HeAacEncoder::new(HeAacConfig::new_v2(sample_rate, bitrate))
+        .map_err(|e| Error::invalid(format!("oxideav-aac HE-AAC v2 encoder config: {e}")))?;
+
+    let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    out_params.sample_rate = Some(sample_rate);
+    out_params.channels = Some(2);
+    out_params.sample_format = Some(SampleFormat::S16);
+    out_params.bit_rate = Some(u64::from(bitrate));
+    out_params.extradata = stream.audio_specific_config(false);
+
+    Ok(Box::new(HeAacPacketEncoder {
+        codec_id: CodecId::new(CODEC_ID_STR),
+        out_params,
+        stream,
+        time_base: TimeBase::new(1, i64::from(sample_rate)),
+        pending_pcm: Vec::new(),
+        packets: VecDeque::new(),
+        samples_emitted: 0,
+        flushed: false,
+    }))
+}
 
 /// Frame-to-packet adaptor wrapping [`HeAacEncoder`] in the framework
 /// [`Encoder`] trait (2048-sample hops at the output rate).
@@ -563,6 +642,58 @@ mod tests {
         assert!(make_he_aac_encoder(&params(44_100, 3, None)).is_err());
         assert!(make_he_aac_encoder(&params(12_000, 1, None)).is_err());
         assert!(make_he_aac_encoder(&params(16_000, 1, None)).is_ok());
+    }
+
+    #[test]
+    fn he_v2_profile_via_extradata_and_direct_factory() {
+        let mut p = params(48_000, 2, Some(40_000));
+        let mut enc = make_he_aac_v2_encoder(&p).unwrap();
+        assert_eq!(enc.output_params().channels, Some(2));
+        let extradata = enc.output_params().extradata.clone();
+        let (asc, _) = crate::asc::AudioSpecificConfig::parse(&extradata).unwrap();
+        assert!(asc.ps_present);
+        assert_eq!(asc.channel_configuration, 1);
+        enc.send_frame(&tone_frame(2 * crate::he_aac_encoder::HE_FRAME_LEN, 2))
+            .unwrap();
+        enc.flush().unwrap();
+        let mut stream_bytes = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => {
+                    assert_eq!(pkt.duration, Some(2048));
+                    stream_bytes.extend_from_slice(&pkt.data);
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        let (h, _) = crate::adts::AdtsHeader::parse(&stream_bytes).unwrap();
+        assert_eq!(h.sample_rate(), 24_000);
+        assert_eq!(h.channel_configuration, 1);
+        let mut dec = crate::decode::StreamDecoder::new();
+        let frames = dec.decode_all(&stream_bytes).unwrap();
+        assert!(frames
+            .iter()
+            .all(|f| f.sample_rate == 48_000 && f.channels == 2));
+
+        // The generic factory dispatches on the PS-signalling ASC
+        // (both forms).
+        p.extradata = extradata;
+        let enc2 = make_encoder(&p).unwrap();
+        assert_eq!(enc2.output_params().channels, Some(2));
+        let mut hier = params(48_000, 2, None);
+        hier.extradata = crate::asc_writer::he_aac_v2_asc(24_000, 48_000, true);
+        assert!(make_encoder(&hier).is_ok());
+        // Unset channels default to the stereo pair.
+        let mut unset = params(48_000, 2, None);
+        unset.channels = None;
+        unset.extradata = crate::asc_writer::he_aac_v2_asc(24_000, 48_000, false);
+        assert_eq!(
+            make_encoder(&unset).unwrap().output_params().channels,
+            Some(2)
+        );
+        // Mono input has nothing to pan.
+        assert!(make_he_aac_v2_encoder(&params(48_000, 1, None)).is_err());
     }
 
     #[test]

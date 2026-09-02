@@ -17,6 +17,11 @@
 //!   `extensionSamplingFrequencyIndex`, then the core
 //!   `audioObjectType = 2` and its `GASpecificConfig()`.
 //!
+//! and the two HE-AAC v2 forms of §1.6.6 ([`he_aac_v2_asc`]): the
+//! backward-compatible SBR trailer followed by `syncExtensionType
+//! 0x548` + `psPresentFlag`, or the hierarchical `audioObjectType =
+//! 29` wrapper.
+//!
 //! Every writer pads to a whole byte with zero bits (the ASC is carried
 //! as bytes in MP4 `esds` / LATM `StreamMuxConfig`).
 
@@ -98,10 +103,94 @@ pub fn he_aac_v1_asc(
     w.finish()
 }
 
+/// The HE-AAC v2 `AudioSpecificConfig` (§1.6.6): a single-channel
+/// AAC-LC core at `core_rate`, SBR output at `sbr_rate` and the
+/// parametric stereo tool, in the backward-compatible form
+/// (`hierarchical == false`: the AAC-LC ASC, the `0x2b7` SBR trailer
+/// with `sbrPresentFlag = 1`, then `syncExtensionType 0x548` +
+/// `psPresentFlag = 1` — 49 bits) or the hierarchical form
+/// (`audioObjectType = 29` up front, `extensionSamplingFrequencyIndex`,
+/// the core `audioObjectType = 2` — 25 bits; the form LATM with
+/// `audioMuxVersion == 0` requires, since it conveys no ASC length).
+///
+/// `channelConfiguration` is always 1: it describes the underlying
+/// AAC stream, the PS tool producing the two output channels.
+pub fn he_aac_v2_asc(core_rate: u32, sbr_rate: u32, hierarchical: bool) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    if hierarchical {
+        write_aot(&mut w, 29);
+        write_sampling_frequency(&mut w, core_rate);
+        w.write_u32(1, 4);
+        write_sampling_frequency(&mut w, sbr_rate);
+        write_aot(&mut w, 2);
+        write_ga_specific_config(&mut w);
+    } else {
+        write_aot(&mut w, 2);
+        write_sampling_frequency(&mut w, core_rate);
+        w.write_u32(1, 4);
+        write_ga_specific_config(&mut w);
+        w.write_u32(u32::from(crate::asc::SYNC_EXTENSION_TYPE_SBR), 11);
+        write_aot(&mut w, 5);
+        w.write_bit(true); // sbrPresentFlag
+        write_sampling_frequency(&mut w, sbr_rate);
+        w.write_u32(u32::from(crate::asc::SYNC_EXTENSION_TYPE_PS), 11);
+        w.write_bit(true); // psPresentFlag
+    }
+    w.align_to_byte_zero();
+    w.finish()
+}
+
+/// The exact syntax bit count of an ASC this module writes (for
+/// length-prefixed carriers such as [`crate::latm_writer`]): the rates
+/// must be Table 1.18 indices (an escaped rate adds 24 bits each).
+#[must_use]
+pub fn asc_bits(sbr: bool, ps: bool, hierarchical: bool) -> u32 {
+    match (sbr, ps, hierarchical) {
+        (false, _, _) => 16,
+        (true, _, true) => 25,
+        (true, false, false) => 37,
+        (true, true, false) => 49,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::asc::AudioSpecificConfig;
+
+    #[test]
+    fn he_aac_v2_ascs_signal_ps_both_ways() {
+        // Backward compatible: AAC-LC + SBR trailer + PS trailer.
+        let bytes = he_aac_v2_asc(24_000, 48_000, false);
+        assert_eq!(bytes.len(), 7);
+        let (asc, _) = AudioSpecificConfig::parse(&bytes).unwrap();
+        assert_eq!(asc.outer_aot, 2);
+        assert_eq!(asc.aot, 2);
+        assert_eq!(asc.channel_configuration, 1);
+        assert_eq!(asc.sample_rate, 24_000);
+        let probe = asc.trailing_sbr_probe.expect("0x2b7 trailer");
+        assert!(probe.sbr_present_flag);
+        assert_eq!(probe.extension_sample_rate, Some(48_000));
+        assert_eq!(probe.ps_present_flag, Some(true));
+        assert!(asc.ps_present);
+        // Hierarchical: AOT 29 wrapper.
+        let bytes = he_aac_v2_asc(22_050, 44_100, true);
+        assert_eq!(bytes.len(), 4);
+        let (asc, _) = AudioSpecificConfig::parse(&bytes).unwrap();
+        assert_eq!(asc.outer_aot, 29);
+        assert_eq!(asc.aot, 2);
+        assert!(asc.sbr_present);
+        assert!(asc.ps_present);
+        assert_eq!(asc.sample_rate, 22_050);
+        assert_eq!(asc.extension_sample_rate, Some(44_100));
+        assert_eq!(asc.channel_configuration, 1);
+        // Bit counts.
+        assert_eq!(asc_bits(false, false, false), 16);
+        assert_eq!(asc_bits(true, false, true), 25);
+        assert_eq!(asc_bits(true, false, false), 37);
+        assert_eq!(asc_bits(true, true, false), 49);
+        assert_eq!(asc_bits(true, true, true), 25);
+    }
 
     #[test]
     fn aac_lc_asc_is_the_canonical_two_bytes() {

@@ -148,6 +148,24 @@ const ICC_TOL: f64 = 0.25;
 /// Bands quieter than this fraction of the frame's loudest band are
 /// ignored by the region-similarity test.
 const QUIET_BAND_RATIO: f64 = 1e-3;
+/// Estimation-noise scaling of the tolerances: a region of `N`
+/// complex samples measures a level difference to roughly
+/// `6.1/√N` dB and a coherence to `1/√N` (one sigma); the
+/// tolerances widen to three sigma so a narrow band's sub-frame
+/// estimates (one hybrid channel × 8 slots) do not elect envelopes
+/// on noise alone.
+const NOISE_SIGMAS: f64 = 3.0;
+/// Cross-frame smoothing of the whole-frame excitations for narrow
+/// bands: `λ = clamp(1 − N/192, 0, 0.7)` on the previous frame's
+/// smoothed value — a one-channel band (N = 32) averages over about
+/// two frames, bands of six or more channels are not smoothed.
+const SMOOTH_SAMPLES: f64 = 192.0;
+const SMOOTH_MAX: f64 = 0.7;
+/// IPD/OPD are only transmitted for bands whose magnitude coherence
+/// reaches this: below it the angle of `e_R` is noise, and a random
+/// per-band rotation costs bits and disturbs the neighbouring bands'
+/// alias cancellation in the synthesis bank.
+const PHASE_MIN_COHERENCE: f64 = 0.6;
 
 /// One encoded frame with its diagnostics.
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +202,8 @@ pub struct PsEncoder {
     frames: u64,
     /// The decoder's cross-frame differential state, mirrored.
     state: PsIndexState,
+    /// The previous frame's smoothed whole-frame excitations.
+    prev_whole: Option<Vec<BandStats>>,
 }
 
 impl PsEncoder {
@@ -196,6 +216,7 @@ impl PsEncoder {
             analysis: PsAnalysis::new(hybrid_config_for(cfg.bands.count())),
             frames: 0,
             state: PsIndexState::default(),
+            prev_whole: None,
         })
     }
 
@@ -249,6 +270,7 @@ impl PsEncoder {
         // Parameter positions.
         let energies = slot_energies(&hyb);
         let whole = band_stats(&hyb, n_pars, 0, NUM_QMF_SLOTS - 1)?;
+        let channels = band_channels(n_pars)?;
         let attack = detect_attack(&energies);
         let mut transient = None;
         // (estimation region lo, hi, parameter position n_e).
@@ -256,10 +278,19 @@ impl PsEncoder {
             Some(t) if self.cfg.variable_borders => {
                 let pre = band_stats(&hyb, n_pars, 0, t - 1)?;
                 let post = band_stats(&hyb, n_pars, t, NUM_QMF_SLOTS - 1)?;
-                if cues_close(&pre, &post, self.cfg.phase) {
+                let n_pre: Vec<usize> = channels.iter().map(|&c| c * t).collect();
+                let n_post: Vec<usize> =
+                    channels.iter().map(|&c| c * (NUM_QMF_SLOTS - t)).collect();
+                if cues_close(&pre, &post, &n_pre, &n_post, self.cfg.phase) {
                     (
                         false,
-                        fixed_regions(elect_fixed(&hyb, n_pars, &whole, self.cfg.phase)?),
+                        fixed_regions(elect_fixed(
+                            &hyb,
+                            n_pars,
+                            &whole,
+                            &channels,
+                            self.cfg.phase,
+                        )?),
                     )
                 } else {
                     transient = Some(t);
@@ -279,10 +310,38 @@ impl PsEncoder {
             }
             _ => (
                 false,
-                fixed_regions(elect_fixed(&hyb, n_pars, &whole, self.cfg.phase)?),
+                fixed_regions(elect_fixed(
+                    &hyb,
+                    n_pars,
+                    &whole,
+                    &channels,
+                    self.cfg.phase,
+                )?),
             ),
         };
         let borders: Vec<usize> = regions.iter().map(|&(_, _, n_e)| n_e).collect();
+
+        // Cross-frame smoothing of the whole-frame estimate (narrow
+        // bands only); an attack frame restarts the history.
+        let smoothed: Vec<BandStats> = match (&self.prev_whole, transient) {
+            (Some(prev), None) => whole
+                .iter()
+                .zip(prev.iter())
+                .zip(channels.iter())
+                .map(|((cur, old), &c)| {
+                    let n = (c * NUM_QMF_SLOTS) as f64;
+                    let lambda = (1.0 - n / SMOOTH_SAMPLES).clamp(0.0, SMOOTH_MAX);
+                    BandStats {
+                        el: cur.el + lambda * old.el,
+                        er: cur.er + lambda * old.er,
+                        e_lr: cur.e_lr + old.e_lr * lambda,
+                        e_lm: cur.e_lm + old.e_lm * lambda,
+                    }
+                })
+                .collect(),
+            _ => whole.clone(),
+        };
+        self.prev_whole = Some(smoothed.clone());
 
         // Estimation + quantisation per envelope.
         let mut stats = Vec::with_capacity(regions.len());
@@ -293,7 +352,7 @@ impl PsEncoder {
         let nr_phase = self.ps_config.nr_ipdopd_par();
         for &(lo, hi, _) in &regions {
             let st = if (lo, hi) == (0, NUM_QMF_SLOTS - 1) {
-                whole.clone()
+                smoothed.clone()
             } else {
                 band_stats(&hyb, n_pars, lo, hi)?
             };
@@ -316,16 +375,25 @@ impl PsEncoder {
                 );
             }
             if self.cfg.phase {
+                // Phases only where the coherence makes them
+                // meaningful; index 0 elsewhere.
+                let gate = |s: &BandStats, angle: f64| {
+                    if s.icc_magnitude() >= PHASE_MIN_COHERENCE {
+                        quantise_phase(angle)
+                    } else {
+                        0
+                    }
+                };
                 ipd_abs.push(
                     st.iter()
                         .take(nr_phase)
-                        .map(|s| quantise_phase(s.ipd()))
+                        .map(|s| gate(s, s.ipd()))
                         .collect::<Vec<i32>>(),
                 );
                 opd_abs.push(
                     st.iter()
                         .take(nr_phase)
-                        .map(|s| quantise_phase(s.opd()))
+                        .map(|s| gate(s, s.opd()))
                         .collect::<Vec<i32>>(),
                 );
             }
@@ -446,57 +514,83 @@ fn fixed_regions(n: usize) -> Vec<(usize, usize, usize)> {
         .collect()
 }
 
+/// Hybrid channels summed per stereo band (the Table 8.C.2 / 8.C.3
+/// range widths) — the per-slot sample count of each band's estimate.
+fn band_channels(n_pars: usize) -> Result<Vec<usize>> {
+    Ok(crate::ps_analysis::estimation_ranges(n_pars)?
+        .iter()
+        .map(|&(lo, hi)| hi - lo + 1)
+        .collect())
+}
+
 /// Elect 1, 2 or 4 fixed envelopes from how far the quarter-frame cues
-/// stray from the coarser estimates.
+/// stray from the coarser estimates (beyond their estimation noise).
 fn elect_fixed(
     hyb: &crate::ps_analysis::HybridStereo,
     n_pars: usize,
     whole: &[BandStats],
+    channels: &[usize],
     phase: bool,
 ) -> Result<usize> {
+    let samples = |slots: usize| -> Vec<usize> { channels.iter().map(|&c| c * slots).collect() };
+    let n_whole = samples(NUM_QMF_SLOTS);
+    let n_half = samples(NUM_QMF_SLOTS / 2);
+    let n_quarter = samples(NUM_QMF_SLOTS / 4);
     let quarters: Vec<Vec<BandStats>> = fixed_regions(4)
         .into_iter()
         .map(|(lo, hi, _)| band_stats(hyb, n_pars, lo, hi))
         .collect::<Result<_>>()?;
-    if quarters.iter().all(|q| cues_close(q, whole, phase)) {
+    if quarters
+        .iter()
+        .all(|q| cues_close(q, whole, &n_quarter, &n_whole, phase))
+    {
         return Ok(1);
     }
     let halves: Vec<Vec<BandStats>> = fixed_regions(2)
         .into_iter()
         .map(|(lo, hi, _)| band_stats(hyb, n_pars, lo, hi))
         .collect::<Result<_>>()?;
-    let two = cues_close(&quarters[0], &halves[0], phase)
-        && cues_close(&quarters[1], &halves[0], phase)
-        && cues_close(&quarters[2], &halves[1], phase)
-        && cues_close(&quarters[3], &halves[1], phase);
+    let two = cues_close(&quarters[0], &halves[0], &n_quarter, &n_half, phase)
+        && cues_close(&quarters[1], &halves[0], &n_quarter, &n_half, phase)
+        && cues_close(&quarters[2], &halves[1], &n_quarter, &n_half, phase)
+        && cues_close(&quarters[3], &halves[1], &n_quarter, &n_half, phase);
     Ok(if two { 2 } else { 4 })
 }
 
-/// Whether two regions' cues agree within one quantiser step in every
-/// band that carries energy (relative to the loudest band of either).
-fn cues_close(a: &[BandStats], b: &[BandStats], phase: bool) -> bool {
+/// Whether two regions' cues agree within one quantiser step plus
+/// their estimation noise (`n_a` / `n_b` complex samples per band) in
+/// every band that carries energy (relative to the loudest band of
+/// either).
+fn cues_close(a: &[BandStats], b: &[BandStats], n_a: &[usize], n_b: &[usize], phase: bool) -> bool {
     let peak = a
         .iter()
         .chain(b.iter())
         .map(BandStats::energy)
         .fold(0.0f64, f64::max);
     let floor = peak * QUIET_BAND_RATIO;
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        if x.energy() < floor && y.energy() < floor {
-            return true;
-        }
-        let icc_x = if phase {
-            x.icc_magnitude()
-        } else {
-            x.icc_real()
-        };
-        let icc_y = if phase {
-            y.icc_magnitude()
-        } else {
-            y.icc_real()
-        };
-        (x.iid_db() - y.iid_db()).abs() <= IID_TOL_DB && (icc_x - icc_y).abs() <= ICC_TOL
-    })
+    a.iter()
+        .zip(b.iter())
+        .zip(n_a.iter().zip(n_b.iter()))
+        .all(|((x, y), (&na, &nb))| {
+            if x.energy() < floor && y.energy() < floor {
+                return true;
+            }
+            // Noise of the *difference* of two independent estimates.
+            let inv_n = 1.0 / na.max(1) as f64 + 1.0 / nb.max(1) as f64;
+            let iid_tol = IID_TOL_DB + NOISE_SIGMAS * 6.1 * inv_n.sqrt();
+            let icc_tol = ICC_TOL + NOISE_SIGMAS * inv_n.sqrt();
+            let icc_x = if phase {
+                x.icc_magnitude()
+            } else {
+                x.icc_real()
+            };
+            let icc_y = if phase {
+                y.icc_magnitude()
+            } else {
+                y.icc_real()
+            };
+            (x.iid_db() - y.iid_db()).abs() <= iid_tol && (icc_x - icc_y).abs() <= icc_tol
+        })
 }
 
 /// Annex 8.C.6.3 — nearest Table 8.25 / 8.26 index.
@@ -722,7 +816,8 @@ mod tests {
                 for f in 0..7u64 {
                     let a = noise(100 + f);
                     let b = noise(200 + f);
-                    let g = 0.2 + 0.15 * f as f64;
+                    // Cues drift over the first frames, then settle.
+                    let g = 0.2 + 0.15 * f.min(3) as f64;
                     let rot = Complex::new((0.4 * f as f64).cos(), (0.4 * f as f64).sin());
                     let l = frame(|n, k| a(n, k) + b(n, k) * 0.3);
                     let r = frame(|n, k| (a(n, k) * g + b(n, k) * 0.7) * rot);
@@ -737,13 +832,18 @@ mod tests {
                         idx, fr.indices,
                         "{bands:?} fine={fine} phase={phase} frame {f}"
                     );
-                    saw_time |= fr.data.iid_dt.iter().any(|&d| d);
+                    // Either the time direction won a row, or the
+                    // whole set repeated and became a hold element.
+                    saw_time |= fr.data.iid_dt.iter().any(|&d| d) || fr.data.num_env == 0;
                     assert_eq!(fr.data.enable_ipdopd, phase);
                     if phase && fr.data.num_env > 0 {
                         assert_eq!(fr.indices.ipd[0].len(), cfg.ps_config().nr_ipdopd_par());
                     }
                 }
-                assert!(saw_time, "{bands:?}: time coding never elected");
+                assert!(
+                    saw_time,
+                    "{bands:?}: neither time coding nor a hold elected"
+                );
             }
         }
     }

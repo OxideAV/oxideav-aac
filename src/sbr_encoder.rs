@@ -64,7 +64,7 @@
 //! analysis and slices this window per frame.
 
 use crate::raw_data_block::IdSynEle;
-use crate::sbr_element::{SbrChannel, SbrElement};
+use crate::sbr_element::{SbrChannel, SbrElement, SbrExtension};
 use crate::sbr_envelope::{SbrEnvelopeData, SbrNoiseData};
 use crate::sbr_freq_bands::{k0, k2, master_table, HiLoTables};
 use crate::sbr_grid::{FrameClass, SbrDtdf, SbrGrid, SbrInvf};
@@ -456,14 +456,33 @@ impl SbrEncoder {
         k.min(31)
     }
 
+    /// Whether the next [`encode_frame`](Self::encode_frame) transmits
+    /// `sbr_header()` (every [`SbrEncoderConfig::header_interval`]
+    /// frames, and always the first).
+    #[must_use]
+    pub fn next_header_due(&self) -> bool {
+        self.frames % u64::from(self.cfg.header_interval.max(1)) == 0
+    }
+
     /// Encode one frame. `x[ch]` holds [`SBR_ENC_COLS`] analysis
     /// columns per channel (see the module docs for the alignment).
     pub fn encode_frame(&mut self, x: &[&[[Complex; 64]]]) -> Result<SbrFrame> {
+        self.encode_frame_with_extension(x, None)
+    }
+
+    /// [`encode_frame`](Self::encode_frame) with an `sbr_extension()`
+    /// payload carried in the element's extended-data block (Tables
+    /// 4.65 / 4.66 `bs_extended_data`) — the Annex 8.A carriage of
+    /// `ps_data()` under `EXTENSION_ID_PS`.
+    pub fn encode_frame_with_extension(
+        &mut self,
+        x: &[&[[Complex; 64]]],
+        extension: Option<SbrExtension>,
+    ) -> Result<SbrFrame> {
         if x.len() != self.cfg.channels || x.iter().any(|c| c.len() < SBR_ENC_COLS) {
             return Err(Error::SbrQmfInvalid);
         }
-        let interval = self.cfg.header_interval.max(1) as u64;
-        let header_sent = self.frames % interval == 0;
+        let header_sent = self.next_header_due();
         let reset = self.frames == 0;
         let id_aac = if self.cfg.channels == 1 {
             IdSynEle::Sce
@@ -488,7 +507,7 @@ impl SbrEncoder {
         let element = SbrElement {
             coupling,
             channels,
-            extension: None,
+            extension,
         };
         let payload = build_extension_payload(
             id_aac,

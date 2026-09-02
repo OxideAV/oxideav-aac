@@ -39,21 +39,52 @@
 //! measure it (about 1.1 hops at the output rate) rather than assume
 //! it.
 //!
+//! ## HE-AAC v2 (parametric stereo)
+//!
+//! With [`HeAacConfig::parametric_stereo`] a stereo input is coded as
+//! **one** SCE plus the Annex 8.A `ps_data()` extension inside the SBR
+//! payload (`bs_extension_id = EXTENSION_ID_PS`):
+//!
+//! * both channels run through their own 64-band analysis banks; the
+//!   mono downmix is formed in the QMF domain as
+//!   `m = g_k · (l + r) / 2` (Annex 8.C.6.1) with a per-QMF-band gain
+//!   `g_k = √((e_l + e_r) / (2·e_m))` re-establishing the pair's
+//!   energy the decoder's energy-preserving §8.6.4.6 mixing expects
+//!   (a plain `(l + r)/2` loses 3 dB on incoherent and everything on
+//!   anti-phase content; the gain is capped at +12 dB and
+//!   interpolated across the hop), then re-synthesised through the
+//!   §4.6.18.4.2 bank into a time signal for the mono HE-AAC v1 path;
+//! * the analysis→synthesis pair delays that signal by [`QMF_PAIR_DELAY`]
+//!   samples; a further [`PS_MONO_PAD`] makes the total lag from the
+//!   stereo analysis to the mono path's analysis exactly
+//!   [`PS_ALIGN_COLS`] QMF columns, so the [`crate::ps_encoder`]
+//!   sees the same `Xinput` slots (Annex 8.A.3: frame slots `0..32`
+//!   plus 6 look-ahead) the decoder will hand its PS tool for this
+//!   frame's core block;
+//! * the PS header rides on the SBR header cadence, and the ADTS
+//!   signalling stays implicit (`channel_configuration = 1`, the
+//!   decoder detects `EXTENSION_ID_PS`); explicit signalling is the
+//!   §1.6.6 `psPresentFlag` trailer or the hierarchical AOT-29 ASC.
+//!
 //! ## Explicit signalling
 //!
 //! [`HeAacEncoder::audio_specific_config`] returns the Table 1.15
 //! `AudioSpecificConfig` for MP4 / LATM carriage in either the
 //! backward-compatible form (AAC-LC + trailing `syncExtensionType
-//! 0x2b7` SBR extension) or the hierarchical form
-//! (`audioObjectType = 5`); [`crate::latm_writer`] wraps the ADTS
-//! payloads into LOAS/LATM with that configuration.
+//! 0x2b7` SBR extension, + the `0x548` PS trailer for HE-AAC v2) or
+//! the hierarchical form (`audioObjectType = 5`, or `29` with PS);
+//! [`crate::latm_writer`] wraps the ADTS payloads into LOAS/LATM with
+//! that configuration.
 
 use std::collections::VecDeque;
 
 use crate::adts::ADTS_SAMPLE_RATES_HZ;
 use crate::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use crate::ps_encoder::{PsEncoder, PsEncoderConfig, PsFrame};
+use crate::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
+use crate::sbr_element::{SbrExtension, EXTENSION_ID_PS};
 use crate::sbr_encoder::{SbrEncoder, SbrEncoderConfig, SbrFrame, RATE, SBR_ENC_COLS, T_HF_GEN};
-use crate::sbr_qmf::{Complex, EncoderAnalysisQmf};
+use crate::sbr_qmf::{Complex, EncoderAnalysisQmf, SynthesisQmf};
 use crate::{Error, Result};
 
 /// Full-rate samples per encoder hop per channel (`2 × 1024`).
@@ -66,6 +97,23 @@ pub const FIR_TAPS: usize = 65;
 
 /// The FIR group delay in full-rate samples.
 pub const FIR_DELAY: usize = (FIR_TAPS - 1) / 2;
+
+/// Delay of the 64-band analysis → synthesis QMF pair
+/// ([`EncoderAnalysisQmf`] into [`SynthesisQmf`]) in samples — nine
+/// columns, measured on the pair (near-perfect reconstruction).
+pub const QMF_PAIR_DELAY: usize = 576;
+
+/// Extra delay on the PS downmix so that `FIR_DELAY + QMF_PAIR_DELAY
+/// + PS_MONO_PAD` is a whole number of QMF columns.
+pub const PS_MONO_PAD: usize = 64 - (FIR_DELAY + QMF_PAIR_DELAY) % 64;
+
+/// The mono path's analysis column `j` covers the same input samples
+/// as the stereo analysis column `j − PS_ALIGN_COLS`.
+pub const PS_ALIGN_COLS: usize = (FIR_DELAY + QMF_PAIR_DELAY + PS_MONO_PAD) / 64;
+
+/// Cap on the PS downmix gain (`+12 dB`): anti-phase content whose
+/// sum cancels is not boosted without bound.
+const PS_DOWNMIX_GAIN_MAX: f64 = 4.0;
 
 /// Configuration for [`HeAacEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,6 +140,11 @@ pub struct HeAacConfig {
     /// `bs_interpol_freq` — see
     /// [`crate::sbr_encoder::SbrEncoderConfig::interpol_freq`].
     pub interpol_freq: bool,
+    /// Code a stereo input as HE-AAC v2: one SCE plus the parametric
+    /// stereo tool (requires `channels == 2`).
+    pub parametric_stereo: bool,
+    /// The PS encoder's configuration (used when `parametric_stereo`).
+    pub ps: PsEncoderConfig,
 }
 
 impl HeAacConfig {
@@ -110,6 +163,28 @@ impl HeAacConfig {
             coupling: false,
             header_interval: 8,
             interpol_freq: true,
+            parametric_stereo: false,
+            ps: PsEncoderConfig::default(),
+        }
+    }
+
+    /// An HE-AAC v2 configuration: stereo input at `sample_rate`,
+    /// `bitrate` for the whole stream (mono core + SBR + PS), the
+    /// default [`PsEncoderConfig`].
+    pub fn new_v2(sample_rate: u32, bitrate: u32) -> Self {
+        HeAacConfig {
+            parametric_stereo: true,
+            ..HeAacConfig::new(sample_rate, 2, bitrate)
+        }
+    }
+
+    /// Channels the core coder and SBR tool carry: 1 under parametric
+    /// stereo, else the input channel count.
+    pub fn core_channels(&self) -> u8 {
+        if self.parametric_stereo {
+            1
+        } else {
+            self.channels
         }
     }
 
@@ -121,7 +196,7 @@ impl HeAacConfig {
     pub fn crossover(&self) -> f64 {
         let fs = f64::from(self.sample_rate);
         self.crossover_hz.unwrap_or_else(|| {
-            let per_ch = f64::from(self.bitrate) / f64::from(self.channels.max(1));
+            let per_ch = f64::from(self.bitrate) / f64::from(self.core_channels().max(1));
             (0.115 * fs * (per_ch / 24_000.0).sqrt()).clamp(0.09 * fs, 0.22 * fs)
         })
     }
@@ -192,7 +267,121 @@ impl ChannelFrontEnd {
     }
 }
 
-/// The HE-AAC v1 (AAC-LC + SBR) streaming encoder.
+/// Stereo analysis columns kept for the PS encoder: the frame's
+/// `Xinput` starts `PS_ALIGN_COLS + 70` columns behind the newest.
+const PS_RING_COLS: usize = 96;
+
+/// The HE-AAC v2 front end: stereo analysis, QMF-domain downmix and
+/// the parametric stereo encoder.
+#[derive(Debug, Clone)]
+struct PsFrontEnd {
+    bank_l: EncoderAnalysisQmf,
+    bank_r: EncoderAnalysisQmf,
+    cols_l: VecDeque<[Complex; 64]>,
+    cols_r: VecDeque<[Complex; 64]>,
+    synth: SynthesisQmf,
+    /// The previous hop's per-band downmix gains (interpolation start).
+    gains: [f64; 64],
+    /// The last `PS_MONO_PAD` downmix samples not yet released.
+    pad: Vec<f64>,
+    enc: PsEncoder,
+}
+
+impl PsFrontEnd {
+    fn new(cfg: PsEncoderConfig) -> Result<Self> {
+        let mut cols_l = VecDeque::with_capacity(PS_RING_COLS + 32);
+        let mut cols_r = VecDeque::with_capacity(PS_RING_COLS + 32);
+        for _ in 0..PS_RING_COLS {
+            cols_l.push_back([Complex::default(); 64]);
+            cols_r.push_back([Complex::default(); 64]);
+        }
+        Ok(PsFrontEnd {
+            bank_l: EncoderAnalysisQmf::new(),
+            bank_r: EncoderAnalysisQmf::new(),
+            cols_l,
+            cols_r,
+            synth: SynthesisQmf::new(),
+            gains: [1.0; 64],
+            pad: vec![0.0; PS_MONO_PAD],
+            enc: PsEncoder::new(cfg)?,
+        })
+    }
+
+    /// Analyse one stereo hop, push its columns, and return the
+    /// energy-preserving mono downmix hop (delayed by
+    /// `QMF_PAIR_DELAY + PS_MONO_PAD`).
+    fn downmix_hop(&mut self, l: &[f64], r: &[f64]) -> Result<Vec<f64>> {
+        let slots = l.len() / 64;
+        let mut lc = Vec::with_capacity(slots);
+        let mut rc = Vec::with_capacity(slots);
+        let mut el = [0.0f64; 64];
+        let mut er = [0.0f64; 64];
+        let mut em = [0.0f64; 64];
+        for s in 0..slots {
+            let xl = self.bank_l.push_slot(&l[64 * s..64 * s + 64])?;
+            let xr = self.bank_r.push_slot(&r[64 * s..64 * s + 64])?;
+            for k in 0..64 {
+                el[k] += xl[k].norm_sqr();
+                er[k] += xr[k].norm_sqr();
+                em[k] += ((xl[k] + xr[k]) * 0.5).norm_sqr();
+            }
+            lc.push(xl);
+            rc.push(xr);
+        }
+        // Annex 8.C.6.1 downmix with the per-band energy restoration
+        // (√((e_l + e_r)/(2·e_m)), ≥ 1 by construction, capped).
+        let mut g_new = [1.0f64; 64];
+        for k in 0..64 {
+            let pair = el[k] + er[k];
+            if pair > 1e-9 {
+                g_new[k] = (pair / (2.0 * em[k] + 1e-12))
+                    .sqrt()
+                    .clamp(1.0, PS_DOWNMIX_GAIN_MAX);
+            }
+        }
+        let mut mono = Vec::with_capacity(PS_MONO_PAD + l.len());
+        mono.extend_from_slice(&self.pad);
+        let mut bands = [Complex::default(); 64];
+        for s in 0..slots {
+            let t = (s + 1) as f64 / slots as f64;
+            for k in 0..64 {
+                let g = self.gains[k] + (g_new[k] - self.gains[k]) * t;
+                bands[k] = (lc[s][k] + rc[s][k]) * (0.5 * g);
+            }
+            mono.extend_from_slice(&self.synth.push_slot(&bands)?);
+        }
+        self.gains = g_new;
+        let keep = mono.len() - PS_MONO_PAD;
+        self.pad.clear();
+        self.pad.extend_from_slice(&mono[keep..]);
+        mono.truncate(keep);
+        for (xl, xr) in lc.into_iter().zip(rc) {
+            self.cols_l.push_back(xl);
+            self.cols_r.push_back(xr);
+            if self.cols_l.len() > PS_RING_COLS {
+                self.cols_l.pop_front();
+                self.cols_r.pop_front();
+            }
+        }
+        Ok(mono)
+    }
+
+    /// The Annex 8.A.3 `Xinput` matrices of both channels for the
+    /// frame being emitted: slot `l` is mono-path window column
+    /// `l + tHFAdj`, i.e. stereo column `newest − PS_ALIGN_COLS − 70 + l`.
+    fn xinput(&self) -> (Vec<[Complex; 64]>, Vec<[Complex; 64]>) {
+        let newest = self.cols_l.len();
+        let start = newest - (PS_ALIGN_COLS + 2 * RATE * 16 + T_HF_GEN - 2);
+        let n = NUM_QMF_SLOTS + LOOKAHEAD;
+        (
+            (start..start + n).map(|i| self.cols_l[i]).collect(),
+            (start..start + n).map(|i| self.cols_r[i]).collect(),
+        )
+    }
+}
+
+/// The HE-AAC v1 (AAC-LC + SBR) / v2 (+ parametric stereo) streaming
+/// encoder.
 #[derive(Debug, Clone)]
 pub struct HeAacEncoder {
     config: HeAacConfig,
@@ -200,9 +389,12 @@ pub struct HeAacEncoder {
     sbr: SbrEncoder,
     fir: Vec<f64>,
     fe: Vec<ChannelFrontEnd>,
+    ps: Option<PsFrontEnd>,
     frames: u64,
     /// The last SBR frame's diagnostics.
     last_sbr: Option<SbrFrame>,
+    /// The last PS frame's diagnostics.
+    last_ps: Option<PsFrame>,
 }
 
 impl HeAacEncoder {
@@ -210,9 +402,12 @@ impl HeAacEncoder {
     ///
     /// Errors with [`Error::EncoderInvalidConfig`] when the rate has no
     /// half-rate ADTS core / SBR table, the channel count is not 1 or
-    /// 2, or the bitrate is 0.
+    /// 2 (exactly 2 under `parametric_stereo`), or the bitrate is 0.
     pub fn new(config: HeAacConfig) -> Result<Self> {
         if !(1..=2).contains(&config.channels) || config.bitrate == 0 {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        if config.parametric_stereo && config.channels != 2 {
             return Err(Error::EncoderInvalidConfig);
         }
         if config.sample_rate % 2 != 0 {
@@ -224,7 +419,7 @@ impl HeAacEncoder {
         }
         let mut sbr_cfg = SbrEncoderConfig::new(
             config.sample_rate,
-            usize::from(config.channels),
+            usize::from(config.core_channels()),
             config.crossover(),
             config.stop_hz(),
         )?;
@@ -243,18 +438,25 @@ impl HeAacEncoder {
         let fir = design_lowpass(xo_hz / fs);
         let core = StreamEncoder::new(EncoderConfig {
             sample_rate: core_rate,
-            channels: config.channels,
+            channels: config.core_channels(),
             bitrate: config.bitrate,
         })?;
-        let n = usize::from(config.channels);
+        let n = usize::from(config.core_channels());
+        let ps = if config.parametric_stereo {
+            Some(PsFrontEnd::new(config.ps)?)
+        } else {
+            None
+        };
         Ok(HeAacEncoder {
             config,
             core,
             sbr,
             fir,
             fe: (0..n).map(|_| ChannelFrontEnd::new()).collect(),
+            ps,
             frames: 0,
             last_sbr: None,
+            last_ps: None,
         })
     }
 
@@ -276,6 +478,17 @@ impl HeAacEncoder {
     /// Diagnostics of the most recently encoded SBR frame.
     pub fn last_sbr_frame(&self) -> Option<&SbrFrame> {
         self.last_sbr.as_ref()
+    }
+
+    /// The parametric stereo encoder (`None` unless
+    /// [`HeAacConfig::parametric_stereo`]).
+    pub fn ps(&self) -> Option<&PsEncoder> {
+        self.ps.as_ref().map(|p| &p.enc)
+    }
+
+    /// Diagnostics of the most recently encoded PS frame.
+    pub fn last_ps_frame(&self) -> Option<&PsFrame> {
+        self.last_ps.as_ref()
     }
 
     /// Run the front end over one channel's full-rate hop: returns the
@@ -347,6 +560,29 @@ impl HeAacEncoder {
     }
 
     fn encode_hops(&mut self, hops: &[Vec<f64>]) -> Result<Vec<u8>> {
+        // HE-AAC v2: stereo analysis + downmix, the mono hop feeding
+        // the v1 path below; the PS payload rides in the SBR
+        // extension of this frame.
+        let mut extension = None;
+        let mono: Vec<Vec<f64>>;
+        let hops: &[Vec<f64>] = match self.ps.as_mut() {
+            Some(ps) => {
+                if hops.len() != 2 {
+                    return Err(Error::EncoderInvalidConfig);
+                }
+                mono = vec![ps.downmix_hop(&hops[0], &hops[1])?];
+                let header = self.sbr.next_header_due();
+                let (xl, xr) = ps.xinput();
+                let ps_frame = ps.enc.encode_frame_with_header(&xl, &xr, header)?;
+                extension = Some(SbrExtension {
+                    id: EXTENSION_ID_PS,
+                    data: ps_frame.payload.clone(),
+                });
+                self.last_ps = Some(ps_frame);
+                &mono
+            }
+            None => hops,
+        };
         let ch = hops.len();
         // Front end: decimated core PCM + fresh analysis columns.
         let mut core_pcm: Vec<Vec<f64>> = Vec::with_capacity(ch);
@@ -356,7 +592,7 @@ impl HeAacEncoder {
         // SBR side info for the core block this frame decodes to.
         let windows: Vec<Vec<[Complex; 64]>> = (0..ch).map(|c| self.frame_window(c)).collect();
         let refs: Vec<&[[Complex; 64]]> = windows.iter().map(|w| w.as_slice()).collect();
-        let sbr_frame = self.sbr.encode_frame(&refs)?;
+        let sbr_frame = self.sbr.encode_frame_with_extension(&refs, extension)?;
         let fills = vec![sbr_frame.payload.clone()];
         self.last_sbr = Some(sbr_frame);
         // Core encode (interleaved S16 on the ±32768 axis).
@@ -410,12 +646,27 @@ impl HeAacEncoder {
     ///   `extensionSamplingFrequencyIndex` (the SBR rate) and the core
     ///   `audioObjectType = 2` behind it.
     pub fn audio_specific_config(&self, hierarchical: bool) -> Vec<u8> {
-        crate::asc_writer::he_aac_v1_asc(
-            self.core_sample_rate(),
-            self.config.sample_rate,
-            self.config.channels,
-            hierarchical,
-        )
+        if self.config.parametric_stereo {
+            crate::asc_writer::he_aac_v2_asc(
+                self.core_sample_rate(),
+                self.config.sample_rate,
+                hierarchical,
+            )
+        } else {
+            crate::asc_writer::he_aac_v1_asc(
+                self.core_sample_rate(),
+                self.config.sample_rate,
+                self.config.channels,
+                hierarchical,
+            )
+        }
+    }
+
+    /// The exact bit count of
+    /// [`audio_specific_config`](Self::audio_specific_config) for
+    /// length-prefixed carriers.
+    pub fn audio_specific_config_bits(&self, hierarchical: bool) -> u32 {
+        crate::asc_writer::asc_bits(true, self.config.parametric_stereo, hierarchical)
     }
 }
 
@@ -485,5 +736,88 @@ mod tests {
         assert!(frames.iter().all(|f| f.sample_rate == 44_100));
         assert!(frames.iter().all(|f| f.pcm.len() == HE_FRAME_LEN));
         assert!(enc.last_sbr_frame().is_some());
+    }
+
+    /// HE-AAC v2: a stereo input becomes a mono-core ADTS stream whose
+    /// SBR payload carries `ps_data()`; the crate's decoder renders
+    /// it as two channels at the full rate, and the v2 ASCs signal PS.
+    #[test]
+    fn parametric_stereo_frames_decode_as_stereo() {
+        assert!(HeAacEncoder::new(HeAacConfig {
+            channels: 1,
+            ..HeAacConfig::new_v2(44_100, 32_000)
+        })
+        .is_err());
+        let mut enc = HeAacEncoder::new(HeAacConfig::new_v2(44_100, 32_000)).unwrap();
+        assert_eq!(enc.config().core_channels(), 1);
+        let n = 4 * HE_FRAME_LEN;
+        let mut pcm = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            let a = 6000.0 * (0.02 * i as f64).sin();
+            let b = 3000.0 * (0.9 * i as f64).sin();
+            pcm.push((a + 0.2 * b) as i16);
+            pcm.push((0.2 * a + b) as i16);
+        }
+        let stream = enc.encode_all(&pcm).unwrap();
+        let (h, _) = crate::adts::AdtsHeader::parse(&stream).unwrap();
+        assert_eq!(h.sample_rate(), 22_050);
+        assert_eq!(h.channel_configuration, 1);
+        let ps = enc.last_ps_frame().expect("PS frame");
+        assert!(!ps.payload.is_empty());
+        assert!(enc.ps().is_some());
+        let mut dec = crate::decode::StreamDecoder::new();
+        let frames = dec.decode_all(&stream).unwrap();
+        assert_eq!(frames.len(), 5);
+        assert!(frames.iter().all(|f| f.sample_rate == 44_100));
+        assert!(frames.iter().all(|f| f.channels == 2));
+        assert!(frames.iter().all(|f| f.pcm.len() == 2 * HE_FRAME_LEN));
+        // Signalling.
+        let (asc, _) =
+            crate::asc::AudioSpecificConfig::parse(&enc.audio_specific_config(false)).unwrap();
+        assert!(asc.ps_present);
+        assert_eq!(enc.audio_specific_config_bits(false), 49);
+        let (asc, _) =
+            crate::asc::AudioSpecificConfig::parse(&enc.audio_specific_config(true)).unwrap();
+        assert_eq!(asc.outer_aot, 29);
+        assert_eq!(enc.audio_specific_config_bits(true), 25);
+    }
+
+    /// The alignment constants: the stereo→mono lag is a whole number
+    /// of columns and the QMF pair delay is what the banks measure.
+    #[test]
+    fn ps_alignment_constants_and_qmf_pair_delay() {
+        assert_eq!((FIR_DELAY + QMF_PAIR_DELAY + PS_MONO_PAD) % 64, 0);
+        assert_eq!(PS_ALIGN_COLS * 64, FIR_DELAY + QMF_PAIR_DELAY + PS_MONO_PAD);
+        // Measure the analysis → synthesis delay on a multitone.
+        let mut a = EncoderAnalysisQmf::new();
+        let mut s = SynthesisQmf::new();
+        let n = 64 * 100;
+        let input: Vec<f64> = (0..n)
+            .map(|t| {
+                (2.0 * core::f64::consts::PI * 0.013 * t as f64).sin()
+                    + 0.5 * (2.0 * core::f64::consts::PI * 0.21 * t as f64).cos()
+            })
+            .collect();
+        let mut output = Vec::new();
+        for slot in input.chunks_exact(64) {
+            let x = a.push_slot(slot).unwrap();
+            output.extend_from_slice(&s.push_slot(&x).unwrap());
+        }
+        let mut best = (f64::INFINITY, 0usize);
+        for delay in 0..1000usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for t in 1500..output.len() {
+                let e = output[t] - input[t - delay];
+                err += e * e;
+                sig += output[t] * output[t];
+            }
+            let ratio = err / sig.max(1e-30);
+            if ratio < best.0 {
+                best = (ratio, delay);
+            }
+        }
+        assert_eq!(best.1, QMF_PAIR_DELAY);
+        assert!(best.0 < 1e-3, "pair error ratio {}", best.0);
     }
 }
