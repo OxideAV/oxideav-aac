@@ -186,6 +186,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     out_params.channels = Some(channels);
     out_params.sample_format = Some(SampleFormat::S16);
     out_params.bit_rate = Some(u64::from(bitrate));
+    // Advertise the speaker set: the caller's named layout, or the
+    // 6.1 default a bare 7-channel count was mapped onto.
+    out_params.channel_layout = params
+        .channel_layout
+        .or_else(|| (channels == 7 && positions.is_some()).then_some(ChannelLayout::Surround61));
 
     Ok(Box::new(AacEncoder {
         codec_id: CodecId::new(CODEC_ID_STR),
@@ -647,7 +652,12 @@ mod tests {
             out
         };
         let mut p = params(48_000, 7, None);
-        let bytes = stream_of(make_encoder(&p).unwrap(), 7);
+        let enc7 = make_encoder(&p).unwrap();
+        assert_eq!(
+            enc7.output_params().channel_layout,
+            Some(ChannelLayout::Surround61)
+        );
+        let bytes = stream_of(enc7, 7);
         let (h, _) = crate::adts::AdtsHeader::parse(&bytes).unwrap();
         assert_eq!(h.channel_configuration, 0);
         let frames = crate::decode::StreamDecoder::new()
@@ -657,7 +667,12 @@ mod tests {
 
         p.channel_layout = Some(ChannelLayout::Surround71);
         p.channels = Some(8);
-        let bytes = stream_of(make_encoder(&p).unwrap(), 8);
+        let enc8 = make_encoder(&p).unwrap();
+        assert_eq!(
+            enc8.output_params().channel_layout,
+            Some(ChannelLayout::Surround71)
+        );
+        let bytes = stream_of(enc8, 8);
         let (h, _) = crate::adts::AdtsHeader::parse(&bytes).unwrap();
         assert_eq!(h.channel_configuration, 0);
         // The Table 1.19 5.1 set keeps channelConfiguration 6.
