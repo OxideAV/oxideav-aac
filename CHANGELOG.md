@@ -6,6 +6,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-aac/compare/v0.1.7...v0.1.8) - 2026-09-02
+
+### Other
+
+- advertise the PCE layout's channel_layout on the output parameters
+- rustfmt reflow of the phase-layer test
+- PS phase layer end to end — an eight-sample inter-channel delay's per-band IPD reproduced to 0.13 rad (0.83 rad phase-less control)
+- PCE-described speaker sets (channelConfiguration = 0) + registry channel_layout routing
+- VARVAR grids — late onsets after a variable lead, two onsets per frame (five envelopes)
+- HE-AAC v2 (parametric stereo) encoder section, encoder-remainders truth, CHANGELOG
+- ps_data() writer↔parser + PS encoder targets, Fuzz workflow; two fuzz-found fixes
+- HE-AAC v2 encoder validation — own subpart-8 decoder oracle + reference-binary black box
+- HE-AAC v2 — QMF-domain energy-preserving downmix, PS carriage, v2 signalling, registry factory
+- Annex 8.C.6 parameter estimation, border election, quantisation, closed-loop delta coding
+- forward ps_data() writer (Tables 8.9-8.14) + Annex 8.B codebook encoder
+- Annex 8.C.6.2 stereo hybrid analysis front end + band excitations
+
 ### Added
 
 - HE-AAC v2 (parametric stereo) encoder: `ps_analysis` (Annex 8.C.6.2
