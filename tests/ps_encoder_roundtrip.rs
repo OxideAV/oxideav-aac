@@ -546,7 +546,12 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
         f64::from(seed >> 8) / f64::from(1u32 << 24)
     };
     let comps: Vec<(f64, f64)> = (0..160)
-        .map(|i| (60.0 + 25.0 * i as f64 + rnd() * 20.0, rnd() * std::f64::consts::TAU))
+        .map(|i| {
+            (
+                60.0 + 25.0 * i as f64 + rnd() * 20.0,
+                rnd() * std::f64::consts::TAU,
+            )
+        })
         .collect();
     let mono = |i: usize| -> f64 {
         let t = i as f64 / f64::from(fs);
@@ -599,5 +604,8 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
     }
     let (without, with) = (errors[0], errors[1]);
     assert!(with < 0.5, "phase layer IPD error {with} rad");
-    assert!(with * 2.0 < without, "phase layer no better than none: {with} vs {without}");
+    assert!(
+        with * 2.0 < without,
+        "phase layer no better than none: {with} vs {without}"
+    );
 }
