@@ -144,7 +144,14 @@ impl PsStereo {
             HybridConfig::Bands1020 => 20,
             HybridConfig::Bands34 => 34,
         };
-        if expected != nb || s.len() != NUM_QMF_SLOTS || d.len() != NUM_QMF_SLOTS {
+        // `numQMFSlots` (Annex 8.A.3): 32 for a 1024-line core, 30
+        // for a 960-line one — the frame the hybrid analysis produced.
+        let num_qmf_slots = s.len();
+        if expected != nb
+            || num_qmf_slots == 0
+            || num_qmf_slots > NUM_QMF_SLOTS
+            || d.len() != num_qmf_slots
+        {
             return Err(Error::PsDataInvalid);
         }
         let b_k = parameter_map(config);
@@ -155,7 +162,7 @@ impl PsStereo {
         }
 
         // Per-slot H matrices, per stereo band.
-        let mut h_slots = vec![vec![[Complex::default(); 4]; nb]; NUM_QMF_SLOTS];
+        let mut h_slots = vec![vec![[Complex::default(); 4]; nb]; num_qmf_slots];
 
         if ps.num_env == 0 {
             // §8.6.4.6.5: hold the previous coefficients all frame.
@@ -167,11 +174,11 @@ impl PsStereo {
             let borders: Vec<usize> = if ps.frame_class {
                 ps.border_position
                     .iter()
-                    .map(|&b| usize::from(b).min(NUM_QMF_SLOTS - 1))
+                    .map(|&b| usize::from(b).min(num_qmf_slots - 1))
                     .collect()
             } else {
                 (0..ps.num_env)
-                    .map(|e| NUM_QMF_SLOTS * (e + 1) / ps.num_env - 1)
+                    .map(|e| num_qmf_slots * (e + 1) / ps.num_env - 1)
                     .collect()
             };
 
@@ -187,7 +194,7 @@ impl PsStereo {
                     (((n_e as isize - n_from).max(1)) as f64, n_from)
                 };
                 let lo = ((n_from + 1).max(0)) as usize;
-                let hi = n_e.min(NUM_QMF_SLOTS - 1);
+                let hi = n_e.min(num_qmf_slots - 1);
                 for (n, slot) in h_slots.iter_mut().enumerate().take(hi + 1).skip(lo) {
                     let t = (n as isize - base) as f64 / den;
                     for (b, cell) in slot.iter_mut().enumerate() {
@@ -208,9 +215,9 @@ impl PsStereo {
         }
 
         // Mix.
-        let mut l = vec![vec![Complex::default(); nr_hyb]; NUM_QMF_SLOTS];
-        let mut r = vec![vec![Complex::default(); nr_hyb]; NUM_QMF_SLOTS];
-        for n in 0..NUM_QMF_SLOTS {
+        let mut l = vec![vec![Complex::default(); nr_hyb]; num_qmf_slots];
+        let mut r = vec![vec![Complex::default(); nr_hyb]; num_qmf_slots];
+        for n in 0..num_qmf_slots {
             for k in 0..nr_hyb {
                 let b = usize::from(b_k[k]);
                 let mut h = h_slots[n][b];

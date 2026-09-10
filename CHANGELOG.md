@@ -44,6 +44,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the previous one; `bs_freq_res` is elected per envelope from the
   measured spread between a low band's high-resolution children
   (four-slot minimum); black-box pinned through the reference decoder
+- SBR decode over the 960-line core: `SbrDecoder::new_slots` /
+  `num_time_slots_for` (§4.6.18.2.6 `numTimeSlots = 15`, 30-slot
+  frames, 1920 output samples per channel), `PsDecoder::new_slots` /
+  `PsHybrid::new_slots` (Annex 8.A.3 `numQMFSlots = 30`); the stream
+  decoder keys the SBR slot count on the ASC-resolved frame family and
+  rejects only the LD families
 
 ### Fixed
 

@@ -500,7 +500,9 @@ impl StreamDecoder {
                     let dec = match self.sbr.entry(el.key) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                         std::collections::hash_map::Entry::Vacant(v) => {
-                            let mut d = SbrDecoder::new(fs_sbr, n_ch)?;
+                            let slots = crate::sbr_decoder::num_time_slots_for(self.family)
+                                .ok_or(Error::SbrUnsupportedFrameFamily)?;
+                            let mut d = SbrDecoder::new_slots(fs_sbr, n_ch, slots)?;
                             d.set_downsampled(self.sbr_downsampled)?;
                             d.set_low_power(self.sbr_low_power)?;
                             v.insert(d)
@@ -594,13 +596,13 @@ impl StreamDecoder {
                     let n = p.byte_length().max(1);
                     remaining = remaining.saturating_sub(n);
                 }
-                Some(_) if self.family != FrameFamily::Lc1024 => {
-                    // The §4.6.18 SBR tool in this crate is defined
-                    // over the 1024-line core frame (32-subband
-                    // analysis / 2048-sample output); a 960-line or
-                    // LD core cannot feed it, so an SBR extension
-                    // type is rejected before its body is even
-                    // parsed. Non-SBR payload types stay usable.
+                Some(_) if crate::sbr_decoder::num_time_slots_for(self.family).is_none() => {
+                    // The §4.6.18 SBR tool is defined over the 1024-
+                    // and 960-line core frames (16 / 15 time slots);
+                    // an LD core cannot feed it (§4.6.19 LD-SBR is a
+                    // separate tool), so an SBR extension type is
+                    // rejected before its body is even parsed.
+                    // Non-SBR payload types stay usable.
                     match ExtensionPayload::parse(reader, remaining) {
                         Ok(p) => {
                             let n = p.byte_length().max(1);

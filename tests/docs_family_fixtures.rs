@@ -672,47 +672,203 @@ fn ld_families_are_wire_incompatible() {
     }
 }
 
-/// An SBR extension on a 960-line stream is out of scope and must be
-/// rejected cleanly (Error::SbrUnsupportedFrameFamily), not
-/// mis-decoded.
+/// An SBR extension on a 960-line stream decodes over the §4.6.18
+/// 15-time-slot frame (`numTimeSlots = 15` for a 960 AAC frame): a
+/// LC-960 SCE followed by a FIL carrying a complete `sbr_extension_data()`
+/// (header + one FIXFIX envelope) yields 1920 samples at the doubled
+/// rate with the high band populated, a payload-less frame holds
+/// the SBR state through pure upsampling, and the LD families still
+/// reject the extension.
 #[test]
-fn sbr_on_960_family_is_rejected() {
-    // An LC-960 frame followed by a FIL carrying an SBR extension
-    // header fragment (extension_type 0b1101 = EXT_SBR_DATA).
-    let fam = FrameFamily::Lc960;
-    let cbs: &[u8] = &[1, 1, 1, 1];
-    let ics = ics_for(
-        fam,
-        WindowSequence::OnlyLong,
-        WindowShape::Sine,
-        4,
-        None,
-        None,
-    );
-    let (body, spectral) = make_channel(&ics, cbs, 130, 0xABCD, None);
-    let mut fa = FrameAssembler::new();
-    fa.push_channel_header(IdSynEle::Sce, 0).unwrap();
-    let mut bw = BitWriter::new();
-    body.write(&mut bw, AOT_LC, FS_INDEX, false).unwrap();
-    spectral
-        .write(&mut bw, &ics, &body.section_data, FS_INDEX)
-        .unwrap();
-    let bits = bw.bit_position();
-    fa.push_channel_body_bits(&bw.finish(), bits).unwrap();
-    // FIL body: extension_type EXT_SBR_DATA + a plausible header bit.
-    let mut fil = BitWriter::new();
-    fil.write_u32(0b1101, 4);
-    fil.write_u32(0, 4);
-    fil.write_u32(0, 8);
-    fa.push_fill(&fil.finish()).unwrap();
-    let payload = fa.push_end();
+fn sbr_on_960_family_decodes_at_fifteen_slots() {
+    use oxideav_aac::sbr_element::{SbrChannel, SbrElement};
+    use oxideav_aac::sbr_envelope::{SbrEnvelopeData, SbrNoiseData};
+    use oxideav_aac::sbr_grid::{FrameClass, SbrDtdf, SbrGrid, SbrInvf};
+    use oxideav_aac::sbr_header::SbrHeader;
+    use oxideav_aac::sbr_writer::build_extension_payload;
 
+    let fam = FrameFamily::Lc960;
+    let fs_sbr = SAMPLE_RATE * 2;
+    // SBR range 12–21 kHz at the 96 kHz SBR rate (within the
+    // §4.6.18.3.6 `k2 − k0 ≤ 32` bound).
+    let start_freq = oxideav_aac::sbr_encoder::pick_start_freq(fs_sbr, 12_000.0).unwrap();
+    let stop_freq = oxideav_aac::sbr_encoder::pick_stop_freq(fs_sbr, start_freq, 21_000.0).unwrap();
+    let header = SbrHeader {
+        amp_res: true,
+        start_freq,
+        stop_freq,
+        xover_band: 0,
+        reserved: 0,
+        header_extra_1: false,
+        header_extra_2: false,
+        freq_scale: 2,
+        alter_scale: true,
+        noise_bands: 2,
+        limiter_bands: 2,
+        limiter_gains: 2,
+        interpol_freq: true,
+        smoothing_mode: true,
+    };
+    let bands = header.derive_bands(fs_sbr).unwrap();
+    let n_high = bands.n_high();
+    let n_q = bands.n_q();
+    let mut env_row = vec![0i32; n_high];
+    env_row[0] = 30;
+    let mut noise_row = vec![0i32; n_q];
+    noise_row[0] = 8;
+    let element = SbrElement {
+        coupling: false,
+        channels: vec![SbrChannel {
+            grid: SbrGrid {
+                frame_class: FrameClass::FixFix,
+                num_env: 1,
+                num_noise: 1,
+                freq_res: vec![true],
+                var_bord_0: 0,
+                var_bord_1: 0,
+                rel_bord_0: vec![],
+                rel_bord_1: vec![],
+                pointer: 0,
+                amp_res_override: true,
+            },
+            dtdf: SbrDtdf {
+                df_env: vec![false],
+                df_noise: vec![false],
+            },
+            invf: SbrInvf {
+                invf_mode: vec![0; n_q],
+            },
+            envelope: SbrEnvelopeData {
+                data: vec![env_row],
+            },
+            noise: SbrNoiseData {
+                data: vec![noise_row],
+            },
+            add_harmonic: vec![],
+        }],
+        extension: None,
+    };
+    let sbr_payload = build_extension_payload(
+        IdSynEle::Sce,
+        Some(&header),
+        &header,
+        &element,
+        &bands,
+        false,
+    )
+    .unwrap();
+
+    let frame = |with_sbr: bool, seed: u32| -> Vec<u8> {
+        let cbs: &[u8] = &[1, 1, 1, 1, 2, 2, 3, 3];
+        let ics = ics_for(
+            fam,
+            WindowSequence::OnlyLong,
+            WindowShape::Sine,
+            8,
+            None,
+            None,
+        );
+        let (body, spectral) = make_channel(&ics, cbs, 140, seed, None);
+        let mut fa = FrameAssembler::new();
+        fa.push_channel_header(IdSynEle::Sce, 0).unwrap();
+        let mut bw = BitWriter::new();
+        body.write(&mut bw, AOT_LC, FS_INDEX, false).unwrap();
+        spectral
+            .write(&mut bw, &ics, &body.section_data, FS_INDEX)
+            .unwrap();
+        let bits = bw.bit_position();
+        fa.push_channel_body_bits(&bw.finish(), bits).unwrap();
+        if with_sbr {
+            fa.push_fill(&sbr_payload).unwrap();
+        }
+        fa.push_end()
+    };
+
+    // Raw-block path: SBR frames, then a payload-less frame.
     let mut dec = StreamDecoder::new();
     dec.set_frame_family(fam);
-    let err = dec
-        .decode_raw_data_block(AOT_LC, FS_INDEX, SAMPLE_RATE, 1, 1, &payload)
-        .unwrap_err();
-    assert_eq!(err, oxideav_aac::Error::SbrUnsupportedFrameFamily);
+    let mut pcm: Vec<i16> = Vec::new();
+    for (i, with_sbr) in [true, true, true, false, true].into_iter().enumerate() {
+        let f = dec
+            .decode_raw_data_block(
+                AOT_LC,
+                FS_INDEX,
+                SAMPLE_RATE,
+                1,
+                1,
+                &frame(with_sbr, 0x9600 + i as u32),
+            )
+            .unwrap();
+        assert_eq!(f.pcm.len(), 1920, "frame {i}: 15 slots × 2 × 64");
+        assert_eq!(f.sample_rate, fs_sbr, "frame {i}");
+        assert_eq!(f.channels, 1);
+        pcm.extend_from_slice(&f.pcm);
+    }
+    assert!(pcm.iter().any(|&s| s != 0));
+    // High band populated: energy above the core Nyquist over the
+    // steady frames (a coarse DFT on a stride of bins).
+    let tail: Vec<f64> = pcm[1920..].iter().map(|&v| f64::from(v)).collect();
+    let n = tail.len();
+    let (mut hi, mut total) = (0.0f64, 0.0f64);
+    for k in (1..n / 2).step_by(53) {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (t, &v) in tail.iter().enumerate() {
+            let a = 2.0 * std::f64::consts::PI * ((k * t) % n) as f64 / n as f64;
+            re += v * a.cos();
+            im += v * a.sin();
+        }
+        let p = re * re + im * im;
+        total += p;
+        if k > n / 4 {
+            hi += p;
+        }
+    }
+    assert!(hi > 1e-4 * total, "high band {hi} of {total}");
+
+    // LOAS path: the same frames through the ASC-driven family
+    // selection.
+    let payloads: Vec<Vec<u8>> = (0..4).map(|i| frame(true, 0x9700 + i)).collect();
+    let loas = wrap_loas(&payloads, AOT_LC, fam);
+    let frames = LoasDecoder::new().decode_all(&loas).unwrap();
+    assert_eq!(frames.len(), 4);
+    for f in &frames {
+        assert_eq!(f.pcm.len(), 1920);
+        assert_eq!(f.sample_rate, fs_sbr);
+    }
+
+    // The LD families stay out of the tool's scope.
+    for ld in [FrameFamily::Ld512, FrameFamily::Ld480] {
+        let mut fil = BitWriter::new();
+        fil.write_u32(0b1101, 4);
+        fil.write_u32(0, 4);
+        fil.write_u32(0, 8);
+        let ics = ics_for(
+            ld,
+            WindowSequence::OnlyLong,
+            WindowShape::Sine,
+            4,
+            None,
+            None,
+        );
+        let (body, spectral) = make_channel(&ics, &[1, 1, 1, 1], 130, 0xABCD, None);
+        let mut fa = FrameAssembler::new();
+        fa.push_channel_header(IdSynEle::Sce, 0).unwrap();
+        let mut bw = BitWriter::new();
+        body.write(&mut bw, AOT_ER_LD, FS_INDEX, false).unwrap();
+        spectral
+            .write(&mut bw, &ics, &body.section_data, FS_INDEX)
+            .unwrap();
+        let bits = bw.bit_position();
+        fa.push_channel_body_bits(&bw.finish(), bits).unwrap();
+        fa.push_fill(&fil.finish()).unwrap();
+        let payload = fa.push_end();
+        let mut dec = StreamDecoder::new();
+        dec.set_frame_family(ld);
+        let err = dec
+            .decode_raw_data_block(AOT_ER_LD, FS_INDEX, SAMPLE_RATE, 1, 1, &payload)
+            .unwrap_err();
+        assert_eq!(err, oxideav_aac::Error::SbrUnsupportedFrameFamily, "{ld:?}");
+    }
 }
 
 /// A mid-stream StreamMuxConfig replacement that changes the layer's

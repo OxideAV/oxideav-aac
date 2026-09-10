@@ -83,11 +83,13 @@ pub enum Error {
     /// malformed.
     LdShortWindow,
 
-    /// An SBR extension payload arrived on a stream running a
-    /// non-1024-line §4.5.1.1 frame family. The §4.6.18 SBR tool in
-    /// this crate covers the 1024-line core (32-subband QMF analysis,
-    /// 2048-sample dual-rate output); SBR over a 960-line core (and
-    /// the §4.6.19 LD SBR tool) is out of scope.
+    /// An SBR extension payload arrived on a stream running an LD
+    /// §4.5.1.1 frame family. The §4.6.18 SBR tool is defined over
+    /// the 1024-line (16 time slots) and 960-line (15 time slots)
+    /// cores — both decoded here; the §4.6.19 LD SBR tool is a
+    /// separate tool and out of scope. Also returned by
+    /// [`crate::sbr_decoder::SbrDecoder::new_slots`] for any other
+    /// slot count.
     SbrUnsupportedFrameFamily,
 
     /// [`crate::ics_info::IcsInfo::write`] was handed an in-memory
@@ -835,7 +837,7 @@ impl core::fmt::Display for Error {
             Error::SbrUnsupportedFrameFamily => {
                 write!(
                     f,
-                    "SBR extension on a non-1024-line frame family: the §4.6.18 tool covers the 1024-line core only"
+                    "SBR extension on an LD frame family: the §4.6.18 tool covers the 1024- and 960-line cores only"
                 )
             }
             Error::LdShortWindow => {

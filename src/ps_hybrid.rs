@@ -203,19 +203,37 @@ impl HybridConfig {
 #[derive(Debug, Clone)]
 pub struct PsHybrid {
     config: HybridConfig,
-    /// `history[p][j]` — the previous frame's QMF slots `26..32` for
-    /// split band `p` (`j = 0` is the oldest).
+    /// `history[p][j]` — the previous frame's last `LOOKAHEAD` QMF
+    /// slots for split band `p` (`j = 0` is the oldest).
     history: Vec<[Complex; LOOKAHEAD]>,
+    /// `numQMFSlots` per frame (Annex 8.A.3: `numTimeSlots · RATE` —
+    /// 32 for the 1024-line core, 30 for the 960-line one).
+    slots: usize,
 }
 
 impl PsHybrid {
-    /// A fresh filterbank for `config` (zero history).
+    /// A fresh filterbank for `config` (zero history) over
+    /// [`NUM_QMF_SLOTS`] slots per frame.
     #[must_use]
     pub fn new(config: HybridConfig) -> Self {
+        Self::new_slots(config, NUM_QMF_SLOTS)
+    }
+
+    /// [`new`](Self::new) with `slots` QMF slots per frame (at most
+    /// [`NUM_QMF_SLOTS`]; 30 for a 960-line core).
+    #[must_use]
+    pub fn new_slots(config: HybridConfig, slots: usize) -> Self {
         PsHybrid {
             config,
             history: vec![[Complex::default(); LOOKAHEAD]; config.split_bands()],
+            slots: slots.clamp(LOOKAHEAD, NUM_QMF_SLOTS),
         }
+    }
+
+    /// QMF slots per frame.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.slots
     }
 
     /// The active configuration.
@@ -234,23 +252,24 @@ impl PsHybrid {
     /// Hybrid analysis of one stereo frame.
     ///
     /// `x` is the Annex 8.A.3 `Xinput` matrix: at least
-    /// `NUM_QMF_SLOTS + LOOKAHEAD` slots of 64 QMF bands (the trailing
+    /// `slots() + LOOKAHEAD` slots of 64 QMF bands (the trailing
     /// 6 slots only need bands `0..split_bands` populated). Returns
-    /// `NUM_QMF_SLOTS` slots of `nr_bands()` hybrid channels, and
+    /// `slots()` slots of `nr_bands()` hybrid channels, and
     /// advances the cross-frame history.
     pub fn analyze(&mut self, x: &[[Complex; 64]]) -> Result<Vec<Vec<Complex>>> {
-        if x.len() < NUM_QMF_SLOTS + LOOKAHEAD {
+        let slots = self.slots;
+        if x.len() < slots + LOOKAHEAD {
             return Err(Error::PsDataInvalid);
         }
         let nb = self.config.nr_bands();
         let split = self.config.split_bands();
-        let mut out = vec![vec![Complex::default(); nb]; NUM_QMF_SLOTS];
+        let mut out = vec![vec![Complex::default(); nb]; slots];
 
         for p in 0..split {
             // Extended buffer: 6 history slots + the frame + look-ahead.
             let mut buf = [Complex::default(); LOOKAHEAD + NUM_QMF_SLOTS + LOOKAHEAD];
             buf[..LOOKAHEAD].copy_from_slice(&self.history[p]);
-            for (j, slot) in x.iter().enumerate().take(NUM_QMF_SLOTS + LOOKAHEAD) {
+            for (j, slot) in x.iter().enumerate().take(slots + LOOKAHEAD) {
                 buf[LOOKAHEAD + j] = slot[p];
             }
             let q_cnt = self.config.q(p);
@@ -283,9 +302,9 @@ impl PsHybrid {
                     accumulate_channel(&self.config, p, q, acc, row);
                 }
             }
-            // Next frame's x[−6..0] are this frame's slots 26..32.
+            // Next frame's x[−6..0] are this frame's last six slots.
             for j in 0..LOOKAHEAD {
-                self.history[p][j] = x[NUM_QMF_SLOTS - LOOKAHEAD + j][p];
+                self.history[p][j] = x[slots - LOOKAHEAD + j][p];
             }
         }
 

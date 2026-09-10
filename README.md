@@ -423,10 +423,17 @@ carry the default 1024-line family):
   (`n_filt == 0` throughout, so 4 / 3 vs 6 / 5 is undetermined), the
   §0.6 configurability recommendation is kept via the explicit-width
   `TnsData::parse_widths` / `write_widths` entry points.
-- An SBR payload on a 960-line or LD stream is rejected before its
-  body is parsed (`Error::SbrUnsupportedFrameFamily`) — the §4.6.18
-  tool here is defined over the 1024-line core, and the §4.6.19 LD
-  SBR tool belongs to ELD (out of scope).
+- **SBR over the 960-line core** — §4.6.18.2.6 `numTimeSlots = 15`
+  ("16 for a 1024 AAC frame and 15 for a 960 AAC frame"): the SBR
+  decoder (`SbrDecoder::new_slots`) and the Annex 8.A PS chain
+  (`numQMFSlots = numTimeSlots · RATE = 30`: hybrid analysis
+  history, envelope interpolation, mixing) run over 30-slot frames,
+  so a 960-line LATM/ASC stream with SBR decodes to 1920 samples per
+  channel at the doubled rate; a payload-less frame holds the state
+  through pure upsampling. An SBR payload on an LD stream is still
+  rejected before its body is parsed
+  (`Error::SbrUnsupportedFrameFamily`) — the §4.6.19 LD SBR tool
+  belongs to ELD (out of scope).
 
 ### Scalable AAC (AOT 6) / ER AAC scalable (AOT 20) — §4.4.2.2 / §4.5.2.2
 
@@ -1362,9 +1369,9 @@ component still open (see below):
   region — see `adts_crc`; a derived type-14 fixture is staged as
   `he-aac-v1-sbrcrc-adts`). The §4.6.18.4.3 downsampled-output mode
   and the §4.6.18.8 low-power variant are now **both selectable end
-  to end** (see the SBR back-end section above). Still open: SBR is
-  defined here over the 1024-line core only — an SBR payload on a
-  960-line or LD stream is rejected
+  to end** (see the SBR back-end section above), and the decoder
+  runs over both the 1024-line (16-slot) and 960-line (15-slot)
+  cores. Still open: an SBR payload on an LD stream is rejected
   (`Error::SbrUnsupportedFrameFamily`; the §4.6.19 LD SBR tool is
   ELD's and stays out of scope) — and low-power PS is undefined by
   design (the subpart-8 tool needs the complex QMF domain, so LP +

@@ -61,13 +61,21 @@ impl Default for PsDecoder {
 
 impl PsDecoder {
     /// A fresh, inactive PS decoder (20-band configuration until the
-    /// first header says otherwise).
+    /// first header says otherwise) over 32 QMF slots per frame.
     #[must_use]
     pub fn new() -> Self {
+        Self::new_slots(crate::ps_hybrid::NUM_QMF_SLOTS)
+    }
+
+    /// [`new`](Self::new) for `num_qmf_slots` QMF slots per frame
+    /// (Annex 8.A.3 `numTimeSlots · RATE`: 32 for a 1024-line core,
+    /// 30 for a 960-line one).
+    #[must_use]
+    pub fn new_slots(num_qmf_slots: usize) -> Self {
         PsDecoder {
             config: None,
             idx_state: PsIndexState::default(),
-            hybrid: PsHybrid::new(HybridConfig::Bands1020),
+            hybrid: PsHybrid::new_slots(HybridConfig::Bands1020, num_qmf_slots),
             decorr: PsDecorr::new(HybridConfig::Bands1020),
             stereo: PsStereo::new(20),
             prev_frame_had_ps: false,

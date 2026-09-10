@@ -52,14 +52,26 @@ use crate::{Error, Result};
 /// `numTimeSlots` for the 1024-sample core frame (§4.6.18.2.6).
 pub const NUM_TIME_SLOTS: i32 = 16;
 
+/// `numTimeSlots` for the 960-sample core frame (§4.6.18.2.6: "16
+/// for a 1024 AAC frame and 15 for a 960 AAC frame").
+pub const NUM_TIME_SLOTS_960: i32 = 15;
+
 /// `RATE = 2` (§4.6.18.2.5).
 pub const RATE: i32 = 2;
 
-/// Slots per frame at the SBR rate (`lf = numTimeSlots · RATE`).
-const LF: usize = (NUM_TIME_SLOTS * RATE) as usize;
-
-/// Total `XLow` / `XHigh` / `Y` columns (`lf + tHFGen`).
-const COLS: usize = LF + T_HF_GEN;
+/// The `numTimeSlots` of a §4.5.1.1 frame-length family: 16 for the
+/// 1024-line family, 15 for the 960-line one; `None` for the LD
+/// families (§4.6.18 defines the tool over the 1024 / 960 cores
+/// only — the §4.6.19 LD-SBR variant is a separate tool).
+#[must_use]
+pub fn num_time_slots_for(family: crate::swb_offset::FrameFamily) -> Option<i32> {
+    use crate::swb_offset::FrameFamily;
+    match family {
+        FrameFamily::Lc1024 => Some(NUM_TIME_SLOTS),
+        FrameFamily::Lc960 => Some(NUM_TIME_SLOTS_960),
+        _ => None,
+    }
+}
 
 /// The synthesis filterbank of one output channel: the §4.6.18.4.2
 /// 64-band dual-rate bank, or the §4.6.18.4.3 32-channel downsampled
@@ -175,16 +187,20 @@ struct ChannelState {
     prev_bw: Vec<f64>,
     prev_env: Option<EnvelopeScalefactors>,
     prev_noise: Option<NoiseScalefactors>,
+    /// Slots per frame at the SBR rate (`lf = numTimeSlots · RATE`:
+    /// 32 for the 1024-line core, 30 for the 960-line one).
+    lf: usize,
 }
 
 impl ChannelState {
-    fn new(downsampled: bool, low_power: bool) -> Self {
+    fn new(downsampled: bool, low_power: bool, num_time_slots: i32) -> Self {
+        let lf = (num_time_slots * RATE) as usize;
         ChannelState {
             analysis: AnalysisBank::new(low_power),
             synthesis: SynthesisBank::new(downsampled, low_power),
             w_hist: vec![[Complex::default(); 32]; T_HF_GEN],
-            y_prev: vec![[Complex::default(); 64]; COLS],
-            t_e_last_prev: NUM_TIME_SLOTS,
+            y_prev: vec![[Complex::default(); 64]; lf + T_HF_GEN],
+            t_e_last_prev: num_time_slots,
             k_x_prev: 0,
             m_prev: 0,
             env_state: EnvAdjustState::new(),
@@ -192,24 +208,26 @@ impl ChannelState {
             prev_bw: Vec::new(),
             prev_env: None,
             prev_noise: None,
+            lf,
         }
     }
 
-    /// Run the analysis QMF over one 1024-sample core frame and build
+    /// Run the analysis QMF over one core frame (`lf · 32` samples:
+    /// 1024 or 960) and build
     /// the `XLow` buffer: columns `0..tHFGen` are the previous frame's
     /// trailing slots (`W'`), columns `tHFGen..` the current `W`.
     fn analyze(&mut self, core: &[f64]) -> Result<Vec<[Complex; 32]>> {
-        if core.len() != 1024 {
+        if core.len() != self.lf * 32 {
             return Err(Error::SbrQmfInvalid);
         }
-        let mut x_low = Vec::with_capacity(COLS);
+        let mut x_low = Vec::with_capacity(self.lf + T_HF_GEN);
         x_low.extend_from_slice(&self.w_hist);
-        for slot in 0..LF {
+        for slot in 0..self.lf {
             let w = self.analysis.push_slot(&core[slot * 32..(slot + 1) * 32])?;
             x_low.push(w);
         }
         self.w_hist.clear();
-        self.w_hist.extend_from_slice(&x_low[COLS - T_HF_GEN..]);
+        self.w_hist.extend_from_slice(&x_low[self.lf..]);
         Ok(x_low)
     }
 }
@@ -236,6 +254,8 @@ pub struct SbrDecoder {
     /// Set once the first frame is processed (mode switches are then
     /// rejected — the QMF synthesis state is rate-specific).
     started: bool,
+    /// `numTimeSlots` of the core frame family (16 / 15).
+    num_time_slots: i32,
     channels: Vec<ChannelState>,
     /// Annex 8.A parametric stereo state, created when a
     /// single-channel element first carries a PS extension. Holds the
@@ -255,8 +275,20 @@ impl SbrDecoder {
     /// A fresh SBR decoder. `fs_sbr` is the SBR internal rate (twice
     /// the core rate); `num_channels` is 1 (SCE) or 2 (CPE).
     pub fn new(fs_sbr: u32, num_channels: usize) -> Result<Self> {
+        Self::new_slots(fs_sbr, num_channels, NUM_TIME_SLOTS)
+    }
+
+    /// [`new`](Self::new) for a core frame of `num_time_slots · 64`
+    /// samples: [`NUM_TIME_SLOTS`] (16, the 1024-line family) or
+    /// [`NUM_TIME_SLOTS_960`] (15, the 960-line family — every SBR
+    /// frame then spans 30 QMF slots and yields 1920 output samples
+    /// per channel). Other values are rejected.
+    pub fn new_slots(fs_sbr: u32, num_channels: usize, num_time_slots: i32) -> Result<Self> {
         if num_channels == 0 || num_channels > 2 || fs_sbr == 0 {
             return Err(Error::SbrFreqBandInvalid);
+        }
+        if num_time_slots != NUM_TIME_SLOTS && num_time_slots != NUM_TIME_SLOTS_960 {
+            return Err(Error::SbrUnsupportedFrameFamily);
         }
         Ok(SbrDecoder {
             fs_sbr,
@@ -268,11 +300,23 @@ impl SbrDecoder {
             low_power: false,
             k0: 0,
             started: false,
+            num_time_slots,
             channels: (0..num_channels)
-                .map(|_| ChannelState::new(false, false))
+                .map(|_| ChannelState::new(false, false, num_time_slots))
                 .collect(),
             ps: None,
         })
+    }
+
+    /// `numTimeSlots` of the core frame family this decoder runs on.
+    #[must_use]
+    pub fn num_time_slots(&self) -> i32 {
+        self.num_time_slots
+    }
+
+    /// Slots per frame at the SBR rate (`numTimeSlots · RATE`).
+    fn lf(&self) -> usize {
+        (self.num_time_slots * RATE) as usize
     }
 
     /// Select the §4.6.18.4.3 downsampled output mode: the SBR-processed
@@ -347,9 +391,9 @@ impl SbrDecoder {
     /// analysis / synthesis pair with the high 32 bands zero, keeping
     /// the output rate steady and the QMF state continuous.
     ///
-    /// `core` holds one 1024-sample time signal per channel; returns
-    /// 2048 samples per channel (1024 in the §4.6.18.4.3 downsampled
-    /// mode).
+    /// `core` holds one core-frame time signal (1024 or 960 samples)
+    /// per channel; returns twice as many samples per channel (the
+    /// core count in the §4.6.18.4.3 downsampled mode).
     pub fn upsample_frame(&mut self, core: &[&[f64]]) -> Result<Vec<Vec<f64>>> {
         if core.len() != self.channels.len() {
             return Err(Error::SbrQmfInvalid);
@@ -357,10 +401,12 @@ impl SbrDecoder {
         self.started = true;
         let mut out = Vec::with_capacity(core.len());
         let n_ch = self.channels.len();
+        let lf = self.lf();
+        let num_time_slots = self.num_time_slots;
         for (ch, core_ch) in self.channels.iter_mut().zip(core.iter()) {
             let x_low = ch.analyze(core_ch)?;
-            let mut x_cols: Vec<[Complex; 64]> = Vec::with_capacity(LF);
-            for l in 0..LF {
+            let mut x_cols: Vec<[Complex; 64]> = Vec::with_capacity(lf);
+            for l in 0..lf {
                 let mut x = [Complex::default(); 64];
                 x[..32].copy_from_slice(&x_low[l + T_HF_ADJ]);
                 x_cols.push(x);
@@ -375,9 +421,9 @@ impl SbrDecoder {
                 if let Some(ps) = self.ps.as_mut() {
                     let x_input = build_x_input(&x_cols, &x_low);
                     if let Some((lq, rq)) = ps.dec.process(None, &x_input, 32)? {
-                        let mut pcm_l = Vec::with_capacity(LF * sps);
-                        let mut pcm_r = Vec::with_capacity(LF * sps);
-                        for l in 0..LF {
+                        let mut pcm_l = Vec::with_capacity(lf * sps);
+                        let mut pcm_r = Vec::with_capacity(lf * sps);
+                        for l in 0..lf {
                             ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
                             ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
                         }
@@ -388,7 +434,7 @@ impl SbrDecoder {
                 }
             }
             if !emitted {
-                let mut pcm = Vec::with_capacity(LF * sps);
+                let mut pcm = Vec::with_capacity(lf * sps);
                 for x in &x_cols {
                     ch.synthesis.push_slot(x, &mut pcm)?;
                 }
@@ -399,15 +445,16 @@ impl SbrDecoder {
             ch.y_prev
                 .iter_mut()
                 .for_each(|c| *c = [Complex::default(); 64]);
-            ch.t_e_last_prev = NUM_TIME_SLOTS;
+            ch.t_e_last_prev = num_time_slots;
         }
         Ok(out)
     }
 
     /// Decode one SBR frame: `ext` is the parsed `sbr_extension_data()`
-    /// for this element, `core` one 1024-sample signal per channel.
-    /// Returns 2048 samples per channel at the SBR rate (1024 per
-    /// channel at the core rate in the §4.6.18.4.3 downsampled mode).
+    /// for this element, `core` one core-frame signal (1024 or 960
+    /// samples) per channel. Returns twice as many samples per channel
+    /// at the SBR rate (the core count at the core rate in the
+    /// §4.6.18.4.3 downsampled mode).
     pub fn process_frame(
         &mut self,
         ext: &SbrExtensionData,
@@ -494,9 +541,11 @@ impl SbrDecoder {
         };
 
         let mut out = Vec::with_capacity(n_ch);
+        let lf = self.lf();
+        let num_time_slots = self.num_time_slots;
         for c in 0..n_ch {
             let sbr_ch = &ext.element.channels[c];
-            let grid = derive_time_grid(&sbr_ch.grid, NUM_TIME_SLOTS)?;
+            let grid = derive_time_grid(&sbr_ch.grid, num_time_slots)?;
 
             // Coupling: the second channel transmits no sbr_invf()
             // (Table 4.66) — it shares the first channel's
@@ -517,7 +566,7 @@ impl SbrDecoder {
 
             // HF generation over the envelope span.
             let l_range = (RATE * grid.t_e[0])..(RATE * grid.t_e[grid.t_e.len() - 1]);
-            let x_high = generate_hf(&x_low, patches, &bw, bands, l_range, LF)?;
+            let x_high = generate_hf(&x_low, patches, &bw, bands, l_range, lf)?;
 
             // §4.6.18.8.3 aliasing detection (low power): reflection
             // coefficients over the low band, the Figure 4.53 degree
@@ -526,7 +575,7 @@ impl SbrDecoder {
                 let k0_cnt = usize::try_from(self.k0).map_err(|_| Error::SbrFreqBandInvalid)?;
                 let mut refl = Vec::with_capacity(k0_cnt);
                 for k in 0..k0_cnt.min(32) {
-                    refl.push(reflection_coefficient(&x_low, k, LF)?);
+                    refl.push(reflection_coefficient(&x_low, k, lf)?);
                 }
                 let deg = aliasing_degree(&refl);
                 Some(deg_patched(&deg, patches, bands.k_x, bands.m)?)
@@ -556,12 +605,12 @@ impl SbrDecoder {
             let y = adjust(&x_high, &params, &mut ch.env_state)?;
 
             // §4.6.18.5 X assembly.
-            let l_temp = (RATE * ch.t_e_last_prev - NUM_TIME_SLOTS * RATE).max(0) as usize;
-            let mut x_cols: Vec<[Complex; 64]> = Vec::with_capacity(LF);
-            for l in 0..LF {
+            let l_temp = (RATE * ch.t_e_last_prev - num_time_slots * RATE).max(0) as usize;
+            let mut x_cols: Vec<[Complex; 64]> = Vec::with_capacity(lf);
+            for l in 0..lf {
                 let mut x = [Complex::default(); 64];
                 let (kx_cur, m_cur, y_col) = if l < l_temp {
-                    (ch.k_x_prev, ch.m_prev, &ch.y_prev[l + T_HF_ADJ + LF])
+                    (ch.k_x_prev, ch.m_prev, &ch.y_prev[l + T_HF_ADJ + lf])
                 } else {
                     (bands.k_x, bands.m, &y[l + T_HF_ADJ])
                 };
@@ -609,7 +658,7 @@ impl SbrDecoder {
             }
             if ps_payload.is_some() && self.ps.is_none() {
                 self.ps = Some(PsState {
-                    dec: PsDecoder::new(),
+                    dec: PsDecoder::new_slots(lf),
                     synthesis_r: SynthesisBank::new(self.downsampled, self.low_power),
                 });
             }
@@ -620,9 +669,9 @@ impl SbrDecoder {
                     let x_input = build_x_input(&x_cols, &x_low);
                     let kx_plus_m = (bands.k_x + bands.m).max(0) as usize;
                     if let Some((lq, rq)) = ps.dec.process(ps_payload, &x_input, kx_plus_m)? {
-                        let mut pcm_l = Vec::with_capacity(LF * sps);
-                        let mut pcm_r = Vec::with_capacity(LF * sps);
-                        for l in 0..LF {
+                        let mut pcm_l = Vec::with_capacity(lf * sps);
+                        let mut pcm_r = Vec::with_capacity(lf * sps);
+                        for l in 0..lf {
                             ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
                             ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
                         }
@@ -633,7 +682,7 @@ impl SbrDecoder {
                 }
             }
             if !emitted {
-                let mut pcm = Vec::with_capacity(LF * sps);
+                let mut pcm = Vec::with_capacity(lf * sps);
                 for x in &x_cols {
                     ch.synthesis.push_slot(x, &mut pcm)?;
                 }
@@ -655,14 +704,15 @@ impl SbrDecoder {
     }
 }
 
-/// Assemble the Annex 8.A.3 `Xinput` matrix: the 32 assembled `X`
-/// columns followed by `LOOKAHEAD` slots taken from `XLow` beyond the
-/// frame (`XLow(k, l + tHFAdj)`, `k < 5` — the split bands the hybrid
-/// filterbank consumes ahead of time).
+/// Assemble the Annex 8.A.3 `Xinput` matrix: the `numQMFSlots`
+/// assembled `X` columns followed by `LOOKAHEAD` slots taken from
+/// `XLow` beyond the frame (`XLow(k, l + tHFAdj)`, `k < 5` — the
+/// split bands the hybrid filterbank consumes ahead of time).
 fn build_x_input(x_cols: &[[Complex; 64]], x_low: &[[Complex; 32]]) -> Vec<[Complex; 64]> {
-    let mut v = Vec::with_capacity(LF + LOOKAHEAD);
+    let lf = x_cols.len();
+    let mut v = Vec::with_capacity(lf + LOOKAHEAD);
     v.extend_from_slice(x_cols);
-    for l in LF..LF + LOOKAHEAD {
+    for l in lf..lf + LOOKAHEAD {
         let mut col = [Complex::default(); 64];
         col[..5].copy_from_slice(&x_low[l + T_HF_ADJ][..5]);
         v.push(col);
@@ -720,6 +770,118 @@ mod tests {
             best = best.min(err / sig.max(1e-30));
         }
         assert!(best < 1e-4, "upsample error ratio {best}");
+    }
+
+    /// The 960-line family: pure upsampling over 15-slot frames
+    /// (960 core samples in, 1920 out) reproduces the same delayed
+    /// 2× sine, and the 16-slot decoder's core length is rejected.
+    #[test]
+    fn upsample_960_frames_are_continuous() {
+        let mut dec = SbrDecoder::new_slots(44_100, 1, NUM_TIME_SLOTS_960).unwrap();
+        assert_eq!(dec.num_time_slots(), 15);
+        assert_eq!(
+            dec.upsample_frame(&[&sine(0.02, 1024, 0)]).unwrap_err(),
+            Error::SbrQmfInvalid
+        );
+        let freq = 0.02;
+        let mut out = Vec::new();
+        for f in 0..4 {
+            let core = sine(freq, 960, f * 960);
+            let o = dec.upsample_frame(&[&core]).unwrap();
+            assert_eq!(o[0].len(), 1920);
+            out.extend_from_slice(&o[0]);
+        }
+        let ideal = |t: f64, d: f64| (2.0 * core::f64::consts::PI * freq * (t - d) / 2.0).sin();
+        let mut best = f64::INFINITY;
+        for delay in 0..1500usize {
+            let mut err = 0.0;
+            let mut sig = 0.0;
+            for (t, &o) in out.iter().enumerate().skip(2500) {
+                let e = o - ideal(t as f64, delay as f64);
+                err += e * e;
+                sig += o * o;
+            }
+            best = best.min(err / sig.max(1e-30));
+        }
+        assert!(best < 1e-4, "upsample error ratio {best}");
+        assert!(SbrDecoder::new_slots(44_100, 1, 14).is_err());
+        assert!(SbrDecoder::new_slots(44_100, 1, 17).is_err());
+    }
+
+    /// A synthetic SBR frame decodes over the 960-line family: 1920
+    /// finite samples per frame, deterministic, with the high band
+    /// populated, and a four-envelope FIXFIX grid (`NINT(15/4) = 4`
+    /// spacing: borders 0/4/8/12/15) threads across frames.
+    #[test]
+    fn synthetic_sbr_frame_decodes_at_fifteen_slots() {
+        let fs_sbr = 44_100;
+        let mut ext = synthetic_ext(fs_sbr, 10, 6);
+        let mut dec = SbrDecoder::new_slots(fs_sbr, 1, NUM_TIME_SLOTS_960).unwrap();
+        let freq = 0.11;
+        let mut all = Vec::new();
+        for f in 0..3 {
+            let core = sine(freq, 960, f * 960);
+            let out = dec.process_frame(&ext, &[&core]).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].len(), 1920);
+            assert!(out[0].iter().all(|v| v.is_finite()));
+            all.extend_from_slice(&out[0]);
+        }
+        let energy: f64 = all.iter().map(|v| v * v).sum();
+        assert!(energy > 1.0, "energy {energy}");
+        // The envelope scalefactor controls the high band: a loud
+        // envelope puts far more energy into the high-passed output
+        // than a quiet one (the core tone is identical).
+        let mut quiet = SbrDecoder::new_slots(fs_sbr, 1, NUM_TIME_SLOTS_960).unwrap();
+        let mut loud = SbrDecoder::new_slots(fs_sbr, 1, NUM_TIME_SLOTS_960).unwrap();
+        let ext_quiet = synthetic_ext(fs_sbr, 2, 10);
+        let ext_loud = synthetic_ext(fs_sbr, 12, 10);
+        let (mut hi_q, mut hi_l) = (0.0f64, 0.0f64);
+        for f in 0..3 {
+            let core = sine(0.09, 960, f * 960);
+            let oq = quiet.process_frame(&ext_quiet, &[&core]).unwrap();
+            let ol = loud.process_frame(&ext_loud, &[&core]).unwrap();
+            if f > 0 {
+                for w in oq[0].windows(2) {
+                    hi_q += (w[1] - w[0]) * (w[1] - w[0]);
+                }
+                for w in ol[0].windows(2) {
+                    hi_l += (w[1] - w[0]) * (w[1] - w[0]);
+                }
+            }
+        }
+        assert!(hi_l > hi_q * 4.0, "loud {hi_l} vs quiet {hi_q}");
+        let mut dec2 = SbrDecoder::new_slots(fs_sbr, 1, NUM_TIME_SLOTS_960).unwrap();
+        let mut all2 = Vec::new();
+        for f in 0..3 {
+            let core = sine(freq, 960, f * 960);
+            all2.extend_from_slice(&dec2.process_frame(&ext, &[&core]).unwrap()[0]);
+        }
+        assert_eq!(all, all2);
+
+        // Four FIXFIX envelopes over 15 slots.
+        let n_high = ext.header.derive_bands(fs_sbr).unwrap().n_high();
+        let ch = &mut ext.element.channels[0];
+        ch.grid.num_env = 4;
+        ch.grid.num_noise = 2;
+        ch.grid.freq_res = vec![true; 4];
+        ch.grid.amp_res_override = false;
+        ch.dtdf.df_env = vec![false, true, true, true];
+        ch.dtdf.df_noise = vec![false, true];
+        let mut row = vec![0i32; n_high];
+        row[0] = 20;
+        ch.envelope.data = vec![row, vec![0; n_high], vec![0; n_high], vec![0; n_high]];
+        let n_q = ch.noise.data[0].len();
+        ch.noise.data = vec![ch.noise.data[0].clone(), vec![0; n_q]];
+        let tg = derive_time_grid(&ch.grid, NUM_TIME_SLOTS_960).unwrap();
+        assert_eq!(tg.t_e, vec![0, 4, 8, 12, 15]);
+        assert_eq!(tg.t_q, vec![0, 8, 15]);
+        for f in 0..3 {
+            let core = sine(freq, 960, f * 960);
+            let out = dec.process_frame(&ext, &[&core]).unwrap();
+            assert_eq!(out[0].len(), 1920);
+            assert!(out[0].iter().all(|v| v.is_finite()));
+        }
     }
 
     /// Build a minimal single-channel SBR extension: one FIXFIX
