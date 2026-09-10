@@ -291,3 +291,128 @@ fn reference_binary_accepts_double_onset_varvar_frames() {
     assert!(mean < 1.0, "mean band delta {mean} dB");
     assert!(worst < 3.0, "worst band delta {worst} dB");
 }
+
+/// Decode `stream` with the reference binary (no diagnostics allowed)
+/// and with this crate, and return the per-QMF-band long-term energy
+/// disagreement (mean, worst, bands) over the SBR range.
+fn cross_decode(
+    ff: &str,
+    name: &str,
+    stream: &[u8],
+    k_end: usize,
+    fs_out: u32,
+) -> (f64, f64, usize) {
+    let dir = scratch_dir();
+    let aac = dir.join(format!("{name}.aac"));
+    let wav = dir.join(format!("{name}.wav"));
+    fs::write(&aac, stream).unwrap();
+    let _ = fs::remove_file(&wav);
+    let out = Command::new(ff)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&aac)
+        .arg(&wav)
+        .output()
+        .expect("run reference decoder");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "reference decoder diagnostics: {stderr}"
+    );
+    let (ref_pcm, ref_ch, ref_rate) = read_wav(&wav).expect("reference WAV");
+    assert_eq!(ref_rate, fs_out);
+
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(stream).expect("own decode");
+    let ours: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
+    let e_ref = band_energies(&ref_pcm, ref_ch, 0);
+    let e_ours = band_energies(&ours, 1, 0);
+    let floor = e_ours.iter().cloned().fold(0.0, f64::max) * 1e-5;
+    let (mut mean, mut worst, mut count) = (0.0f64, 0.0f64, 0usize);
+    for k in 1..k_end.min(64) {
+        if e_ours[k] < floor {
+            continue;
+        }
+        let db = (10.0 * (e_ref[k] / e_ours[k]).log10()).abs();
+        worst = worst.max(db);
+        mean += db;
+        count += 1;
+    }
+    mean /= count.max(1) as f64;
+    eprintln!("{name}: {count} bands, mean |Δ| {mean:.2} dB, worst {worst:.2} dB");
+    (mean, worst, count)
+}
+
+/// Three bursts per frame — a click train with three onsets inside
+/// one SBR frame — drive the general VARVAR solver's five-envelope
+/// grids (an envelope per onset, the first isolated) and the
+/// per-envelope `bs_freq_res` election; the reference decoder binary
+/// must accept every frame without diagnostics and agree with this
+/// crate's decoder on the per-band energies.
+#[test]
+fn reference_binary_accepts_triple_onset_varvar_frames() {
+    let Some(ff) = ffmpeg() else {
+        eprintln!("skip: no ffmpeg binary on PATH");
+        return;
+    };
+    let fs_out = 44_100u32;
+    let n = (1.5 * f64::from(fs_out)) as usize;
+    let mut seed = 0x2468_ace1u32;
+    let mut pcm = Vec::with_capacity(n);
+    for i in 0..n {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let noise = f64::from(seed >> 8) / f64::from(1u32 << 24) - 0.5;
+        let t = i as f64 / f64::from(fs_out);
+        // 128-sample bursts of bright noise at hop offsets 700, 1300
+        // and 1900 (SBR slots ≈ 4.5, 9, 14 after the encoder's frame
+        // alignment), over a soft tonal bed.
+        let off = i % HE_FRAME_LEN;
+        let burst =
+            (700..828).contains(&off) || (1300..1428).contains(&off) || (1900..2028).contains(&off);
+        let v = 300.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+            + 200.0 * (2.0 * std::f64::consts::PI * 9_300.0 * t).sin()
+            + if burst {
+                noise * 24_000.0
+            } else {
+                noise * 60.0
+            };
+        pcm.push(v.clamp(-32768.0, 32767.0) as i16);
+    }
+    let mut enc = HeAacEncoder::new(HeAacConfig::new(fs_out, 1, 40_000)).unwrap();
+    let mut stream = Vec::new();
+    let mut five = 0usize;
+    let mut three_onsets = 0usize;
+    let mut mixed_res = 0usize;
+    for chunk in pcm.chunks(HE_FRAME_LEN) {
+        stream.extend_from_slice(&enc.encode_frame(chunk).unwrap());
+        let f = enc.last_sbr_frame().unwrap();
+        let g = &f.element.channels[0].grid;
+        if g.num_env == 5 {
+            five += 1;
+        }
+        // Three onset envelopes: borders [lead, a, a+2, b, c, trail]
+        // with the last two onsets well apart (a double-onset grid
+        // ends in a two-slot envelope instead).
+        let t_e = &f.reports[0].t_e;
+        if t_e.len() == 6 && t_e[2] - t_e[1] == 2 && t_e[3] - t_e[2] >= 2 && t_e[4] - t_e[3] >= 3 {
+            three_onsets += 1;
+        }
+        if g.freq_res.iter().any(|&r| r) && g.freq_res.iter().any(|&r| !r) {
+            mixed_res += 1;
+        }
+    }
+    stream.extend_from_slice(&enc.finish().unwrap());
+    eprintln!("five-envelope frames {five}, three-onset frames {three_onsets}, mixed-resolution frames {mixed_res}");
+    assert!(five > 0, "no five-envelope frame");
+    assert!(three_onsets > 0, "no frame with three onset envelopes");
+    assert!(mixed_res > 0, "no frame with per-envelope resolution");
+
+    let k_end = (enc.sbr().bands().k_x + enc.sbr().bands().m) as usize;
+    let (mean, worst, _) = cross_decode(ff, "triple_onset", &stream, k_end, fs_out);
+    assert!(mean < 1.0, "mean band delta {mean} dB");
+    assert!(worst < 3.0, "worst band delta {worst} dB");
+}

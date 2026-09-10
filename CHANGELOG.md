@@ -35,6 +35,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   and two onsets in one frame elect the §4.B.18.3 five-envelope grid
   (arrangements A / G within the 2-bit `bs_num_rel_*` counts, `lA` on
   the first onset); black-box pinned through the reference decoder
+- `sbr_encoder`: three onsets in one frame elect a five-envelope
+  VARVAR grid through a general border solver (every leading /
+  trailing split, trailing border and one-slot adjustment searched
+  for the cheapest even segmentation; onset borders only move
+  earlier; a two-slot first-attack envelope weighed against border
+  movement); the onset detector also sees an attack in the decay of
+  the previous one; `bs_freq_res` is elected per envelope from the
+  measured spread between a low band's high-resolution children
+  (four-slot minimum); black-box pinned through the reference decoder
 
 ### Fixed
 

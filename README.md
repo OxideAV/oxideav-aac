@@ -1080,8 +1080,17 @@ the EP section below).
   late onset after a variable lead — the trailing border pushed past
   a full two-slot attack envelope — and for two onsets in one frame,
   the §4.B.18.3 five-envelope grid with an envelope on each, `lA` on
-  the first, both `bs_num_rel_*` sides within their 2-bit counts),
-  §4.B.18.4
+  the first, both `bs_num_rel_*` sides within their 2-bit counts;
+  three onsets go through a general VARVAR solver that searches every
+  split of the wanted borders between the leading- and
+  trailing-relative sides, every trailing border and every one-slot
+  border adjustment — onsets only earlier — for the cheapest even
+  `2..=8` segmentation within the §4.6.18.3.6 five-envelope limit,
+  weighing a two-slot first-attack envelope against border
+  movement), per-envelope `bs_freq_res` election (the high table for
+  envelopes of four or more slots whose low-band children differ by
+  more than 6 dB — the two-slot attack envelopes and flat spectra
+  stay low), §4.B.18.4
   envelope energies, §4.B.18.6 quantisers, §4.B.18.7 time/frequency
   delta election closed-loop over the decoder's own §4.6.18.3.5
   reconstruction (LAV-clamped, header frames freq-forced for random
@@ -1306,8 +1315,12 @@ component still open (see below):
   `raw_data_block()`; the registry maps a named non-default
   `channel_layout` (and the bare 7-channel count, as 6.1) onto it.
   The SBR grid election spans all four frame classes (VARVAR up to
-  five envelopes for late and double onsets), leaving only
-  three-onset frames to the single-attack fallback.
+  the five-envelope limit for late, double and triple onsets — a
+  fourth onset in one frame falls into the last envelope) with
+  per-envelope `bs_freq_res`; the noise-floor count and split are
+  not elections (Table 4.69 derives `bs_num_noise` from the envelope
+  count, and Table 4.174 pins the split at `lA` for a transient
+  frame).
 - SSR remainders — the §4.6.12 gain-control tool is now implemented
   and wired **end to end** (front-half filterbank, gain
   reconstruction, IPQF — see the "SSR gain control" section above),

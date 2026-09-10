@@ -95,6 +95,10 @@ pub const SBR_ENC_COLS: usize = RATE * (NUM_TIME_SLOTS + 8) + T_HF_ADJ;
 /// `NOISE_FLOOR_OFFSET = 6` (§4.6.18.2.5).
 const NOISE_FLOOR_OFFSET: f64 = 6.0;
 
+/// Level spread between a low band's high-resolution children that
+/// elects `bs_freq_res = 1` for an envelope (see `elect_freq_res`).
+const FREQ_RES_SPREAD_DB: f64 = 6.0;
+
 /// Configuration of one [`SbrEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SbrEncoderConfig {
@@ -543,15 +547,20 @@ impl SbrEncoder {
         }
         let peak = e.iter().cloned().fold(0.0f64, f64::max);
         // Attacks: a slot at least 8× the mean of the preceding four
-        // and carrying a non-negligible share of the frame's peak;
-        // a second onset at least four slots after the first.
+        // (or of the preceding two, so an onset in the decay of the
+        // previous one is still seen) and carrying a non-negligible
+        // share of the frame's peak; further onsets at least four
+        // slots after the previous one (room for a two-slot attack
+        // envelope and a gap envelope).
         let is_attack = |s: usize| {
-            let prev = e[s - 4..s].iter().sum::<f64>() / 4.0;
+            let prev4 = e[s - 4..s].iter().sum::<f64>() / 4.0;
+            let prev2 = e[s - 2..s].iter().sum::<f64>() / 2.0;
+            let prev = prev4.min(prev2);
             e[s] > 8.0 * prev + 1e-9 && e[s] > 0.1 * peak && e[s] > 64.0
         };
-        let attack: Option<usize> = (4..NUM_TIME_SLOTS).find(|&s| is_attack(s));
-        let second: Option<usize> =
-            attack.and_then(|s1| (s1 + 4..NUM_TIME_SLOTS).find(|&s| is_attack(s)));
+        let onsets = detect_onsets(is_attack);
+        let attack = onsets.first().copied();
+        let second = onsets.get(1).copied();
         let transient = attack.is_some();
 
         // The leading border must meet the previous trailing one; a
@@ -561,13 +570,26 @@ impl SbrEncoder {
 
         let grid = match attack {
             Some(s) if self.cfg.variable_borders => {
-                // Two onsets: one VARVAR grid with an envelope on
-                // each (§4.B.18.3 allows five); a late onset after a
-                // variable lead: VARVAR with the trailing border
-                // pushed past its envelope; otherwise the FIXVAR /
-                // VARFIX single-attack grids.
-                second
-                    .and_then(|s2| double_attack_grid(s, s2, lead))
+                // Three or more onsets: the general VARVAR solver
+                // spends the §4.6.18.3.6 five-envelope budget on an
+                // envelope per onset (the first one isolated in two
+                // slots). Two onsets: one VARVAR grid with an
+                // envelope on each; a late onset after a variable
+                // lead: VARVAR with the trailing border pushed past
+                // its envelope; otherwise the FIXVAR / VARFIX
+                // single-attack grids. Every builder is a fallback
+                // for the one before it, the solver last.
+                let solver = || {
+                    if onsets.len() >= 2 {
+                        multi_onset_grid(&onsets, lead)
+                    } else {
+                        None
+                    }
+                };
+                let multi = if onsets.len() >= 3 { solver() } else { None };
+                multi
+                    .or_else(|| second.and_then(|s2| double_attack_grid(s, s2, lead)))
+                    .or_else(solver)
                     .or_else(|| late_attack_varvar(s, lead))
                     .unwrap_or_else(|| variable_grid(s, lead))
             }
@@ -588,12 +610,55 @@ impl SbrEncoder {
         };
         // A grid the decoder would reject falls back to the safe one.
         match derive_time_grid(&grid, NUM_TIME_SLOTS as i32) {
-            Ok(_) => (grid, transient),
+            Ok(tg) => {
+                let mut grid = grid;
+                if grid.frame_class != FrameClass::FixFix {
+                    for l in 0..grid.num_env {
+                        grid.freq_res[l] = self.elect_freq_res(x, tg.t_e[l], tg.t_e[l + 1]);
+                    }
+                }
+                (grid, transient)
+            }
             Err(_) => (
                 fixfix_grid(if transient { 4 } else { 1 }, !transient),
                 transient,
             ),
         }
+    }
+
+    /// Per-envelope `bs_freq_res` election (§4.B.18.3): the high
+    /// resolution table is worth its extra scalefactors only when the
+    /// envelope is long enough for stable band estimates (four
+    /// slots) *and* the measured spectrum has structure the low
+    /// table would flatten — some low band whose high-resolution
+    /// children differ by more than [`FREQ_RES_SPREAD_DB`].
+    fn elect_freq_res(&self, x: &[[Complex; 64]], t0: i32, t1: i32) -> bool {
+        if t1 - t0 < 4 {
+            return false;
+        }
+        let c0 = RATE * t0 as usize + T_HF_ADJ;
+        let c1 = RATE * t1 as usize + T_HF_ADJ;
+        let band_energy = |kl: usize, kh: usize| -> f64 {
+            x[c0..c1]
+                .iter()
+                .map(|col| col[kl..kh].iter().map(|v| v.norm_sqr()).sum::<f64>())
+                .sum::<f64>()
+                / ((c1 - c0) * (kh - kl)) as f64
+        };
+        let high = &self.bands.f_table_high;
+        let floor = 64.0;
+        self.bands.f_table_low.windows(2).any(|lo| {
+            let children: Vec<f64> = high
+                .windows(2)
+                .filter(|h| h[0] >= lo[0] && h[1] <= lo[1])
+                .map(|h| band_energy(h[0] as usize, h[1] as usize))
+                .collect();
+            let max = children.iter().cloned().fold(0.0, f64::max);
+            let min = children.iter().cloned().fold(f64::INFINITY, f64::min);
+            children.len() > 1
+                && max > floor
+                && 10.0 * (max / min.max(floor)).log10() > FREQ_RES_SPREAD_DB
+        })
     }
 
     /// Envelope energies (§4.B.18.4) for `grid` over `x`.
@@ -1267,6 +1332,202 @@ fn double_attack_grid(s1: usize, s2: usize, lead: u8) -> Option<SbrGrid> {
     })
 }
 
+/// Onset slots of a frame from the per-slot attack predicate: every
+/// attack slot in `4..NUM_TIME_SLOTS` at least four slots after the
+/// previous onset, at most [`MAX_ONSETS`] of them (the first ones —
+/// later onsets beyond the envelope budget fall into the last
+/// envelope).
+fn detect_onsets(is_attack: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut onsets: Vec<usize> = Vec::new();
+    let mut s = 4;
+    while s < NUM_TIME_SLOTS && onsets.len() < MAX_ONSETS {
+        if is_attack(s) {
+            onsets.push(s);
+            s += 4;
+        } else {
+            s += 1;
+        }
+    }
+    onsets
+}
+
+/// The most onsets one frame's grid can give an envelope each: the
+/// §4.6.18.3.6 VARVAR limit of five envelopes, with the first onset
+/// isolated in a two-slot envelope — `[lead, s1) [s1, s1+2) [s1+2, s2)
+/// [s2, s3) [s3, trail)`.
+const MAX_ONSETS: usize = 3;
+
+/// One wanted envelope border of the general VARVAR solver.
+#[derive(Debug, Clone, Copy)]
+struct WantedBorder {
+    /// The slot the border should land on.
+    slot: i32,
+    /// An onset border (may only move *earlier*, so the attack never
+    /// leaks into the quiet envelope before it); an auxiliary border
+    /// may move one slot either way.
+    onset: bool,
+}
+
+/// General VARVAR grid solver (§4.6.18.3.3 / §4.B.18.3): the
+/// leading border `lead`, up to four wanted internal borders, and a
+/// trailing border in `numTimeSlots..=numTimeSlots + 3`. The syntax
+/// codes the borders as even segments of `2..=8` slots from each
+/// end (`bs_rel_bord_*`, at most three per side) with one implicit
+/// segment between the two runs absorbing any parity, so the solver
+/// searches every split of the borders between the two sides, every
+/// trailing border and every one-slot adjustment of the borders
+/// (onsets only earlier), and keeps the cheapest fit — least border
+/// movement, then the earliest trailing border — returned with its
+/// cost. `bs_pointer` marks the envelope starting on the first onset
+/// border as `lA`. `None` when no arrangement fits.
+fn varvar_from_borders(lead: u8, wanted: &[WantedBorder]) -> Option<(i32, SbrGrid)> {
+    let n = NUM_TIME_SLOTS as i32;
+    let lead_i = i32::from(lead);
+    let nb = wanted.len();
+    if nb == 0 || nb + 1 > crate::sbr_grid::SBR_MAX_NUM_ENV {
+        return None;
+    }
+    let shifts = |b: &WantedBorder| -> &'static [i32] {
+        if b.onset {
+            &[0, -1]
+        } else {
+            &[0, -1, 1]
+        }
+    };
+    // lA = index of the envelope starting on the first onset.
+    let l_a = wanted.iter().position(|b| b.onset)? + 1;
+    let mut best: Option<(i32, SbrGrid)> = None;
+    let mut choice = vec![0usize; nb];
+    loop {
+        let borders: Vec<i32> = wanted
+            .iter()
+            .zip(choice.iter())
+            .map(|(b, &c)| b.slot + shifts(b)[c])
+            .collect();
+        let cost: i32 = wanted
+            .iter()
+            .zip(choice.iter())
+            .map(|(b, &c)| shifts(b)[c].abs() * if b.onset { 2 } else { 1 })
+            .sum();
+        let monotone = borders[0] > lead_i && borders.windows(2).all(|w| w[1] > w[0]);
+        if monotone {
+            for t in n..=n + 3 {
+                if borders[nb - 1] >= t {
+                    continue;
+                }
+                let total = cost + (t - n);
+                if best.as_ref().is_some_and(|(c, _)| *c <= total) {
+                    continue;
+                }
+                for nl in 0..=nb.min(3) {
+                    let nt = nb - nl;
+                    if nt > 3 {
+                        continue;
+                    }
+                    let even_ok = |seg: i32| (2..=8).contains(&seg) && seg % 2 == 0;
+                    let mut prev = lead_i;
+                    let mut lead_segs = Vec::with_capacity(nl);
+                    let mut ok = true;
+                    for &b in &borders[..nl] {
+                        ok &= even_ok(b - prev);
+                        lead_segs.push(b - prev);
+                        prev = b;
+                    }
+                    let mut prev = t;
+                    let mut trail_segs = Vec::with_capacity(nt);
+                    for &b in borders[nl..].iter().rev() {
+                        ok &= even_ok(prev - b);
+                        trail_segs.push(prev - b);
+                        prev = b;
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    let num_env = nb + 1;
+                    let grid = SbrGrid {
+                        frame_class: FrameClass::VarVar,
+                        num_env,
+                        num_noise: 2,
+                        freq_res: vec![false; num_env],
+                        var_bord_0: lead,
+                        var_bord_1: (t - n) as u8,
+                        rel_bord_0: raw_rel(&lead_segs),
+                        rel_bord_1: raw_rel(&trail_segs),
+                        pointer: num_env as u32 + 1 - l_a as u32,
+                        amp_res_override: false,
+                    };
+                    if derive_time_grid(&grid, n).is_ok() {
+                        best = Some((total, grid));
+                    }
+                    break;
+                }
+            }
+        }
+        // Next shift combination (mixed radix).
+        let mut i = 0;
+        loop {
+            if i == nb {
+                return best;
+            }
+            choice[i] += 1;
+            if choice[i] < shifts(&wanted[i]).len() {
+                break;
+            }
+            choice[i] = 0;
+            i += 1;
+        }
+    }
+}
+
+/// A VARVAR grid with an envelope starting on each of `onsets` (up
+/// to [`MAX_ONSETS`], ascending), the first onset isolated in a
+/// two-slot attack envelope when the budget allows, solved by
+/// [`varvar_from_borders`]. The isolated and the bare arrangement
+/// are both solved; the bare one wins only when it is strictly
+/// cheaper by more than [`ISOLATION_WORTH`] (a two-slot attack
+/// envelope is worth one onset border moved a slot earlier).
+fn multi_onset_grid(onsets: &[usize], lead: u8) -> Option<SbrGrid> {
+    let first = *onsets.first()?;
+    if onsets.len() > MAX_ONSETS {
+        return None;
+    }
+    let mut wanted: Vec<WantedBorder> = onsets
+        .iter()
+        .map(|&s| WantedBorder {
+            slot: s as i32,
+            onset: true,
+        })
+        .collect();
+    // The first attack's two-slot envelope, when a border is spare
+    // and the next onset is not already within two slots.
+    let room = crate::sbr_grid::SBR_MAX_NUM_ENV - 1 - wanted.len();
+    if room >= 1 && !onsets.get(1).is_some_and(|&s2| s2 <= first + 2) {
+        wanted.insert(
+            1,
+            WantedBorder {
+                slot: first as i32 + 2,
+                onset: false,
+            },
+        );
+    }
+    let isolated = varvar_from_borders(lead, &wanted);
+    let bare: Vec<WantedBorder> = wanted.iter().copied().filter(|b| b.onset).collect();
+    let plain = if bare.len() < wanted.len() {
+        varvar_from_borders(lead, &bare)
+    } else {
+        None
+    };
+    match (isolated, plain) {
+        (Some((ci, gi)), Some((cp, gp))) => Some(if cp + ISOLATION_WORTH < ci { gp } else { gi }),
+        (Some((_, g)), None) | (None, Some((_, g))) => Some(g),
+        (None, None) => None,
+    }
+}
+
+/// Solver cost a two-slot first-attack envelope is worth (see
+/// [`multi_onset_grid`]).
+const ISOLATION_WORTH: i32 = 2;
+
 /// A FIXFIX grid with `num_env` envelopes at one resolution.
 fn fixfix_grid(num_env: usize, high: bool) -> SbrGrid {
     SbrGrid {
@@ -1883,6 +2144,208 @@ mod tests {
             built * 10 >= pairs * 8,
             "{built} of {pairs} pairs representable"
         );
+    }
+
+    /// The general solver over every lead and every onset triple the
+    /// detector can produce: decodable VARVAR grids within the
+    /// §4.6.18.3.6 five-envelope limit, a border on (or one slot
+    /// before) each onset, `lA` on the first, round-tripping through
+    /// the writer; and it agrees with the dedicated two-onset builder
+    /// on landing the onsets wherever both fit.
+    #[test]
+    fn multi_onset_solver_covers_the_onset_triples() {
+        use crate::sbr_time_grid::derive_time_grid;
+        let mut triples = 0;
+        let mut built = 0;
+        let mut isolated = 0;
+        for lead in 0..=3u8 {
+            for s1 in 4..NUM_TIME_SLOTS {
+                for s2 in s1 + 4..NUM_TIME_SLOTS {
+                    for s3 in s2 + 4..NUM_TIME_SLOTS {
+                        triples += 1;
+                        let onsets = [s1, s2, s3];
+                        let Some(g) = multi_onset_grid(&onsets, lead) else {
+                            continue;
+                        };
+                        built += 1;
+                        assert_eq!(g.frame_class, FrameClass::VarVar);
+                        assert!(g.num_env <= crate::sbr_grid::SBR_MAX_NUM_ENV);
+                        let tg = derive_time_grid(&g, NUM_TIME_SLOTS as i32).unwrap();
+                        assert!(tg.t_e.windows(2).all(|w| w[1] > w[0]), "{:?}", tg.t_e);
+                        assert_eq!(tg.t_e[0], i32::from(lead));
+                        let last = *tg.t_e.last().unwrap();
+                        assert!((NUM_TIME_SLOTS as i32..=NUM_TIME_SLOTS as i32 + 3).contains(&last));
+                        for &s in &onsets {
+                            let s = s as i32;
+                            assert!(
+                                tg.t_e.contains(&s) || tg.t_e.contains(&(s - 1)),
+                                "lead {lead} {onsets:?}: {:?}",
+                                tg.t_e
+                            );
+                        }
+                        let l_a = tg.l_a as usize;
+                        assert!(tg.t_e[l_a] == s1 as i32 || tg.t_e[l_a] == s1 as i32 - 1);
+                        assert_eq!(tg.t_q[1], tg.t_e[l_a]);
+                        if g.num_env == 5 {
+                            isolated += 1;
+                            assert!((2..=3).contains(&(tg.t_e[l_a + 1] - tg.t_e[l_a])));
+                        }
+                        let mut w = oxideav_core::bits::BitWriter::new();
+                        crate::sbr_writer::write_grid(&mut w, &g).unwrap();
+                        let bytes = w.finish();
+                        let mut r = BitReader::new(&bytes);
+                        assert_eq!(SbrGrid::parse(&mut r).unwrap(), g);
+                    }
+                }
+            }
+        }
+        assert!(built * 10 >= triples * 9, "{built} of {triples} triples");
+        assert!(
+            isolated * 2 >= built,
+            "{isolated} of {built} isolate the first attack"
+        );
+        // Two onsets: the solver lands both wherever the dedicated
+        // builder does.
+        for lead in 0..=3u8 {
+            for s1 in 4..NUM_TIME_SLOTS {
+                for s2 in s1 + 4..NUM_TIME_SLOTS {
+                    if double_attack_grid(s1, s2, lead).is_none() {
+                        continue;
+                    }
+                    let g = multi_onset_grid(&[s1, s2], lead)
+                        .unwrap_or_else(|| panic!("lead {lead} {s1} {s2}"));
+                    let tg = derive_time_grid(&g, NUM_TIME_SLOTS as i32).unwrap();
+                    for s in [s1 as i32, s2 as i32] {
+                        assert!(
+                            tg.t_e.contains(&s) || tg.t_e.contains(&(s - 1)),
+                            "{:?}",
+                            tg.t_e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Three bursts in one frame elect a five-envelope VARVAR grid
+    /// with an envelope starting on each burst, the three attack
+    /// envelopes carrying the frame's largest per-slot energies; the
+    /// payload reparses and the next frame's lead meets the trail.
+    #[test]
+    fn three_onsets_elect_an_envelope_each() {
+        let cfg = SbrEncoderConfig::new(44_100, 1, 6_000.0, 16_000.0).unwrap();
+        let mut enc = SbrEncoder::new(cfg).unwrap();
+        let burst = |slot: usize| -> (usize, usize) {
+            let c0 = 10 + 2 + 2 * slot;
+            (c0 * 64, (c0 + 4) * 64)
+        };
+        // Five slots apart: the 640-tap analysis prototype's ringing
+        // from one burst has decayed by the next.
+        let spans = [burst(3), burst(8), burst(13)];
+        let cols = analyse(
+            move |t| {
+                if spans.iter().any(|&(a, b)| (a..b).contains(&t)) {
+                    tone(40.5, 3000.0)(t)
+                } else {
+                    0.0
+                }
+            },
+            SBR_ENC_COLS,
+        );
+        let frame = enc.encode_frame(&[&cols]).unwrap();
+        let rep = &frame.reports[0];
+        assert!(rep.transient);
+        let ch = &frame.element.channels[0];
+        assert_eq!(ch.grid.frame_class, FrameClass::VarVar, "{:?}", ch.grid);
+        assert_eq!(ch.grid.num_env, 5, "{:?}", rep.t_e);
+        let t_e = &rep.t_e;
+        // Borders [lead, sp1, sp1+2, sp2, sp3, trail].
+        assert_eq!(t_e[2] - t_e[1], 2, "{t_e:?}");
+        assert!(
+            (3..=5).contains(&t_e[1]) && (8..=10).contains(&t_e[3]) && (12..=15).contains(&t_e[4]),
+            "{t_e:?}"
+        );
+        let e: Vec<f64> = rep.energy.iter().map(|v| v.iter().sum()).collect();
+        assert!(e[1] > 5.0 * e[0].max(1.0), "energies {e:?} borders {t_e:?}");
+        // Per-slot peak inside each onset envelope beats the envelope
+        // before the first onset.
+        let mut order: Vec<usize> = (0..e.len()).collect();
+        order.sort_by(|&a, &b| e[b].partial_cmp(&e[a]).unwrap());
+        assert!(!order[..3].contains(&0), "energies {e:?}");
+        let mut r = BitReader::new(&frame.payload);
+        r.read_u32(4).unwrap();
+        let parsed = SbrExtensionData::parse(
+            &mut r,
+            IdSynEle::Sce,
+            false,
+            44_100,
+            Some(frame.payload.len() as u32),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.element, frame.element);
+        let frame2 = enc.encode_frame(&[&cols]).unwrap();
+        assert_eq!(frame2.reports[0].t_e[0], rep.t_e[rep.t_e.len() - 1] - 16);
+    }
+
+    /// `bs_freq_res` is elected per envelope: a long envelope whose
+    /// spectrum has structure between neighbouring high-resolution
+    /// bands takes the high table, a short attack envelope and a
+    /// flat one stay low.
+    #[test]
+    fn freq_res_is_elected_per_envelope() {
+        let cfg = SbrEncoderConfig::new(44_100, 1, 6_000.0, 16_000.0).unwrap();
+        let mut enc = SbrEncoder::new(cfg).unwrap();
+        // Flat noise-like bed (every band level), then from slot 9 a
+        // single strong tone in one high-resolution band.
+        let onset = (10 + 20) * 64;
+        let noise = |t: usize| {
+            let h = (t as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(0x9e37_79b9);
+            let h = h ^ (h >> 13);
+            f64::from(h.wrapping_mul(0x85eb_ca6b) >> 8) / f64::from(1u32 << 24) - 0.5
+        };
+        let cols = analyse(
+            move |t| {
+                noise(t) * 40.0
+                    + if t >= onset {
+                        tone(40.5, 3000.0)(t)
+                    } else {
+                        0.0
+                    }
+            },
+            SBR_ENC_COLS,
+        );
+        let frame = enc.encode_frame(&[&cols]).unwrap();
+        let ch = &frame.element.channels[0];
+        let rep = &frame.reports[0];
+        assert!(rep.transient, "{:?}", ch.grid);
+        assert_ne!(ch.grid.frame_class, FrameClass::FixFix);
+        let t_e = &rep.t_e;
+        let l_a = t_e.iter().position(|&b| (8..=12).contains(&b)).unwrap();
+        // Flat lead-in: low resolution.
+        assert!(!ch.grid.freq_res[0], "{:?} {:?}", ch.grid.freq_res, t_e);
+        // The attack envelope is two slots: low resolution by length.
+        assert!(!ch.grid.freq_res[l_a], "{:?} {:?}", ch.grid.freq_res, t_e);
+        // The long tonal tail after it: high resolution.
+        let tail = ch.grid.num_env - 1;
+        assert!(tail > l_a && t_e[tail + 1] - t_e[tail] >= 4, "{t_e:?}");
+        assert!(ch.grid.freq_res[tail], "{:?} {:?}", ch.grid.freq_res, t_e);
+        assert_eq!(rep.energy[tail].len(), enc.bands().n_high());
+        assert_eq!(rep.energy[0].len(), enc.bands().n_low());
+        let mut r = BitReader::new(&frame.payload);
+        r.read_u32(4).unwrap();
+        let parsed = SbrExtensionData::parse(
+            &mut r,
+            IdSynEle::Sce,
+            false,
+            44_100,
+            Some(frame.payload.len() as u32),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.element, frame.element);
     }
 
     /// Two onsets inside one frame become a five-envelope VARVAR grid
