@@ -80,6 +80,9 @@ use crate::{Error, Result};
 
 /// `numTimeSlots` for the 1024-sample core frame (§4.6.18.2.6).
 pub const NUM_TIME_SLOTS: usize = 16;
+
+/// `numTimeSlots` for the 960-line core (§4.6.18.2.6).
+pub const NUM_TIME_SLOTS_960: usize = 15;
 /// `RATE = 2` — QMF columns per SBR time slot.
 pub const RATE: usize = 2;
 /// `tHFAdj = 2` — the envelope adjuster's column offset into `XLow`.
@@ -152,6 +155,12 @@ pub struct SbrEncoderConfig {
     /// `bs_limiter_gains` (Table 4.109): 0 = −3 dB, 1 = 0 dB,
     /// 2 = 3 dB, 3 = no limit.
     pub limiter_gains: u8,
+    /// `numTimeSlots` of the core frame family (§4.6.18.2.6):
+    /// [`NUM_TIME_SLOTS`] (16) for the 1024-line core,
+    /// [`NUM_TIME_SLOTS_960`] (15) for the 960-line one. Every frame
+    /// then spans `RATE · numTimeSlots` analysis columns and the
+    /// grids are laid out over that many slots.
+    pub num_time_slots: usize,
 }
 
 impl SbrEncoderConfig {
@@ -183,7 +192,16 @@ impl SbrEncoderConfig {
             coupling: false,
             interpol_freq: crate::sbr_header::DEFAULT_INTERPOL_FREQ,
             limiter_gains: crate::sbr_header::DEFAULT_LIMITER_GAINS,
+            num_time_slots: NUM_TIME_SLOTS,
         })
+    }
+
+    /// Analysis columns one frame needs from the encoder:
+    /// `RATE · (numTimeSlots + 8) + tHFAdj` ([`SBR_ENC_COLS`] for the
+    /// 1024-line core).
+    #[must_use]
+    pub fn enc_cols(&self) -> usize {
+        RATE * (self.num_time_slots + 8) + T_HF_ADJ
     }
 
     /// The `sbr_header()` this configuration transmits. The extra
@@ -412,6 +430,9 @@ impl SbrEncoder {
         if cfg.channels == 0 || cfg.channels > 2 {
             return Err(Error::EncoderInvalidConfig);
         }
+        if cfg.num_time_slots != NUM_TIME_SLOTS && cfg.num_time_slots != NUM_TIME_SLOTS_960 {
+            return Err(Error::SbrUnsupportedFrameFamily);
+        }
         let header = cfg.header();
         let k0v = k0(cfg.fs_sbr, header.start_freq)?;
         let k2v = k2(cfg.fs_sbr, header.stop_freq, k0v)?;
@@ -483,7 +504,7 @@ impl SbrEncoder {
         x: &[&[[Complex; 64]]],
         extension: Option<SbrExtension>,
     ) -> Result<SbrFrame> {
-        if x.len() != self.cfg.channels || x.iter().any(|c| c.len() < SBR_ENC_COLS) {
+        if x.len() != self.cfg.channels || x.iter().any(|c| c.len() < self.cfg.enc_cols()) {
             return Err(Error::SbrQmfInvalid);
         }
         let header_sent = self.next_header_due();
@@ -537,7 +558,8 @@ impl SbrEncoder {
         // SBR-range energy per SBR time slot (RATE columns each) over
         // the nominal frame [tHFAdj, tHFAdj + 32) plus the lookahead
         // the variable trailing border can reach.
-        let n_slots = NUM_TIME_SLOTS + 8;
+        let nts = self.cfg.num_time_slots;
+        let n_slots = nts + 8;
         let mut e = vec![0.0f64; n_slots];
         for (s, es) in e.iter_mut().enumerate() {
             for r in 0..RATE {
@@ -558,7 +580,7 @@ impl SbrEncoder {
             let prev = prev4.min(prev2);
             e[s] > 8.0 * prev + 1e-9 && e[s] > 0.1 * peak && e[s] > 64.0
         };
-        let onsets = detect_onsets(is_attack);
+        let onsets = detect_onsets(is_attack, nts);
         let attack = onsets.first().copied();
         let second = onsets.get(1).copied();
         let transient = attack.is_some();
@@ -566,7 +588,7 @@ impl SbrEncoder {
         // The leading border must meet the previous trailing one; a
         // previous VAR trailing border beyond numTimeSlots becomes
         // this frame's bs_var_bord_0.
-        let lead = (t_e_last_prev - NUM_TIME_SLOTS as i32).clamp(0, 3) as u8;
+        let lead = (t_e_last_prev - nts as i32).clamp(0, 3) as u8;
 
         let grid = match attack {
             Some(s) if self.cfg.variable_borders => {
@@ -581,35 +603,35 @@ impl SbrEncoder {
                 // for the one before it, the solver last.
                 let solver = || {
                     if onsets.len() >= 2 {
-                        multi_onset_grid(&onsets, lead)
+                        multi_onset_grid(&onsets, lead, nts)
                     } else {
                         None
                     }
                 };
                 let multi = if onsets.len() >= 3 { solver() } else { None };
                 multi
-                    .or_else(|| second.and_then(|s2| double_attack_grid(s, s2, lead)))
+                    .or_else(|| second.and_then(|s2| double_attack_grid(s, s2, lead, nts)))
                     .or_else(solver)
-                    .or_else(|| late_attack_varvar(s, lead))
-                    .unwrap_or_else(|| variable_grid(s, lead))
+                    .or_else(|| late_attack_varvar(s, lead, nts))
+                    .unwrap_or_else(|| variable_grid(s, lead, nts))
             }
             Some(_) if lead == 0 => fixfix_grid(4, false),
-            Some(_) => varfix_plain(lead, 4),
+            Some(_) => varfix_plain(lead, 4, nts),
             None => {
                 // Stationary vs slowly varying: compare the two halves.
-                let first: f64 = e[..NUM_TIME_SLOTS / 2].iter().sum();
-                let second: f64 = e[NUM_TIME_SLOTS / 2..NUM_TIME_SLOTS].iter().sum();
+                let first: f64 = e[..nts / 2].iter().sum();
+                let second: f64 = e[nts / 2..nts].iter().sum();
                 let ratio = (first + 1.0) / (second + 1.0);
                 let n = if (0.5..=2.0).contains(&ratio) { 1 } else { 2 };
                 if lead == 0 {
                     fixfix_grid(n, true)
                 } else {
-                    varfix_plain(lead, n)
+                    varfix_plain(lead, n, nts)
                 }
             }
         };
         // A grid the decoder would reject falls back to the safe one.
-        match derive_time_grid(&grid, NUM_TIME_SLOTS as i32) {
+        match derive_time_grid(&grid, nts as i32) {
             Ok(tg) => {
                 let mut grid = grid;
                 if grid.frame_class != FrameClass::FixFix {
@@ -919,7 +941,7 @@ impl SbrEncoder {
         reset: bool,
     ) -> Result<(SbrChannel, SbrChannelReport)> {
         let (grid, transient) = self.elect_grid(x, self.ch[c].t_e_last_prev);
-        let tg = derive_time_grid(&grid, NUM_TIME_SLOTS as i32)?;
+        let tg = derive_time_grid(&grid, self.cfg.num_time_slots as i32)?;
         let eff_amp = self.header.amp_res && !grid.amp_res_override;
         let energy = self.estimate_envelopes(x, &grid, &tg.t_e);
         let (q, invf_mode, harm) = self.estimate_noise(x, &tg.t_q, &tg.t_e, &grid.freq_res);
@@ -1036,7 +1058,7 @@ impl SbrEncoder {
             })
             .collect();
         let (grid, transient) = self.elect_grid(&sum, self.ch[0].t_e_last_prev);
-        let tg = derive_time_grid(&grid, NUM_TIME_SLOTS as i32)?;
+        let tg = derive_time_grid(&grid, self.cfg.num_time_slots as i32)?;
         let eff_amp = self.header.amp_res && !grid.amp_res_override;
         let e_l = self.estimate_envelopes(xl, &grid, &tg.t_e);
         let e_r = self.estimate_envelopes(xr, &grid, &tg.t_e);
@@ -1221,16 +1243,16 @@ fn aligned_attack(s: usize, lead: u8) -> i32 {
 /// two-slot attack envelope and extends the trailing border past it
 /// (the implicit segment is the one-slot tail). `None` when the
 /// onset is not late, or the grid would not fit.
-fn late_attack_varvar(s: usize, lead: u8) -> Option<SbrGrid> {
+fn late_attack_varvar(s: usize, lead: u8, nts: usize) -> Option<SbrGrid> {
     if lead == 0 {
         return None;
     }
     let sp = aligned_attack(s, lead);
-    if sp + 2 < NUM_TIME_SLOTS as i32 {
+    if sp + 2 < nts as i32 {
         return None;
     }
     let t = sp + 3;
-    if t > NUM_TIME_SLOTS as i32 + 3 {
+    if t > nts as i32 + 3 {
         return None;
     }
     let mut segs = even_segments(sp - i32::from(lead));
@@ -1246,7 +1268,7 @@ fn late_attack_varvar(s: usize, lead: u8) -> Option<SbrGrid> {
         num_noise: 2,
         freq_res: vec![false; num_env],
         var_bord_0: lead,
-        var_bord_1: (t - NUM_TIME_SLOTS as i32) as u8,
+        var_bord_1: (t - nts as i32) as u8,
         rel_bord_0: raw_rel(&segs),
         rel_bord_1: vec![],
         pointer: num_env as u32 + 1 - l_a,
@@ -1267,8 +1289,8 @@ fn late_attack_varvar(s: usize, lead: u8) -> Option<SbrGrid> {
 /// envelope (`bs_num_rel_*` are 2-bit fields, so each side carries at
 /// most three explicit segments). `lA` marks the first attack.
 /// `None` when neither arrangement fits.
-fn double_attack_grid(s1: usize, s2: usize, lead: u8) -> Option<SbrGrid> {
-    let n = NUM_TIME_SLOTS as i32;
+fn double_attack_grid(s1: usize, s2: usize, lead: u8, nts: usize) -> Option<SbrGrid> {
+    let n = nts as i32;
     let lead_i = i32::from(lead);
     let sp2 = s2 as i32;
     // Tail after the second envelope: even, ≥ 2, reaching the nominal
@@ -1337,10 +1359,10 @@ fn double_attack_grid(s1: usize, s2: usize, lead: u8) -> Option<SbrGrid> {
 /// previous onset, at most [`MAX_ONSETS`] of them (the first ones —
 /// later onsets beyond the envelope budget fall into the last
 /// envelope).
-fn detect_onsets(is_attack: impl Fn(usize) -> bool) -> Vec<usize> {
+fn detect_onsets(is_attack: impl Fn(usize) -> bool, nts: usize) -> Vec<usize> {
     let mut onsets: Vec<usize> = Vec::new();
     let mut s = 4;
-    while s < NUM_TIME_SLOTS && onsets.len() < MAX_ONSETS {
+    while s < nts && onsets.len() < MAX_ONSETS {
         if is_attack(s) {
             onsets.push(s);
             s += 4;
@@ -1380,8 +1402,8 @@ struct WantedBorder {
 /// movement, then the earliest trailing border — returned with its
 /// cost. `bs_pointer` marks the envelope starting on the first onset
 /// border as `lA`. `None` when no arrangement fits.
-fn varvar_from_borders(lead: u8, wanted: &[WantedBorder]) -> Option<(i32, SbrGrid)> {
-    let n = NUM_TIME_SLOTS as i32;
+fn varvar_from_borders(lead: u8, wanted: &[WantedBorder], nts: usize) -> Option<(i32, SbrGrid)> {
+    let n = nts as i32;
     let lead_i = i32::from(lead);
     let nb = wanted.len();
     if nb == 0 || nb + 1 > crate::sbr_grid::SBR_MAX_NUM_ENV {
@@ -1486,7 +1508,7 @@ fn varvar_from_borders(lead: u8, wanted: &[WantedBorder]) -> Option<(i32, SbrGri
 /// are both solved; the bare one wins only when it is strictly
 /// cheaper by more than [`ISOLATION_WORTH`] (a two-slot attack
 /// envelope is worth one onset border moved a slot earlier).
-fn multi_onset_grid(onsets: &[usize], lead: u8) -> Option<SbrGrid> {
+fn multi_onset_grid(onsets: &[usize], lead: u8, nts: usize) -> Option<SbrGrid> {
     let first = *onsets.first()?;
     if onsets.len() > MAX_ONSETS {
         return None;
@@ -1510,10 +1532,10 @@ fn multi_onset_grid(onsets: &[usize], lead: u8) -> Option<SbrGrid> {
             },
         );
     }
-    let isolated = varvar_from_borders(lead, &wanted);
+    let isolated = varvar_from_borders(lead, &wanted, nts);
     let bare: Vec<WantedBorder> = wanted.iter().copied().filter(|b| b.onset).collect();
     let plain = if bare.len() < wanted.len() {
-        varvar_from_borders(lead, &bare)
+        varvar_from_borders(lead, &bare, nts)
     } else {
         None
     };
@@ -1547,8 +1569,8 @@ fn fixfix_grid(num_env: usize, high: bool) -> SbrGrid {
 /// A VARFIX grid whose leading border `lead` meets the previous
 /// frame's late trailing border, with `num_env` envelopes spread as
 /// evenly as the even-length relative borders allow, no transient.
-fn varfix_plain(lead: u8, num_env: usize) -> SbrGrid {
-    let span = NUM_TIME_SLOTS as i32 - i32::from(lead);
+fn varfix_plain(lead: u8, num_env: usize, nts: usize) -> SbrGrid {
+    let span = nts as i32 - i32::from(lead);
     let mut rel = Vec::new();
     let mut used = 0;
     for _ in 1..num_env {
@@ -1591,14 +1613,15 @@ fn varfix_plain(lead: u8, num_env: usize) -> SbrGrid {
 ///   the attack is too late to leave a whole envelope behind it.
 /// * `lead > 0` → VARFIX: segments coded from the leading border
 ///   (`bs_rel_bord_0`); the last envelope absorbs the remainder.
-fn variable_grid(s: usize, lead: u8) -> SbrGrid {
+fn variable_grid(s: usize, lead: u8, nts: usize) -> SbrGrid {
     let s = s as i32;
     let lead_i = i32::from(lead);
+    let n = nts as i32;
     if lead == 0 {
         // Even attack border ≥ 4.
         let sp = s - (s % 2);
         // Trailing border: nominal, or extended so the tail is ≥ 2.
-        let t = (NUM_TIME_SLOTS as i32).max(sp + 4);
+        let t = n.max(sp + 4);
         let rem = t - sp;
         // Even segments after the attack, each 2..=8.
         let segs: Vec<i32> = if rem <= 2 {
@@ -1618,7 +1641,7 @@ fn variable_grid(s: usize, lead: u8) -> SbrGrid {
             num_noise: 2,
             freq_res: vec![false; num_env],
             var_bord_0: 0,
-            var_bord_1: (t - NUM_TIME_SLOTS as i32) as u8,
+            var_bord_1: (t - n) as u8,
             rel_bord_0: vec![],
             rel_bord_1,
             pointer: num_env as u32 + 1 - l_a,
@@ -1637,10 +1660,10 @@ fn variable_grid(s: usize, lead: u8) -> SbrGrid {
             vec![8, first - 8]
         };
         // Short attack envelope, then the implicit tail (≥ 1 slot).
-        if sp + 2 < NUM_TIME_SLOTS as i32 {
+        if sp + 2 < n {
             rel.push(2);
         }
-        let l_a = rel.len() as u32 - 1 + u32::from(sp + 2 < NUM_TIME_SLOTS as i32);
+        let l_a = rel.len() as u32 - 1 + u32::from(sp + 2 < n);
         let num_env = rel.len() + 1;
         let l_a = l_a.min(num_env as u32 - 1).max(1);
         SbrGrid {
@@ -2078,7 +2101,7 @@ mod tests {
         let mut late = 0;
         for lead in 1..=3u8 {
             for s in 4..NUM_TIME_SLOTS {
-                let Some(g) = late_attack_varvar(s, lead) else {
+                let Some(g) = late_attack_varvar(s, lead, NUM_TIME_SLOTS) else {
                     assert!(aligned_attack(s, lead) + 2 < NUM_TIME_SLOTS as i32);
                     continue;
                 };
@@ -2105,7 +2128,7 @@ mod tests {
             for s1 in 4..NUM_TIME_SLOTS {
                 for s2 in s1 + 4..NUM_TIME_SLOTS {
                     pairs += 1;
-                    let Some(g) = double_attack_grid(s1, s2, lead) else {
+                    let Some(g) = double_attack_grid(s1, s2, lead, NUM_TIME_SLOTS) else {
                         continue;
                     };
                     built += 1;
@@ -2164,7 +2187,7 @@ mod tests {
                     for s3 in s2 + 4..NUM_TIME_SLOTS {
                         triples += 1;
                         let onsets = [s1, s2, s3];
-                        let Some(g) = multi_onset_grid(&onsets, lead) else {
+                        let Some(g) = multi_onset_grid(&onsets, lead, NUM_TIME_SLOTS) else {
                             continue;
                         };
                         built += 1;
@@ -2209,10 +2232,10 @@ mod tests {
         for lead in 0..=3u8 {
             for s1 in 4..NUM_TIME_SLOTS {
                 for s2 in s1 + 4..NUM_TIME_SLOTS {
-                    if double_attack_grid(s1, s2, lead).is_none() {
+                    if double_attack_grid(s1, s2, lead, NUM_TIME_SLOTS).is_none() {
                         continue;
                     }
-                    let g = multi_onset_grid(&[s1, s2], lead)
+                    let g = multi_onset_grid(&[s1, s2], lead, NUM_TIME_SLOTS)
                         .unwrap_or_else(|| panic!("lead {lead} {s1} {s2}"));
                     let tg = derive_time_grid(&g, NUM_TIME_SLOTS as i32).unwrap();
                     for s in [s1 as i32, s2 as i32] {
@@ -2346,6 +2369,116 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.element, frame.element);
+    }
+
+    /// The 960-line core: every grid builder over `numTimeSlots = 15`
+    /// is decodable with borders inside `15..=18`, and an encoder
+    /// configured for 15 slots consumes 48-column frames, codes a
+    /// stationary tone and a transient (the attack border landing on
+    /// the onset), reparses, and rejects the 16-slot column count.
+    #[test]
+    fn fifteen_slot_frames_encode_and_reparse() {
+        use crate::sbr_time_grid::derive_time_grid;
+        let nts = NUM_TIME_SLOTS_960;
+        let n = nts as i32;
+        let check = |g: &SbrGrid| {
+            let tg = derive_time_grid(g, n).unwrap_or_else(|e| panic!("{e:?}: {g:?}"));
+            assert!(tg.t_e.windows(2).all(|w| w[1] > w[0]), "{:?}", tg.t_e);
+            assert!((n..=n + 3).contains(tg.t_e.last().unwrap()), "{:?}", tg.t_e);
+            let mut w = oxideav_core::bits::BitWriter::new();
+            crate::sbr_writer::write_grid(&mut w, g).unwrap();
+            let bytes = w.finish();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(SbrGrid::parse(&mut r).unwrap(), *g);
+        };
+        for lead in 0..=3u8 {
+            for num_env in 1..=4 {
+                check(&varfix_plain(lead, num_env, nts));
+            }
+            for s1 in 4..nts {
+                check(&variable_grid(s1, lead, nts));
+                if let Some(g) = late_attack_varvar(s1, lead, nts) {
+                    check(&g);
+                }
+                for s2 in s1 + 4..nts {
+                    if let Some(g) = double_attack_grid(s1, s2, lead, nts) {
+                        check(&g);
+                    }
+                    if let Some(g) = multi_onset_grid(&[s1, s2], lead, nts) {
+                        check(&g);
+                    }
+                    for s3 in s2 + 4..nts {
+                        if let Some(g) = multi_onset_grid(&[s1, s2, s3], lead, nts) {
+                            check(&g);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cfg = SbrEncoderConfig::new(44_100, 1, 6_000.0, 16_000.0).unwrap();
+        cfg.num_time_slots = nts;
+        assert_eq!(cfg.enc_cols(), 48);
+        let mut enc = SbrEncoder::new(cfg).unwrap();
+        let cols = analyse(tone(30.5, 2000.0), 48);
+        let frame = enc.encode_frame(&[&cols]).unwrap();
+        let rep = &frame.reports[0];
+        assert!(!rep.transient);
+        assert_eq!(rep.t_e, vec![0, 15]);
+        let mut r = BitReader::new(&frame.payload);
+        r.read_u32(4).unwrap();
+        let parsed = SbrExtensionData::parse(
+            &mut r,
+            IdSynEle::Sce,
+            false,
+            44_100,
+            Some(frame.payload.len() as u32),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.element, frame.element);
+        // Transient at nominal slot 9.
+        let onset = (10 + 2 + 2 * 9) * 64;
+        let cols = analyse(
+            move |t| {
+                if t >= onset {
+                    tone(40.5, 3000.0)(t)
+                } else {
+                    0.0
+                }
+            },
+            48,
+        );
+        let frame = enc.encode_frame(&[&cols]).unwrap();
+        let rep = &frame.reports[0];
+        assert!(rep.transient);
+        assert!(
+            rep.t_e.iter().any(|&b| (8..=12).contains(&b)),
+            "{:?}",
+            rep.t_e
+        );
+        assert!(*rep.t_e.last().unwrap() >= n && *rep.t_e.last().unwrap() <= n + 3);
+        // No header in this frame: the parser needs the previous one.
+        let mut r = BitReader::new(&frame.payload);
+        r.read_u32(4).unwrap();
+        let parsed = SbrExtensionData::parse(
+            &mut r,
+            IdSynEle::Sce,
+            false,
+            44_100,
+            Some(frame.payload.len() as u32),
+            Some(*enc.header()),
+        )
+        .unwrap();
+        assert_eq!(parsed.element, frame.element);
+        // Column-count discipline.
+        assert_eq!(
+            enc.encode_frame(&[&cols[..47]]).unwrap_err(),
+            Error::SbrQmfInvalid
+        );
+        let mut bad = SbrEncoderConfig::new(44_100, 1, 6_000.0, 16_000.0).unwrap();
+        bad.num_time_slots = 14;
+        assert!(SbrEncoder::new(bad).is_err());
     }
 
     /// Two onsets inside one frame become a five-envelope VARVAR grid

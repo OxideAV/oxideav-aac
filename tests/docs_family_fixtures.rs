@@ -135,9 +135,22 @@ fn ics_for(
     grouping: Option<u8>,
     ltp: Option<LtpData>,
 ) -> IcsInfo {
+    ics_for_fs(family, seq, shape, max_sfb, grouping, ltp, FS_INDEX)
+}
+
+/// [`ics_for`] at an explicit sampling-frequency index.
+fn ics_for_fs(
+    family: FrameFamily,
+    seq: WindowSequence,
+    shape: WindowShape,
+    max_sfb: u8,
+    grouping: Option<u8>,
+    ltp: Option<LtpData>,
+    fs_index: u8,
+) -> IcsInfo {
     let short = seq == WindowSequence::EightShort;
     let (num_windows, num_window_groups, window_group_length, num_swb) =
-        derive_window_grouping_family(family, seq, grouping, FS_INDEX).unwrap();
+        derive_window_grouping_family(family, seq, grouping, fs_index).unwrap();
     IcsInfo {
         family,
         ics_reserved_bit: false,
@@ -167,6 +180,18 @@ fn make_channel(
     global_gain: u8,
     seed: u32,
     tns: Option<TnsData>,
+) -> (IcsBody, SpectralData) {
+    make_channel_fs(ics, sfb_cbs, global_gain, seed, tns, FS_INDEX)
+}
+
+/// [`make_channel`] at an explicit sampling-frequency index.
+fn make_channel_fs(
+    ics: &IcsInfo,
+    sfb_cbs: &[u8],
+    global_gain: u8,
+    seed: u32,
+    tns: Option<TnsData>,
+    fs_index: u8,
 ) -> (IcsBody, SpectralData) {
     let max_sfb = sfb_cbs.len() as u8;
     assert_eq!(max_sfb, ics.max_sfb, "codebook row must match max_sfb");
@@ -214,11 +239,11 @@ fn make_channel(
     };
     let short = ics.window_sequence == WindowSequence::EightShort;
     let offsets: Vec<u16> = if short {
-        short_window_offsets_family(ics.family, FS_INDEX)
+        short_window_offsets_family(ics.family, fs_index)
             .unwrap()
             .to_vec()
     } else {
-        long_window_offsets_family(ics.family, FS_INDEX)
+        long_window_offsets_family(ics.family, fs_index)
             .unwrap()
             .to_vec()
     };
@@ -266,10 +291,10 @@ fn make_channel(
 /// Write the `AudioSpecificConfig()` for one stream: `aot` at
 /// 48 kHz mono, `frameLengthFlag` per the family, ER trailer
 /// (resilience triplet all-zero + `epConfig == 0`) for AOT 23.
-fn write_asc(w: &mut BitWriter, aot: u8, family: FrameFamily) {
+fn write_asc_fs(w: &mut BitWriter, aot: u8, family: FrameFamily, fs_index: u8) {
     let flf = matches!(family, FrameFamily::Lc960 | FrameFamily::Ld480);
     w.write_u32(u32::from(aot), 5);
-    w.write_u32(u32::from(FS_INDEX), 4);
+    w.write_u32(u32::from(fs_index), 4);
     w.write_u32(1, 4); // channelConfiguration = 1 (mono)
     w.write_bit(flf); // frameLengthFlag
     w.write_bit(false); // dependsOnCoreCoder
@@ -289,6 +314,11 @@ fn write_asc(w: &mut BitWriter, aot: u8, family: FrameFamily) {
 /// StreamMuxConfig on the first sync frame, `useSameStreamMux`
 /// afterwards).
 fn wrap_loas(payloads: &[Vec<u8>], aot: u8, family: FrameFamily) -> Vec<u8> {
+    wrap_loas_fs(payloads, aot, family, FS_INDEX)
+}
+
+/// [`wrap_loas`] at an explicit sampling-frequency index.
+fn wrap_loas_fs(payloads: &[Vec<u8>], aot: u8, family: FrameFamily, fs_index: u8) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, payload) in payloads.iter().enumerate() {
         let mut w = BitWriter::new();
@@ -299,7 +329,7 @@ fn wrap_loas(payloads: &[Vec<u8>], aot: u8, family: FrameFamily) -> Vec<u8> {
             w.write_u32(0, 6); // numSubFrames
             w.write_u32(0, 4); // numProgram
             w.write_u32(0, 3); // numLayer
-            write_asc(&mut w, aot, family);
+            write_asc_fs(&mut w, aot, family, fs_index);
             w.write_u32(0, 3); // frameLengthType = 0
             w.write_u32(0xFF, 8); // latmBufferFullness
             w.write_bit(false); // otherDataPresent
@@ -869,6 +899,256 @@ fn sbr_on_960_family_decodes_at_fifteen_slots() {
             .unwrap_err();
         assert_eq!(err, oxideav_aac::Error::SbrUnsupportedFrameFamily, "{ld:?}");
     }
+}
+
+/// HE-AAC over the 960-line core, both directions: the SBR encoder
+/// laid out over `numTimeSlots = 15` (48 analysis columns per frame,
+/// grids over 15 slots) codes a wideband 48 kHz signal, its
+/// `sbr_extension_data()` rides in a FIL after each writer-assembled
+/// LC-960 SCE (24 kHz core), and the LOAS stream decodes through this
+/// crate to 1920 samples per frame with a populated high band.
+///
+/// When a reference decoder binary is on PATH the same stream is
+/// decoded black-box. The available reference implementation does
+/// not implement SBR over 960-line frames (it reports so under
+/// explicit signalling and silently decodes the core alone under the
+/// implicit signalling used here), so the black-box check is the
+/// core band: the stream must decode without diagnostics, and the
+/// per-QMF-band long-term energies below the crossover must agree in
+/// shape with this crate's decode (its 375 Hz bands at the SBR rate
+/// against the reference's paired 187.5 Hz bands at the core rate,
+/// up to one common scale).
+#[test]
+fn he_aac_960_round_trips_and_core_band_matches_the_reference_binary() {
+    use oxideav_aac::sbr_encoder::{SbrEncoder, SbrEncoderConfig, NUM_TIME_SLOTS_960};
+    use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
+    use std::process::Command;
+
+    // A 24 kHz core (implicit SBR signalling is only honoured at
+    // core rates up to 24 kHz — §1.6.5.2) → 48 kHz SBR output.
+    let fam = FrameFamily::Lc960;
+    let fs_index = 6u8;
+    let core_rate = 24_000u32;
+    let fs_sbr = core_rate * 2;
+    let n_frames = 24usize;
+    let mut cfg = SbrEncoderConfig::new(fs_sbr, 1, 7_000.0, 16_000.0).unwrap();
+    cfg.num_time_slots = NUM_TIME_SLOTS_960;
+    let mut sbr = SbrEncoder::new(cfg).unwrap();
+    let cols_per_frame = cfg.enc_cols();
+    assert_eq!(cols_per_frame, 48);
+
+    // Wideband source at the SBR rate: tones across the SBR range
+    // over a noise bed, with a burst every fourth frame so the
+    // variable grids are exercised on 15-slot frames.
+    let total_cols = 30 * n_frames + cols_per_frame;
+    let mut seed = 0x0960_ACE1u32;
+    let mut bank = EncoderAnalysisQmf::new();
+    let mut cols = Vec::with_capacity(total_cols);
+    for c in 0..total_cols {
+        let slot: Vec<f64> = (0..64)
+            .map(|i| {
+                let t = (c * 64 + i) as f64 / f64::from(fs_sbr);
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = f64::from(seed >> 8) / f64::from(1u32 << 24) - 0.5;
+                let frame = c / 30;
+                let burst = frame % 4 == 1 && (c % 30) >= 12 && (c % 30) < 16;
+                700.0 * (2.0 * std::f64::consts::PI * 8_100.0 * t).sin()
+                    + 500.0 * (2.0 * std::f64::consts::PI * 11_300.0 * t).sin()
+                    + 300.0 * (2.0 * std::f64::consts::PI * 14_600.0 * t).sin()
+                    + noise * if burst { 24_000.0 } else { 100.0 }
+            })
+            .collect();
+        cols.push(bank.push_slot(&slot).unwrap());
+    }
+
+    // Core spectrum across the whole band below the crossover (36
+    // scalefactor bands reach ≈ 7 kHz at 24 kHz / 960 lines).
+    let cbs: Vec<u8> = (0..36).map(|i| [1u8, 2, 3, 5, 7, 9][i % 6]).collect();
+    let cbs: &[u8] = &cbs;
+    let mut payloads = Vec::with_capacity(n_frames);
+    let mut classes = [0usize; 4];
+    for f in 0..n_frames {
+        let window = &cols[30 * f..30 * f + cols_per_frame];
+        let frame = sbr.encode_frame(&[window]).unwrap();
+        let g = &frame.element.channels[0].grid;
+        classes[g.frame_class.to_bits() as usize] += 1;
+        let last = *frame.reports[0].t_e.last().unwrap();
+        assert!(
+            (15..=18).contains(&last),
+            "frame {f}: {:?}",
+            frame.reports[0].t_e
+        );
+        let ics = ics_for_fs(
+            fam,
+            WindowSequence::OnlyLong,
+            WindowShape::Sine,
+            cbs.len() as u8,
+            None,
+            None,
+            fs_index,
+        );
+        let (body, spectral) = make_channel_fs(&ics, cbs, 140, 0x9600 + f as u32, None, fs_index);
+        let mut fa = FrameAssembler::new();
+        fa.push_channel_header(IdSynEle::Sce, 0).unwrap();
+        let mut bw = BitWriter::new();
+        body.write(&mut bw, AOT_LC, fs_index, false).unwrap();
+        spectral
+            .write(&mut bw, &ics, &body.section_data, fs_index)
+            .unwrap();
+        let bits = bw.bit_position();
+        fa.push_channel_body_bits(&bw.finish(), bits).unwrap();
+        fa.push_fill(&frame.payload).unwrap();
+        payloads.push(fa.push_end());
+    }
+    eprintln!("960 SBR frame classes FIXFIX/FIXVAR/VARFIX/VARVAR = {classes:?}");
+    assert!(
+        classes[1] + classes[2] + classes[3] > 0,
+        "no variable grid on a 15-slot frame"
+    );
+
+    let loas = wrap_loas_fs(&payloads, AOT_LC, fam, fs_index);
+    let frames = LoasDecoder::new().decode_all(&loas).unwrap();
+    assert_eq!(frames.len(), n_frames);
+    let mut ours: Vec<i16> = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        assert_eq!(f.pcm.len(), 1920, "frame {i}");
+        assert_eq!(f.sample_rate, fs_sbr, "frame {i}");
+        ours.extend_from_slice(&f.pcm);
+    }
+    let band_energies = |pcm: &[i16], channels: usize| -> [f64; 64] {
+        let mono: Vec<f64> = pcm
+            .iter()
+            .step_by(channels)
+            .map(|&v| f64::from(v))
+            .collect();
+        let mut bank = EncoderAnalysisQmf::new();
+        let mut e = [0.0f64; 64];
+        for slot in mono.chunks_exact(64) {
+            for (k, v) in bank.push_slot(slot).unwrap().iter().enumerate() {
+                e[k] += v.norm_sqr();
+            }
+        }
+        e
+    };
+    let e_ours = band_energies(&ours, 1);
+    let k_x = sbr.bands().k_x as usize;
+    let k_end = (sbr.bands().k_x + sbr.bands().m) as usize;
+    let low: f64 = e_ours[..k_x].iter().sum();
+    let high: f64 = e_ours[k_x..k_end].iter().sum();
+    assert!(high > 1e-3 * low, "SBR range silent: {high} vs {low}");
+
+    // Black-box: the reference decoder binary on the same LOAS stream.
+    let ff = "ffmpeg";
+    if !Command::new(ff)
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        eprintln!("skip black-box: no ffmpeg binary on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join("oxideav-aac-he960-blackbox");
+    fs::create_dir_all(&dir).unwrap();
+    let latm = dir.join("he960.latm");
+    let wav = dir.join("he960.wav");
+    fs::write(&latm, &loas).unwrap();
+    let _ = fs::remove_file(&wav);
+    let out = Command::new(ff)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "loas",
+            "-i",
+        ])
+        .arg(&latm)
+        .arg(&wav)
+        .output()
+        .expect("run reference decoder");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.trim().is_empty(),
+        "reference decoder diagnostics: {stderr}"
+    );
+    let d = fs::read(&wav).unwrap();
+    let mut i = 12;
+    let (mut ch, mut rate, mut pcm) = (0usize, 0u32, Vec::new());
+    while i + 8 <= d.len() {
+        let cid = &d[i..i + 4];
+        let sz = u32::from_le_bytes([d[i + 4], d[i + 5], d[i + 6], d[i + 7]]) as usize;
+        let body = i + 8;
+        if cid == b"fmt " {
+            ch = usize::from(u16::from_le_bytes([d[body + 2], d[body + 3]]));
+            rate = u32::from_le_bytes([d[body + 4], d[body + 5], d[body + 6], d[body + 7]]);
+        }
+        if cid == b"data" {
+            let end = (body + sz).min(d.len());
+            pcm = d[body..end]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            break;
+        }
+        i = body + sz + (sz & 1);
+    }
+    assert!(
+        rate == core_rate || rate == fs_sbr,
+        "reference output rate {rate}"
+    );
+    assert!(ch == 1 || ch == 2, "reference channels {ch}");
+    let n_ref = pcm.len() / ch.max(1) * (fs_sbr / rate) as usize;
+    assert!(
+        (n_ref as i64 - ours.len() as i64).unsigned_abs() <= 2 * 1920,
+        "length {n_ref} vs ours {}",
+        ours.len()
+    );
+    // Reference bands mapped onto this crate's 48 kHz band grid.
+    let e_raw = band_energies(&pcm, ch.max(1));
+    let e_ref: Vec<f64> = if rate == fs_sbr {
+        e_raw.to_vec()
+    } else {
+        (0..32).map(|k| e_raw[2 * k] + e_raw[2 * k + 1]).collect()
+    };
+    // At the core rate the band just below the crossover is skipped:
+    // this crate's output carries the SBR range there and the
+    // analysis bank's adjacent-band overlap leaks it into `k_x − 1`,
+    // which the reference's core-only output cannot show.
+    let k_hi = if rate == fs_sbr {
+        k_end.min(64)
+    } else {
+        (k_x - 1).min(32)
+    };
+    // Bands carrying real signal, relative to the compared range's
+    // own peak (the SBR range above it is far louder than the
+    // writer-assembled core spectrum).
+    let floor = e_ours[1..k_hi].iter().cloned().fold(0.0, f64::max) * 1e-4;
+    let mut deltas: Vec<f64> = (1..k_hi)
+        .filter(|&k| e_ours[k] >= floor)
+        .map(|k| 10.0 * (e_ref[k] / e_ours[k]).log10())
+        .collect();
+    assert!(deltas.len() >= 8, "{} comparable bands", deltas.len());
+    let mut sorted = deltas.clone();
+    sorted.sort_by(f64::total_cmp);
+    let offset = sorted[sorted.len() / 2];
+    for d in deltas.iter_mut() {
+        *d = (*d - offset).abs();
+    }
+    let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+    let worst = deltas.iter().cloned().fold(0.0, f64::max);
+    eprintln!(
+        "he-aac 960 core band vs reference ({rate} Hz): {} bands, common offset {offset:.2} dB, mean |Δ| {mean:.2} dB, worst {worst:.2} dB",
+        deltas.len()
+    );
+    assert!(mean < 1.0, "mean band delta {mean} dB");
+    assert!(worst < 3.0, "worst band delta {worst} dB");
 }
 
 /// A mid-stream StreamMuxConfig replacement that changes the layer's

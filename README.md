@@ -430,8 +430,18 @@ carry the default 1024-line family):
   history, envelope interpolation, mixing) run over 30-slot frames,
   so a 960-line LATM/ASC stream with SBR decodes to 1920 samples per
   channel at the doubled rate; a payload-less frame holds the state
-  through pure upsampling. An SBR payload on an LD stream is still
-  rejected before its body is parsed
+  through pure upsampling. The SBR **encoder** is laid out over the
+  same family (`SbrEncoderConfig::num_time_slots = 15`: 48 analysis
+  columns per frame, every grid builder and the onset detector over
+  15 slots, trailing borders in `15..=18`), and a writer-assembled
+  LC-960 stream carrying its payloads decodes end to end. The
+  available reference decoder binary does not implement SBR over
+  960-line frames (it says so under explicit signalling and decodes
+  the core alone under implicit signalling), so the black-box check
+  for this family is the core band: no diagnostics, and the
+  per-band energies below the crossover match this crate's decode
+  in shape (one common scale). An SBR payload on an LD stream is
+  still rejected before its body is parsed
   (`Error::SbrUnsupportedFrameFamily`) — the §4.6.19 LD SBR tool
   belongs to ELD (out of scope).
 

@@ -50,6 +50,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `PsHybrid::new_slots` (Annex 8.A.3 `numQMFSlots = 30`); the stream
   decoder keys the SBR slot count on the ASC-resolved frame family and
   rejects only the LD families
+- `SbrEncoderConfig::num_time_slots` / `enc_cols` (`NUM_TIME_SLOTS_960`):
+  the SBR encoder laid out over the 960-line core's 15 time slots —
+  onset detection, every grid builder and the VARVAR solver take the
+  slot count; a writer-assembled LC-960 + SBR LOAS stream round-trips
+  through this crate's decoder and its core band matches the reference
+  decoder binary (which does not implement SBR over 960-line frames)
 
 ### Fixed
 
