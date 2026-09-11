@@ -1167,7 +1167,23 @@ the EP section below).
   frequency-forced on envelope 0 for random access, phase deltas
   modulo 8), with the decoder's own `PsData::resolve` run against a
   mirrored index state to assert every frame lands on the intended
-  indices.
+  indices. Header-level tools are **elected from the measured
+  image** (`Election::Auto`, the default for both): the fine IID
+  grid (`iid_mode + 3`) when the energy-weighted error of the coarse
+  Table 8.25 grid against the measured level differences exceeds
+  0.75 dB over the frames since the last header (hard pans sit on
+  the coarse grid's 3–7 dB steps, near-centre images do not), and
+  the phase layer (`enable_ext`, ICC as magnitude coherence, mixing
+  procedure Rb) when at least 10 % of the IPD/OPD bands' energy sits
+  in bands coherent above 0.6 with an inter-channel phase beyond half
+  a Table 8.31 step; a decision taken over silence (the encoder's
+  priming frame) is provisional and the first frame with signal
+  re-elects with its own header. Inside the phase layer
+  `enable_ipdopd` is sent per frame only when some band carrying
+  energy has a non-zero quantised IPD or OPD (a hold element repeats
+  the previous decision so the decoder keeps the same H vectors);
+  the IPD/OPD band count is Table 8.24's `nr_ipdopd_par_tab[iid_mode]`
+  (5 / 11 / 17), not a separate election.
 - **`ps_writer`** — the forward `ps_data()` (Tables 8.9–8.14): header
   block, Table 8.29 inversion, VAR borders, Huffman-coded rows on
   the ten codebooks (inverse of `ps_huff_dec`), and the byte-counted
@@ -1196,11 +1212,15 @@ the EP section below).
   2 dB / 0.12; a hard left→right switch re-appears within 4 slots of
   the audio; the phase layer reproduces an eight-sample inter-channel
   delay's per-band IPD to **0.13 rad** mean (0.83 rad on the
-  phase-less Ra control); LOAS wrapping with either v2 ASC decodes
+  phase-less Ra control) — and the `Auto` election reaches the same
+  0.13 rad on that pair while staying on Ra for the phase-less
+  panned synthetic; LOAS wrapping with either v2 ASC decodes
   identically to ADTS as stereo. The reference decoder **binary** (skip-if-absent)
   decodes every stream without diagnostics as stereo at the doubled
   rate, its long-term per-band IID agreeing with this crate's
-  decoder to **0.2–0.5 dB mean**. Pure tones expose the parametric
+  decoder to **0.0–0.5 dB mean**, and on the auto-elected phase
+  layer its per-band IPD agrees with this crate's decode to
+  **0.000 rad** (both 0.127 rad from the source). Pure tones expose the parametric
   model's own limit (an all-pass de-correlator turns a sinusoid into
   a phase-shifted copy), not the encoder's.
 - Registry: `codec_encoder::make_he_aac_v2_encoder`, and

@@ -17,7 +17,7 @@ use std::process::Command;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
 use oxideav_aac::ps_analysis::{band_stats, hybrid_config_for, BandStats, PsAnalysis};
-use oxideav_aac::ps_encoder::{PsBands, PsEncoderConfig};
+use oxideav_aac::ps_encoder::{Election, PsBands, PsEncoderConfig};
 use oxideav_aac::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
 use oxideav_aac::sbr_qmf::{Complex, EncoderAnalysisQmf};
 
@@ -247,6 +247,15 @@ fn stereo_image_survives_the_default_configuration() {
     assert!(e.frames > 30);
     assert!(e.iid_mean_db < 2.5, "IID error {} dB", e.iid_mean_db);
     assert!(e.icc_mean < 0.25, "ICC error {}", e.icc_mean);
+    // The panned synthetic carries no inter-channel phase: the Auto
+    // election stays on procedure Ra (no extension layer).
+    let ps = enc.ps().unwrap();
+    eprintln!(
+        "v2 default elections: fine IID {} phase {}",
+        ps.fine_iid_on(),
+        ps.phase_on()
+    );
+    assert!(!ps.phase_on(), "phase layer elected on a phase-less image");
     // Rate: within 1.5× of the target over 2 s (+ flush).
     assert!(
         rt.stream.len() < (32_000 / 8 * 2) * 3 / 2,
@@ -265,8 +274,8 @@ fn configuration_matrix_keeps_the_image() {
             let cfg = HeAacConfig {
                 ps: PsEncoderConfig {
                     bands,
-                    fine_iid: fine,
-                    phase,
+                    fine_iid: fine.into(),
+                    phase: phase.into(),
                     ..PsEncoderConfig::default()
                 },
                 ..HeAacConfig::new_v2(48_000, 40_000)
@@ -434,6 +443,18 @@ fn long_term_iid(pcm: &[i16]) -> Vec<f64> {
     (0..20).map(|b| 10.0 * (el[b] / er[b]).log10()).collect()
 }
 
+/// Long-term per-band energy (both channels) of a stereo signal.
+fn long_term_energy(pcm: &[i16]) -> Vec<f64> {
+    let cues = cues_of(pcm, 20);
+    let mut e = vec![0.0f64; 20];
+    for f in cues.iter().skip(2) {
+        for (b, s) in f.iter().enumerate() {
+            e[b] += s.el + s.er;
+        }
+    }
+    e
+}
+
 /// Black box: an external reference decoder BINARY (invoked as an
 /// opaque tool, skip-if-absent) must decode every HE-AAC v2 stream
 /// without diagnostics, as stereo at the doubled rate, and its
@@ -447,12 +468,13 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
     };
     let dir = std::env::temp_dir().join("oxideav-aac-ps-blackbox");
     fs::create_dir_all(&dir).unwrap();
-    for (name, fs_out, bitrate, ps) in [
+    for (name, fs_out, bitrate, ps, delayed) in [
         (
             "v2_44k_default",
             44_100u32,
             32_000u32,
             PsEncoderConfig::default(),
+            false,
         ),
         (
             "v2_48k_34fine_phase",
@@ -460,18 +482,38 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
             48_000,
             PsEncoderConfig {
                 bands: PsBands::ThirtyFour,
-                fine_iid: true,
-                phase: true,
+                fine_iid: Election::On,
+                phase: Election::On,
                 ..PsEncoderConfig::default()
             },
+            false,
+        ),
+        // The delayed pair under the default `Auto` elections: the
+        // phase layer is elected from the measured image.
+        (
+            "v2_44k_auto_phase",
+            44_100,
+            40_000,
+            PsEncoderConfig::default(),
+            true,
         ),
     ] {
-        let pcm = synthetic_stereo(1.5, fs_out);
+        let pcm = if delayed {
+            delayed_stereo(fs_out, 8)
+        } else {
+            synthetic_stereo(1.5, fs_out)
+        };
         let cfg = HeAacConfig {
             ps,
             ..HeAacConfig::new_v2(fs_out, bitrate)
         };
-        let (_enc, rt) = round_trip(&pcm, cfg);
+        let (enc, rt) = round_trip(&pcm, cfg);
+        if delayed {
+            assert!(
+                enc.ps().unwrap().phase_on(),
+                "{name}: phase layer not elected"
+            );
+        }
         let aac = dir.join(format!("{name}.aac"));
         let wav = dir.join(format!("{name}.wav"));
         fs::write(&aac, &rt.stream).unwrap();
@@ -505,41 +547,89 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
         let iid_src = long_term_iid(&pcm);
         let iid_ours = long_term_iid(&rt.aligned);
         let iid_ref = long_term_iid(&ref_pcm);
+        // Bands carrying source energy (the delayed pair stops near
+        // 4 kHz; a silent band's level difference is noise).
+        let energy = long_term_energy(&pcm);
+        let peak = energy.iter().cloned().fold(0.0, f64::max);
         let mut d_ours = 0.0;
         let mut d_src = 0.0;
         let mut worst_ours: f64 = 0.0;
+        let mut count = 0usize;
         for b in 0..20 {
+            if energy[b] < peak * 1e-3 {
+                continue;
+            }
             let d = (iid_ref[b] - iid_ours[b]).abs();
             d_ours += d;
             worst_ours = worst_ours.max(d);
             d_src += (iid_ref[b] - iid_src[b]).abs();
+            count += 1;
         }
-        d_ours /= 20.0;
-        d_src /= 20.0;
+        assert!(count >= 8, "{name}: {count} bands with energy");
+        d_ours /= count as f64;
+        d_src /= count as f64;
         eprintln!(
             "{name}: reference vs ours mean |ΔIID| {d_ours:.2} dB (worst {worst_ours:.2}), reference vs source {d_src:.2} dB"
         );
         assert!(d_ours < 1.5, "{name}: decoders disagree by {d_ours} dB");
         assert!(worst_ours < 4.0, "{name}: worst band {worst_ours} dB");
         assert!(d_src < 3.0, "{name}: image vs source {d_src} dB");
+
+        if delayed {
+            // Phase parity: the reference decoder's per-band IPD over
+            // the coherent phase bands against this crate's decode
+            // (both aligned to the source).
+            let sum_in: Vec<f64> = pcm
+                .chunks_exact(2)
+                .map(|c| f64::from(c[0]) + f64::from(c[1]))
+                .collect();
+            let sum_ref: Vec<f64> = ref_pcm
+                .chunks_exact(2)
+                .map(|c| f64::from(c[0]) + f64::from(c[1]))
+                .collect();
+            let lag = best_lag(&sum_in, &sum_ref, 3 * HE_FRAME_LEN);
+            let ref_aligned = &ref_pcm[2 * lag..];
+            let m = ref_aligned.len().min(rt.aligned.len()).min(pcm.len());
+            let ipd_err = |a: &[Vec<BandStats>], b: &[Vec<BandStats>]| -> f64 {
+                let nf = a.len().min(b.len());
+                let (mut sum, mut count) = (0.0, 0usize);
+                for f in 3..nf.saturating_sub(2) {
+                    for band in 1..=10 {
+                        let (x, y) = (&a[f][band], &b[f][band]);
+                        if x.icc_magnitude() < 0.8 {
+                            continue;
+                        }
+                        let d = (x.ipd() - y.ipd()).rem_euclid(std::f64::consts::TAU);
+                        sum += d.min(std::f64::consts::TAU - d);
+                        count += 1;
+                    }
+                }
+                sum / count.max(1) as f64
+            };
+            let src = cues_of(&pcm[..m], 20);
+            let ours = cues_of(&rt.aligned[..m], 20);
+            let theirs = cues_of(&ref_aligned[..m], 20);
+            let (e_ours, e_theirs, e_pair) = (
+                ipd_err(&src, &ours),
+                ipd_err(&src, &theirs),
+                ipd_err(&ours, &theirs),
+            );
+            eprintln!(
+                "{name}: mean |ΔIPD| source→ours {e_ours:.3} rad, source→reference {e_theirs:.3} rad, ours→reference {e_pair:.3} rad"
+            );
+            assert!(e_ours < 0.5, "{name}: our IPD error {e_ours} rad");
+            assert!(e_theirs < 0.5, "{name}: reference IPD error {e_theirs} rad");
+            assert!(e_pair < 0.5, "{name}: decoders disagree by {e_pair} rad");
+        }
     }
 }
 
-/// The phase layer end to end: a right channel that is the left
-/// delayed by eight samples carries a frequency-proportional
-/// inter-channel phase difference (`2π·f·τ`, within ±π across the
-/// IPD bands). With `phase` enabled the decoded pair reproduces the
-/// per-band IPD of the source (the §8.6.4.6.3.2 rotation, sign
-/// conventions and the Table 8.31 grid all in the loop); the
-/// default Ra path, which carries no phase, leaves the decoded IPD
-/// near zero and serves as the control.
-#[test]
-fn phase_layer_reproduces_the_inter_channel_phase() {
-    let fs = 44_100u32;
+/// A stereo pair whose left channel is the right delayed by `tau`
+/// samples: broadband multi-sine content up to ~4 kHz (the phase
+/// bands and a bit above), fully shared, so every band carries the
+/// inter-channel phase `2π·f·τ`.
+fn delayed_stereo(fs: u32, tau: usize) -> Vec<i16> {
     let n = (1.5 * f64::from(fs)) as usize;
-    let tau = 8usize;
-    // Broadband multi-sine "noise" up to ~4 kHz (the phase bands and
-    // a bit above), fully shared between the channels.
     let mut seed = 0x0f1e_2d3cu32;
     let mut rnd = move || {
         seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -568,9 +658,25 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
         pcm.push(l.clamp(-32768.0, 32767.0) as i16);
         pcm.push(r.clamp(-32768.0, 32767.0) as i16);
     }
+    pcm
+}
+
+/// The phase layer end to end: a right channel that is the left
+/// delayed by eight samples carries a frequency-proportional
+/// inter-channel phase difference (`2π·f·τ`, within ±π across the
+/// IPD bands). With `phase` on the decoded pair reproduces the
+/// per-band IPD of the source (the §8.6.4.6.3.2 rotation, sign
+/// conventions and the Table 8.31 grid all in the loop); the Ra
+/// path, which carries no phase, leaves the decoded IPD near zero
+/// and serves as the control; the default `Auto` election measures
+/// the image, elects the layer and matches the forced result.
+#[test]
+fn phase_layer_reproduces_the_inter_channel_phase() {
+    let fs = 44_100u32;
+    let pcm = delayed_stereo(fs, 8);
     let src = cues_of(&pcm, 20);
     let mut errors = Vec::new();
-    for phase in [false, true] {
+    for phase in [Election::Off, Election::On, Election::Auto] {
         let cfg = HeAacConfig {
             ps: PsEncoderConfig {
                 phase,
@@ -578,7 +684,12 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
             },
             ..HeAacConfig::new_v2(fs, 40_000)
         };
-        let (_enc, rt) = round_trip(&pcm, cfg);
+        let (enc, rt) = round_trip(&pcm, cfg);
+        assert_eq!(
+            enc.ps().unwrap().phase_on(),
+            phase != Election::Off,
+            "{phase:?}: phase layer election"
+        );
         let m = rt.aligned.len().min(pcm.len());
         let out = cues_of(&rt.aligned[..m], 20);
         // Bands 1..=10 carry IPD/OPD (band 0's hybrid channel sits
@@ -599,13 +710,18 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
             }
         }
         let mean = sum / count.max(1) as f64;
-        eprintln!("phase={phase}: mean |ΔIPD| {mean:.3} rad over {count} band-frames");
+        eprintln!("phase={phase:?}: mean |ΔIPD| {mean:.3} rad over {count} band-frames");
         errors.push(mean);
     }
-    let (without, with) = (errors[0], errors[1]);
+    let (without, with, auto) = (errors[0], errors[1], errors[2]);
     assert!(with < 0.5, "phase layer IPD error {with} rad");
     assert!(
         with * 2.0 < without,
         "phase layer no better than none: {with} vs {without}"
+    );
+    assert!(auto < 0.5, "auto-elected phase layer IPD error {auto} rad");
+    assert!(
+        (auto - with).abs() < 0.1,
+        "auto {auto} vs forced {with} rad"
     );
 }

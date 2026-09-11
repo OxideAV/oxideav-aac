@@ -89,21 +89,57 @@ impl PsBands {
     }
 }
 
+/// A header-level tool decision: forced on / off, or elected from
+/// the measured signal at every header frame (see
+/// [`PsEncoderConfig::fine_iid`] / [`PsEncoderConfig::phase`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Election {
+    /// Never.
+    Off,
+    /// Always.
+    On,
+    /// Elected at each `enable_ps_header` frame from the frames
+    /// since the previous header (the first frame from itself).
+    #[default]
+    Auto,
+}
+
+impl From<bool> for Election {
+    fn from(on: bool) -> Self {
+        if on {
+            Election::On
+        } else {
+            Election::Off
+        }
+    }
+}
+
 /// Configuration of one [`PsEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PsEncoderConfig {
     /// Stereo band count for IID and ICC.
     pub bands: PsBands,
     /// Quantise IID on the fine Table 8.26 grid (`iid_mode + 3`).
-    pub fine_iid: bool,
+    /// `Auto` elects the fine grid when the energy-weighted error of
+    /// the coarse Table 8.25 grid against the measured level
+    /// differences exceeds [`FINE_IID_ELECT_DB`] (large IIDs sit on
+    /// the coarse grid's 3–7 dB steps; near-centre images do not).
+    pub fine_iid: Election,
     /// Transmit ICC (`enable_icc`). Off leaves the decoder at ρ = 1
     /// (pure intensity panning).
     pub icc: bool,
-    /// Code the phase layer: `enable_ext` with IPD/OPD in every
-    /// frame, ICC as the magnitude coherence and mixing procedure Rb
-    /// (`icc_mode + 3`). Off codes the real coherence for procedure
-    /// Ra, which reproduces anti-phase content through `ρ < 0`.
-    pub phase: bool,
+    /// Code the phase layer: `enable_ext` with IPD/OPD, ICC as the
+    /// magnitude coherence and mixing procedure Rb (`icc_mode + 3`).
+    /// Off codes the real coherence for procedure Ra, which
+    /// reproduces anti-phase content through `ρ < 0`. `Auto` elects
+    /// the phase layer when at least [`PHASE_ELECT_FRACTION`] of the
+    /// IPD/OPD bands' energy sits in bands that are coherent
+    /// (magnitude coherence ≥ [`PHASE_MIN_COHERENCE`]) with an
+    /// inter-channel phase beyond half a Table 8.31 step — a stereo
+    /// image the real coherence cannot carry. Within the phase
+    /// layer, `enable_ipdopd` is sent per frame only when some band
+    /// carrying energy has a non-zero quantised IPD or OPD.
+    pub phase: Election,
     /// Transmit the `enable_ps_header` block every N frames (and
     /// always in the first). `0` behaves as `1`.
     pub header_interval: u32,
@@ -116,9 +152,9 @@ impl Default for PsEncoderConfig {
     fn default() -> Self {
         PsEncoderConfig {
             bands: PsBands::Twenty,
-            fine_iid: false,
+            fine_iid: Election::Auto,
             icc: true,
-            phase: false,
+            phase: Election::Auto,
             header_interval: 8,
             variable_borders: true,
         }
@@ -128,19 +164,27 @@ impl Default for PsEncoderConfig {
 impl PsEncoderConfig {
     /// The Table 8.9 header block this configuration transmits, in
     /// the parser's canonical form (a disabled kind's mode is 0 — the
-    /// field is not on the wire).
+    /// field is not on the wire), with every `Auto` election taken
+    /// as off (its initial state; [`PsEncoder::ps_config`] reports
+    /// the elected form).
     #[must_use]
     pub fn ps_config(&self) -> PsConfig {
+        self.ps_config_for(self.fine_iid == Election::On, self.phase == Election::On)
+    }
+
+    /// The header block for resolved fine-IID / phase decisions.
+    #[must_use]
+    pub fn ps_config_for(&self, fine: bool, phase: bool) -> PsConfig {
         PsConfig {
             enable_iid: true,
-            iid_mode: self.bands.mode() + if self.fine_iid { 3 } else { 0 },
+            iid_mode: self.bands.mode() + if fine { 3 } else { 0 },
             enable_icc: self.icc,
             icc_mode: if self.icc {
-                self.bands.mode() + if self.phase { 3 } else { 0 }
+                self.bands.mode() + if phase { 3 } else { 0 }
             } else {
                 0
             },
-            enable_ext: self.phase,
+            enable_ext: phase,
         }
     }
 }
@@ -172,6 +216,34 @@ const SMOOTH_MAX: f64 = 0.7;
 /// per-band rotation costs bits and disturbs the neighbouring bands'
 /// alias cancellation in the synthesis bank.
 const PHASE_MIN_COHERENCE: f64 = 0.6;
+/// `Election::Auto` phase layer: the fraction of the IPD/OPD bands'
+/// energy that must sit in coherent bands with an inter-channel
+/// phase beyond half a Table 8.31 step (π/8).
+pub const PHASE_ELECT_FRACTION: f64 = 0.1;
+/// `Election::Auto` fine IID: the energy-weighted mean error (dB) of
+/// the coarse Table 8.25 grid that elects the fine Table 8.26 grid.
+pub const FINE_IID_ELECT_DB: f64 = 0.75;
+/// Bands below this fraction of the frame's loudest band do not vote
+/// in the phase / fine-IID elections and do not keep `enable_ipdopd`
+/// on.
+const ELECT_BAND_RATIO: f64 = 1e-2;
+/// Accumulated band energy (squared PCM-scale QMF magnitudes) at or
+/// below which an election window counts as silent.
+const SILENCE_ENERGY: f64 = 1.0;
+
+/// Energy-weighted measurements accumulated between header frames
+/// for the `Auto` elections.
+#[derive(Debug, Clone, Copy, Default)]
+struct ElectionStats {
+    /// Energy of IPD/OPD bands carrying a coherent, non-trivial phase.
+    phase_energy: f64,
+    /// Energy of every IPD/OPD band that voted.
+    phase_total: f64,
+    /// Σ energy × |coarse-grid error| (dB).
+    iid_error: f64,
+    /// Σ energy of the bands behind `iid_error`.
+    iid_total: f64,
+}
 
 /// One encoded frame with its diagnostics.
 #[derive(Debug, Clone, PartialEq)]
@@ -210,19 +282,33 @@ pub struct PsEncoder {
     state: PsIndexState,
     /// The previous frame's smoothed whole-frame excitations.
     prev_whole: Option<Vec<BandStats>>,
+    /// The fine-IID / phase decisions in force since the last header.
+    fine_on: bool,
+    phase_on: bool,
+    /// The previous frame's `enable_ipdopd` (a hold frame repeats it).
+    prev_send_phase: bool,
+    stats: ElectionStats,
+    /// The decisions in force were elected from a silent window.
+    elected_from_silence: bool,
 }
 
 impl PsEncoder {
     /// Build an encoder for `cfg`.
     pub fn new(cfg: PsEncoderConfig) -> Result<Self> {
-        let ps_config = cfg.ps_config();
+        let fine_on = cfg.fine_iid == Election::On;
+        let phase_on = cfg.phase == Election::On;
         Ok(PsEncoder {
             cfg,
-            ps_config,
+            ps_config: cfg.ps_config_for(fine_on, phase_on),
             analysis: PsAnalysis::new(hybrid_config_for(cfg.bands.count())),
             frames: 0,
             state: PsIndexState::default(),
             prev_whole: None,
+            fine_on,
+            phase_on,
+            prev_send_phase: false,
+            stats: ElectionStats::default(),
+            elected_from_silence: false,
         })
     }
 
@@ -232,10 +318,79 @@ impl PsEncoder {
         &self.cfg
     }
 
-    /// The transmitted `ps_data()` header configuration.
+    /// The transmitted `ps_data()` header configuration (the `Auto`
+    /// elections as currently in force).
     #[must_use]
     pub fn ps_config(&self) -> PsConfig {
         self.ps_config
+    }
+
+    /// Whether the fine IID grid is in force.
+    #[must_use]
+    pub fn fine_iid_on(&self) -> bool {
+        self.fine_on
+    }
+
+    /// Whether the phase layer (`enable_ext`, mixing procedure Rb) is
+    /// in force.
+    #[must_use]
+    pub fn phase_on(&self) -> bool {
+        self.phase_on
+    }
+
+    /// Fold one frame's whole-frame band statistics into the
+    /// election measurements.
+    fn accumulate(&mut self, whole: &[BandStats]) {
+        let peak = whole.iter().map(BandStats::energy).fold(0.0f64, f64::max);
+        let floor = peak * ELECT_BAND_RATIO;
+        let nr_phase = self.cfg.ps_config_for(false, true).nr_ipdopd_par();
+        for (b, st) in whole.iter().enumerate() {
+            let e = st.energy();
+            if e < floor || e <= 0.0 {
+                continue;
+            }
+            if b < nr_phase {
+                self.stats.phase_total += e;
+                let ipd = st.ipd().rem_euclid(core::f64::consts::TAU);
+                let ipd = ipd.min(core::f64::consts::TAU - ipd);
+                if st.icc_magnitude() >= PHASE_MIN_COHERENCE && ipd > core::f64::consts::FRAC_PI_8 {
+                    self.stats.phase_energy += e;
+                }
+            }
+            let iid = st.iid_db();
+            if iid.is_finite() {
+                let q = quantise_iid(iid, false);
+                let g = IID_DB_COARSE[(q + (IID_DB_COARSE.len() / 2) as i32) as usize];
+                self.stats.iid_error += e * (iid - g).abs();
+                self.stats.iid_total += e;
+            }
+        }
+    }
+
+    /// Resolve the `Auto` elections for a header frame from the
+    /// accumulated measurements, then restart them.
+    fn elect(&mut self) {
+        let st = self.stats;
+        self.fine_on = match self.cfg.fine_iid {
+            Election::On => true,
+            Election::Off => false,
+            Election::Auto => {
+                st.iid_total > 0.0 && st.iid_error >= FINE_IID_ELECT_DB * st.iid_total
+            }
+        };
+        self.phase_on = match self.cfg.phase {
+            Election::On => true,
+            Election::Off => false,
+            Election::Auto => {
+                st.phase_total > 0.0 && st.phase_energy >= PHASE_ELECT_FRACTION * st.phase_total
+            }
+        };
+        // A window without signal (the encoder's priming frame, a
+        // silent lead-in) decides nothing: the next frame carrying
+        // signal re-elects with an extra header.
+        self.elected_from_silence = st.iid_total <= SILENCE_ENERGY;
+        self.ps_config = self.cfg.ps_config_for(self.fine_on, self.phase_on);
+        self.stats = ElectionStats::default();
     }
 
     /// Frames encoded so far.
@@ -262,7 +417,9 @@ impl PsEncoder {
     }
 
     /// [`encode_frame`](Self::encode_frame) with an explicit header
-    /// decision (the first frame always carries one).
+    /// decision (the first frame always carries one, and so does the
+    /// first frame with signal after an `Auto` election taken over
+    /// silence).
     pub fn encode_frame_with_header(
         &mut self,
         l: &[[Complex; 64]],
@@ -277,6 +434,19 @@ impl PsEncoder {
         let energies = slot_energies(&hyb);
         let whole = band_stats(&hyb, n_pars, 0, NUM_QMF_SLOTS - 1)?;
         let channels = band_channels(n_pars)?;
+
+        // Header-level elections from the measured image. Decisions
+        // taken over silence are provisional: the first frame with
+        // signal re-elects and carries the header itself.
+        self.accumulate(&whole);
+        let auto = self.cfg.phase == Election::Auto || self.cfg.fine_iid == Election::Auto;
+        let header =
+            header || (auto && self.elected_from_silence && self.stats.iid_total > SILENCE_ENERGY);
+        if header {
+            self.elect();
+        }
+        let phase = self.phase_on;
+        let fine = self.fine_on;
         let attack = detect_attack(&energies);
         let mut transient = None;
         // (estimation region lo, hi, parameter position n_e).
@@ -287,16 +457,10 @@ impl PsEncoder {
                 let n_pre: Vec<usize> = channels.iter().map(|&c| c * t).collect();
                 let n_post: Vec<usize> =
                     channels.iter().map(|&c| c * (NUM_QMF_SLOTS - t)).collect();
-                if cues_close(&pre, &post, &n_pre, &n_post, self.cfg.phase) {
+                if cues_close(&pre, &post, &n_pre, &n_post, phase) {
                     (
                         false,
-                        fixed_regions(elect_fixed(
-                            &hyb,
-                            n_pars,
-                            &whole,
-                            &channels,
-                            self.cfg.phase,
-                        )?),
+                        fixed_regions(elect_fixed(&hyb, n_pars, &whole, &channels, phase)?),
                     )
                 } else {
                     transient = Some(t);
@@ -316,13 +480,7 @@ impl PsEncoder {
             }
             _ => (
                 false,
-                fixed_regions(elect_fixed(
-                    &hyb,
-                    n_pars,
-                    &whole,
-                    &channels,
-                    self.cfg.phase,
-                )?),
+                fixed_regions(elect_fixed(&hyb, n_pars, &whole, &channels, phase)?),
             ),
         };
         let borders: Vec<usize> = regions.iter().map(|&(_, _, n_e)| n_e).collect();
@@ -364,14 +522,14 @@ impl PsEncoder {
             };
             iid_abs.push(
                 st.iter()
-                    .map(|s| quantise_iid(s.iid_db(), self.cfg.fine_iid))
+                    .map(|s| quantise_iid(s.iid_db(), fine))
                     .collect::<Vec<i32>>(),
             );
             if self.cfg.icc {
                 icc_abs.push(
                     st.iter()
                         .map(|s| {
-                            quantise_icc(if self.cfg.phase {
+                            quantise_icc(if phase {
                                 s.icc_magnitude()
                             } else {
                                 s.icc_real()
@@ -380,7 +538,7 @@ impl PsEncoder {
                         .collect::<Vec<i32>>(),
                 );
             }
-            if self.cfg.phase {
+            if phase {
                 // Phases only where the coherence makes them
                 // meaningful; index 0 elsewhere.
                 let gate = |s: &BandStats, angle: f64| {
@@ -406,6 +564,32 @@ impl PsEncoder {
             stats.push(st);
         }
 
+        // Phase rows are only worth sending when some band carrying
+        // energy has a non-zero quantised IPD or OPD; otherwise
+        // `enable_ipdopd = 0` (the decoder takes index 0 — §8.5.2).
+        let send_phase = phase && {
+            let peak = stats
+                .iter()
+                .flatten()
+                .map(BandStats::energy)
+                .fold(0.0f64, f64::max);
+            let floor = peak * ELECT_BAND_RATIO;
+            stats.iter().enumerate().any(|(e, row)| {
+                row.iter().enumerate().take(nr_phase).any(|(b, st)| {
+                    st.energy() >= floor && (ipd_abs[e][b] != 0 || opd_abs[e][b] != 0)
+                })
+            })
+        };
+        if !send_phase {
+            ipd_abs.clear();
+            opd_abs.clear();
+        }
+        let phase_rows_same = if send_phase {
+            ipd_abs[0] == self.state.ipd && opd_abs[0] == self.state.opd
+        } else {
+            self.state.ipd.is_empty() && self.state.opd.is_empty()
+        };
+
         // Hold: a single parameter set identical to the decoder's
         // current one needs no new data.
         let hold = !header
@@ -413,7 +597,7 @@ impl PsEncoder {
             && regions.len() == 1
             && iid_abs[0] == self.state.iid
             && (!self.cfg.icc || icc_abs[0] == self.state.icc)
-            && (!self.cfg.phase || (ipd_abs[0] == self.state.ipd && opd_abs[0] == self.state.opd));
+            && (!phase || phase_rows_same);
 
         let num_env = if hold { 0 } else { regions.len() };
         let mut data = PsData {
@@ -430,7 +614,13 @@ impl PsEncoder {
             iid_deltas: Vec::new(),
             icc_dt: Vec::new(),
             icc_deltas: Vec::new(),
-            enable_ipdopd: false,
+            // A hold element repeats the previous decision so the
+            // decoder keeps (§8.6.4.6.5) the same H vectors.
+            enable_ipdopd: if hold {
+                phase && self.prev_send_phase
+            } else {
+                send_phase
+            },
             ipd_dt: Vec::new(),
             ipd_deltas: Vec::new(),
             opd_dt: Vec::new(),
@@ -449,8 +639,7 @@ impl PsEncoder {
                 data.icc_dt = dt;
                 data.icc_deltas = deltas;
             }
-            if self.cfg.phase {
-                data.enable_ipdopd = true;
+            if send_phase {
                 let (dt, deltas) = code_kind(&ipd_abs, &self.state.ipd, header, true, ipd_table)?;
                 data.ipd_dt = dt;
                 data.ipd_deltas = deltas;
@@ -476,6 +665,7 @@ impl PsEncoder {
             }
         }
         self.state = state;
+        self.prev_send_phase = data.enable_ipdopd;
 
         let mut w = oxideav_core::bits::BitWriter::new();
         write_ps_data(&mut w, &data)?;
@@ -757,9 +947,9 @@ mod tests {
                     for phase in [false, true] {
                         let cfg = PsEncoderConfig {
                             bands,
-                            fine_iid: fine,
+                            fine_iid: fine.into(),
                             icc,
-                            phase,
+                            phase: phase.into(),
                             ..PsEncoderConfig::default()
                         };
                         let c = cfg.ps_config();
@@ -805,24 +995,39 @@ mod tests {
         assert_eq!(quantise_phase(2.0 * core::f64::consts::PI), 0);
     }
 
-    /// The default configuration on a hard-left/right-panned frame:
-    /// header'd first element, the decoder resolves ±25 dB IIDs, and
-    /// a repeated frame becomes a hold element.
+    /// A hard-left-panned frame (+40 dB): with the coarse grid forced
+    /// the header'd first element resolves the +25 dB coarse ceiling,
+    /// the default `Auto` election takes the fine grid (a 15 dB
+    /// coarse error) and resolves +40 dB, and a repeated frame
+    /// becomes a hold element.
     #[test]
     fn panned_input_codes_extreme_iid_then_holds() {
-        let mut enc = PsEncoder::new(PsEncoderConfig::default()).unwrap();
         let sig = noise(5);
         let l = frame(&sig);
         let r = frame(|n, k| sig(n, k) * 0.01); // −40 dB
+        let coarse = PsEncoderConfig {
+            fine_iid: Election::Off,
+            ..PsEncoderConfig::default()
+        };
+        let mut enc_c = PsEncoder::new(coarse).unwrap();
+        let fc = enc_c.encode_frame(&l, &r).unwrap();
+        assert_eq!(fc.data.config, coarse.ps_config());
+        assert!(fc.indices.iid.last().unwrap().iter().all(|&i| i == 7));
+
+        let mut enc = PsEncoder::new(PsEncoderConfig::default()).unwrap();
         let f0 = enc.encode_frame(&l, &r).unwrap();
         assert!(f0.header_sent);
         assert!(f0.data.header_present);
-        assert_eq!(f0.data.config, PsEncoderConfig::default().ps_config());
+        assert!(enc.fine_iid_on() && !enc.phase_on());
+        assert_eq!(
+            f0.data.config,
+            PsEncoderConfig::default().ps_config_for(true, false)
+        );
         assert!(!f0.data.frame_class);
         assert!(f0.data.num_env >= 1);
         assert!(!f0.data.iid_dt[0], "header frame env 0 must be freq-coded");
         let last = f0.indices.iid.last().unwrap();
-        assert!(last.iter().all(|&i| i == 7), "{last:?}");
+        assert!(last.iter().all(|&i| i == 13), "{last:?}"); // +40 dB
         assert!(f0.indices.icc.last().unwrap().iter().all(|&i| i == 0));
         // The payload reparses to the same element.
         let mut rd = BitReader::new(&f0.payload);
@@ -846,8 +1051,8 @@ mod tests {
             for (fine, phase) in [(false, false), (true, false), (false, true), (true, true)] {
                 let cfg = PsEncoderConfig {
                     bands,
-                    fine_iid: fine,
-                    phase,
+                    fine_iid: fine.into(),
+                    phase: phase.into(),
                     header_interval: 3,
                     ..PsEncoderConfig::default()
                 };
@@ -855,6 +1060,7 @@ mod tests {
                 let mut dec_cfg = None;
                 let mut dec_state = PsIndexState::default();
                 let mut saw_time = false;
+                let mut saw_phase = false;
                 for f in 0..7u64 {
                     let a = noise(100 + f);
                     let b = noise(200 + f);
@@ -877,15 +1083,24 @@ mod tests {
                     // Either the time direction won a row, or the
                     // whole set repeated and became a hold element.
                     saw_time |= fr.data.iid_dt.iter().any(|&d| d) || fr.data.num_env == 0;
-                    assert_eq!(fr.data.enable_ipdopd, phase);
-                    if phase && fr.data.num_env > 0 {
+                    // Phase rows only under the layer, and only once
+                    // the rotation and the coherence make them
+                    // non-zero (frame 0 is unrotated; the early
+                    // frames' 0.2–0.35 gains keep the coherence
+                    // under the gate).
+                    if !phase {
+                        assert!(!fr.data.enable_ipdopd);
+                    }
+                    if fr.data.enable_ipdopd && fr.data.num_env > 0 {
                         assert_eq!(fr.indices.ipd[0].len(), cfg.ps_config().nr_ipdopd_par());
+                        saw_phase = true;
                     }
                 }
                 assert!(
                     saw_time,
                     "{bands:?}: neither time coding nor a hold elected"
                 );
+                assert_eq!(saw_phase, phase, "{bands:?} fine={fine}: phase rows");
             }
         }
     }
@@ -895,7 +1110,11 @@ mod tests {
     /// cues on either side.
     #[test]
     fn cue_flipping_attack_elects_variable_borders() {
-        let mut enc = PsEncoder::new(PsEncoderConfig::default()).unwrap();
+        let coarse = PsEncoderConfig {
+            fine_iid: Election::Off,
+            ..PsEncoderConfig::default()
+        };
+        let mut enc = PsEncoder::new(coarse).unwrap();
         let sig = noise(77);
         let t = 20usize;
         // Quiet left-only, then a loud right-only burst from slot t.
@@ -929,7 +1148,7 @@ mod tests {
         // With variable borders disabled the same frame is FIX.
         let mut enc = PsEncoder::new(PsEncoderConfig {
             variable_borders: false,
-            ..PsEncoderConfig::default()
+            ..coarse
         })
         .unwrap();
         let fr = enc.encode_frame(&l, &r).unwrap();
@@ -955,6 +1174,129 @@ mod tests {
         assert!(fr.transient.is_none());
         assert!(!fr.data.frame_class);
         assert_eq!(fr.data.num_env, 1);
+    }
+
+    /// The `Auto` elections follow the measured image at header
+    /// frames: a 4 dB pan sits on the coarse grid and carries no
+    /// phase (coarse, procedure Ra); a 5.5 dB pan misses the coarse
+    /// grid by 1.5 dB (fine); a coherent π/2 rotation elects the
+    /// phase layer with `enable_ipdopd` and index 2 in every phase
+    /// band; inside the layer a frame without phase content sends
+    /// `enable_ipdopd = 0`, and the decoder-side closed loop holds
+    /// through both transitions. Elections only move at header
+    /// frames.
+    #[test]
+    fn auto_elections_follow_the_measured_image() {
+        let sig = noise(9);
+        let l = frame(&sig);
+        let pan = |db: f64| {
+            let g = 10f64.powf(-db / 20.0);
+            frame(|n, k| sig(n, k) * g)
+        };
+        let cfg = PsEncoderConfig {
+            header_interval: 3,
+            ..PsEncoderConfig::default()
+        };
+
+        let mut enc = PsEncoder::new(cfg).unwrap();
+        let f = enc.encode_frame(&l, &pan(4.0)).unwrap();
+        assert!(!enc.fine_iid_on() && !enc.phase_on(), "4 dB pan");
+        assert!(!f.data.config.enable_ext && f.data.config.iid_mode == 1);
+        assert!(!f.data.enable_ipdopd);
+        assert!(
+            f.indices.iid[0].iter().all(|&i| i == 2),
+            "{:?}",
+            f.indices.iid[0]
+        );
+
+        let mut enc = PsEncoder::new(cfg).unwrap();
+        let f = enc.encode_frame(&l, &pan(5.5)).unwrap();
+        assert!(enc.fine_iid_on() && !enc.phase_on(), "5.5 dB pan");
+        assert_eq!(f.data.config.iid_mode, 4);
+        assert!(
+            f.indices.iid[0].iter().all(|&i| i == 3),
+            "{:?}",
+            f.indices.iid[0]
+        ); // 6 dB
+
+        // Coherent quarter-turn: phase layer.
+        let rot = Complex::new(0.0, 1.0);
+        let r_rot = frame(|n, k| sig(n, k) * rot);
+        let mut enc = PsEncoder::new(cfg).unwrap();
+        let f0 = enc.encode_frame(&l, &r_rot).unwrap();
+        assert!(enc.phase_on(), "rotation elects the phase layer");
+        assert!(f0.data.config.enable_ext && f0.data.config.icc_mode == 4);
+        assert!(f0.data.enable_ipdopd);
+        let nr = f0.data.config.nr_ipdopd_par();
+        assert_eq!(f0.indices.ipd[0].len(), nr);
+        assert!(
+            f0.indices.ipd[0].iter().all(|&i| i == 2 || i == 6),
+            "{:?}",
+            f0.indices.ipd[0]
+        );
+        // Frames 1–2 (no header): the layer stays on an unrotated
+        // pan (the narrowest band's cross-frame smoothing still
+        // carries a trace of the rotation, so its phase row may go
+        // out for a frame or two). Frame 3 (header) re-elects from
+        // frames 1–2: that trace is far below the election fraction
+        // → Ra. Once the smoothing has settled the identical input
+        // becomes a hold element.
+        let f1 = enc.encode_frame(&l, &pan(4.0)).unwrap();
+        assert!(!f1.header_sent && enc.phase_on());
+        let f2 = enc.encode_frame(&l, &pan(4.0)).unwrap();
+        assert!(!f2.header_sent && enc.phase_on());
+        let f3 = enc.encode_frame(&l, &pan(4.0)).unwrap();
+        assert!(f3.header_sent && !enc.phase_on());
+        assert!(!f3.data.config.enable_ext && !f3.data.enable_ipdopd);
+        assert!(f3.indices.ipd.is_empty());
+        let mut frames = vec![f0, f1, f2, f3];
+        for _ in 0..8 {
+            frames.push(enc.encode_frame(&l, &pan(4.0)).unwrap());
+        }
+        assert!(
+            frames[4..].iter().any(|f| f.data.num_env == 0),
+            "no hold element once the smoothing settled"
+        );
+        // Every payload reparses and resolves to the encoder's indices.
+        let mut dec_cfg = None;
+        let mut st = PsIndexState::default();
+        for f in &frames {
+            let mut rd = BitReader::new(&f.payload);
+            let back = PsData::parse(&mut rd, dec_cfg.as_ref()).unwrap().unwrap();
+            dec_cfg = Some(back.config);
+            assert_eq!(back, f.data);
+            assert_eq!(back.resolve(&mut st).unwrap(), f.indices);
+        }
+        // Forced modes ignore the measurements.
+        let mut enc = PsEncoder::new(PsEncoderConfig {
+            fine_iid: Election::On,
+            phase: Election::Off,
+            ..cfg
+        })
+        .unwrap();
+        enc.encode_frame(&l, &r_rot).unwrap();
+        assert!(enc.fine_iid_on() && !enc.phase_on());
+        // A forced phase layer over a phase-less pan: the extension
+        // layer is on, its IPD/OPD rows are not sent.
+        let mut enc = PsEncoder::new(PsEncoderConfig {
+            phase: Election::On,
+            ..cfg
+        })
+        .unwrap();
+        let f = enc.encode_frame(&l, &pan(4.0)).unwrap();
+        assert!(
+            f.data.config.enable_ext && !f.data.enable_ipdopd,
+            "{:?}",
+            f.data
+        );
+        assert!(f.indices.ipd.is_empty() && f.indices.opd.is_empty());
+        let mut rd = BitReader::new(&f.payload);
+        let back = PsData::parse(&mut rd, None).unwrap().unwrap();
+        assert_eq!(back, f.data);
+        assert_eq!(
+            back.resolve(&mut PsIndexState::default()).unwrap(),
+            f.indices
+        );
     }
 
     /// A short look-ahead is rejected.

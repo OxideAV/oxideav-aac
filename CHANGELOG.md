@@ -56,6 +56,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   slot count; a writer-assembled LC-960 + SBR LOAS stream round-trips
   through this crate's decoder and its core band matches the reference
   decoder binary (which does not implement SBR over 960-line frames)
+- `ps_encoder::Election` (`Off` / `On` / `Auto`) replaces the boolean
+  `fine_iid` / `phase` configuration fields (`From<bool>` keeps the
+  old spellings), `Auto` the default for both: the fine IID grid and
+  the phase layer are elected at header frames from the measured
+  image (energy-weighted coarse-grid error ≥ 0.75 dB; ≥ 10 % of the
+  IPD/OPD bands' energy coherent with a phase beyond π/8), a decision
+  taken over silence re-elected by the first frame with signal;
+  `enable_ipdopd` per frame only when a band with energy carries a
+  non-zero phase index; `PsEncoderConfig::ps_config_for`,
+  `PsEncoder::fine_iid_on` / `phase_on`; the reference decoder binary
+  agrees with this crate's decode on the auto-elected phase layer
+  (IID 0.00 dB, IPD 0.000 rad)
 
 ### Fixed
 

@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_aac::ps_data::{PsData, PsIndexState};
-use oxideav_aac::ps_encoder::{PsBands, PsEncoder, PsEncoderConfig};
+use oxideav_aac::ps_encoder::{Election, PsBands, PsEncoder, PsEncoderConfig};
 use oxideav_aac::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
 use oxideav_aac::sbr_qmf::Complex;
 use oxideav_core::bits::BitReader;
@@ -20,9 +20,9 @@ fuzz_target!(|data: &[u8]| {
     }
     let cfg = PsEncoderConfig {
         bands: [PsBands::Ten, PsBands::Twenty, PsBands::ThirtyFour][usize::from(data[0] % 3)],
-        fine_iid: data[0] & 4 != 0,
+        fine_iid: [Election::Off, Election::On, Election::Auto][usize::from((data[0] >> 2) % 3)],
         icc: data[0] & 8 != 0,
-        phase: data[0] & 16 != 0,
+        phase: [Election::Off, Election::On, Election::Auto][usize::from((data[0] >> 4) % 3)],
         header_interval: u32::from(data[1] % 4),
         variable_borders: data[0] & 32 != 0,
     };
