@@ -83,6 +83,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - `fuzz/sbr_encoder_frame`: the SBR encoder over arbitrary analysis
   frames under every configuration (16 / 15 slots, mono / coupled,
   all header options), payloads reparsed and grids derived
+- `he_aac_encoder`: the default SBR crossover follows
+  `CROSSOVER_HZ_PER_BPS` (0.35 Hz per bit/s of core-channel rate,
+  clamped to `[0.09, 0.22]·fs`) instead of `0.115·fs·√(bps/24 000)`
+  — 5.6 / 8.4 kHz at 16 / 24 kbps per channel, where the reference HE
+  encoder still waveform-codes; mean NMR against it improves
+  0.6 / 1.5 dB at 32 / 48 kbps stereo on the equal-rate harness
 
 ### Fixed
 

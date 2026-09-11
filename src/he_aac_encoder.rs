@@ -189,15 +189,23 @@ impl HeAacConfig {
     }
 
     /// The crossover frequency in force: the explicit one, else a
-    /// bitrate-driven choice — `0.115·fs·√(bps_per_channel / 24 000)`
-    /// (≈ 4.1 kHz at 16 kbps/ch and 5.9 kHz at 32 kbps/ch for 44.1 kHz
-    /// output), kept within `[0.09·fs, 0.22·fs]` so the core always
-    /// carries a band below it and the SBR range is never empty.
+    /// bitrate-driven choice — [`CROSSOVER_HZ_PER_BPS`] Hz per bit/s
+    /// of per-core-channel rate (5.6 kHz at 16 kbps/ch, 8.4 kHz at
+    /// 24 kbps/ch), kept within `[0.09·fs, 0.22·fs]` so the core
+    /// always carries a band below it and the SBR range is never
+    /// empty (9.7 kHz at 44.1 kHz output from 28 kbps/ch up).
+    ///
+    /// Measured on the equal-rate harness against the black-box
+    /// reference HE encoder: the earlier `0.115·fs·√(bps/24 000)` rule
+    /// (4.1 / 5.1 kHz at 16 / 24 kbps/ch) handed the SBR tool the
+    /// bands the reference still waveform-codes (its crossover sits
+    /// at ≈ 5.9 / 8.3 kHz there), which the noise tables show at
+    /// +3 dB NSR against the reference's −16 dB.
     pub fn crossover(&self) -> f64 {
         let fs = f64::from(self.sample_rate);
         self.crossover_hz.unwrap_or_else(|| {
             let per_ch = f64::from(self.bitrate) / f64::from(self.core_channels().max(1));
-            (0.115 * fs * (per_ch / 24_000.0).sqrt()).clamp(0.09 * fs, 0.22 * fs)
+            (CROSSOVER_HZ_PER_BPS * per_ch).clamp(0.09 * fs, 0.22 * fs)
         })
     }
 
@@ -207,6 +215,10 @@ impl HeAacConfig {
         (0.36 * f64::from(self.sample_rate)).min(16_500.0)
     }
 }
+
+/// Default SBR crossover per bit of core-channel rate (see
+/// [`HeAacConfig::crossover`]).
+pub const CROSSOVER_HZ_PER_BPS: f64 = 0.35;
 
 /// Windowed-sinc low-pass FIR with cutoff `fc` (cycles per sample,
 /// `0 < fc < 0.5`), [`FIR_TAPS`] taps, unity DC gain.

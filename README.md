@@ -1387,9 +1387,16 @@ component still open (see below):
   SBR fill bytes from the frame budget *and* measured them inside
   the assembled block, charging them twice, so HE-AAC streams ran
   16–27 % under target (26.8 / 43.9 kbps for 32 / 48); priced once,
-  they land on it (31.9 / 48.4 kbps) and sit +2.5 / +3.8 dB mean NMR
-  behind the reference HE encoder, the worst band at the SBR
-  crossover — the next lever.
+  they land on it (31.9 / 48.4 kbps). Its third: the SBR crossover —
+  the reference HE encoder still waveform-codes up to ≈ 5.9 / 8.3 kHz
+  at 16 / 24 kbps per channel (−16 dB NSR there) where the old
+  `0.115·fs·√(bps/24 000)` rule (4.1 / 5.1 kHz) had already handed
+  the bands to SBR (+3 dB); the crossover now follows
+  `0.35 Hz per bit/s` of core-channel rate (5.6 / 8.4 kHz, clamped to
+  `[0.09, 0.22]·fs`), taking the mean NMR gap to +1.9 / +2.4 dB
+  (from +2.8 / +4.1 at the round's start; the remaining bands are
+  SBR-regenerated on both sides, where a waveform measure no longer
+  discriminates).
   The SBR grid election spans all four frame classes (VARVAR up to
   the five-envelope limit for late, double and triple onsets — a
   fourth onset in one frame falls into the last envelope) with
