@@ -68,6 +68,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `PsEncoder::fine_iid_on` / `phase_on`; the reference decoder binary
   agrees with this crate's decode on the auto-elected phase layer
   (IID 0.00 dB, IPD 0.000 rad)
+- `encoder`: rate-derived coded bandwidth —
+  `EncoderConfig::default_bandwidth_hz` (0.26 Hz per bit/s of
+  per-channel rate, clamped 4–20 kHz and Nyquist),
+  `StreamEncoder::set_bandwidth` / `bandwidth`; lines above the cutoff
+  are zeroed before quantisation (per window of a short frame) so the
+  rate loop spends the bits below it; the HE-AAC core runs full band
+  (its input is band-limited at the SBR crossover). Measured on the
+  new equal-rate harness (`tests/encoder_psy_harness.rs`: black-box
+  reference encoders for LC 64/96/128 kbps and HE 32/48 kbps, both
+  decoders on every stream, per-band NSR / NMR tables): mean NMR
+  improves 1.0–1.4 dB on the LC cases; the 10.1 PCE layout joins the
+  reference-decoder black-box list
 
 ### Fixed
 

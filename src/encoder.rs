@@ -223,6 +223,22 @@ const MAX_RATE_ITERATIONS: usize = 48;
 /// (magnitudes ×2^6 over the [`TARGET_PEAK_MAG`] baseline).
 const MAX_REFINE_OFFSET: i32 = 32;
 
+/// Default coded bandwidth per bit of channel rate: the audio
+/// bandwidth kept at `bitrate / channels` bits per second per
+/// channel is `BANDWIDTH_HZ_PER_BPS · (bitrate / channels)`, clamped
+/// to [`BANDWIDTH_MIN_HZ`]`..=`[`BANDWIDTH_MAX_HZ`] and the Nyquist
+/// rate. Measured on the equal-rate harness against the black-box
+/// reference encoder: at 32 kbps per channel the square-root masking
+/// spread was buying ~0 dB NSR (noise ≈ signal) in every band above
+/// 8 kHz while the bands below 4 kHz sat 8 dB noisier than the
+/// reference's; culling the top of the spectrum and spending those
+/// bits below closes most of that gap.
+const BANDWIDTH_HZ_PER_BPS: f64 = 0.26;
+/// Floor of the default coded bandwidth (Hz).
+const BANDWIDTH_MIN_HZ: f64 = 4_000.0;
+/// Ceiling of the default coded bandwidth (Hz).
+const BANDWIDTH_MAX_HZ: f64 = 20_000.0;
+
 /// Minimum §4.5.4 band width (coefficients) for the §4.6.13 PNS
 /// noise-likeness statistic to be meaningful; narrower bands always
 /// code spectrally.
@@ -264,6 +280,18 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
+    /// The default coded bandwidth for this rate (see
+    /// [`BANDWIDTH_HZ_PER_BPS`]): `0.26 Hz` per bit/s of per-channel
+    /// rate — 8.3 kHz at 32 kbps per channel, 12.5 kHz at 48,
+    /// 16.6 kHz at 64, the full 20 kHz from 77 kbps per channel.
+    #[must_use]
+    pub fn default_bandwidth_hz(&self) -> f64 {
+        let per_channel = f64::from(self.bitrate) / f64::from(self.channels.max(1));
+        (BANDWIDTH_HZ_PER_BPS * per_channel)
+            .clamp(BANDWIDTH_MIN_HZ, BANDWIDTH_MAX_HZ)
+            .min(f64::from(self.sample_rate) / 2.0)
+    }
+
     /// Resolve `sample_rate` to its Table 1.18
     /// `sampling_frequency_index`. Index 12 (7350 Hz) is excluded:
     /// the §4.5.4 scalefactor-band tables only cover indices
@@ -545,6 +573,8 @@ pub struct StreamEncoder {
     /// §4.6.8.2 intensity-stereo emission toggle — see
     /// [`StreamEncoder::set_intensity_stereo`].
     is_enabled: bool,
+    /// Coded bandwidth (`None` = full band); see [`Self::set_bandwidth`].
+    bandwidth_hz: Option<f64>,
 }
 
 impl StreamEncoder {
@@ -641,6 +671,7 @@ impl StreamEncoder {
             pns_enabled: false,
             tns_enabled: true,
             is_enabled: false,
+            bandwidth_hz: Some(config.default_bandwidth_hz()),
         })
     }
 
@@ -670,6 +701,21 @@ impl StreamEncoder {
     /// predictability measure.
     pub fn set_pns(&mut self, enabled: bool) {
         self.pns_enabled = enabled;
+    }
+
+    /// Set the coded bandwidth: spectral lines above `hz` are zeroed
+    /// before quantisation (every window of a short frame alike) so
+    /// the rate loop spends the frame's bits below it. `None` keeps
+    /// the full band. Defaults to
+    /// [`EncoderConfig::default_bandwidth_hz`] for the configured rate.
+    pub fn set_bandwidth(&mut self, hz: Option<f64>) {
+        self.bandwidth_hz = hz.filter(|h| h.is_finite() && *h > 0.0);
+    }
+
+    /// The coded bandwidth in force (`None` = full band).
+    #[must_use]
+    pub fn bandwidth(&self) -> Option<f64> {
+        self.bandwidth_hz
     }
 
     /// Enable / disable §4.6.9 TNS emission (default **on**).
@@ -855,7 +901,11 @@ impl StreamEncoder {
             .zip(self.lfe_slot.iter())
         {
             let ch_seq = if lfe { WindowSequence::OnlyLong } else { seq };
-            spectra.push(analyze_channel(hist, chan, ch_seq)?);
+            let mut spec = analyze_channel(hist, chan, ch_seq)?;
+            if let (Some(hz), false) = (self.bandwidth_hz, lfe) {
+                cull_bandwidth(&mut spec, ch_seq, hz, self.config.sample_rate);
+            }
+            spectra.push(spec);
         }
         self.prev_seq = seq;
 
@@ -1309,6 +1359,23 @@ const TRANSIENT_ARM: f64 = TRANSIENT_FLOOR / TRANSIENT_RATIO;
 /// digital silence codes acceptably with the long-window pair (its
 /// left flank is silence — there is nothing to smear pre-echo into),
 /// so the detector deliberately stays quiet there.
+/// Zero the spectral lines above `cutoff_hz` (per window of an
+/// `EIGHT_SHORT` frame): the bandwidth limit the rate loop then
+/// never has to price.
+fn cull_bandwidth(spec: &mut [f64], seq: WindowSequence, cutoff_hz: f64, sample_rate: u32) {
+    let frac = (cutoff_hz / (f64::from(sample_rate) / 2.0)).clamp(0.0, 1.0);
+    if seq == WindowSequence::EightShort {
+        let short_len = SHORT_WINDOW_LEN as usize;
+        let keep = ((frac * short_len as f64).ceil() as usize).min(short_len);
+        for window in spec.chunks_exact_mut(short_len) {
+            window[keep..].iter_mut().for_each(|v| *v = 0.0);
+        }
+    } else {
+        let keep = ((frac * FRAME_LEN as f64).ceil() as usize).min(spec.len());
+        spec[keep..].iter_mut().for_each(|v| *v = 0.0);
+    }
+}
+
 fn detect_transient(hist: &[f64], cur: &[f64]) -> bool {
     let energies: Vec<f64> = hist
         .chunks(TRANSIENT_SUBBLOCK)

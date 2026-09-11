@@ -264,12 +264,27 @@ fn reference_binary_decodes_pce_layouts() {
     };
     let dir = std::env::temp_dir().join("oxideav-aac-pce-blackbox");
     fs::create_dir_all(&dir).unwrap();
-    for (label, layout) in [
-        ("s61", ChannelLayout::Surround61),
-        ("s71", ChannelLayout::Surround71),
-        ("quad", ChannelLayout::Quad),
+    use ChannelPosition::*;
+    let cinema = vec![
+        FrontLeft,
+        FrontRight,
+        FrontCenter,
+        LowFrequency,
+        FrontLeftOfCenter,
+        FrontRightOfCenter,
+        BackCenter,
+        SideLeft,
+        SideRight,
+        BackLeft,
+        BackRight,
+    ];
+    for (label, positions) in [
+        ("s61", ChannelLayout::Surround61.positions_owned()),
+        ("s71", ChannelLayout::Surround71.positions_owned()),
+        ("quad", ChannelLayout::Quad.positions_owned()),
+        ("cinema101", cinema),
     ] {
-        let rt = round_trip(&layout.positions_owned());
+        let rt = round_trip(&positions);
         let aac = dir.join(format!("{label}.aac"));
         let wav = dir.join(format!("{label}.wav"));
         fs::write(&aac, &rt.stream).unwrap();
@@ -293,6 +308,6 @@ fn reference_binary_decodes_pce_layouts() {
         let wav_bytes = fs::read(&wav).unwrap();
         // fmt chunk: channel count at byte 22 of a canonical header.
         let channels = u16::from_le_bytes([wav_bytes[22], wav_bytes[23]]);
-        assert_eq!(channels, layout.channel_count(), "{label}");
+        assert_eq!(usize::from(channels), positions.len(), "{label}");
     }
 }

@@ -1315,7 +1315,10 @@ component still open (see below):
 - Encoder-side tool remainders — the end-to-end AAC-LC encoder (see
   `encoder` below) covers block switching with §4.5.2.3.4 short-frame
   grouping, M/S on both frame shapes, the scalefactor/quantizer rate
-  loop with measured-bit-cost codebook/section choice, every
+  loop with measured-bit-cost codebook/section choice, a
+  rate-derived coded bandwidth (`EncoderConfig::default_bandwidth_hz`
+  = 0.26 Hz per bit/s of per-channel rate, 4–20 kHz;
+  `StreamEncoder::set_bandwidth`), every
   Table 1.19 default channel layout, and opt-in §4.6.13 PNS emission
   (`StreamEncoder::set_pns` — off by default because a single-frame
   spectral statistic cannot tell true noise from noise-shaped
@@ -1351,6 +1354,31 @@ component still open (see below):
   `L/R` are rejected up front), the PCE opening every
   `raw_data_block()`; the registry maps a named non-default
   `channel_layout` (and the bare 7-channel count, as 6.1) onto it.
+  Beyond the 11 positions of that set (the 10.1 "cinema" layout:
+  `C, Lc/Rc, L/R, Ls/Rs, Lb/Rb, Cs, LFE` — black-box decoded by the
+  reference binary) the staged 2009 edition has no height layer in
+  `program_config_element()` and Table 1.19 ends at
+  `channelConfiguration = 7` — 22.2 and the top-layer speaker sets
+  are out of its reach (see the docs asks).
+  **Equal-rate harness** (`tests/encoder_psy_harness.rs`, black-box
+  reference encoders for AAC-LC at 64/96/128 kbps stereo and HE-AAC
+  at 32/48 kbps): every stream — ours and the reference encoder's —
+  decoded by this crate and by the reference decoder binary
+  (per-band parity 0.00 dB on ours, 0.03–0.06 dB mean on theirs), the
+  coding noise per 64-band QMF band against the input after lag
+  alignment (NSR, and a noise-to-mask ratio under a 10 dB / 12 dB-
+  per-band spreading masker). The measurement's largest lever was
+  bandwidth: at 32 kbps per channel the square-root masking spread
+  bought ~0 dB NSR in every band above 8 kHz while the bands below
+  4 kHz sat 8 dB noisier than the reference's, which zeroes the top
+  of the spectrum; the rate-derived cull (slope swept over
+  0.20/0.26/0.32 Hz per bit/s — 0.26 matches the reference's cutoffs
+  and wins the 64 kbps case) now puts the mean NMR at −0.2 / −0.9 /
+  −2.0 dB against the reference on the mixed material at 64/96/128
+  kbps (from +1.1 / +0.1 / −2.1) and −0.1 / +1.6 / +1.6 dB on the
+  transient material (from +0.8 / +3.0 / +2.6); HE-AAC sits +2.8 /
+  +4.1 dB behind the reference HE encoder at 32/48 kbps (our streams
+  run 16–27 % under the target rate there — the next lever).
   The SBR grid election spans all four frame classes (VARVAR up to
   the five-envelope limit for late, double and triple onsets — a
   fourth onset in one frame falls into the last envelope) with

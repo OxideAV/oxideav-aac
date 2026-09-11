@@ -14,8 +14,12 @@ use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 
 /// Encode `pcm` and decode it back, returning the interleaved
 /// decoder output.
+/// Encode → decode at full band (these tests measure the coding
+/// tools, not the rate-derived bandwidth cull — several of their
+/// signals sit at or near Nyquist).
 fn roundtrip(pcm: &[i16], config: EncoderConfig) -> Vec<i16> {
     let mut enc = StreamEncoder::new(config).expect("encoder builds");
+    enc.set_bandwidth(None);
     let stream = enc.encode_all(pcm).expect("encode succeeds");
     let mut dec = StreamDecoder::new();
     let frames = dec
@@ -417,6 +421,8 @@ fn transient_input_switches_to_short_windows() {
         bitrate: 128_000,
     })
     .unwrap();
+    // The burst is a Nyquist-rate square wave: full band.
+    enc.set_bandwidth(None);
     let stream = enc.encode_all(&pcm).unwrap();
     let seqs = window_sequences(&stream);
     eprintln!("window sequences: {seqs:?}");
@@ -533,6 +539,9 @@ fn fixture_transcode_preserves_the_signal() {
             bitrate,
         })
         .unwrap();
+        // Transcode fidelity over the whole band (the chirp sweeps to
+        // Nyquist).
+        enc.set_bandwidth(None);
         let stream = enc.encode_all(&pcm).unwrap();
         let mut dec2 = StreamDecoder::new();
         let frames2 = dec2.decode_all(&stream).expect("re-encoded stream decodes");
@@ -637,6 +646,7 @@ fn correlated_high_bands_engage_intensity_stereo() {
     };
     let mut enc = StreamEncoder::new(config).unwrap();
     enc.set_intensity_stereo(true);
+    enc.set_bandwidth(None); // the IS bands are the top of the spectrum
     let stream = enc.encode_all(&pcm).unwrap();
 
     let (in_phase, out_phase) = count_intensity_bands(&stream);
@@ -663,6 +673,7 @@ fn correlated_high_bands_engage_intensity_stereo() {
     // The IS stream must be smaller than the same encode without IS
     // (the whole point: high bands transmitted once).
     let mut enc_off = StreamEncoder::new(config).unwrap();
+    enc_off.set_bandwidth(None);
     let stream_off = enc_off.encode_all(&pcm).unwrap();
     assert_eq!(count_intensity_bands(&stream_off), (0, 0));
     eprintln!(
@@ -995,6 +1006,7 @@ fn identical_noise_channels_emit_correlated_pns() {
     })
     .unwrap();
     enc.set_pns(true);
+    enc.set_bandwidth(None); // full-band noise: the energy contract spans it
     let stream = enc.encode_all(&pcm).unwrap();
 
     let (both, correlated) = cpe_noise_stats(&stream);
@@ -1058,6 +1070,7 @@ fn independent_noise_channels_stay_uncorrelated() {
     })
     .unwrap();
     enc.set_pns(true);
+    enc.set_bandwidth(None); // full-band noise: the energy contract spans it
     let stream = enc.encode_all(&pcm).unwrap();
 
     let (both, correlated) = cpe_noise_stats(&stream);

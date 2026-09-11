@@ -436,11 +436,15 @@ impl HeAacEncoder {
         let fs = f64::from(config.sample_rate);
         let xo_hz = (k_x * fs / 128.0).min(0.225 * fs);
         let fir = design_lowpass(xo_hz / fs);
-        let core = StreamEncoder::new(EncoderConfig {
+        let mut core = StreamEncoder::new(EncoderConfig {
             sample_rate: core_rate,
             channels: config.core_channels(),
             bitrate: config.bitrate,
         })?;
+        // The core input is already band-limited at the SBR
+        // crossover; the LC encoder's rate-derived bandwidth cull
+        // must not cut below it.
+        core.set_bandwidth(None);
         let n = usize::from(config.core_channels());
         let ps = if config.parametric_stereo {
             Some(PsFrontEnd::new(config.ps)?)
