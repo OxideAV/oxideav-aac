@@ -1084,7 +1084,10 @@ impl SbrEncoder {
             for (&l, &r) in rl.iter().zip(rr.iter()) {
                 lv.push((l + r) / 2.0);
                 let ratio = (eps + l) / (eps + r);
-                let raw = (a * ratio.log2() + 0.5).floor() as i32 + pan_e;
+                // Bounded before the integer cast: a non-finite or
+                // astronomically panned ratio must not overflow the
+                // offset addition (fuzz-found).
+                let raw = (a * ratio.log2() + 0.5).floor().clamp(-1e6, 1e6) as i32 + pan_e;
                 // Even values only, within [0, 2·panOffset].
                 let even = ((raw + 1) / 2 * 2).clamp(0, 2 * pan_e);
                 bv.push(even);
@@ -1100,7 +1103,7 @@ impl SbrEncoder {
             let mut bv = Vec::with_capacity(rl.len());
             for (&l, &r) in rl.iter().zip(rr.iter()) {
                 lv.push((l + r) / 2.0);
-                let raw = ((l / r).log2() + 0.5).floor() as i32 + pan_q;
+                let raw = ((l / r).log2() + 0.5).floor().clamp(-1e6, 1e6) as i32 + pan_q;
                 bv.push(((raw + 1) / 2 * 2).clamp(0, 2 * pan_q));
             }
             q_level.push(lv);
@@ -2479,6 +2482,61 @@ mod tests {
         let mut bad = SbrEncoderConfig::new(44_100, 1, 6_000.0, 16_000.0).unwrap();
         bad.num_time_slots = 14;
         assert!(SbrEncoder::new(bad).is_err());
+    }
+
+    /// Fuzz regression: a coupled pair whose analysis columns are
+    /// non-finite or astronomically panned still encodes (the balance
+    /// quantisers bound the ratio before the integer cast) and the
+    /// payload reparses.
+    #[test]
+    fn coupled_pair_survives_non_finite_input() {
+        let mut cfg = SbrEncoderConfig::new(44_100, 2, 6_000.0, 16_000.0).unwrap();
+        cfg.coupling = true;
+        let mut enc = SbrEncoder::new(cfg).unwrap();
+        let cols = cfg.enc_cols();
+        let pattern = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e300,
+            0.0,
+            -1e300,
+            64.0,
+        ];
+        let l: Vec<[Complex; 64]> = (0..cols)
+            .map(|c| {
+                let mut col = [Complex::default(); 64];
+                for (k, cell) in col.iter_mut().enumerate() {
+                    let v = pattern[(c + k) % pattern.len()];
+                    *cell = Complex::new(v, pattern[(c * 3 + k) % pattern.len()]);
+                }
+                col
+            })
+            .collect();
+        let r: Vec<[Complex; 64]> = (0..cols)
+            .map(|c| {
+                let mut col = [Complex::default(); 64];
+                for (k, cell) in col.iter_mut().enumerate() {
+                    *cell = Complex::new(pattern[(c + 2 * k) % pattern.len()], 0.0);
+                }
+                col
+            })
+            .collect();
+        for _ in 0..3 {
+            let frame = enc.encode_frame(&[&l, &r]).unwrap();
+            let mut rd = BitReader::new(&frame.payload);
+            rd.read_u32(4).unwrap();
+            let parsed = SbrExtensionData::parse(
+                &mut rd,
+                IdSynEle::Cpe,
+                false,
+                44_100,
+                Some(frame.payload.len() as u32),
+                Some(*enc.header()),
+            )
+            .unwrap();
+            assert_eq!(parsed.element, frame.element);
+        }
     }
 
     /// Two onsets inside one frame become a five-envelope VARVAR grid

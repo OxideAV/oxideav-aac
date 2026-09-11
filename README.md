@@ -1227,10 +1227,16 @@ the EP section below).
   `make_encoder` dispatches on a PS-signalling extradata ASC (AOT 29
   or `psPresentFlag`).
 - Fuzz: `fuzz/` carries `ps_data_roundtrip` (parse → write → reparse
-  identity + build-first recipes) and `ps_encoder_frame` (arbitrary,
+  identity + build-first recipes), `ps_encoder_frame` (arbitrary,
   non-finite QMF input through the encoder and back through the
-  parser); the first run found and fixed a parser quirk (a repeated
-  `ps_extension_id = 0` block left stale phase rows).
+  parser; the first run found and fixed a parser quirk — a repeated
+  `ps_extension_id = 0` block left stale phase rows) and
+  `sbr_encoder_frame` (every SBR encoder configuration — both core
+  families, mono / coupled pairs, every header option — over
+  arbitrary analysis frames, each payload reparsed to the encoder's
+  element with a decoder-derived grid; its first run found the
+  coupled balance quantiser adding `panOffset` to a saturated
+  integer cast of a non-finite ratio — fixed).
 
 ### ER BSAC (AOT 22) — noiseless-coder bring-up (§4.4.2.6 / §4.5.2.6 / §4.6.4)
 

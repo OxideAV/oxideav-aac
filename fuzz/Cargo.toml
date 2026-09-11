@@ -31,3 +31,10 @@ path = "fuzz_targets/ps_encoder_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sbr_encoder_frame"
+path = "fuzz_targets/sbr_encoder_frame.rs"
+test = false
+doc = false
+bench = false

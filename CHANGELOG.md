@@ -80,12 +80,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   decoders on every stream, per-band NSR / NMR tables): mean NMR
   improves 1.0–1.4 dB on the LC cases; the 10.1 PCE layout joins the
   reference-decoder black-box list
+- `fuzz/sbr_encoder_frame`: the SBR encoder over arbitrary analysis
+  frames under every configuration (16 / 15 slots, mono / coupled,
+  all header options), payloads reparsed and grids derived
 
 ### Fixed
 
 - `ps_data`: a repeated `ps_extension_id = 0` block re-reads every
   field instead of leaving the first block's phase rows behind
   (fuzz-found)
+- `sbr_encoder`: the coupled balance quantisers bound the level /
+  noise ratio before the integer cast so a non-finite ratio cannot
+  overflow the `panOffset` addition (fuzz-found)
 
 ## [0.1.7](https://github.com/OxideAV/oxideav-aac/compare/v0.1.6...v0.1.7) - 2026-08-30
 
