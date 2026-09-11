@@ -92,6 +92,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - `sbr_encoder`: the coupled balance quantisers bound the level /
   noise ratio before the integer cast so a non-finite ratio cannot
   overflow the `panOffset` addition (fuzz-found)
+- `encoder`: fill elements (the SBR / PS payloads of an HE-AAC frame)
+  were charged against the frame budget twice — subtracted up front
+  and measured inside the assembled block — leaving HE-AAC streams
+  16–27 % under their target rate; priced once, 32 / 48 kbps HE-AAC
+  now lands at 31.9 / 48.4 kbps (equal-rate harness)
 
 ## [0.1.7](https://github.com/OxideAV/oxideav-aac/compare/v0.1.6...v0.1.7) - 2026-08-30
 

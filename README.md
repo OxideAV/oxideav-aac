@@ -1382,9 +1382,14 @@ component still open (see below):
   and wins the 64 kbps case) now puts the mean NMR at −0.2 / −0.9 /
   −2.0 dB against the reference on the mixed material at 64/96/128
   kbps (from +1.1 / +0.1 / −2.1) and −0.1 / +1.6 / +1.6 dB on the
-  transient material (from +0.8 / +3.0 / +2.6); HE-AAC sits +2.8 /
-  +4.1 dB behind the reference HE encoder at 32/48 kbps (our streams
-  run 16–27 % under the target rate there — the next lever).
+  transient material (from +0.8 / +3.0 / +2.6). The harness's second
+  finding was the HE-AAC rate: the core's rate loop subtracted the
+  SBR fill bytes from the frame budget *and* measured them inside
+  the assembled block, charging them twice, so HE-AAC streams ran
+  16–27 % under target (26.8 / 43.9 kbps for 32 / 48); priced once,
+  they land on it (31.9 / 48.4 kbps) and sit +2.5 / +3.8 dB mean NMR
+  behind the reference HE encoder, the worst band at the SBR
+  crossover — the next lever.
   The SBR grid election spans all four frame classes (VARVAR up to
   the five-envelope limit for late, double and triple onsets — a
   fourth onset in one frame falls into the last envelope) with

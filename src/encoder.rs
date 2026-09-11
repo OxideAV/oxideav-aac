@@ -938,18 +938,21 @@ impl StreamEncoder {
         // fits, refine (spend the remaining budget on precision) as
         // long as the finer frame still fits, down to
         // `-MAX_REFINE_OFFSET`.
-        // Fill elements are charged up front: 3-bit id + 4-bit count
-        // (+ 8-bit esc_count from 15 bytes) + payload, rounded up.
+        // Fill elements ride inside the assembled raw data block, so
+        // the block is priced against the whole frame budget; the
+        // floor only guarantees the channel elements a minimal
+        // budget beyond the fills (3-bit id + 4-bit count (+ 8-bit
+        // esc_count from 15 bytes) + payload, rounded up). Subtracting
+        // the fills from the budget *and* measuring them inside the
+        // block charged them twice and left HE-AAC streams 16–27 %
+        // under their target rate (measured on the equal-rate
+        // harness).
         let fill_bytes: usize = fills
             .iter()
             .filter(|f| !f.is_empty())
             .map(|f| f.len() + if f.len() >= 15 { 2 } else { 1 })
             .sum();
-        let budget = self
-            .config
-            .frame_budget_bytes()
-            .saturating_sub(fill_bytes)
-            .max(16);
+        let budget = self.config.frame_budget_bytes().max(fill_bytes + 16);
         let mut sf_offset = 0i32;
         let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
         let mut iterations = 0usize;
