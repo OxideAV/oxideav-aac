@@ -450,6 +450,18 @@ impl AacDecoder {
         if let Some(Ok(asc)) = &self.asc {
             self.stream
                 .set_frame_family(crate::latm::asc_frame_family(asc));
+            // Implicitly signalled HE-AAC (§1.6.5: the ASC says nothing
+            // about SBR, the payload carries EXT_SBR_DATA) in a container
+            // that declares the *core* rate: downstream consumers (a WAV
+            // muxer, an audio device) are configured from that declared
+            // rate before the first frame decodes, so emit at it through
+            // the §4.6.18.4.3 downsampled SBR mode rather than switching
+            // to the doubled rate mid-stream. A container declaring the
+            // SBR rate (the usual MP4 `mp4a` sample entry) keeps the
+            // dual-rate output.
+            if !asc.sbr_present && self.param_hint.0 == Some(asc.sample_rate) {
+                self.stream.set_sbr_downsampled(true);
+            }
         }
         Ok(Transport::Raw)
     }

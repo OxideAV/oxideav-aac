@@ -25,6 +25,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   rate / channel count taken from the ASC (explicit or §1.6.5
   backward-compatible SBR → SBR rate, PS → stereo). Without extradata,
   bare AUs are decoded as AAC-LC at the stream's rate / channel count.
+- Implicitly signalled HE-AAC carried as bare access units in a
+  container that declares the AAC core rate (e.g. Matroska written
+  without an SBR `OutputSamplingFrequency`) is emitted at that declared
+  rate via the §4.6.18.4.3 downsampled SBR mode, so consumers configured
+  from the stream parameters (a WAV muxer) no longer receive
+  double-rate PCM (half-speed playback).
 - The AAC-LC encoder now advertises its `AudioSpecificConfig` (with the
   inline PCE for `channelConfiguration = 0` layouts) in
   `output_params().extradata`, so MP4 / Matroska muxers can write
