@@ -403,6 +403,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod adts;
+pub mod adts_container;
 pub mod adts_crc;
 pub mod asc;
 pub mod asc_writer;
@@ -641,15 +642,16 @@ pub use error::Error;
 /// Result alias used throughout the crate.
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Codec-registry entry point. Installs the AAC
-/// [`Decoder`](oxideav_core::Decoder) (id `"aac"`) — the ADTS-framed
-/// AAC-LC decode chain wired through [`codec_decoder::register_codecs`],
-/// claiming the MP4 object-type / WAVEFORMATEX / FourCC / Matroska tags
-/// an AAC elementary stream is routed under. No encoder is wired yet
-/// (the crate has the bit-exact wire writers but no rate-control
-/// encoder back-end).
+/// Registry entry point. Installs the AAC
+/// [`Decoder`](oxideav_core::Decoder) and [`Encoder`](oxideav_core::Encoder)
+/// (id `"aac"`) through [`codec_decoder::register_codecs`] — claiming the
+/// MP4 object-type / WAVEFORMATEX / FourCC / Matroska tags an AAC
+/// elementary stream is routed under — and the `"adts"` elementary-stream
+/// container (`.aac` / `.adts`) through
+/// [`adts_container::register_container`].
 pub fn register(ctx: &mut RuntimeContext) {
     codec_decoder::register_codecs(&mut ctx.codecs);
+    adts_container::register_container(&mut ctx.containers);
 }
 
 oxideav_core::register!("aac", register);

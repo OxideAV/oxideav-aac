@@ -1288,20 +1288,7 @@ impl LoasDecoder {
                     sample_rate,
                 }));
         }
-        // An SBR-signalling ASC (explicit AOT 5 wrapper or the implicit
-        // trailing probe) needs no pre-rejection: the shared
-        // `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`
-        // FIL payloads in-band and doubles the output rate (§4.6.18).
-        // The decode runs at the *core* configuration (`asc.aot` is the
-        // unwrapped core object type, `asc.sample_rate` the core rate);
-        // a PS payload renders stereo through the subpart-8 tool.
-        // §4.5.1.1 — resolve the frame-length family from the layer's
-        // ASC (`frameLengthFlag` semantics depend on the AOT: 1024/960
-        // lines for the general GA types, 512/480 for ER AAC LD).
-        let family = crate::swb_offset::FrameFamily::from_aot_and_flag(
-            asc.aot,
-            asc.ga_body.frame_length == crate::asc::FrameLength::Long960,
-        );
+        let family = asc_frame_family(asc);
         let dec = self.streams.entry(payload.stream_id).or_insert_with({
             let force_down = self.sbr_downsampled;
             let force_lp = self.sbr_low_power;
@@ -1324,53 +1311,93 @@ impl LoasDecoder {
             d.set_frame_family(family);
             *dec = d;
         }
-        // §4.6.18.2.6: FsSBR is twice the core rate; an explicit SBR
-        // ASC whose extensionSamplingFrequency equals the core rate is
-        // therefore declaring the §4.6.18.4.3 downsampled output.
-        if asc.sbr_present && asc.extension_sample_rate == Some(asc.sample_rate) {
-            dec.set_sbr_downsampled(true);
+        decode_access_unit(dec, asc, &payload.data)
+    }
+}
+
+/// The §4.5.1.1 frame-length family an `AudioSpecificConfig` selects
+/// (`frameLengthFlag` semantics depend on the AOT: 1024/960 lines for
+/// the general GA types, 512/480 for ER AAC LD).
+pub fn asc_frame_family(asc: &AudioSpecificConfig) -> crate::swb_offset::FrameFamily {
+    crate::swb_offset::FrameFamily::from_aot_and_flag(
+        asc.aot,
+        asc.ga_body.frame_length == crate::asc::FrameLength::Long960,
+    )
+}
+
+/// Decode one out-of-band-configured access unit — a single
+/// `raw_data_block()` (or, for the ER object types, one
+/// `er_raw_data_block()`) whose configuration rides in a separate
+/// `AudioSpecificConfig` — against the persistent `dec`.
+///
+/// This is the transport-independent half of every non-ADTS carrier:
+/// a LATM payload ([`LoasDecoder::decode_payload`]) and an MP4 / Matroska
+/// sample (the `esds` DecoderSpecificInfo / `A_AAC` `CodecPrivate` ASC,
+/// ISO/IEC 14496-14 §3.1.2 / §5.6: one access unit per sample, no
+/// ADTS header) both land here. `dec` must already carry the ASC's
+/// frame-length family ([`asc_frame_family`]).
+///
+/// The scalable object types (AOTs 6 / 20) decode per layer stack and
+/// are not routed here.
+pub fn decode_access_unit(
+    dec: &mut StreamDecoder,
+    asc: &AudioSpecificConfig,
+    au: &[u8],
+) -> Result<DecodedFrame> {
+    // An SBR-signalling ASC (explicit AOT 5 wrapper or the implicit
+    // trailing probe) needs no pre-rejection: the shared
+    // `decode_raw_data_block` core auto-detects the `EXT_SBR_DATA`
+    // FIL payloads in-band and doubles the output rate (§4.6.18).
+    // The decode runs at the *core* configuration (`asc.aot` is the
+    // unwrapped core object type, `asc.sample_rate` the core rate);
+    // a PS payload renders stereo through the subpart-8 tool.
+    //
+    // §4.6.18.2.6: FsSBR is twice the core rate; an explicit SBR
+    // ASC whose extensionSamplingFrequency equals the core rate is
+    // therefore declaring the §4.6.18.4.3 downsampled output.
+    if asc.sbr_present && asc.extension_sample_rate == Some(asc.sample_rate) {
+        dec.set_sbr_downsampled(true);
+    }
+    // A channelConfiguration-0 stream carries its layout in the
+    // ASC's inline program_config_element(); install it so the
+    // §8.5.2.2 canonical output reorder applies (an in-band PCE in
+    // a later raw_data_block() still supersedes it).
+    if asc.channel_configuration == 0 {
+        if let Some(pce) = &asc.ga_body.pce {
+            dec.set_program_config(pce.clone());
         }
-        // A channelConfiguration-0 layer carries its layout in the
-        // ASC's inline program_config_element(); install it so the
-        // §8.5.2.2 canonical output reorder applies (an in-band PCE in
-        // a later raw_data_block() still supersedes it).
-        if asc.channel_configuration == 0 {
-            if let Some(pce) = &asc.ga_body.pce {
-                dec.set_program_config(pce.clone());
-            }
-        }
-        // The ER General-Audio object types use the §4.4.2.3 Table 4.19
-        // fixed-sequence er_raw_data_block() instead of the tagged
-        // element walk; route AOT 17 (ER AAC LC), AOT 19 (ER AAC LTP —
-        // the §4.6.7 LTP tool over the same Table 4.19 walk) and
-        // AOT 23 (ER AAC LD, §4.6.17 — the 512/480-line family
-        // installed above) there with the ASC's resilience triplet.
-        if asc.aot == 17 || asc.aot == 19 || asc.aot == 23 {
-            let resilience = asc
-                .ga_body
-                .extension_body
-                .as_ref()
-                .and_then(|ext| ext.resilience)
-                .unwrap_or_default();
-            return dec.decode_er_raw_data_block(
-                asc.aot,
-                asc.sampling_frequency_index,
-                asc.sample_rate,
-                asc.channel_configuration,
-                resilience,
-                &payload.data,
-            );
-        }
-        // LATM carries exactly one raw_data_block() per payload.
-        dec.decode_raw_data_block(
+    }
+    // The ER General-Audio object types use the §4.4.2.3 Table 4.19
+    // fixed-sequence er_raw_data_block() instead of the tagged
+    // element walk; route AOT 17 (ER AAC LC), AOT 19 (ER AAC LTP —
+    // the §4.6.7 LTP tool over the same Table 4.19 walk) and
+    // AOT 23 (ER AAC LD, §4.6.17 — the 512/480-line family
+    // installed by the caller) there with the ASC's resilience triplet.
+    if asc.aot == 17 || asc.aot == 19 || asc.aot == 23 {
+        let resilience = asc
+            .ga_body
+            .extension_body
+            .as_ref()
+            .and_then(|ext| ext.resilience)
+            .unwrap_or_default();
+        return dec.decode_er_raw_data_block(
             asc.aot,
             asc.sampling_frequency_index,
             asc.sample_rate,
             asc.channel_configuration,
-            1,
-            &payload.data,
-        )
+            resilience,
+            au,
+        );
     }
+    // One raw_data_block() per access unit.
+    dec.decode_raw_data_block(
+        asc.aot,
+        asc.sampling_frequency_index,
+        asc.sample_rate,
+        asc.channel_configuration,
+        1,
+        au,
+    )
 }
 
 #[cfg(test)]

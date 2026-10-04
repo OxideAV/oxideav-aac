@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `adts_container`: the `"adts"` elementary-stream container (`.aac` /
+  `.adts`) — demuxer (frame index, resync, duration, seeking, an
+  equivalent `AudioSpecificConfig` in `extradata`, implicit-SBR / PS
+  output geometry from the first frame) and muxer (ADTS frames verbatim,
+  bare access units wrapped in a header built from the stream's ASC).
+- `asc_writer::ga_asc` / `aac_lc_asc_with_pce`; `latm::decode_access_unit`
+  / `asc_frame_family` (the transport-independent ASC-driven AU decode).
+
+### Fixed
+
+- AAC from MP4 / Matroska failed to decode ("packet has neither an ADTS
+  nor a LOAS syncword"): the registry decoder now parses the
+  `AudioSpecificConfig` from `extradata` (`esds` DecoderSpecificInfo /
+  `A_AAC` CodecPrivate) and decodes bare access units, with the output
+  rate / channel count taken from the ASC (explicit or §1.6.5
+  backward-compatible SBR → SBR rate, PS → stereo). Without extradata,
+  bare AUs are decoded as AAC-LC at the stream's rate / channel count.
+- The AAC-LC encoder now advertises its `AudioSpecificConfig` (with the
+  inline PCE for `channelConfiguration = 0` layouts) in
+  `output_params().extradata`, so MP4 / Matroska muxers can write
+  `esds` / `CodecPrivate`.
+
 - HE-AAC v2 (parametric stereo) encoder: `ps_analysis` (Annex 8.C.6.2
   stereo hybrid analysis + band excitations on the Table 8.C.2/8.C.3
   ranges), `ps_encoder` (FIX/VAR parameter positions, IID/ICC/IPD/OPD

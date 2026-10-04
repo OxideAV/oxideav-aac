@@ -186,6 +186,17 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     out_params.channels = Some(channels);
     out_params.sample_format = Some(SampleFormat::S16);
     out_params.bit_rate = Some(u64::from(bitrate));
+    // The out-of-band AudioSpecificConfig (§1.6.2.1) every
+    // non-ADTS carrier needs up front: the MP4 `esds`
+    // DecoderSpecificInfo, the Matroska `CodecPrivate`.
+    out_params.extradata = match stream.program_config() {
+        Some(pce) => crate::asc_writer::aac_lc_asc_with_pce(sample_rate, pce)
+            .map_err(|e| Error::invalid(format!("oxideav-aac encoder ASC: {e}")))?,
+        None => crate::asc_writer::aac_lc_asc(
+            sample_rate,
+            if channels == 8 { 7 } else { channels as u8 },
+        ),
+    };
     // Advertise the speaker set: the caller's named layout, or the
     // 6.1 default a bare 7-channel count was mapped onto.
     out_params.channel_layout = params

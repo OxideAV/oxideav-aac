@@ -72,6 +72,41 @@ pub fn aac_lc_asc(sample_rate: u32, channel_configuration: u8) -> Vec<u8> {
     w.finish()
 }
 
+/// A plain General-Audio `AudioSpecificConfig` for any of the four
+/// ADTS-representable object types (`audioObjectType` 1 Main, 2 LC,
+/// 3 SSR, 4 LTP — ISO/IEC 14496-3 §1.A.2.2.1 `profile_ObjectType + 1`)
+/// at `sample_rate` / `channel_configuration`, with the default
+/// 1024-line `GASpecificConfig`. This is the out-of-band equivalent of
+/// an ADTS fixed header (§1.A.2.2.1), as stored in an MP4 `esds`
+/// DecoderSpecificInfo or a Matroska `A_AAC` `CodecPrivate`.
+pub fn ga_asc(audio_object_type: u8, sample_rate: u32, channel_configuration: u8) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    write_aot(&mut w, audio_object_type);
+    write_sampling_frequency(&mut w, sample_rate);
+    w.write_u32(u32::from(channel_configuration & 0xf), 4);
+    write_ga_specific_config(&mut w);
+    w.align_to_byte_zero();
+    w.finish()
+}
+
+/// The AAC-LC `AudioSpecificConfig` for a PCE-described layout:
+/// `channelConfiguration = 0` with the §8.5.2.2
+/// `program_config_element()` inline in the Table 4.1
+/// `GASpecificConfig` (after `extensionFlag`). The ASC starts
+/// byte-aligned in every carrier this is written for (`esds`,
+/// `CodecPrivate`), so the PCE's `byte_alignment()` is relative to
+/// bit 0.
+pub fn aac_lc_asc_with_pce(sample_rate: u32, pce: &crate::pce::Pce) -> crate::Result<Vec<u8>> {
+    let mut w = BitWriter::new();
+    write_aot(&mut w, 2);
+    write_sampling_frequency(&mut w, sample_rate);
+    w.write_u32(0, 4);
+    write_ga_specific_config(&mut w);
+    pce.write(&mut w, 0)?;
+    w.align_to_byte_zero();
+    Ok(w.finish())
+}
+
 /// The HE-AAC v1 `AudioSpecificConfig`: AAC-LC core at `core_rate`
 /// with SBR output at `sbr_rate`, in the backward-compatible
 /// (`hierarchical == false`) or hierarchical form.

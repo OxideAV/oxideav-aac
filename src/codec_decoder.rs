@@ -1,4 +1,6 @@
-//! `oxideav_core::Decoder` wiring for AAC-LC carried in ADTS.
+//! `oxideav_core::Decoder` wiring for AAC carried in ADTS, LOAS, or as
+//! bare access units configured by an out-of-band `AudioSpecificConfig`
+//! (MP4 `esds`, Matroska `A_AAC` `CodecPrivate`).
 //!
 //! The crate's [`decode::StreamDecoder`](crate::decode::StreamDecoder)
 //! already walks one ADTS frame's §4.4.2.1 `raw_data_block()` to
@@ -15,7 +17,8 @@
 //! The framework trait is *packet-in, frame-out*:
 //!
 //! * [`send_packet`](Decoder::send_packet) accepts one [`Packet`] whose
-//!   `data` is **one or more complete ADTS frames** — each an ADTS
+//!   `data` is one bare access unit when `extradata` carries an ASC (see
+//!   [`make_decoder`]), otherwise **one or more complete ADTS frames** — each an ADTS
 //!   fixed/variable header (+ optional 16-bit CRC) followed by its
 //!   `aac_frame_length`-delimited `raw_data_block()`. A leading ID3v2 tag
 //!   (the streaming-mux convention) is skipped. Every ADTS frame in the
@@ -73,6 +76,7 @@ use oxideav_core::{
 };
 
 use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
+use crate::asc::AudioSpecificConfig;
 use crate::decode::{DecodedFrame, StreamDecoder};
 use crate::latm::{LoasDecoder, AUDIO_SYNC_STREAM_SYNCWORD};
 
@@ -92,15 +96,52 @@ pub const WAVE_FORMAT_MPEG_ADTS_AAC: u16 = 0x1601;
 
 /// Build a boxed AAC [`Decoder`] from `params`.
 ///
-/// `params.sample_rate` and `params.channels` seed the returned
-/// decoder's [`output_params`](AacDecoder)-equivalent stream description;
-/// the real per-frame sample rate and channel count are re-derived from
-/// each ADTS frame header on `send_packet`, so the values supplied here
-/// are a hint only. The decoder is always built — AAC carries its full
-/// configuration in-band (the ADTS header), so no parameter is mandatory.
+/// Two carriages are accepted:
+///
+/// * **Out-of-band configuration** — `params.extradata` holds the
+///   §1.6.2.1 `AudioSpecificConfig` (the MP4 `esds` DecoderSpecificInfo,
+///   the Matroska `A_AAC` `CodecPrivate`, the WAVEFORMATEX `0x00FF`
+///   trailer, …) and every packet is one bare access unit
+///   (ISO/IEC 14496-14 §3.1.2 / §5.6: a sample is one AU, no ADTS
+///   header). A packet that is nevertheless a complete ADTS frame is
+///   still decoded as ADTS.
+/// * **In-band configuration** — ADTS frames or a LOAS
+///   `AudioSyncStream`, auto-detected from the first packet's syncword.
+///   When neither syncword is present and no extradata was supplied,
+///   an AAC-LC configuration is synthesised from `params.sample_rate` /
+///   `params.channels` (the legacy Matroska `A_AAC/MPEG4/LC` CodecIDs
+///   and WAVEFORMATEX carriage without a trailer).
+///
+/// `params.sample_rate` and `params.channels` otherwise only seed the
+/// advertised output description; the real per-frame sample rate and
+/// channel count come from the configuration actually decoded.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let sample_rate = params.sample_rate.unwrap_or(44_100);
-    let channels = params.channels.unwrap_or(2);
+    let mut sample_rate = params.sample_rate.unwrap_or(44_100);
+    let mut channels = params.channels.unwrap_or(2);
+
+    // An extradata ASC is authoritative for the stream geometry. A
+    // malformed one is kept as an error and only surfaces if the
+    // packets do not carry their own (ADTS / LOAS) configuration.
+    let asc = if params.extradata.is_empty() {
+        None
+    } else {
+        Some(
+            AudioSpecificConfig::parse(&params.extradata)
+                .map(|(asc, _)| asc)
+                .map_err(|e| format!("oxideav-aac: extradata AudioSpecificConfig: {e}")),
+        )
+    };
+    let sbr_downsampled_opt = params
+        .options
+        .get("sbr_downsampled")
+        .is_some_and(|v| matches!(v, "true" | "1"));
+    if let Some(Ok(asc)) = &asc {
+        let (rate, ch) = asc_output_geometry(asc, sbr_downsampled_opt);
+        sample_rate = rate;
+        if ch > 0 {
+            channels = ch;
+        }
+    }
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
@@ -108,6 +149,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     out_params.sample_format = Some(SampleFormat::S16);
 
     let mut dec = AacDecoder::new(CodecId::new(CODEC_ID_STR), out_params);
+    dec.asc = asc;
+    dec.param_hint = (params.sample_rate, params.channels);
     // `{"sbr_downsampled": "true"}` selects the §4.6.18.4.3
     // downsampled SBR output mode: HE-AAC streams are emitted at the
     // core sampling rate instead of the doubled SBR rate.
@@ -121,6 +164,26 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         dec.set_sbr_low_power(matches!(v, "true" | "1"));
     }
     Ok(Box::new(dec))
+}
+
+/// The output `(sample_rate, channels)` an `AudioSpecificConfig`
+/// declares: the SBR output rate when SBR is signalled (explicitly or
+/// via the §1.6.5 backward-compatible trailer) unless the downsampled
+/// mode is selected, and two channels for a PS-signalled mono core
+/// (§8.6.4: parametric stereo renders a stereo pair).
+pub fn asc_output_geometry(asc: &AudioSpecificConfig, sbr_downsampled: bool) -> (u32, u16) {
+    let rate = if asc.sbr_present && !sbr_downsampled {
+        asc.extension_sample_rate
+            .unwrap_or_else(|| asc.sample_rate.saturating_mul(2))
+    } else {
+        asc.sample_rate
+    };
+    let channels = if asc.ps_present {
+        2
+    } else {
+        asc.channel_count() as u16
+    };
+    (rate, channels)
 }
 
 /// Packet-to-frame adaptor wrapping [`StreamDecoder`] in the framework
@@ -148,6 +211,18 @@ pub struct AacDecoder {
     transport: Option<Transport>,
     pending: VecDeque<AudioFrame>,
     eof: bool,
+    /// The out-of-band `AudioSpecificConfig` from `params.extradata`
+    /// (`None` without extradata; `Some(Err)` when the extradata did
+    /// not parse — reported only if the packets carry no in-band
+    /// configuration either).
+    asc: Option<std::result::Result<AudioSpecificConfig, String>>,
+    /// The at-construction `(sample_rate, channels)` hints, used to
+    /// synthesise an AAC-LC configuration for bare access units that
+    /// arrive without any extradata.
+    param_hint: (Option<u32>, Option<u16>),
+    /// §4.5.2.2 decoder for a raw-carried scalable (AOT 6 / 20)
+    /// single-layer stream.
+    scalable: Option<crate::scalable::ScalableDecoder>,
     /// The caller-selected §4.6.18.4.3 downsampled SBR output mode,
     /// kept so [`Decoder::reset`] re-applies it to the fresh backends.
     sbr_downsampled: bool,
@@ -165,6 +240,11 @@ enum Transport {
     /// LOAS `AudioSyncStream` (`0x2B7` 11-bit syncword), routed through
     /// [`LoasDecoder::decode_all`].
     Loas,
+    /// Bare access units (one `raw_data_block()` per packet) configured
+    /// by an out-of-band `AudioSpecificConfig` — the MP4 / Matroska /
+    /// WAVEFORMATEX carriage — routed through
+    /// [`crate::latm::decode_access_unit`].
+    Raw,
 }
 
 impl std::fmt::Debug for AacDecoder {
@@ -188,6 +268,9 @@ impl AacDecoder {
             transport: None,
             pending: VecDeque::new(),
             eof: false,
+            asc: None,
+            param_hint: (None, None),
+            scalable: None,
             sbr_downsampled: false,
             sbr_low_power: false,
         }
@@ -290,6 +373,87 @@ impl AacDecoder {
         Ok(())
     }
 
+    /// Decode one bare access unit against the out-of-band
+    /// [`AudioSpecificConfig`].
+    fn send_raw(&mut self, data: &[u8], pts: Option<i64>) -> Result<()> {
+        let asc = match &self.asc {
+            Some(Ok(asc)) => asc,
+            Some(Err(e)) => return Err(Error::invalid(e.clone())),
+            None => {
+                return Err(Error::invalid(
+                    "oxideav-aac: raw access unit without config",
+                ))
+            }
+        };
+        let decoded = if asc.aot == 6 || asc.aot == 20 {
+            if self.scalable.is_none() {
+                let cfg = crate::scalable::ScalableConfig::from_layer_ascs(&[asc])
+                    .map_err(|e| Error::invalid(format!("oxideav-aac: scalable config: {e}")))?;
+                self.scalable = Some(
+                    crate::scalable::ScalableDecoder::new(cfg)
+                        .map_err(|e| Error::invalid(format!("oxideav-aac: scalable: {e}")))?,
+                );
+            }
+            let dec = self.scalable.as_mut().expect("just installed");
+            dec.decode_frame(&[data])
+        } else {
+            crate::latm::decode_access_unit(&mut self.stream, asc, data)
+        }
+        .map_err(|e| Error::invalid(format!("oxideav-aac: decode access unit: {e}")))?;
+        self.queue_decoded(&decoded, pts);
+        Ok(())
+    }
+
+    /// Pick the carrier for the first non-empty packet: a complete
+    /// ADTS frame or a LOAS sync frame carries its own configuration
+    /// and wins; anything else is a bare access unit configured by
+    /// the extradata ASC (or, lacking one, by an AAC-LC ASC
+    /// synthesised from the parameter hints).
+    fn select_transport(&mut self, data: &[u8]) -> Result<Transport> {
+        match detect_transport(data) {
+            Some(Transport::Adts) if is_complete_adts_frame(data) => return Ok(Transport::Adts),
+            // A syncword without extradata: trust it. With extradata, a
+            // LOAS-looking first byte pair is just as likely the start of
+            // a bare `raw_data_block()`, so the ASC wins.
+            Some(t) if self.asc.is_none() => return Ok(t),
+            _ => {}
+        }
+        if self.asc.is_none() {
+            let (Some(rate), Some(channels)) = self.param_hint else {
+                return Err(Error::invalid(
+                    "oxideav-aac: packet has neither an ADTS nor a LOAS syncword, and no \
+                     AudioSpecificConfig was supplied in extradata",
+                ));
+            };
+            let chan_cfg = match channels {
+                1..=6 => channels as u8,
+                8 => 7,
+                _ => {
+                    return Err(Error::invalid(format!(
+                        "oxideav-aac: bare access units without AudioSpecificConfig and \
+                         {channels} channels (no Table 1.19 default layout)"
+                    )))
+                }
+            };
+            if !crate::adts::ADTS_SAMPLE_RATES_HZ.contains(&rate) {
+                return Err(Error::invalid(format!(
+                    "oxideav-aac: bare access units without AudioSpecificConfig at {rate} Hz"
+                )));
+            }
+            let bytes = crate::asc_writer::aac_lc_asc(rate, chan_cfg);
+            self.asc = Some(
+                AudioSpecificConfig::parse(&bytes)
+                    .map(|(a, _)| a)
+                    .map_err(|e| format!("oxideav-aac: synthesised ASC: {e}")),
+            );
+        }
+        if let Some(Ok(asc)) = &self.asc {
+            self.stream
+                .set_frame_family(crate::latm::asc_frame_family(asc));
+        }
+        Ok(Transport::Raw)
+    }
+
     /// Route a LOAS `AudioSyncStream` packet (`data` already ID3-stripped)
     /// through the [`LoasDecoder`], queuing one [`AudioFrame`] per
     /// recovered access unit. A packet may carry one or several LOAS sync
@@ -327,14 +491,14 @@ impl Decoder for AacDecoder {
 
         // Pick the carrier from the first non-empty packet, then route
         // every later packet the same way.
+        if data.is_empty() {
+            // An empty sample carries no access unit.
+            return Ok(());
+        }
         let transport = match self.transport {
             Some(t) => t,
             None => {
-                let Some(t) = detect_transport(data) else {
-                    return Err(Error::other(
-                        "oxideav-aac: packet has neither an ADTS nor a LOAS syncword",
-                    ));
-                };
+                let t = self.select_transport(data)?;
                 self.transport = Some(t);
                 t
             }
@@ -343,6 +507,7 @@ impl Decoder for AacDecoder {
         match transport {
             Transport::Adts => self.send_adts(data, packet.pts),
             Transport::Loas => self.send_loas(data, packet.pts),
+            Transport::Raw => self.send_raw(&packet.data, packet.pts),
         }
     }
 
@@ -372,6 +537,7 @@ impl Decoder for AacDecoder {
         self.stream.set_sbr_low_power(self.sbr_low_power);
         self.loas.set_sbr_low_power(self.sbr_low_power);
         self.transport = None;
+        self.scalable = None;
         self.pending.clear();
         self.eof = false;
         Ok(())
@@ -401,6 +567,20 @@ fn detect_transport(data: &[u8]) -> Option<Transport> {
         return Some(Transport::Loas);
     }
     None
+}
+
+/// Whether `data` starts with a structurally valid ADTS header whose
+/// `aac_frame_length` fits in the buffer — the test that separates a
+/// genuine ADTS frame from a bare access unit that merely begins with
+/// `0xFFF` bits.
+pub(crate) fn is_complete_adts_frame(data: &[u8]) -> bool {
+    match AdtsHeader::parse(data) {
+        Ok((h, off)) => {
+            let len = h.aac_frame_length as usize;
+            len > off && len <= data.len()
+        }
+        Err(_) => false,
+    }
 }
 
 /// Skip a leading ID3v2 tag (`"ID3"` + 6-byte header + syncsafe size +
