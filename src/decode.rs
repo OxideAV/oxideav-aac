@@ -208,6 +208,8 @@ pub struct StreamDecoder {
     /// Fail blocks carrying a coupling channel element
     /// ([`Self::set_reject_coupling`]).
     reject_coupling: bool,
+    /// Skip SBR and PS extension payloads ([`Self::set_core_only`]).
+    core_only: bool,
 }
 
 /// Per-element decoder settings a [`StreamDecoder`] installs on every
@@ -275,6 +277,13 @@ impl StreamDecoder {
     /// macOS's decoder rejects coupling.
     pub fn set_reject_coupling(&mut self, enabled: bool) {
         self.reject_coupling = enabled;
+    }
+
+    /// Decode the AAC core only: fill elements, and with them any SBR
+    /// and PS extension payloads, are skipped, as macOS's decoder does
+    /// for a stream configured as AAC-LC.
+    pub fn set_core_only(&mut self, enabled: bool) {
+        self.core_only = enabled;
     }
 
     /// Install the program configuration of a
@@ -516,6 +525,9 @@ impl StreamDecoder {
                     Element::ChannelElement { kind, .. } => {
                         // Any other channel-element id has no decode path.
                         return Err(unsupported_element(kind));
+                    }
+                    Element::Fill { payload_bytes } if self.core_only => {
+                        reader.skip(payload_bytes * 8).map_err(|_| Error::UnexpectedEnd)?;
                     }
                     Element::Fill { payload_bytes } => {
                         // The FIL body was left unconsumed: walk the
