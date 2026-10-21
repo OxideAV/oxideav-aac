@@ -433,8 +433,8 @@ pub struct Filterbank {
     overlap: Vec<f64>,
     /// `window_shape` of the previous block, governing the left-half
     /// window shape of the next block. [`None`] before the first
-    /// frame: per §4.6.11.3.2 the first block's left and right halves
-    /// share its own `window_shape`.
+    /// frame, whose left half is the sine window's, as macOS's decoder
+    /// has it.
     prev_shape: Option<WindowShape>,
 }
 
@@ -544,7 +544,7 @@ impl Filterbank {
     /// 2048`) windowed time signal `z[i][n]` for this frame, before
     /// the inter-block overlap-add. Dispatches on `window_sequence`.
     fn windowed_signal(&self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
-        let left_shape = self.prev_shape.unwrap_or(ics_info.window_shape);
+        let left_shape = self.prev_shape.unwrap_or(WindowShape::Sine);
         let right_shape = ics_info.window_shape;
         match ics_info.window_sequence {
             WindowSequence::OnlyLong => {
@@ -1361,10 +1361,9 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_uses_own_shape_for_left_half() {
-        // Before any frame, prev_shape is None, so the first frame's
-        // left half uses its own window_shape (KBD here). Confirm the
-        // left half equals the KBD left window, not the sine one.
+    fn kbd_left_half_after_a_kbd_block() {
+        // The KBD left window of a block whose previous block was KBD
+        // equals the KBD left window, not the sine one.
         let info = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
         let fb = Filterbank::new();
         let w = fb
@@ -1380,6 +1379,24 @@ mod tests {
         for n in 0..1024 {
             assert!((win[n] - kbd[n]).abs() < 1e-15);
         }
+    }
+
+    #[test]
+    fn first_block_follows_a_sine_shaped_block() {
+        // The first block's left half is the sine window's: a fresh
+        // filterbank synthesizes a KBD block exactly as one that first
+        // ran a silent sine-shaped block does.
+        let spec: Vec<f64> = (0..1024)
+            .map(|k| if k % 37 == 3 { 1000.0 } else { 0.0 })
+            .collect();
+        let kbd = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
+        let sine = long_info(WindowShape::Sine, WindowSequence::OnlyLong);
+        let mut fresh = Filterbank::new();
+        let first = fresh.synthesize(&spec, &kbd).unwrap();
+        let mut primed = Filterbank::new();
+        primed.synthesize(&vec![0.0; spec.len()], &sine).unwrap();
+        let after_sine = primed.synthesize(&spec, &kbd).unwrap();
+        assert_eq!(first, after_sine);
     }
 
     /// Table 4.A.13 — the normative Kaiser-Bessel window for the AAC
