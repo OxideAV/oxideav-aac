@@ -1274,6 +1274,46 @@ fn skip_id3v2(data: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    /// A raw_data_block with one channel pair without common_window: each
+    /// channel an all-zero long-window ICS with its own window sequence
+    /// and max_sfb (one ZERO_HCB section), then END.
+    fn independent_cpe_block(left: (u32, u32), right: (u32, u32)) -> Vec<u8> {
+        let mut w = oxideav_core::bits::BitWriter::new();
+        w.write_u32(1, 3); // ID_CPE
+        w.write_u32(0, 4); // element_instance_tag
+        w.write_bit(false); // common_window
+        for (sequence, max_sfb) in [left, right] {
+            w.write_u32(100, 8); // global_gain
+            w.write_bit(false); // ics_reserved_bit
+            w.write_u32(sequence, 2);
+            w.write_bit(false); // window_shape
+            w.write_u32(max_sfb, 6);
+            w.write_bit(false); // predictor_data_present
+            if max_sfb > 0 {
+                w.write_u32(0, 4); // sect_cb = ZERO_HCB
+                w.write_u32(max_sfb, 5); // sect_len
+            }
+            w.write_bit(false); // pulse_data_present
+            w.write_bit(false); // tns_data_present
+            w.write_bit(false); // gain_control_data_present
+        }
+        w.write_u32(7, 3); // ID_END
+        w.finish()
+    }
+
+    #[test]
+    fn independent_cpe_channels_may_differ_in_max_sfb_and_window_sequence() {
+        for (left, right) in [((0, 1), (0, 0)), ((0, 1), (1, 1)), ((0, 0), (0, 2))] {
+            let block = independent_cpe_block(left, right);
+            let mut dec = StreamDecoder::new();
+            let frame = dec
+                .decode_raw_data_block(2, 4, 44_100, 2, 1, &block)
+                .unwrap_or_else(|e| panic!("{left:?} {right:?}: {e:?}"));
+            assert_eq!(frame.channels, 2);
+            assert!(frame.pcm.iter().all(|&v| v == 0));
+        }
+    }
+
     #[test]
     fn skip_id3v2_passes_through_non_id3() {
         let data = [0xFFu8, 0xF1, 0x00, 0x00];
