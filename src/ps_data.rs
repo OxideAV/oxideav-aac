@@ -468,13 +468,10 @@ fn resolve_kind(
 #[inline]
 fn accumulate(prev: i32, delta: i32, range: Option<(i32, i32)>) -> Result<i32> {
     match range {
-        Some((lo, hi)) => {
-            let v = prev + delta;
-            if v < lo || v > hi {
-                return Err(Error::PsDataInvalid);
-            }
-            Ok(v)
-        }
+        // Out of range, as when a decoder starts mid-stream on a
+        // time-differential parameter: clamped, as macOS's decoder
+        // decodes such a stream.
+        Some((lo, hi)) => Ok((prev + delta).clamp(lo, hi)),
         None => Ok((prev + delta).rem_euclid(8)),
     }
 }
@@ -633,9 +630,9 @@ mod tests {
     }
 
     /// A frequency ramp that leaves the Table 8.24 index range is
-    /// rejected.
+    /// clamped into it.
     #[test]
-    fn out_of_range_iid_rejected() {
+    fn out_of_range_iid_clamped() {
         let mut w = BitWriter::new();
         w.write_bit(true); // header
         w.write_bit(true); // enable_iid
@@ -652,7 +649,8 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let ps = PsData::parse(&mut r, None).unwrap().unwrap();
         let mut st = PsIndexState::default();
-        assert!(matches!(ps.resolve(&mut st), Err(Error::PsDataInvalid)));
+        let idx = ps.resolve(&mut st).unwrap();
+        assert_eq!(idx.iid[0][..10], [1, 2, 3, 4, 5, 6, 7, 7, 7, 7]);
     }
 
     /// Two `ps_extension_id == 0` blocks inside one extension layer:
