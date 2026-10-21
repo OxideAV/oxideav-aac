@@ -152,6 +152,9 @@ pub struct StreamDecoder {
     /// `AudioSpecificConfig` installs the ASC-resolved family via
     /// [`Self::set_frame_family`] before the first block.
     family: FrameFamily,
+    // Local opt-in view of the most recent successfully decoded frame,
+    // in normalized canonical-order f64, before integer rendering.
+    float_pcm: Option<Vec<f64>>,
 }
 
 impl StreamDecoder {
@@ -159,6 +162,21 @@ impl StreamDecoder {
     #[must_use]
     pub fn new() -> Self {
         StreamDecoder::default()
+    }
+
+    /// Capture normal raw-data-block PCM before i16 rounding.
+    /// The separate ER decode entry point does not populate this view.
+    /// Disabled by default; enabling or disabling clears the previous view.
+    /// The view is replaced after each successful decoded frame. Decode
+    /// failures retain the previous successful view, not partial samples.
+    pub fn set_float_pcm_capture(&mut self, enabled: bool) {
+        self.float_pcm = if enabled { Some(Vec::new()) } else { None };
+    }
+
+    /// Borrow the last successful normal raw-data-block PCM (full scale 1.0).
+    /// This does not compensate decoder delay or drain pending synthesis.
+    pub fn last_pcm_f64(&self) -> Option<&[f64]> {
+        self.float_pcm.as_deref()
     }
 
     /// Install the program configuration of a
@@ -487,6 +505,7 @@ impl StreamDecoder {
         // interleaved PCM (all blocks of a frame must agree on the
         // channel count).
         let mut pcm: Vec<i16> = Vec::new();
+        let mut float_pcm = self.float_pcm.as_ref().map(|_| Vec::new());
         let mut frame_channels: Option<usize> = None;
         for block in 0..num_raw_data_blocks {
             let mut channels: Vec<Vec<f64>> = Vec::new();
@@ -556,8 +575,19 @@ impl StreamDecoder {
                 Some(_) => {}
             }
             pcm.extend(interleave_s16(&channels)?);
+            if let Some(output) = &mut float_pcm {
+                // interleave_s16 above has already validated channel lengths.
+                if let Some(first) = channels.first() {
+                    for frame in 0..first.len() {
+                        for channel in &channels {
+                            output.push(channel[frame] / 32768.0);
+                        }
+                    }
+                }
+            }
         }
 
+        self.float_pcm = float_pcm;
         Ok(DecodedFrame {
             pcm,
             channels: frame_channels.unwrap_or(0),
