@@ -88,7 +88,7 @@ use crate::ics_info::IcsInfo;
 use crate::intensity_stereo::{IntensityPairSpectra, apply_intensity_stereo};
 use crate::ltp::LtpState;
 use crate::ms_stereo::{ChannelPairSpectra, MsMaskPresent, apply_ms_stereo};
-use crate::pns::{PnsChannel, apply_pns, apply_pns_pair, gen_rand_vector};
+use crate::pns::{PnsChannel, apply_pns, apply_pns_pair_channels, gen_rand_vector};
 use crate::predictor::PredictorBank;
 use crate::scale_factor_data::{AbsoluteScaleFactorEntry, AbsoluteScaleFactors, accumulate};
 use crate::section_data::ZERO_HCB;
@@ -585,7 +585,9 @@ pub struct ElementDecoder {
     ssr_decoders: [Option<Box<SsrChannelDecoder>>; 2],
     /// §4.6.13.3 default generator state, advanced across every noise
     /// band of every frame so the noise is reproducible per decode run.
-    pns_state: u32,
+    // one noise generator per channel, from the same seed: matching
+    // channels draw matching noise, as macOS's decoder does
+    pns_state: [u32; 2],
 }
 
 impl Default for ElementDecoder {
@@ -616,7 +618,7 @@ impl ElementDecoder {
             // §4.6.13.3 normalisation makes the per-band energy
             // independent of the seed, so this choice only fixes the
             // (spec-undefined) per-coefficient phase.
-            pns_state: 0x0001_2345,
+            pns_state: [0x0001_2345; 2],
         }
     }
 
@@ -637,7 +639,7 @@ impl ElementDecoder {
             ltp_states: [LtpState::new(), LtpState::new()],
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
-            pns_state: seed,
+            pns_state: [seed; 2],
         }
     }
 
@@ -685,7 +687,7 @@ impl ElementDecoder {
 
         // §4.6.13 PNS on the single channel (no pair correlation).
         let noise_nrg = noise_nrg_table(&abs, &ch.body.section_data.sfb_cb, max_sfb)?;
-        let state = &mut self.pns_state;
+        let state = &mut self.pns_state[slot];
         let mut pns_chan = PnsChannel {
             spec: &mut spec,
             sfb_cb: &ch.body.section_data.sfb_cb,
@@ -849,8 +851,8 @@ impl ElementDecoder {
                 sfb_cb: &right.body.section_data.sfb_cb,
                 noise_nrg: &right_nrg,
             };
-            let state = &mut self.pns_state;
-            apply_pns_pair(
+            let states = &mut self.pns_state;
+            apply_pns_pair_channels(
                 &mut left_chan,
                 &mut right_chan,
                 is_mask,
@@ -858,7 +860,17 @@ impl ElementDecoder {
                 ms_used_slice,
                 geom,
                 fs_index,
-                |out| gen_rand_vector(out, state),
+                |channel, out| {
+                    if channel == 2 {
+                        // a shared vector: both channels' noise histories
+                        // advance by it
+                        let [left, right] = states;
+                        gen_rand_vector(out, left);
+                        gen_rand_vector(&mut vec![0.0; out.len()], right);
+                    } else {
+                        gen_rand_vector(out, &mut states[channel]);
+                    }
+                },
             )?;
         }
 

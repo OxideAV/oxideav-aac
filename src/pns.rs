@@ -362,6 +362,35 @@ pub fn apply_pns_pair<F>(
 where
     F: FnMut(&mut [f64]),
 {
+    apply_pns_pair_channels(
+        left,
+        right,
+        ms_mask_present,
+        all_shared,
+        ms_used,
+        ics_info,
+        fs_index,
+        |_, out| rng(out),
+    )
+}
+
+/// [`apply_pns_pair`] with a noise source per channel: `rng(channel,
+/// out)` fills `out` for channel 0 (left) or 1 (right), or with a
+/// vector both channels share (2).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_pns_pair_channels<F>(
+    left: &mut PnsChannel<'_>,
+    right: &mut PnsChannel<'_>,
+    ms_mask_present: bool,
+    all_shared: bool,
+    ms_used: &[Vec<bool>],
+    ics_info: &IcsInfo,
+    fs_index: u8,
+    mut rng: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &mut [f64]),
+{
     let (window_len, offsets) = channel_geometry(
         left.spec.len(),
         left.sfb_cb,
@@ -423,7 +452,7 @@ where
                     // One random vector, scaled independently into both
                     // channels (§4.6.13.3 correlated-noise path).
                     let mut vec = vec![0.0f64; size];
-                    rng(&mut vec);
+                    rng(2, &mut vec);
                     let lband = &mut left.spec[base + start..base + end];
                     lband.copy_from_slice(&vec);
                     normalise_band(lband, left.noise_nrg[g][sfb]);
@@ -433,12 +462,12 @@ where
                 } else {
                     if l_noise {
                         let lband = &mut left.spec[base + start..base + end];
-                        rng(lband);
+                        rng(0, lband);
                         normalise_band(lband, left.noise_nrg[g][sfb]);
                     }
                     if r_noise {
                         let rband = &mut right.spec[base + start..base + end];
-                        rng(rband);
+                        rng(1, rband);
                         normalise_band(rband, right.noise_nrg[g][sfb]);
                     }
                 }
