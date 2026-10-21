@@ -205,6 +205,9 @@ pub struct StreamDecoder {
     /// Emit channels in the configuration's element order instead of
     /// the canonical speaker order ([`Self::set_declaration_order`]).
     declaration_order: bool,
+    /// Fail blocks carrying a coupling channel element
+    /// ([`Self::set_reject_coupling`]).
+    reject_coupling: bool,
 }
 
 /// Per-element decoder settings a [`StreamDecoder`] installs on every
@@ -265,6 +268,13 @@ impl StreamDecoder {
     /// order).
     pub fn set_declaration_order(&mut self, enabled: bool) {
         self.declaration_order = enabled;
+    }
+
+    /// Fail a block that carries a coupling channel element with
+    /// [`Error::UnsupportedElementSkip`] (the CCE's element id), as
+    /// macOS's decoder rejects coupling.
+    pub fn set_reject_coupling(&mut self, enabled: bool) {
+        self.reject_coupling = enabled;
     }
 
     /// Install the program configuration of a
@@ -485,6 +495,9 @@ impl StreamDecoder {
                         kind: IdSynEle::Cce,
                         element_instance_tag,
                     } => {
+                        if self.reject_coupling {
+                            return Err(Error::UnsupportedElementSkip(IdSynEle::Cce as u8));
+                        }
                         // §4.6.8.3 / Table 4.8: parse the whole coupling
                         // channel element (header + embedded
                         // single_channel_element + gain lists). Its
