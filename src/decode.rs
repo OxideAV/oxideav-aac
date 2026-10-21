@@ -76,6 +76,29 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
     }
 }
 
+/// The permutation taking a block's element-order channels to the
+/// PCE's declaration order (`out[i] = channels[perm[i]]`); `None` unless
+/// the block carries exactly the PCE's elements.
+fn declaration_permutation(pce: &Pce, elements: &[(PceElementKind, u8, usize)]) -> Option<Vec<usize>> {
+    let declared = pce.front_elements.iter().chain(&pce.side_elements).chain(&pce.back_elements)
+        .map(|e| (if e.is_cpe { PceElementKind::Cpe } else { PceElementKind::Sce }, e.tag_select))
+        .chain(pce.lfe_element_tag_selects.iter().map(|&tag| (PceElementKind::Lfe, tag)));
+    let mut first = Vec::with_capacity(elements.len());
+    let mut at = 0;
+    for &(_, _, n) in elements {
+        first.push(at);
+        at += n;
+    }
+    let mut used = vec![false; elements.len()];
+    let mut perm = Vec::with_capacity(at);
+    for (kind, tag) in declared {
+        let i = (0..elements.len()).find(|&i| !used[i] && elements[i].0 == kind && elements[i].1 == tag)?;
+        used[i] = true;
+        perm.extend(first[i]..first[i] + elements[i].2);
+    }
+    used.iter().all(|&u| u).then_some(perm)
+}
+
 /// The §4.6.11 per-frame sample count for the default 1024-line
 /// transform family. The other §4.5.1.1 families emit 960 / 512 /
 /// 480 samples per frame per channel
@@ -152,6 +175,9 @@ pub struct StreamDecoder {
     /// `AudioSpecificConfig` installs the ASC-resolved family via
     /// [`Self::set_frame_family`] before the first block.
     family: FrameFamily,
+    /// Emit channels in the configuration's element order instead of
+    /// the canonical speaker order ([`Self::set_declaration_order`]).
+    declaration_order: bool,
 }
 
 impl StreamDecoder {
@@ -159,6 +185,16 @@ impl StreamDecoder {
     #[must_use]
     pub fn new() -> Self {
         StreamDecoder::default()
+    }
+
+    /// Emit each block's channels in the order the configuration
+    /// declares its elements, as macOS's decoder does: a default
+    /// `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs,
+    /// LFE), or the active PCE's front, side, back and LFE lists, each
+    /// element found by its tag. A block whose elements do not match
+    /// the PCE fails with [`Error::ElementDecodeInvalid`].
+    pub fn set_declaration_order(&mut self, enabled: bool) {
+        self.declaration_order = enabled;
     }
 
     /// Install the program configuration of a
@@ -533,17 +569,24 @@ impl StreamDecoder {
             // active §8.5.2.2 PCE instead, when one is installed and it
             // maps onto canonical positions; otherwise element order is
             // kept.
-            let channels =
+            let channels = if self.declaration_order {
                 if channel_configuration == 0 {
-                    match self.program_config.as_ref().and_then(|pce| {
-                        crate::channel_map::pce_reorder_permutation(pce, &element_desc)
-                    }) {
-                        Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
-                        None => channels,
-                    }
+                    let pce = self.program_config.as_ref().ok_or(Error::ElementDecodeInvalid)?;
+                    let perm = declaration_permutation(pce, &element_desc).ok_or(Error::ElementDecodeInvalid)?;
+                    crate::channel_map::apply_permutation(&perm, channels)
                 } else {
-                    crate::channel_map::reorder_channels(channel_configuration, channels)
-                };
+                    channels
+                }
+            } else if channel_configuration == 0 {
+                match self.program_config.as_ref().and_then(|pce| {
+                    crate::channel_map::pce_reorder_permutation(pce, &element_desc)
+                }) {
+                    Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
+                    None => channels,
+                }
+            } else {
+                crate::channel_map::reorder_channels(channel_configuration, channels)
+            };
 
             match frame_channels {
                 None => frame_channels = Some(channels.len()),
