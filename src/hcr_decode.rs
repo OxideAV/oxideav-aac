@@ -50,15 +50,15 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
-use crate::hcr::{assigned_unit_nr, segment_width, Direction, Segmentation};
+use crate::hcr::{Direction, Segmentation, assigned_unit_nr, segment_width};
 use crate::ics_info::IcsInfo;
 use crate::section_data::SectionData;
 use crate::spectral_data::{
-    decode_codeword, read_and_apply_signs, read_escape_sequence, write_tuple, SpectralData,
+    SpectralData, decode_codeword, read_and_apply_signs, read_escape_sequence, write_tuple,
 };
+use crate::swb_offset::{LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
 #[cfg(test)]
 use crate::swb_offset::{long_window_offsets, short_window_offsets};
-use crate::swb_offset::{LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
 use crate::{Error, Result};
 
 /// The `ESC_FLAG` magnitude of the escape book (§4.6.3.3).
@@ -510,7 +510,7 @@ fn empty_spectral(ics_info: &IcsInfo) -> Result<SpectralData> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ics_info::{WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+    use crate::ics_info::{NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
     use crate::section_data::Section;
 
     const FS: u8 = 4; // 44.1 kHz

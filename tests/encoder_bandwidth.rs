@@ -31,7 +31,7 @@ fn split_energy(pcm: &[i16], fs: u32, cutoff_hz: f64) -> (f64, f64) {
             .map(|&v| f64::from(v))
             .collect();
         let mut q = EncoderAnalysisQmf::new();
-        for slot in mono.chunks_exact(64) {
+        for slot in mono.as_chunks::<64>().0 {
             for (k, v) in q.push_slot(slot).unwrap().iter().enumerate() {
                 // The two bands straddling the cutoff belong to
                 // neither side (the analysis bank overlaps its
@@ -154,7 +154,12 @@ fn cull_moves_the_bits_below_the_cutoff() {
                 .collect();
             let mut qa = EncoderAnalysisQmf::new();
             let mut qb = EncoderAnalysisQmf::new();
-            for (sa, sb) in a.chunks_exact(64).zip(b.chunks_exact(64)) {
+            for (sa, sb) in a
+                .as_chunks::<64>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<64>().0.iter())
+            {
                 let xa = qa.push_slot(sa).unwrap();
                 let xb = qb.push_slot(sb).unwrap();
                 for k in 1..k_cut {

@@ -2,8 +2,8 @@
 //! headers constructed via `oxideav_core::bits::BitWriter` so the
 //! tests do not depend on any external AAC encoder.
 
-use oxideav_aac::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC, ADTS_HEADER_BYTES_WITH_CRC};
 use oxideav_aac::Error;
+use oxideav_aac::adts::{ADTS_HEADER_BYTES_NO_CRC, ADTS_HEADER_BYTES_WITH_CRC, AdtsHeader};
 use oxideav_core::bits::BitWriter;
 
 /// Build a 7- or 9-byte ADTS header with the given fields. All

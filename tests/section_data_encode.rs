@@ -12,9 +12,9 @@
 //! widths (4-bit `sect_cb` + 3- or 5-bit `sect_len_incr`) and the
 //! §6.3 escape mechanism (`sect_esc_val == 7` or `31`).
 
+use oxideav_aac::Error;
 use oxideav_aac::ics_info::WindowSequence;
 use oxideav_aac::section_data::{Section, SectionData};
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Helper: build a `SectionData` from a list of (codebook, length)

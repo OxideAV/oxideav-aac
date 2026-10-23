@@ -40,7 +40,7 @@
 
 use crate::ps_data::{PsData, PsIndices};
 use crate::ps_hybrid::{HybridConfig, NUM_QMF_SLOTS};
-use crate::ps_map::{conjugate_flags, map_indices, parameter_map, MAP_20_TO_34, MAP_34_TO_20};
+use crate::ps_map::{MAP_20_TO_34, MAP_34_TO_20, conjugate_flags, map_indices, parameter_map};
 use crate::sbr_qmf::Complex;
 use crate::{Error, Result};
 
@@ -281,7 +281,7 @@ impl PsStereo {
         if ps.enable_ipdopd {
             // Zero-extended, band-count-mapped phase indices.
             let nr = ps.config.nr_ipdopd_par();
-            let native = if ps.config.iid_mode % 3 == 0 {
+            let native = if ps.config.iid_mode.is_multiple_of(3) {
                 10
             } else if ps.config.iid_mode % 3 == 1 {
                 20

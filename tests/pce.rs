@@ -1,8 +1,8 @@
 //! Tests for [`oxideav_aac::pce::Pce`] — `program_config_element()`
 //! synthesised via `oxideav_core::bits::BitWriter`.
 
-use oxideav_aac::pce::{CcElementSelect, ElementSelect, Pce};
 use oxideav_aac::Error;
+use oxideav_aac::pce::{CcElementSelect, ElementSelect, Pce};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Append a 4-bit `*_element_tag_select` after a 1-bit
@@ -177,7 +177,7 @@ fn cc_elements_round_trip() {
     // cc[0]
     bw.write_bit(true); // is_ind_sw
     bw.write_u32(5, 4); // tag = 5
-                        // cc[1]
+    // cc[1]
     bw.write_bit(false);
     bw.write_u32(6, 4);
     bw.align_to_byte_zero();
@@ -213,7 +213,7 @@ fn byte_alignment_relative_to_origin() {
     // would be misread.
     let mut bw = BitWriter::new();
     bw.write_u32(0b101, 3); // padding bits before ASC-relative origin
-                            // PCE body — empty layout, no comment:
+    // PCE body — empty layout, no comment:
     bw.write_u32(0, 4); // tag
     bw.write_u32(1, 2); // object_type
     bw.write_u32(4, 4); // sfi

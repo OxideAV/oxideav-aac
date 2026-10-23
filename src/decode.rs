@@ -383,10 +383,9 @@ impl StreamDecoder {
                             .map(|el| (el.kind, el.key));
                         if let Some(ext) =
                             self.consume_fill(&mut reader, payload, payload_bytes, fs_sbr, target)?
+                            && let Some(el) = pending.last_mut()
                         {
-                            if let Some(el) = pending.last_mut() {
-                                el.sbr = Some(ext);
-                            }
+                            el.sbr = Some(ext);
                         }
                     }
                     Element::Data { .. } => {}
@@ -635,10 +634,10 @@ impl StreamDecoder {
                             // and delay adjustment only (the None SBR
                             // slot below selects the §4.6.18.5 pure
                             // upsampling path). No header is threaded.
-                            if let (Some(crc), Some((s, e))) = (crc, crc_region) {
-                                if crate::adts_crc::sbr_crc(payload, s, e) != crc {
-                                    return Err(Error::SbrCrcMismatch);
-                                }
+                            if let (Some(crc), Some((s, e))) = (crc, crc_region)
+                                && crate::adts_crc::sbr_crc(payload, s, e) != crc
+                            {
+                                return Err(Error::SbrCrcMismatch);
                             }
                             self.sbr_active = true;
                             remaining = 0;
@@ -721,7 +720,7 @@ impl StreamDecoder {
             let start_byte = (reader.bit_position() / 8) as usize;
             let regions = crate::adts_crc::collect_block_regions(&mut reader, aot, fs)?;
             let end_bit = reader.bit_position();
-            if end_bit % 8 != 0 {
+            if !end_bit.is_multiple_of(8) {
                 // A block that did not end on its §4.4.2.1
                 // byte_alignment() cannot be followed by the
                 // byte-aligned CRC slot.

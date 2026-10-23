@@ -399,7 +399,7 @@ impl ReorderPlan {
         // segment `sg` in `dir`, recording the global bit positions
         // MSB-first. Returns bits written.
         macro_rules! write_cw_to_seg {
-            ($cw:expr, $sg:expr, $dir:expr) => {{
+            ($cw:expr_2021, $sg:expr_2021, $dir:expr_2021) => {{
                 let cw = $cw;
                 let sg = $sg;
                 let dir = $dir;

@@ -7,9 +7,9 @@
 //! both element shape and byte position. A handful of hand-pinned
 //! wire-layout assertions cover the per-element bit layouts directly.
 
+use oxideav_aac::Error;
 use oxideav_aac::pce::{CcElementSelect, ElementSelect, Pce};
 use oxideav_aac::raw_data_block::{Element, FrameAssembler, IdSynEle, Walker};
-use oxideav_aac::Error;
 use oxideav_core::bits::BitReader;
 
 // -------------------------------------------------------------------

@@ -50,7 +50,7 @@
 use crate::ics_info::IcsInfo;
 use crate::scale_factor_data::{AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
 use crate::section_data::{Codebook, ZERO_HCB};
-use crate::spectral_data::{sect_sfb_offset, SpectralData};
+use crate::spectral_data::{SpectralData, sect_sfb_offset};
 use crate::{Error, Result};
 
 /// `SF_OFFSET` per §4.6.2.3.3 — the scalefactor that maps to unit
@@ -67,11 +67,7 @@ pub fn inverse_quantize(x_quant: i32) -> f64 {
     // exponent 4/3.
     let abs = f64::from(x_quant.unsigned_abs());
     let mag = abs * abs.cbrt();
-    if x_quant < 0 {
-        -mag
-    } else {
-        mag
-    }
+    if x_quant < 0 { -mag } else { mag }
 }
 
 /// §4.6.2.3.3 `get_scale_factor_gain()`:

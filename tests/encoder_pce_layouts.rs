@@ -9,7 +9,7 @@ use std::process::Command;
 
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 use oxideav_aac::raw_data_block::{Element, Walker};
 use oxideav_core::bits::BitReader;
 use oxideav_core::{ChannelLayout, ChannelPosition};
@@ -227,11 +227,13 @@ fn unrepresentable_sets_are_rejected() {
     // Lone left.
     assert!(StreamEncoder::with_layout(cfg(2), &[FrontLeft, FrontCenter]).is_err());
     // Inner pair without the outer pair.
-    assert!(StreamEncoder::with_layout(
-        cfg(3),
-        &[FrontLeftOfCenter, FrontRightOfCenter, FrontCenter]
-    )
-    .is_err());
+    assert!(
+        StreamEncoder::with_layout(
+            cfg(3),
+            &[FrontLeftOfCenter, FrontRightOfCenter, FrontCenter]
+        )
+        .is_err()
+    );
     // A lone back pair reads as the side pair.
     assert!(
         StreamEncoder::with_layout(cfg(4), &[FrontLeft, FrontRight, BackLeft, BackRight]).is_err()

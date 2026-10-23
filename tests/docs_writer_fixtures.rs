@@ -40,7 +40,7 @@ use oxideav_aac::gain_control_data::{GainAdjust, GainBand, GainControlData, Gain
 use oxideav_aac::hcr_decode::encode_reordered_spectral_data;
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{
-    IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
+    IcsInfo, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW, WindowSequence, WindowShape,
 };
 use oxideav_aac::latm::LoasDecoder;
 use oxideav_aac::pce::{CcElementSelect, ElementSelect, Pce};
@@ -164,15 +164,17 @@ fn make_channel(
     seed: u32,
 ) -> (IcsBody, SpectralData) {
     let max_sfb = sfb_cbs.len() as u8;
-    let sections = vec![sfb_cbs
-        .iter()
-        .enumerate()
-        .map(|(sfb, &cb)| Section {
-            codebook: cb,
-            start: sfb as u8,
-            end: sfb as u8 + 1,
-        })
-        .collect()];
+    let sections = vec![
+        sfb_cbs
+            .iter()
+            .enumerate()
+            .map(|(sfb, &cb)| Section {
+                codebook: cb,
+                start: sfb as u8,
+                end: sfb as u8 + 1,
+            })
+            .collect(),
+    ];
     let entries: Vec<ScaleFactorEntry> = sfb_cbs
         .iter()
         .filter(|&&cb| cb != 0)

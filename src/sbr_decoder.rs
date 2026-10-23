@@ -30,14 +30,14 @@
 
 use crate::ps_decoder::PsDecoder;
 use crate::ps_hybrid::LOOKAHEAD;
-use crate::sbr_dequant::{dequant_coupled, dequant_single, DequantizedSbr};
+use crate::sbr_dequant::{DequantizedSbr, dequant_coupled, dequant_single};
 use crate::sbr_element::EXTENSION_ID_PS;
-use crate::sbr_env_adjust::{adjust, EnvAdjustState, EnvParams};
+use crate::sbr_env_adjust::{EnvAdjustState, EnvParams, adjust};
 use crate::sbr_extension::SbrExtensionData;
-use crate::sbr_freq_bands::{k0 as derive_k0, k2 as derive_k2, master_table, HiLoTables};
+use crate::sbr_freq_bands::{HiLoTables, k0 as derive_k0, k2 as derive_k2, master_table};
 use crate::sbr_header::SbrHeader;
 use crate::sbr_hf_gen::{
-    build_patches, chirp_factors, generate_hf, reflection_coefficient, Patches, T_HF_ADJ, T_HF_GEN,
+    Patches, T_HF_ADJ, T_HF_GEN, build_patches, chirp_factors, generate_hf, reflection_coefficient,
 };
 use crate::sbr_limiter::limiter_table;
 use crate::sbr_lp::{aliasing_degree, deg_patched};
@@ -417,20 +417,20 @@ impl SbrDecoder {
             // 32-band spectrum counts as SBR-covered for the partial
             // reset.
             let mut emitted = false;
-            if n_ch == 1 {
-                if let Some(ps) = self.ps.as_mut() {
-                    let x_input = build_x_input(&x_cols, &x_low);
-                    if let Some((lq, rq)) = ps.dec.process(None, &x_input, 32)? {
-                        let mut pcm_l = Vec::with_capacity(lf * sps);
-                        let mut pcm_r = Vec::with_capacity(lf * sps);
-                        for l in 0..lf {
-                            ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
-                            ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
-                        }
-                        out.push(pcm_l);
-                        out.push(pcm_r);
-                        emitted = true;
+            if n_ch == 1
+                && let Some(ps) = self.ps.as_mut()
+            {
+                let x_input = build_x_input(&x_cols, &x_low);
+                if let Some((lq, rq)) = ps.dec.process(None, &x_input, 32)? {
+                    let mut pcm_l = Vec::with_capacity(lf * sps);
+                    let mut pcm_r = Vec::with_capacity(lf * sps);
+                    for l in 0..lf {
+                        ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
+                        ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
                     }
+                    out.push(pcm_l);
+                    out.push(pcm_r);
+                    emitted = true;
                 }
             }
             if !emitted {
@@ -664,21 +664,21 @@ impl SbrDecoder {
             }
             let sps = ch.synthesis.samples_per_slot();
             let mut emitted = false;
-            if n_ch == 1 {
-                if let Some(ps) = self.ps.as_mut() {
-                    let x_input = build_x_input(&x_cols, &x_low);
-                    let kx_plus_m = (bands.k_x + bands.m).max(0) as usize;
-                    if let Some((lq, rq)) = ps.dec.process(ps_payload, &x_input, kx_plus_m)? {
-                        let mut pcm_l = Vec::with_capacity(lf * sps);
-                        let mut pcm_r = Vec::with_capacity(lf * sps);
-                        for l in 0..lf {
-                            ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
-                            ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
-                        }
-                        out.push(pcm_l);
-                        out.push(pcm_r);
-                        emitted = true;
+            if n_ch == 1
+                && let Some(ps) = self.ps.as_mut()
+            {
+                let x_input = build_x_input(&x_cols, &x_low);
+                let kx_plus_m = (bands.k_x + bands.m).max(0) as usize;
+                if let Some((lq, rq)) = ps.dec.process(ps_payload, &x_input, kx_plus_m)? {
+                    let mut pcm_l = Vec::with_capacity(lf * sps);
+                    let mut pcm_r = Vec::with_capacity(lf * sps);
+                    for l in 0..lf {
+                        ch.synthesis.push_slot(&lq[l], &mut pcm_l)?;
+                        ps.synthesis_r.push_slot(&rq[l], &mut pcm_r)?;
                     }
+                    out.push(pcm_l);
+                    out.push(pcm_r);
+                    emitted = true;
                 }
             }
             if !emitted {
@@ -1179,8 +1179,10 @@ mod tests {
             "core tone amplitude LP {a_lp} vs HQ {a_hq}"
         );
         for (block_hq, block_lp) in out_hq
-            .chunks_exact(1024)
-            .zip(out_lp.chunks_exact(1024))
+            .as_chunks::<1024>()
+            .0
+            .iter()
+            .zip(out_lp.as_chunks::<1024>().0.iter())
             .skip(4)
         {
             let e_h: f64 = block_hq.iter().map(|v| v * v).sum();

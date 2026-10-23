@@ -118,7 +118,7 @@
 use crate::ics_info::IcsInfo;
 use crate::section_data::NOISE_HCB;
 #[cfg(test)]
-use crate::swb_offset::{long_window_offsets, LONG_WINDOW_LEN};
+use crate::swb_offset::{LONG_WINDOW_LEN, long_window_offsets};
 use crate::{Error, Result};
 
 /// §4.6.13.3 `is_noise(group,sfb)` — the noise-band predicate.

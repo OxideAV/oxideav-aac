@@ -73,7 +73,7 @@
 use crate::ics_info::IcsInfo;
 use crate::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 #[cfg(test)]
-use crate::swb_offset::{long_window_offsets, short_window_offsets, SHORT_WINDOW_LEN};
+use crate::swb_offset::{SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets};
 use crate::{Error, Result};
 
 /// §4.6.8.1.2 `ms_mask_present` — the two-bit field decoded from the

@@ -8,7 +8,7 @@
 //! `Err`.
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 
 /// A transient-bearing multichannel signal (canonical interleave).
 fn burst_signal(n: usize, channels: usize) -> Vec<i16> {

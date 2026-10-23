@@ -199,11 +199,7 @@ pub fn chirp_factors(cur_invf: &[u8], prev_invf: &[u8], prev_bw: &[f64]) -> Vec<
             } else {
                 0.90625 * nb + 0.09375 * bw_prev
             };
-            if temp < 0.015625 {
-                0.0
-            } else {
-                temp
-            }
+            if temp < 0.015625 { 0.0 } else { temp }
         })
         .collect()
 }

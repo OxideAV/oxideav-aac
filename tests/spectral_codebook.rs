@@ -5,11 +5,11 @@
 //! translation, the §4.6.3.3 sign-bit fix-up, and the §4.6.3.3 ESC
 //! sequence handling.
 
-use oxideav_aac::spectral_codebook::{
-    apply_sign_bits, decode_esc_value, decode_index_to_tuple, derive_sign_bits, encode_esc_value,
-    encode_tuple_to_index, table_4_95, Table495Row, MAX_QUANT, TABLE_4_95,
-};
 use oxideav_aac::Error;
+use oxideav_aac::spectral_codebook::{
+    MAX_QUANT, TABLE_4_95, Table495Row, apply_sign_bits, decode_esc_value, decode_index_to_tuple,
+    derive_sign_bits, encode_esc_value, encode_tuple_to_index, table_4_95,
+};
 
 // ---------------------------------------------------------------------
 // Table 4.95 row-by-row exact-match

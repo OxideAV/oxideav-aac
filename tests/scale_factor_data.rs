@@ -20,11 +20,11 @@
 //! 4.150, and the `noise_pcm_flag` frame-scope behaviour from Table
 //! 4.53.
 
+use oxideav_aac::Error;
 use oxideav_aac::scale_factor_data::{
-    hcod_sf_decode, hcod_sf_encode, ScaleFactorData, ScaleFactorEntry, NOISE_PCM_BITS,
+    NOISE_PCM_BITS, ScaleFactorData, ScaleFactorEntry, hcod_sf_decode, hcod_sf_encode,
 };
 use oxideav_aac::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Encode `sfd` against `sfb_cb`, parse the result back, and assert

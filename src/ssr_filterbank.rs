@@ -51,10 +51,10 @@
 //! C.2.1.1 formula. All from the spec PDFs staged under
 //! `docs/audio/aac/`. No external SSR implementation was consulted.
 
+use crate::Error;
 use crate::filterbank::{imdct, long_sequence_window_n, short_window_n};
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use crate::ipqf::NUM_BANDS;
-use crate::Error;
 
 type Result<T> = core::result::Result<T, Error>;
 
@@ -210,7 +210,7 @@ impl SsrSynthesis {
 #[cfg(test)]
 pub(crate) mod pqf_test_support {
     use super::NUM_BANDS;
-    use crate::ipqf::{prototype, PROTO_LEN};
+    use crate::ipqf::{PROTO_LEN, prototype};
     use core::f64::consts::PI;
 
     /// Annex C.2.1.1 — the encoder-side PQF analysis coefficients
@@ -240,10 +240,10 @@ pub(crate) mod pqf_test_support {
                     let mut acc = 0.0f64;
                     for (n, &hn) in h[b].iter().enumerate() {
                         let idx = 4 * m as isize + 3 - n as isize;
-                        if idx >= 0 {
-                            if let Some(&xv) = x.get(idx as usize) {
-                                acc += hn * xv;
-                            }
+                        if idx >= 0
+                            && let Some(&xv) = x.get(idx as usize)
+                        {
+                            acc += hn * xv;
                         }
                     }
                     acc
@@ -260,7 +260,7 @@ pub(crate) mod pqf_test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::pqf_test_support::{pqf_analysis, PQF_CASCADE_DELAY};
+    use super::pqf_test_support::{PQF_CASCADE_DELAY, pqf_analysis};
     use super::*;
     use crate::filterbank::forward_mdct;
     use crate::ipqf::Ipqf;

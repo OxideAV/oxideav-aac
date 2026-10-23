@@ -586,7 +586,7 @@ impl CouplingGains {
         // coefficient past the last band). The window-major spectrum is
         // `num_windows * window_len` long.
         let window_len = usize::from(*offsets.last().expect("non-empty checked above"));
-        if window_len == 0 || source.len() % window_len != 0 {
+        if window_len == 0 || !source.len().is_multiple_of(window_len) {
             return Err(Error::CceInvalid);
         }
         let num_swb = offsets.len() - 1;

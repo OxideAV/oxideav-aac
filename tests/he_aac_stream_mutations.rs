@@ -9,7 +9,7 @@
 //!   as the uninterrupted decode once the SBR state has settled.
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
 use oxideav_aac::latm_writer::AdtsPayloads;
 use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
 
@@ -91,7 +91,7 @@ fn band_energies(pcm: &[i16]) -> [f64; 64] {
     let mut bank = EncoderAnalysisQmf::new();
     let mut e = [0.0f64; 64];
     let mono: Vec<f64> = pcm.iter().map(|&v| f64::from(v)).collect();
-    for slot in mono.chunks_exact(64) {
+    for slot in mono.as_chunks::<64>().0 {
         let cols = bank.push_slot(slot).unwrap();
         for (k, v) in cols.iter().enumerate() {
             e[k] += v.norm_sqr();

@@ -26,7 +26,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use oxideav_aac::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
+use oxideav_aac::adts::{ADTS_HEADER_BYTES_NO_CRC, AdtsHeader};
 use oxideav_aac::codec_decoder::make_decoder;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 
@@ -46,7 +46,9 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body_start + sz).min(d.len());
             return Some(
                 d[body_start..end]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect(),
             );
@@ -110,7 +112,7 @@ fn decode_via_trait(name: &str) -> Option<Vec<i16>> {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     assert_eq!(a.data.len(), 1, "{name}: interleaved single plane");
-                    for c in a.data[0].chunks_exact(2) {
+                    for c in a.data[0].as_chunks::<2>().0 {
                         pcm.push(i16::from_le_bytes([c[0], c[1]]));
                     }
                 }

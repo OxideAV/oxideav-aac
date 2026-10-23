@@ -21,12 +21,12 @@
 //! §4.6.8.1.4 / §4.6.13 prose-level "done separately" wording
 //! takes precedence (see `scale_factor_data.rs` module docstring).
 
+use oxideav_aac::Error;
 use oxideav_aac::scale_factor_data::{
-    accumulate, differentiate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors, ScaleFactorData,
-    ScaleFactorEntry, NOISE_OFFSET,
+    AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET, ScaleFactorData,
+    ScaleFactorEntry, accumulate, differentiate,
 };
 use oxideav_aac::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB};
-use oxideav_aac::Error;
 
 /// Helper: build an [`AbsoluteScaleFactors`] from a flat list of
 /// per-group inner vectors.

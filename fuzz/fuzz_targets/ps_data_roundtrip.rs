@@ -112,10 +112,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // 2. Build-first.
-    let mut feed = Feed {
-        data,
-        pos: 0,
-    };
+    let mut feed = Feed { data, pos: 0 };
     let mut config = config_from(feed.next());
     let header = feed.next() & 1 != 0;
     let frame_class = feed.next() & 1 != 0;
@@ -171,9 +168,17 @@ fuzz_target!(|data: &[u8]| {
         frame_class,
         num_env,
         border_position,
-        iid_dt: if config.enable_iid { iid_dt } else { Vec::new() },
+        iid_dt: if config.enable_iid {
+            iid_dt
+        } else {
+            Vec::new()
+        },
         iid_deltas,
-        icc_dt: if config.enable_icc { icc_dt } else { Vec::new() },
+        icc_dt: if config.enable_icc {
+            icc_dt
+        } else {
+            Vec::new()
+        },
         icc_deltas,
         enable_ipdopd,
         ipd_dt,

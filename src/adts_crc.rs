@@ -421,7 +421,7 @@ mod tests {
     fn reference(poly_low: u32, k: u32, init: u32, bits: &[bool]) -> u32 {
         let full = u64::from(poly_low) | (1u64 << k);
         let mut dividend: Vec<bool> = bits.to_vec();
-        dividend.extend(std::iter::repeat(false).take(k as usize));
+        dividend.extend(std::iter::repeat_n(false, k as usize));
         for (i, d) in dividend.iter_mut().enumerate().take(k as usize) {
             *d ^= (init >> (k as usize - 1 - i)) & 1 != 0;
         }

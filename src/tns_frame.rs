@@ -59,11 +59,11 @@
 
 use crate::ics_info::IcsInfo;
 use crate::ics_info::WindowSequence;
+use crate::swb_offset::{FrameFamily, long_window_offsets_family, short_window_offsets_family};
 #[cfg(test)]
 use crate::swb_offset::{long_window_offsets, short_window_offsets};
-use crate::swb_offset::{long_window_offsets_family, short_window_offsets_family, FrameFamily};
 use crate::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc, tns_ma_filter};
-use crate::tns_data::{num_windows, TnsData};
+use crate::tns_data::{TnsData, num_windows};
 use crate::tns_max::{clamp_tns_band_family, clamp_tns_order};
 use crate::{Error, Result};
 
@@ -333,7 +333,7 @@ fn tns_frame_filter(
 mod tests {
     use super::*;
     use crate::tns_data::{TnsFilter, TnsWindow};
-    use crate::tns_max::{tns_max_bands, tns_max_order, AOT_AAC_LC, AOT_AAC_MAIN};
+    use crate::tns_max::{AOT_AAC_LC, AOT_AAC_MAIN, tns_max_bands, tns_max_order};
 
     /// 48 kHz — long-window table has 49 SWBs (sentinel 1024), short
     /// has 14 (sentinel 128).

@@ -8,7 +8,7 @@ use oxideav_aac::decoded_spectrum::{decode_channel_spectrum, quant_to_spec};
 use oxideav_aac::dequant::{inverse_quantize, rescale_spectrum, scale_factor_gain};
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape};
-use oxideav_aac::scale_factor_data::{accumulate, ScaleFactorData, ScaleFactorEntry};
+use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry, accumulate};
 use oxideav_aac::section_data::{Section, SectionData, ZERO_HCB};
 use oxideav_aac::spectral_data::SpectralData;
 use oxideav_aac::tns_data::{TnsData, TnsFilter, TnsWindow};

@@ -38,7 +38,7 @@
 //! decode-side correction is bounded-distance (exhaustive syndrome
 //! search up to the code's design correction capability).
 
-use crate::crc::{crc_bits, CrcPoly};
+use crate::crc::{CrcPoly, crc_bits};
 use crate::{Error, Result};
 
 /// Number of tail input bits appended by §1.8.4.6.2 termination.
@@ -185,11 +185,7 @@ pub fn srcpc_decode(
             }
             let inputs: &[bool] = if t >= n_info {
                 // Termination steps: the input is forced to d(state).
-                if feedback(s) {
-                    &[true]
-                } else {
-                    &[false]
-                }
+                if feedback(s) { &[true] } else { &[false] }
             } else {
                 &[false, true]
             };
@@ -226,7 +222,7 @@ pub fn srcpc_decode(
         let (best, m) = metric
             .iter()
             .enumerate()
-            .min_by_key(|(_, &m)| m)
+            .min_by_key(|&(_, &m)| m)
             .map(|(s, &m)| (s as u8, m))
             .unwrap_or((0, INF));
         if m >= INF {
@@ -310,19 +306,19 @@ impl HeaderFec {
 
 /// Polynomial-division parity `R(x)` of `M(x)·x^deg(G) mod G(x)`,
 /// MSB-first over `info` (§1.8.4.3).
-fn poly_parity(info: &[bool], gen: u32, parity: usize) -> Vec<bool> {
+fn poly_parity(info: &[bool], r#gen: u32, parity: usize) -> Vec<bool> {
     let top = 1u32 << parity; // the implicit leading term position
     let mut reg: u32 = 0;
     for &bit in info {
         reg = (reg << 1) | u32::from(bit);
         if reg & top != 0 {
-            reg ^= gen;
+            reg ^= r#gen;
         }
     }
     for _ in 0..parity {
         reg <<= 1;
         if reg & top != 0 {
-            reg ^= gen;
+            reg ^= r#gen;
         }
     }
     (0..parity)
@@ -379,8 +375,8 @@ pub fn header_fec_encode(info: &[bool]) -> Result<Vec<bool>> {
             parity
         }
         other => {
-            let (gen, p, _) = other.poly().ok_or(Error::EpFrameInvalid)?;
-            poly_parity(info, gen, p)
+            let (r#gen, p, _) = other.poly().ok_or(Error::EpFrameInvalid)?;
+            poly_parity(info, r#gen, p)
         }
     })
 }
@@ -428,18 +424,18 @@ pub fn header_fec_decode(info: &[bool], parity: &[bool]) -> Result<Vec<bool>> {
             Ok(msg.to_vec())
         }
         other => {
-            let (gen, p, t) = other.poly().ok_or(Error::EpFrameInvalid)?;
+            let (r#gen, p, t) = other.poly().ok_or(Error::EpFrameInvalid)?;
             let mut word: Vec<bool> = Vec::with_capacity(l + p);
             word.extend_from_slice(info);
             word.extend_from_slice(parity);
-            if poly_syndrome_ok(&word, gen, p) {
+            if poly_syndrome_ok(&word, r#gen, p) {
                 return Ok(info.to_vec());
             }
             // Bounded-distance decoding: search error patterns of
             // weight <= t over the (shortened) codeword.
             let n = word.len();
             let mut positions: Vec<usize> = Vec::with_capacity(t);
-            if search_errors(&mut word, gen, p, t, 0, n, &mut positions) {
+            if search_errors(&mut word, r#gen, p, t, 0, n, &mut positions) {
                 return Ok(word[..l].to_vec());
             }
             Err(Error::EpFrameInvalid)
@@ -449,13 +445,13 @@ pub fn header_fec_decode(info: &[bool], parity: &[bool]) -> Result<Vec<bool>> {
 
 /// `true` iff the codeword (info ‖ parity) has an all-zero syndrome
 /// under `gen`.
-fn poly_syndrome_ok(word: &[bool], gen: u32, parity: usize) -> bool {
+fn poly_syndrome_ok(word: &[bool], r#gen: u32, parity: usize) -> bool {
     let top = 1u32 << parity;
     let mut reg: u32 = 0;
     for &bit in word {
         reg = (reg << 1) | u32::from(bit);
         if reg & top != 0 {
-            reg ^= gen;
+            reg ^= r#gen;
         }
     }
     reg == 0
@@ -466,7 +462,7 @@ fn poly_syndrome_ok(word: &[bool], gen: u32, parity: usize) -> bool {
 /// is left in `word` and `true` is returned.
 fn search_errors(
     word: &mut [bool],
-    gen: u32,
+    r#gen: u32,
     parity: usize,
     budget: usize,
     from: usize,
@@ -479,8 +475,8 @@ fn search_errors(
     for i in from..n {
         word[i] = !word[i];
         positions.push(i);
-        if poly_syndrome_ok(word, gen, parity)
-            || search_errors(word, gen, parity, budget - 1, i + 1, n, positions)
+        if poly_syndrome_ok(word, r#gen, parity)
+            || search_errors(word, r#gen, parity, budget - 1, i + 1, n, positions)
         {
             return true;
         }

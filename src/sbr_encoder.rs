@@ -66,14 +66,14 @@
 use crate::raw_data_block::IdSynEle;
 use crate::sbr_element::{SbrChannel, SbrElement, SbrExtension};
 use crate::sbr_envelope::{SbrEnvelopeData, SbrNoiseData};
-use crate::sbr_freq_bands::{k0, k2, master_table, HiLoTables};
+use crate::sbr_freq_bands::{HiLoTables, k0, k2, master_table};
 use crate::sbr_grid::{FrameClass, SbrDtdf, SbrGrid, SbrInvf};
 use crate::sbr_header::SbrHeader;
-use crate::sbr_hf_gen::{build_patches, Patches};
-use crate::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+use crate::sbr_hf_gen::{Patches, build_patches};
+use crate::sbr_huffman::{SbrHuffContext, env_tables, noise_tables};
 use crate::sbr_limiter::limiter_table;
 use crate::sbr_qmf::Complex;
-use crate::sbr_reconstruct::{ref_band, EnvelopeScalefactors, NoiseScalefactors};
+use crate::sbr_reconstruct::{EnvelopeScalefactors, NoiseScalefactors, ref_band};
 use crate::sbr_time_grid::derive_time_grid;
 use crate::sbr_writer::build_extension_payload;
 use crate::{Error, Result};
@@ -246,7 +246,7 @@ pub fn pick_start_freq(fs_sbr: u32, crossover_hz: f64) -> Result<u8> {
     for idx in 0..16u8 {
         let k = f64::from(k0(fs_sbr, idx)?);
         let d = (k - target).abs();
-        if best.map_or(true, |(bd, _)| d < bd) {
+        if best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, idx));
         }
     }
@@ -265,7 +265,7 @@ pub fn pick_stop_freq(fs_sbr: u32, start_freq: u8, stop_hz: f64) -> Result<u8> {
             continue;
         }
         let d = (f64::from(k) - target).abs();
-        if best.map_or(true, |(bd, _)| d < bd) {
+        if best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, idx));
         }
     }
@@ -486,7 +486,8 @@ impl SbrEncoder {
     /// frames, and always the first).
     #[must_use]
     pub fn next_header_due(&self) -> bool {
-        self.frames % u64::from(self.cfg.header_interval.max(1)) == 0
+        self.frames
+            .is_multiple_of(u64::from(self.cfg.header_interval.max(1)))
     }
 
     /// Encode one frame. `x[ch]` holds [`SBR_ENC_COLS`] analysis
@@ -1412,13 +1413,8 @@ fn varvar_from_borders(lead: u8, wanted: &[WantedBorder], nts: usize) -> Option<
     if nb == 0 || nb + 1 > crate::sbr_grid::SBR_MAX_NUM_ENV {
         return None;
     }
-    let shifts = |b: &WantedBorder| -> &'static [i32] {
-        if b.onset {
-            &[0, -1]
-        } else {
-            &[0, -1, 1]
-        }
-    };
+    let shifts =
+        |b: &WantedBorder| -> &'static [i32] { if b.onset { &[0, -1] } else { &[0, -1, 1] } };
     // lA = index of the envelope starting on the first onset.
     let l_a = wanted.iter().position(|b| b.onset)? + 1;
     let mut best: Option<(i32, SbrGrid)> = None;
@@ -1792,11 +1788,7 @@ fn code_envelopes(
 ) -> (Vec<Vec<i32>>, Vec<bool>) {
     let ((t_huff, t_lav), (f_huff, f_lav)) = env_tables(ctx);
     let start_bits = if ctx.coupling && ctx.ch {
-        if ctx.amp_res {
-            5
-        } else {
-            6
-        }
+        if ctx.amp_res { 5 } else { 6 }
     } else if ctx.amp_res {
         6
     } else {
@@ -2200,7 +2192,9 @@ mod tests {
                         assert!(tg.t_e.windows(2).all(|w| w[1] > w[0]), "{:?}", tg.t_e);
                         assert_eq!(tg.t_e[0], i32::from(lead));
                         let last = *tg.t_e.last().unwrap();
-                        assert!((NUM_TIME_SLOTS as i32..=NUM_TIME_SLOTS as i32 + 3).contains(&last));
+                        assert!(
+                            (NUM_TIME_SLOTS as i32..=NUM_TIME_SLOTS as i32 + 3).contains(&last)
+                        );
                         for &s in &onsets {
                             let s = s as i32;
                             assert!(

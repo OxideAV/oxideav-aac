@@ -1010,11 +1010,11 @@ impl ErScaleFactorData {
                 base[g][i] = folded;
             }
             // `dpcm_is_last_position` escape closes the escape part.
-            if let Some(d) = is_last_base {
-                if d.abs() == crate::rvlc::RVLC_ESC_FLAG {
-                    let mag = crate::rvlc::rvlc_esc_decode(reader)?;
-                    is_last_esc = Some(mag);
-                }
+            if let Some(d) = is_last_base
+                && d.abs() == crate::rvlc::RVLC_ESC_FLAG
+            {
+                let mag = crate::rvlc::rvlc_esc_decode(reader)?;
+                is_last_esc = Some(mag);
             }
             let esc_consumed = reader.bit_position() - esc_start;
             if esc_consumed != len_escapes {

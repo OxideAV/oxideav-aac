@@ -10,7 +10,7 @@
 
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 
 /// One distinct tone per channel (canonical interleaved order); the
 /// `lfe` channel (canonical index, if any) gets a low-frequency tone

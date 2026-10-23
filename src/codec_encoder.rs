@@ -55,8 +55,8 @@ use oxideav_core::{
 };
 
 use crate::codec_decoder::CODEC_ID_STR;
-use crate::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
-use crate::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
+use crate::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
+use crate::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
 
 /// Default target bitrate (bits/second) when `params.bit_rate` is
 /// absent: 64 kbps per channel, the conventional "good quality"
@@ -91,12 +91,12 @@ pub const DEFAULT_BITRATE_PER_CHANNEL: u32 = 64_000;
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params.sample_rate.unwrap_or(44_100);
     let channels = params.channels.unwrap_or(2);
-    if let Some(fmt) = params.sample_format {
-        if fmt != SampleFormat::S16 {
-            return Err(Error::unsupported(
-                "oxideav-aac encoder accepts interleaved S16 input only",
-            ));
-        }
+    if let Some(fmt) = params.sample_format
+        && fmt != SampleFormat::S16
+    {
+        return Err(Error::unsupported(
+            "oxideav-aac encoder accepts interleaved S16 input only",
+        ));
     }
     // An SBR-signalling AudioSpecificConfig in extradata selects the
     // HE-AAC v1 profile.
@@ -267,12 +267,12 @@ fn is_default_speaker_set(positions: &[oxideav_core::ChannelPosition]) -> bool {
 pub fn make_he_aac_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params.sample_rate.unwrap_or(44_100);
     let channels = params.channels.unwrap_or(2);
-    if let Some(fmt) = params.sample_format {
-        if fmt != SampleFormat::S16 {
-            return Err(Error::unsupported(
-                "oxideav-aac encoder accepts interleaved S16 input only",
-            ));
-        }
+    if let Some(fmt) = params.sample_format
+        && fmt != SampleFormat::S16
+    {
+        return Err(Error::unsupported(
+            "oxideav-aac encoder accepts interleaved S16 input only",
+        ));
     }
     if !(1..=2).contains(&channels) {
         return Err(Error::unsupported(
@@ -335,12 +335,12 @@ pub const DEFAULT_HE_V2_BITRATE: u32 = 32_000;
 pub fn make_he_aac_v2_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params.sample_rate.unwrap_or(44_100);
     let channels = params.channels.unwrap_or(2);
-    if let Some(fmt) = params.sample_format {
-        if fmt != SampleFormat::S16 {
-            return Err(Error::unsupported(
-                "oxideav-aac encoder accepts interleaved S16 input only",
-            ));
-        }
+    if let Some(fmt) = params.sample_format
+        && fmt != SampleFormat::S16
+    {
+        return Err(Error::unsupported(
+            "oxideav-aac encoder accepts interleaved S16 input only",
+        ));
     }
     if channels != 2 {
         return Err(Error::unsupported(
@@ -433,7 +433,7 @@ impl Encoder for HeAacPacketEncoder {
             _ => {
                 return Err(Error::invalid(
                     "oxideav-aac encoder expects one interleaved S16 plane",
-                ))
+                ));
             }
         };
         if plane.len() % 2 != 0 {
@@ -441,7 +441,9 @@ impl Encoder for HeAacPacketEncoder {
         }
         self.pending_pcm.extend(
             plane
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| i16::from_le_bytes([b[0], b[1]])),
         );
         self.drain_hops()
@@ -545,7 +547,7 @@ impl Encoder for AacEncoder {
             _ => {
                 return Err(Error::invalid(
                     "oxideav-aac encoder expects one interleaved S16 plane",
-                ))
+                ));
             }
         };
         if plane.len() % 2 != 0 {
@@ -553,7 +555,9 @@ impl Encoder for AacEncoder {
         }
         self.pending_pcm.extend(
             plane
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| i16::from_le_bytes([b[0], b[1]])),
         );
         self.drain_hops()
@@ -802,9 +806,11 @@ mod tests {
         assert_eq!(h.channel_configuration, 1);
         let mut dec = crate::decode::StreamDecoder::new();
         let frames = dec.decode_all(&stream_bytes).unwrap();
-        assert!(frames
-            .iter()
-            .all(|f| f.sample_rate == 48_000 && f.channels == 2));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.sample_rate == 48_000 && f.channels == 2)
+        );
 
         // The generic factory dispatches on the PS-signalling ASC
         // (both forms).
