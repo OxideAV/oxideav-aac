@@ -61,9 +61,10 @@ pub enum Error {
     /// by Phase 1 are 1 (Main), 2 (LC), 3 (SSR), 4 (LTP), 6
     /// (scalable), 7 (TwinVQ), 17 (ER AAC LC), 19 (ER AAC LTP), 20
     /// (ER AAC scalable), 21 (ER TwinVQ), 22 (ER BSAC), 23 (ER AAC
-    /// LD); SBR (5) and PS (29) hierarchical wrappers are
-    /// unwrapped before this check. Any other AOT — CELP, HVXC,
-    /// SSC, USAC, ELD, ALS, SLS, …  — currently surfaces here.
+    /// LD), and 39 (ER AAC ELD, its own `ELDSpecificConfig`); SBR (5)
+    /// and PS (29) hierarchical wrappers are unwrapped before this
+    /// check. Any other AOT — CELP, HVXC, SSC, USAC, ALS, SLS, …  —
+    /// currently surfaces here.
     UnsupportedAot(u8),
 
     /// [`crate::ics_info::IcsInfo::parse`] was called with a

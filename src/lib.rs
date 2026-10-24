@@ -446,6 +446,7 @@ pub mod he_aac_encoder;
 #[doc(hidden)]
 pub mod encoder_tns;
 // internal — exposed for tests/fuzz; not part of the stable API
+mod eld_window;
 #[doc(hidden)]
 pub mod extension_payload;
 // internal — exposed for tests/fuzz; not part of the stable API

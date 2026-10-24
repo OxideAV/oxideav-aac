@@ -434,6 +434,65 @@ impl IcsBody {
         Ok(body)
     }
 
+    /// Parse an ER AAC ELD `individual_channel_stream()` (§4.6.20)
+    /// without the resilience tools: `global_gain`; for a single
+    /// channel its ELD `ics_info()` (`max_sfb`, 6 bits, returned in
+    /// [`IcsBody::ics_info`]), which a channel pair transmits once,
+    /// before both channels (`shared`); `section_data()`,
+    /// `scale_factor_data()`, `tns_data_present` and `tns_data()`. ELD
+    /// has no pulse or gain-control data; `spectral_data()` follows.
+    pub fn parse_eld(
+        reader: &mut BitReader<'_>,
+        family: FrameFamily,
+        sampling_frequency_index: u8,
+        shared: Option<&IcsInfo>,
+    ) -> Result<Self> {
+        let start = reader.bit_position();
+        let global_gain = read_u8(reader, GLOBAL_GAIN_BITS)?;
+        let own = match shared {
+            Some(_) => None,
+            None => Some(IcsInfo::eld(
+                family,
+                read_u8(reader, 6)?,
+                sampling_frequency_index,
+            )?),
+        };
+        let ics_info = shared.or(own.as_ref()).ok_or(Error::ElementDecodeInvalid)?;
+        let section_data = SectionData::parse(
+            reader,
+            ics_info.window_sequence,
+            ics_info.num_window_groups,
+            ics_info.max_sfb,
+        )?;
+        let scale_factor_data = ScaleFactorData::parse(reader, &section_data.sfb_cb)?;
+        let tns_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
+        let tns_data = if tns_data_present {
+            Some(TnsData::parse_family(
+                reader,
+                ics_info.family,
+                ics_info.window_sequence,
+            )?)
+        } else {
+            None
+        };
+        let spectral_data_bit_offset = reader.bit_position() - start;
+        Ok(IcsBody {
+            global_gain,
+            ics_info: own,
+            section_data,
+            scale_factor_data,
+            pulse_data_present: false,
+            pulse_data: None,
+            tns_data_present,
+            tns_data,
+            gain_control_data_present: false,
+            gain_control_data: None,
+            spectral_data_bit_offset,
+            er_scale_factor_data: None,
+            reordered_spectral_lengths: None,
+        })
+    }
+
     /// Parse an error-resilient Table 4.50 body whose `ics_info()` was
     /// already consumed by the surrounding shared-info CPE form.
     ///

@@ -856,7 +856,9 @@ impl StreamDecoder {
     ///
     /// Scope: the ER AAC LC (AOT 17), ER AAC LTP (AOT 19) and ER AAC
     /// LD (AOT 23) object types — the three §4.4.2.3 Table 4.19
-    /// payloads. ER AAC scalable (AOT 20) rides its own layered
+    /// payloads — and ER AAC ELD (AOT 39) without the resilience tools
+    /// or low-delay SBR (see [`Self::decode_eld_elements`]). ER AAC
+    /// scalable (AOT 20) rides its own layered
     /// `aac_scalable_main_element()` walk (see [`crate::scalable`])
     /// and is rejected here with [`Error::NotImplemented`]. For
     /// AOT 19 the §4.6.7 LTP tool is live: `ics_info()` carries the
@@ -887,14 +889,21 @@ impl StreamDecoder {
         // below already thread. ER AAC scalable (AOT 20) uses the
         // layered aac_scalable_main_element() walk instead and stays
         // out of this entry point.
-        if aot != 17 && aot != 19 && aot != 23 {
+        if aot != 17 && aot != 19 && aot != 23 && aot != 39 {
             return Err(Error::NotImplemented);
         }
-        // An LD stream must run an LD family and vice versa — a
+        // An LD or ELD stream must run an LD family and vice versa — a
         // mismatch means the caller never installed the ASC-resolved
         // family, which would silently mis-decode every band.
-        if (aot == 23) != self.family.is_ld() {
+        if (aot == 23 || aot == 39) != self.family.is_ld() {
             return Err(Error::ElementDecodeInvalid);
+        }
+        if aot == 39 {
+            // ELD with the resilience tools is not decoded.
+            if resilience.section_data || resilience.scalefactor_data || resilience.spectral_data {
+                return Err(Error::NotImplemented);
+            }
+            return self.decode_eld_elements(fs_index, sample_rate, channel_configuration, payload);
         }
         let fs = fs_index;
         let family = self.family;
@@ -1092,6 +1101,129 @@ impl StreamDecoder {
 
     // (the per-CPE parse lives in the free `parse_cpe` below so the
     // two-pass §4.6.8.3.3 coupling walk can defer decoding)
+
+    /// The ER AAC ELD (AOT 39) payload of [`Self::decode_er_raw_data_block`]:
+    /// the channel elements `channelConfiguration` fixes, without
+    /// element tags. A single channel (or LFE) is one
+    /// [`IcsBody::parse_eld`] stream; a channel pair transmits its ELD
+    /// `ics_info()` (`max_sfb`, 6 bits) and the Table 4.4
+    /// `ms_mask_present` / `ms_used` fields once, then its two streams.
+    /// Each stream is followed by its `spectral_data()`. Trailing
+    /// extension payloads are not decoded.
+    fn decode_eld_elements(
+        &mut self,
+        fs: u8,
+        sample_rate: u32,
+        channel_configuration: u8,
+        payload: &[u8],
+    ) -> Result<DecodedFrame> {
+        let family = self.family;
+        let sequence: &[IdSynEle] = match channel_configuration {
+            1 => &[IdSynEle::Sce],
+            2 => &[IdSynEle::Cpe],
+            3 => &[IdSynEle::Sce, IdSynEle::Cpe],
+            4 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Sce],
+            5 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Cpe],
+            6 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Cpe, IdSynEle::Lfe],
+            7 => &[
+                IdSynEle::Sce,
+                IdSynEle::Cpe,
+                IdSynEle::Cpe,
+                IdSynEle::Cpe,
+                IdSynEle::Lfe,
+            ],
+            _ => return Err(Error::ElementDecodeInvalid),
+        };
+        let mut reader = BitReader::new(payload);
+        let mut channels: Vec<Vec<f64>> = Vec::new();
+        for (index, &kind) in sequence.iter().enumerate() {
+            let key = (kind_id(kind), index as u8);
+            if !self.decoders.contains_key(&key) {
+                self.decoders
+                    .insert(key, ElementDecoder::new_low_delay(family)?);
+            }
+            match kind {
+                IdSynEle::Sce | IdSynEle::Lfe => {
+                    let body = IcsBody::parse_eld(&mut reader, family, fs, None)?;
+                    let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
+                    let spectral = SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
+                    let ch = ChannelInput {
+                        body: &body,
+                        ics_info: &ics,
+                        spectral: &spectral,
+                    };
+                    let dec = self
+                        .decoders
+                        .get_mut(&key)
+                        .ok_or(Error::ElementDecodeInvalid)?;
+                    channels.push(dec.decode_sce(&ch, 39, fs)?);
+                }
+                IdSynEle::Cpe => {
+                    let max_sfb = reader.read_u32(6).map_err(|_| Error::UnexpectedEnd)? as u8;
+                    let ics = IcsInfo::eld(family, max_sfb, fs)?;
+                    let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
+                    let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
+                    let mut ms_used: Vec<Vec<bool>> = Vec::new();
+                    if ms_mask_present == MsMaskPresent::Mask {
+                        let mut row = Vec::with_capacity(usize::from(max_sfb));
+                        for _ in 0..max_sfb {
+                            row.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
+                        }
+                        ms_used.push(row);
+                    }
+                    let left_body = IcsBody::parse_eld(&mut reader, family, fs, Some(&ics))?;
+                    let left_spectral =
+                        SpectralData::parse(&mut reader, &ics, &left_body.section_data, fs)?;
+                    let right_body = IcsBody::parse_eld(&mut reader, family, fs, Some(&ics))?;
+                    let right_spectral =
+                        SpectralData::parse(&mut reader, &ics, &right_body.section_data, fs)?;
+                    let left = ChannelInput {
+                        body: &left_body,
+                        ics_info: &ics,
+                        spectral: &left_spectral,
+                    };
+                    let right = ChannelInput {
+                        body: &right_body,
+                        ics_info: &ics,
+                        spectral: &right_spectral,
+                    };
+                    let joint = CpeJointStereo {
+                        ms_mask_present,
+                        ms_used,
+                    };
+                    let dec = self
+                        .decoders
+                        .get_mut(&key)
+                        .ok_or(Error::ElementDecodeInvalid)?;
+                    let (l, r) = dec.decode_cpe(&left, &right, &joint, 39, fs)?;
+                    channels.push(l);
+                    channels.push(r);
+                }
+                _ => return Err(Error::ElementDecodeInvalid),
+            }
+        }
+        let channels = if self.declaration_order {
+            channels
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
+        let pcm = interleave_s16(&channels)?;
+        if let Some(output) = &mut self.float_pcm {
+            output.clear();
+            if let Some(first) = channels.first() {
+                for frame in 0..first.len() {
+                    for channel in &channels {
+                        output.push(channel[frame] / 32768.0);
+                    }
+                }
+            }
+        }
+        Ok(DecodedFrame {
+            pcm,
+            channels: channels.len(),
+            sample_rate,
+        })
+    }
 }
 
 /// A parsed `channel_pair_element()` awaiting decode: both channels'
