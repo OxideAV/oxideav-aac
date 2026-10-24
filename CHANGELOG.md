@@ -39,6 +39,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   before integer rounding (#25, ropoctl). Agrees with Apple's float
   decoder output at about 135 dB where the i16 output stops near 90 dB.
   The ER entry point does not fill it.
+- `StreamDecoder::set_declaration_order` (off by default): channels in
+  the order the configuration declares its elements — a default
+  `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs, LFE), or
+  the active PCE's front / side / back / LFE lists matched by tag — as
+  Apple's decoder emits them (#26, ropoctl). A block that does not carry
+  exactly the PCE's elements fails with `ElementDecodeInvalid`; a
+  `channelConfiguration == 0` stream with no PCE keeps its element order.
 
 ### Fixed
 

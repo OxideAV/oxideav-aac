@@ -259,7 +259,10 @@ impl StreamDecoder {
     /// `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs,
     /// LFE), or the active PCE's front, side, back and LFE lists, each
     /// element found by its tag. A block whose elements do not match
-    /// the PCE fails with [`Error::ElementDecodeInvalid`].
+    /// the PCE fails with [`Error::ElementDecodeInvalid`]; a
+    /// `channelConfiguration == 0` stream with no PCE keeps its
+    /// bitstream element order. Off by default (canonical speaker
+    /// order).
     pub fn set_declaration_order(&mut self, enabled: bool) {
         self.declaration_order = enabled;
     }
@@ -665,16 +668,16 @@ impl StreamDecoder {
             // kept.
             let channels =
                 if self.declaration_order {
-                    if channel_configuration == 0 {
-                        let pce = self
-                            .program_config
-                            .as_ref()
-                            .ok_or(Error::ElementDecodeInvalid)?;
-                        let perm = declaration_permutation(pce, &element_desc)
-                            .ok_or(Error::ElementDecodeInvalid)?;
-                        crate::channel_map::apply_permutation(&perm, channels)
-                    } else {
-                        channels
+                    match (channel_configuration, self.program_config.as_ref()) {
+                        (0, Some(pce)) => {
+                            let perm = declaration_permutation(pce, &element_desc)
+                                .ok_or(Error::ElementDecodeInvalid)?;
+                            crate::channel_map::apply_permutation(&perm, channels)
+                        }
+                        // A default configuration declares its elements in
+                        // transmission order; with no PCE, the bitstream's
+                        // element order is the only declaration.
+                        _ => channels,
                     }
                 } else if channel_configuration == 0 {
                     match self.program_config.as_ref().and_then(|pce| {

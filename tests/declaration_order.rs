@@ -42,3 +42,38 @@ fn five_one_in_element_order() {
         }
     }
 }
+
+/// A `channelConfiguration == 0` block of two all-zero SCEs (tags 0, 1).
+fn two_sce_block() -> Vec<u8> {
+    let mut w = oxideav_core::bits::BitWriter::new();
+    for tag in 0..2 {
+        w.write_u32(0, 3); // ID_SCE
+        w.write_u32(tag, 4); // element_instance_tag
+        w.write_u32(100, 8); // global_gain
+        w.write_bit(false); // ics_reserved_bit
+        w.write_u32(0, 2); // ONLY_LONG_SEQUENCE
+        w.write_bit(false); // window_shape
+        w.write_u32(0, 6); // max_sfb
+        w.write_bit(false); // predictor_data_present
+        w.write_bit(false); // pulse_data_present
+        w.write_bit(false); // tns_data_present
+        w.write_bit(false); // gain_control_data_present
+    }
+    w.write_u32(7, 3); // ID_END
+    w.finish()
+}
+
+#[test]
+fn config_zero_without_a_pce_keeps_element_order() {
+    let block = two_sce_block();
+    let plain = StreamDecoder::new()
+        .decode_raw_data_block(2, 4, 44_100, 0, 1, &block)
+        .unwrap();
+    let mut dec = StreamDecoder::new();
+    dec.set_declaration_order(true);
+    let declared = dec
+        .decode_raw_data_block(2, 4, 44_100, 0, 1, &block)
+        .unwrap();
+    assert_eq!(declared.channels, 2);
+    assert_eq!(declared.pcm, plain.pcm);
+}
