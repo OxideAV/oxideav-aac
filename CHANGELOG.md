@@ -19,6 +19,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   bare access units wrapped in a header built from the stream's ASC).
 - `asc_writer::ga_asc` / `aac_lc_asc_with_pce`; `latm::decode_access_unit`
   / `asc_frame_family` (the transport-independent ASC-driven AU decode).
+- `StreamDecoder::set_sine_before_first_block` (and the filterbank /
+  element / coupling decoders'; off by default): decode as if a
+  sine-shaped block preceded the first, as Apple's and FFmpeg's decoders
+  do (black box), instead of the §4.6.11.3.2 rule that the first block's
+  halves share its own `window_shape`. Only the first frame of a stream
+  whose first block is KBD-shaped changes; the LTP analysis window
+  follows the same previous shape (#22, ropoctl).
 
 ### Fixed
 

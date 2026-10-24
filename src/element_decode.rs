@@ -470,6 +470,12 @@ impl CceDecoder {
         }
     }
 
+    /// [`Filterbank::set_sine_before_first_block`] on this coupling
+    /// channel's independently switched filterbank.
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        self.fb.set_sine_before_first_block(enabled);
+    }
+
     /// Decode the CCE's embedded `single_channel_element()` to the
     /// §4.6.8.3.3 `cc_spectrum[]` (and, for an independently switched
     /// CCE, on to the time domain through this slot's persistent
@@ -611,6 +617,14 @@ impl ElementDecoder {
             // independent of the seed, so this choice only fixes the
             // (spec-undefined) per-coefficient phase.
             pns_state: 0x0001_2345,
+        }
+    }
+
+    /// [`Filterbank::set_sine_before_first_block`] on both channel
+    /// filterbanks (off by default; set before the first block).
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        for fb in &mut self.filterbanks {
+            fb.set_sine_before_first_block(enabled);
         }
     }
 

@@ -152,6 +152,31 @@ pub struct StreamDecoder {
     /// `AudioSpecificConfig` installs the ASC-resolved family via
     /// [`Self::set_frame_family`] before the first block.
     family: FrameFamily,
+    /// Settings every element / coupling decoder this stream creates
+    /// is constructed with.
+    element_options: ElementOptions,
+}
+
+/// Per-element decoder settings a [`StreamDecoder`] installs on every
+/// element and coupling decoder it creates.
+#[derive(Debug, Clone, Copy, Default)]
+struct ElementOptions {
+    /// [`StreamDecoder::set_sine_before_first_block`].
+    sine_before_first_block: bool,
+}
+
+impl ElementOptions {
+    fn element_decoder(self, family: FrameFamily) -> ElementDecoder {
+        let mut dec = ElementDecoder::new_family(family);
+        dec.set_sine_before_first_block(self.sine_before_first_block);
+        dec
+    }
+
+    fn cce_decoder(self, family: FrameFamily) -> CceDecoder {
+        let mut dec = CceDecoder::new_family(family);
+        dec.set_sine_before_first_block(self.sine_before_first_block);
+        dec
+    }
 }
 
 impl StreamDecoder {
@@ -220,6 +245,17 @@ impl StreamDecoder {
         self.sbr_low_power = low_power;
     }
 
+    /// Decode as if a sine-shaped block preceded the stream's first
+    /// (off by default). §4.6.11.3.2 gives the first block's left
+    /// window half its own `window_shape`; Apple's and FFmpeg's
+    /// decoders (black box) give it the sine window's, so a stream
+    /// whose first block is KBD-shaped differs from them in its first
+    /// frame. Applies to channel and coupling elements decoded from
+    /// then on; select before decoding.
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        self.element_options.sine_before_first_block = enabled;
+    }
+
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved
     /// 16-bit PCM.
     ///
@@ -271,6 +307,7 @@ impl StreamDecoder {
     ) -> Result<DecodedFrame> {
         let fs = fs_index;
         let family = self.family;
+        let element_options = self.element_options;
         let mut reader = BitReader::new(payload);
 
         // Per channel-element outputs in element order: the decoded
@@ -409,7 +446,7 @@ impl StreamDecoder {
             let dec = self
                 .cce_decoders
                 .entry(cce.element_instance_tag)
-                .or_insert_with(|| CceDecoder::new_family(family));
+                .or_insert_with(|| element_options.cce_decoder(family));
             decoded_cces.push(dec.decode(cce, aot, fs)?);
         }
 
@@ -434,7 +471,7 @@ impl StreamDecoder {
                     let dec = self
                         .decoders
                         .entry(pe.key)
-                        .or_insert_with(|| ElementDecoder::new_family(family));
+                        .or_insert_with(|| element_options.element_decoder(family));
                     vec![dec.decode_sce_coupled(&ch, aot, fs, &coupling)?]
                 }
                 ParsedChannel::Pair(cpe) => {
@@ -446,7 +483,7 @@ impl StreamDecoder {
                     let dec = self
                         .decoders
                         .entry(pe.key)
-                        .or_insert_with(|| ElementDecoder::new_family(family));
+                        .or_insert_with(|| element_options.element_decoder(family));
                     let (l, r) = dec.decode_cpe_coupled(
                         &left,
                         &right,
@@ -825,6 +862,7 @@ impl StreamDecoder {
         }
         let fs = fs_index;
         let family = self.family;
+        let element_options = self.element_options;
         // Table 4.19: the fixed element sequence per channelConfiguration.
         let sequence: &[IdSynEle] = match channel_configuration {
             1 => &[IdSynEle::Sce],
@@ -863,7 +901,7 @@ impl StreamDecoder {
                     let dec = self
                         .decoders
                         .entry(key)
-                        .or_insert_with(|| ElementDecoder::new_family(family));
+                        .or_insert_with(|| element_options.element_decoder(family));
                     channels.push(dec.decode_sce(&ch, aot, fs)?);
                 }
                 IdSynEle::Cpe => {
@@ -924,7 +962,7 @@ impl StreamDecoder {
                         let dec = self
                             .decoders
                             .entry(key)
-                            .or_insert_with(|| ElementDecoder::new_family(family));
+                            .or_insert_with(|| element_options.element_decoder(family));
                         dec.decode_cpe(&left, &right, &joint, aot, fs)?
                     } else {
                         let left_body = IcsBody::parse_er_family(
@@ -980,7 +1018,7 @@ impl StreamDecoder {
                         let dec = self
                             .decoders
                             .entry(key)
-                            .or_insert_with(|| ElementDecoder::new_family(family));
+                            .or_insert_with(|| element_options.element_decoder(family));
                         dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)?
                     };
                     channels.push(dec_out.0);

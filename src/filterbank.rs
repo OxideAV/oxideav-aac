@@ -433,9 +433,13 @@ pub struct Filterbank {
     overlap: Vec<f64>,
     /// `window_shape` of the previous block, governing the left-half
     /// window shape of the next block. [`None`] before the first
-    /// frame, whose left half is the sine window's, as macOS's decoder
-    /// has it.
+    /// frame: per §4.6.11.3.2 the first block's left and right halves
+    /// share its own `window_shape`.
     prev_shape: Option<WindowShape>,
+    /// The shape assumed for the (absent) block before the first, in
+    /// place of the §4.6.11.3.2 first-block rule
+    /// ([`Self::set_sine_before_first_block`]).
+    first_left_shape: Option<WindowShape>,
 }
 
 impl Default for Filterbank {
@@ -461,7 +465,18 @@ impl Filterbank {
             family,
             overlap: vec![0.0f64; family.frame_len()],
             prev_shape: None,
+            first_left_shape: None,
         }
+    }
+
+    /// Treat the stream as if a sine-shaped block preceded the first
+    /// (off by default). §4.6.11.3.2 gives the first block's left half
+    /// its own `window_shape`; Apple's and FFmpeg's decoders (black
+    /// box) give it the sine window's, which differs on a stream whose
+    /// first block is KBD-shaped. Only the first block is affected;
+    /// set before it.
+    pub fn set_sine_before_first_block(&mut self, enabled: bool) {
+        self.first_left_shape = enabled.then_some(WindowShape::Sine);
     }
 
     /// The [`FrameFamily`] this filterbank was constructed for.
@@ -488,14 +503,15 @@ impl Filterbank {
     /// §4.6.11.3.2 — the previous block's `window_shape`, which governs
     /// the left-half shape of the *next* block's analysis/synthesis
     /// window. [`None`] before the first frame (the first block uses its
-    /// own shape for both halves).
+    /// own shape for both halves), or the sine shape before the first
+    /// frame under [`Self::set_sine_before_first_block`].
     ///
     /// The §4.6.7.4.1 LTP analysis MDCT must window `x_est` with the
     /// same composite long window the filterbank uses for this frame, so
     /// the element driver reads the previous shape here before
     /// synthesizing.
     pub fn prev_shape(&self) -> Option<WindowShape> {
-        self.prev_shape
+        self.prev_shape.or(self.first_left_shape)
     }
 
     /// §4.6.11 — synthesize one frame of `LONG_WINDOW_LEN` (1024) PCM
@@ -544,7 +560,7 @@ impl Filterbank {
     /// 2048`) windowed time signal `z[i][n]` for this frame, before
     /// the inter-block overlap-add. Dispatches on `window_sequence`.
     fn windowed_signal(&self, spec: &[f64], ics_info: &IcsInfo) -> Result<Vec<f64>> {
-        let left_shape = self.prev_shape.unwrap_or(WindowShape::Sine);
+        let left_shape = self.prev_shape().unwrap_or(ics_info.window_shape);
         let right_shape = ics_info.window_shape;
         match ics_info.window_sequence {
             WindowSequence::OnlyLong => {
@@ -1360,43 +1376,45 @@ mod tests {
         assert!(w[448] < w[575]);
     }
 
-    #[test]
-    fn kbd_left_half_after_a_kbd_block() {
-        // The KBD left window of a block whose previous block was KBD
-        // equals the KBD left window, not the sine one.
-        let info = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
-        let fb = Filterbank::new();
-        let w = fb
-            .windowed_signal(&vec![0.0; LONG_WINDOW_LEN as usize], &info)
-            .unwrap();
-        // All-zero spectrum → zero time signal regardless, so instead
-        // inspect the window directly.
-        let _ = w;
-        let win = fb
-            .long_window(WindowShape::Kbd, WindowShape::Kbd, LongKind::OnlyLong)
-            .unwrap();
-        let kbd = kbd_left(1024, 4.0);
-        for n in 0..1024 {
-            assert!((win[n] - kbd[n]).abs() < 1e-15);
-        }
-    }
-
-    #[test]
-    fn first_block_follows_a_sine_shaped_block() {
-        // The first block's left half is the sine window's: a fresh
-        // filterbank synthesizes a KBD block exactly as one that first
-        // ran a silent sine-shaped block does.
+    /// A fresh filterbank and one primed with a silent block of
+    /// `primer` shape synthesize the same `KBD` block.
+    fn first_kbd_block_matches_primed(fresh: &mut Filterbank, primer: WindowShape) {
         let spec: Vec<f64> = (0..1024)
             .map(|k| if k % 37 == 3 { 1000.0 } else { 0.0 })
             .collect();
         let kbd = long_info(WindowShape::Kbd, WindowSequence::OnlyLong);
-        let sine = long_info(WindowShape::Sine, WindowSequence::OnlyLong);
-        let mut fresh = Filterbank::new();
         let first = fresh.synthesize(&spec, &kbd).unwrap();
         let mut primed = Filterbank::new();
-        primed.synthesize(&vec![0.0; spec.len()], &sine).unwrap();
-        let after_sine = primed.synthesize(&spec, &kbd).unwrap();
-        assert_eq!(first, after_sine);
+        primed
+            .synthesize(
+                &vec![0.0; spec.len()],
+                &long_info(primer, WindowSequence::OnlyLong),
+            )
+            .unwrap();
+        let after = primed.synthesize(&spec, &kbd).unwrap();
+        assert_eq!(first, after);
+    }
+
+    #[test]
+    fn first_frame_uses_own_shape_for_left_half() {
+        // §4.6.11.3.2: the first block's halves share its own shape, so
+        // a fresh filterbank synthesizes a KBD block as one that first
+        // ran a silent KBD block does.
+        let mut fresh = Filterbank::new();
+        assert_eq!(fresh.prev_shape(), None);
+        first_kbd_block_matches_primed(&mut fresh, WindowShape::Kbd);
+    }
+
+    #[test]
+    fn first_block_follows_a_sine_shaped_block_when_opted_in() {
+        // With set_sine_before_first_block the first block's left half
+        // is the sine window's: a fresh filterbank synthesizes a KBD
+        // block exactly as one that first ran a silent sine-shaped
+        // block does, and LTP analysis sees the same previous shape.
+        let mut fresh = Filterbank::new();
+        fresh.set_sine_before_first_block(true);
+        assert_eq!(fresh.prev_shape(), Some(WindowShape::Sine));
+        first_kbd_block_matches_primed(&mut fresh, WindowShape::Sine);
     }
 
     /// Table 4.A.13 — the normative Kaiser-Bessel window for the AAC
