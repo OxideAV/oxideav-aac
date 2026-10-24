@@ -79,10 +79,30 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
 /// The permutation taking a block's element-order channels to the
 /// PCE's declaration order (`out[i] = channels[perm[i]]`); `None` unless
 /// the block carries exactly the PCE's elements.
-fn declaration_permutation(pce: &Pce, elements: &[(PceElementKind, u8, usize)]) -> Option<Vec<usize>> {
-    let declared = pce.front_elements.iter().chain(&pce.side_elements).chain(&pce.back_elements)
-        .map(|e| (if e.is_cpe { PceElementKind::Cpe } else { PceElementKind::Sce }, e.tag_select))
-        .chain(pce.lfe_element_tag_selects.iter().map(|&tag| (PceElementKind::Lfe, tag)));
+fn declaration_permutation(
+    pce: &Pce,
+    elements: &[(PceElementKind, u8, usize)],
+) -> Option<Vec<usize>> {
+    let declared = pce
+        .front_elements
+        .iter()
+        .chain(&pce.side_elements)
+        .chain(&pce.back_elements)
+        .map(|e| {
+            (
+                if e.is_cpe {
+                    PceElementKind::Cpe
+                } else {
+                    PceElementKind::Sce
+                },
+                e.tag_select,
+            )
+        })
+        .chain(
+            pce.lfe_element_tag_selects
+                .iter()
+                .map(|&tag| (PceElementKind::Lfe, tag)),
+        );
     let mut first = Vec::with_capacity(elements.len());
     let mut at = 0;
     for &(_, _, n) in elements {
@@ -92,7 +112,8 @@ fn declaration_permutation(pce: &Pce, elements: &[(PceElementKind, u8, usize)]) 
     let mut used = vec![false; elements.len()];
     let mut perm = Vec::with_capacity(at);
     for (kind, tag) in declared {
-        let i = (0..elements.len()).find(|&i| !used[i] && elements[i].0 == kind && elements[i].1 == tag)?;
+        let i = (0..elements.len())
+            .find(|&i| !used[i] && elements[i].0 == kind && elements[i].1 == tag)?;
         used[i] = true;
         perm.extend(first[i]..first[i] + elements[i].2);
     }
@@ -642,24 +663,29 @@ impl StreamDecoder {
             // active §8.5.2.2 PCE instead, when one is installed and it
             // maps onto canonical positions; otherwise element order is
             // kept.
-            let channels = if self.declaration_order {
-                if channel_configuration == 0 {
-                    let pce = self.program_config.as_ref().ok_or(Error::ElementDecodeInvalid)?;
-                    let perm = declaration_permutation(pce, &element_desc).ok_or(Error::ElementDecodeInvalid)?;
-                    crate::channel_map::apply_permutation(&perm, channels)
+            let channels =
+                if self.declaration_order {
+                    if channel_configuration == 0 {
+                        let pce = self
+                            .program_config
+                            .as_ref()
+                            .ok_or(Error::ElementDecodeInvalid)?;
+                        let perm = declaration_permutation(pce, &element_desc)
+                            .ok_or(Error::ElementDecodeInvalid)?;
+                        crate::channel_map::apply_permutation(&perm, channels)
+                    } else {
+                        channels
+                    }
+                } else if channel_configuration == 0 {
+                    match self.program_config.as_ref().and_then(|pce| {
+                        crate::channel_map::pce_reorder_permutation(pce, &element_desc)
+                    }) {
+                        Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
+                        None => channels,
+                    }
                 } else {
-                    channels
-                }
-            } else if channel_configuration == 0 {
-                match self.program_config.as_ref().and_then(|pce| {
-                    crate::channel_map::pce_reorder_permutation(pce, &element_desc)
-                }) {
-                    Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
-                    None => channels,
-                }
-            } else {
-                crate::channel_map::reorder_channels(channel_configuration, channels)
-            };
+                    crate::channel_map::reorder_channels(channel_configuration, channels)
+                };
 
             match frame_channels {
                 None => frame_channels = Some(channels.len()),
