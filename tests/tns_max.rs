@@ -8,13 +8,13 @@
 //! `ics_info` `max_sfb` cap and the `swb_offset` table sizes so the
 //! eventual TNS reconstruction loop has a verifiable lockstep.
 
-use oxideav_aac::ics_info::{WindowSequence, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW};
+use oxideav_aac::Error;
+use oxideav_aac::ics_info::{NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW, WindowSequence};
 use oxideav_aac::swb_offset::{long_window_offsets, short_window_offsets};
 use oxideav_aac::tns_max::{
-    clamp_tns_band, clamp_tns_order, tns_max_bands, tns_max_bands_ld_480, tns_max_bands_ld_512,
-    tns_max_order, AOT_AAC_LC, AOT_AAC_MAIN, AOT_AAC_SSR, AOT_ER_AAC_LD,
+    AOT_AAC_LC, AOT_AAC_MAIN, AOT_AAC_SSR, AOT_ER_AAC_LD, clamp_tns_band, clamp_tns_order,
+    tns_max_bands, tns_max_bands_ld_480, tns_max_bands_ld_512, tns_max_order,
 };
-use oxideav_aac::Error;
 
 #[test]
 fn tns_max_bands_never_exceeds_num_swb_for_any_aot_and_fs() {

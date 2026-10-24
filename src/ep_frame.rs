@@ -150,7 +150,7 @@ impl EpFrameCodec {
         Ok(match rt.fec_type {
             0 => srcpc_coded_len(with_crc, rt.rate, rt.terminated)?,
             1 | 2 => {
-                if with_crc % 8 != 0 {
+                if !with_crc.is_multiple_of(8) {
                     return Err(Error::EpFrameInvalid);
                 }
                 let bytes = with_crc / 8;
@@ -185,7 +185,7 @@ impl EpFrameCodec {
         match rt.fec_type {
             0 => srcpc_encode(&with_crc, rt.rate, rt.terminated),
             1 | 2 => {
-                if with_crc.len() % 8 != 0 {
+                if !with_crc.len().is_multiple_of(8) {
                     return Err(Error::EpFrameInvalid);
                 }
                 let bytes = bits_to_bytes(&with_crc);
@@ -205,7 +205,7 @@ impl EpFrameCodec {
         let mut with_crc: Vec<bool> = match rt.fec_type {
             0 => srcpc_decode(coded, with_crc_len, rt.rate, rt.terminated)?,
             1 | 2 => {
-                if with_crc_len % 8 != 0 || coded.len() < with_crc_len {
+                if !with_crc_len.is_multiple_of(8) || coded.len() < with_crc_len {
                     return Err(Error::EpFrameInvalid);
                 }
                 let mut data = bits_to_bytes(&coded[..with_crc_len]);
@@ -270,10 +270,10 @@ impl EpFrameCodec {
                 if frame.classes[j].len() != l {
                     return Err(Error::EpFrameInvalid);
                 }
-            } else if let Some(w) = rt.len_field_bits {
-                if frame.classes[j].len() >= (1usize << w) {
-                    return Err(Error::EpFrameInvalid);
-                }
+            } else if let Some(w) = rt.len_field_bits
+                && frame.classes[j].len() >= (1usize << w)
+            {
+                return Err(Error::EpFrameInvalid);
             }
             rts.push(rt);
         }
@@ -313,7 +313,7 @@ impl EpFrameCodec {
                             with_crc.push(crc & (1u64 << i) != 0);
                         }
                     }
-                    if with_crc.len() % 8 != 0 {
+                    if !with_crc.len().is_multiple_of(8) {
                         return Err(Error::EpFrameInvalid);
                     }
                     chain.extend_from_slice(&with_crc);
@@ -439,7 +439,7 @@ impl EpFrameCodec {
         }
         bits.resize(bits.len() + nstuff, false);
         let _ = frame;
-        if self.cfg.bit_stuffing == 1 && bits.len() % 8 != 0 {
+        if self.cfg.bit_stuffing == 1 && !bits.len().is_multiple_of(8) {
             return Err(Error::EpFrameInvalid);
         }
         Ok(bits_to_bytes_padded(&bits))
@@ -504,7 +504,7 @@ impl EpFrameCodec {
                 }
                 28
             } else if bytewise {
-                if coded[k].len() % 8 != 0 {
+                if !coded[k].len().is_multiple_of(8) {
                     return Err(Error::EpFrameInvalid);
                 }
                 coded[k].len() / 8
@@ -515,7 +515,7 @@ impl EpFrameCodec {
                 28
             };
             buf_y = if bytewise {
-                if buf_y.len() % 8 != 0 {
+                if !buf_y.len().is_multiple_of(8) {
                     return Err(Error::EpFrameInvalid);
                 }
                 let x = bits_to_bytes(&coded[k]);
@@ -868,7 +868,7 @@ impl EpFrameCodec {
                 let mut chain_bits = 0usize;
                 for m in j..=last {
                     let with_crc = info_lens[m].unwrap_or(0) + rts[m].crc_bits as usize;
-                    if with_crc % 8 != 0 {
+                    if !with_crc.is_multiple_of(8) {
                         return Err(Error::EpFrameInvalid);
                     }
                     coded_lens[m] = with_crc;
@@ -936,11 +936,11 @@ impl EpFrameCodec {
             // the boundary.
             if found.is_none() {
                 for cand in 0..=max_info {
-                    if let Ok(cl) = self.coded_len(rt, cand) {
-                        if cl == remaining {
-                            found = Some(cand);
-                            break;
-                        }
+                    if let Ok(cl) = self.coded_len(rt, cand)
+                        && cl == remaining
+                    {
+                        found = Some(cand);
+                        break;
                     }
                     if cand > 4096 && rt.fec_type == 0 {
                         break;
@@ -1379,7 +1379,7 @@ pub fn write_frame(w: &mut BitWriter, frame_bytes: &[u8]) {
 /// Convenience: read the remaining whole bytes of a reader.
 pub fn read_remaining_bytes(reader: &mut BitReader<'_>, total_len: usize) -> Result<Vec<u8>> {
     let pos = reader.bit_position() as usize;
-    if pos % 8 != 0 {
+    if !pos.is_multiple_of(8) {
         return Err(Error::EpFrameInvalid);
     }
     let mut out = Vec::with_capacity(total_len - pos / 8);

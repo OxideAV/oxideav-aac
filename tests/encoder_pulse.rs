@@ -8,7 +8,7 @@
 
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 
 /// Per-frame pulse records of a mono SCE ADTS stream: `Some(pd)`
 /// when the frame's channel body carries `pulse_data()`.

@@ -49,7 +49,7 @@
 //! All truth from ISO/IEC 14496-3:2009 subpart 8 (Annexes 8.A / 8.C)
 //! staged under `docs/audio/aac/`.
 
-use crate::ps_analysis::{band_stats, hybrid_config_for, slot_energies, BandStats, PsAnalysis};
+use crate::ps_analysis::{BandStats, PsAnalysis, band_stats, hybrid_config_for, slot_energies};
 use crate::ps_data::{PsConfig, PsData, PsIndexState, PsIndices};
 use crate::ps_hybrid::NUM_QMF_SLOTS;
 use crate::ps_stereo::{ICC_RHO, IID_DB_COARSE, IID_DB_FINE};
@@ -106,11 +106,7 @@ pub enum Election {
 
 impl From<bool> for Election {
     fn from(on: bool) -> Self {
-        if on {
-            Election::On
-        } else {
-            Election::Off
-        }
+        if on { Election::On } else { Election::Off }
     }
 }
 
@@ -403,7 +399,8 @@ impl PsEncoder {
     /// the header block.
     #[must_use]
     pub fn next_header_due(&self) -> bool {
-        self.frames % u64::from(self.cfg.header_interval.max(1)) == 0
+        self.frames
+            .is_multiple_of(u64::from(self.cfg.header_interval.max(1)))
     }
 
     /// Encode one stereo frame. `l` / `r` are each channel's Annex

@@ -115,14 +115,14 @@ use oxideav_core::bits::{BitReader, BitWriter};
 use crate::ics_info::IcsInfo;
 use crate::section_data::{Codebook, Section, SectionData};
 use crate::spectral_codebook::{
-    apply_sign_bits, decode_esc_value, decode_index_to_tuple, derive_sign_bits, encode_esc_value,
-    encode_tuple_to_index, table_4_95, MAX_QUANT,
+    MAX_QUANT, apply_sign_bits, decode_esc_value, decode_index_to_tuple, derive_sign_bits,
+    encode_esc_value, encode_tuple_to_index, table_4_95,
 };
 use crate::spectrum_huffman::{
-    hcod10_decode, hcod10_write, hcod11_decode, hcod11_write, hcod1_decode, hcod1_write,
-    hcod2_decode, hcod2_write, hcod3_decode, hcod3_write, hcod4_decode, hcod4_write, hcod5_decode,
-    hcod5_write, hcod6_decode, hcod6_write, hcod7_decode, hcod7_write, hcod8_decode, hcod8_write,
-    hcod9_decode, hcod9_write,
+    hcod1_decode, hcod1_write, hcod2_decode, hcod2_write, hcod3_decode, hcod3_write, hcod4_decode,
+    hcod4_write, hcod5_decode, hcod5_write, hcod6_decode, hcod6_write, hcod7_decode, hcod7_write,
+    hcod8_decode, hcod8_write, hcod9_decode, hcod9_write, hcod10_decode, hcod10_write,
+    hcod11_decode, hcod11_write,
 };
 #[cfg(test)]
 use crate::swb_offset::{long_window_offsets, short_window_offsets};
@@ -286,11 +286,7 @@ impl SpectralData {
                             // bit already parsed applies to the
                             // escaped magnitude.
                             let mag = read_escape_sequence(reader)? as i32;
-                            if v < 0 {
-                                -mag
-                            } else {
-                                mag
-                            }
+                            if v < 0 { -mag } else { mag }
                         } else {
                             v
                         };

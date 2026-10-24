@@ -21,7 +21,7 @@
 use oxideav_aac::cce::{CoupledTarget, CouplingGains, CouplingHeader, GainList};
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};

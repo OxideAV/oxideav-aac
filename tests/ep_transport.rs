@@ -8,7 +8,7 @@
 
 use oxideav_aac::ep_config::{EpClass, EpPredefinedSet, ErrorProtectionSpecificConfig};
 use oxideav_aac::ep_frame::{EpFrameCodec, EpFrameData};
-use oxideav_aac::latm::{ep_sync_header_parity, LoasDecoder};
+use oxideav_aac::latm::{LoasDecoder, ep_sync_header_parity};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// AAC-LC 44.1 kHz mono ASC (16 bits).
@@ -24,7 +24,7 @@ fn write_aac_lc_asc(w: &mut BitWriter) {
 /// A tiny mono SCE raw_data_block with small book-1 spectra.
 fn tiny_raw_data_block() -> Vec<u8> {
     use oxideav_aac::ics_body::IcsBody;
-    use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+    use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
     use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
     use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
     use oxideav_aac::section_data::{Section, SectionData};
@@ -61,13 +61,15 @@ fn tiny_raw_data_block() -> Vec<u8> {
         global_gain: 140,
         ics_info: Some(ics.clone()),
         section_data: SectionData {
-            sections: vec![(0..4)
-                .map(|sfb| Section {
-                    codebook: 1,
-                    start: sfb as u8,
-                    end: sfb as u8 + 1,
-                })
-                .collect()],
+            sections: vec![
+                (0..4)
+                    .map(|sfb| Section {
+                        codebook: 1,
+                        start: sfb as u8,
+                        end: sfb as u8 + 1,
+                    })
+                    .collect(),
+            ],
             sfb_cb: vec![vec![1, 1, 1, 1]],
         },
         scale_factor_data: ScaleFactorData {

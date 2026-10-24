@@ -41,15 +41,15 @@
 //! [`TNS_COEF_TRIM`] are trimmed to keep the order (and the 4-bit
 //! coefficient payload) minimal.
 
+use crate::Result;
 use crate::ics_info::WindowSequence;
 use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
+    LONG_WINDOW_LEN, SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets,
 };
 use crate::tns_coef::tns_encode_coef;
-use crate::tns_data::{num_windows, TnsData, TnsFilter, TnsWindow};
+use crate::tns_data::{TnsData, TnsFilter, TnsWindow, num_windows};
 use crate::tns_frame::tns_analysis_frame;
-use crate::tns_max::{clamp_tns_band, tns_max_order, AOT_AAC_LC};
-use crate::Result;
+use crate::tns_max::{AOT_AAC_LC, clamp_tns_band, tns_max_order};
 
 /// Encoder-side cap on the TNS filter order. Table 4.102 allows up
 /// to 12 for AAC LC long windows (7 short), but each tap costs 4

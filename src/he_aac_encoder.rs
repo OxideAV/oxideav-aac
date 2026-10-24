@@ -79,11 +79,11 @@
 use std::collections::VecDeque;
 
 use crate::adts::ADTS_SAMPLE_RATES_HZ;
-use crate::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use crate::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 use crate::ps_encoder::{PsEncoder, PsEncoderConfig, PsFrame};
 use crate::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
-use crate::sbr_element::{SbrExtension, EXTENSION_ID_PS};
-use crate::sbr_encoder::{SbrEncoder, SbrEncoderConfig, SbrFrame, RATE, SBR_ENC_COLS, T_HF_GEN};
+use crate::sbr_element::{EXTENSION_ID_PS, SbrExtension};
+use crate::sbr_encoder::{RATE, SBR_ENC_COLS, SbrEncoder, SbrEncoderConfig, SbrFrame, T_HF_GEN};
 use crate::sbr_qmf::{Complex, EncoderAnalysisQmf, SynthesisQmf};
 use crate::{Error, Result};
 
@@ -422,7 +422,7 @@ impl HeAacEncoder {
         if config.parametric_stereo && config.channels != 2 {
             return Err(Error::EncoderInvalidConfig);
         }
-        if config.sample_rate % 2 != 0 {
+        if !config.sample_rate.is_multiple_of(2) {
             return Err(Error::EncoderInvalidConfig);
         }
         let core_rate = config.sample_rate / 2;
@@ -538,7 +538,7 @@ impl HeAacEncoder {
         fe.qmf_delay.clear();
         fe.qmf_delay
             .extend_from_slice(&hop[hop.len() - FIR_DELAY..]);
-        for slot in delayed.chunks_exact(64) {
+        for slot in delayed.as_chunks::<64>().0 {
             let x = fe.bank.push_slot(slot).expect("64-sample slot");
             fe.cols.push_back(x);
             if fe.cols.len() > RING_COLS {
@@ -563,7 +563,7 @@ impl HeAacEncoder {
     /// samples (a shorter tail is zero-padded) into one ADTS frame.
     pub fn encode_frame(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let ch = usize::from(self.config.channels);
-        if interleaved.len() > HE_FRAME_LEN * ch || interleaved.len() % ch != 0 {
+        if interleaved.len() > HE_FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut hops: Vec<Vec<f64>> = vec![vec![0.0; HE_FRAME_LEN]; ch];
@@ -634,7 +634,7 @@ impl HeAacEncoder {
     /// stream (`⌈n / 2048⌉ + 1` frames including the flush).
     pub fn encode_all(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let ch = usize::from(self.config.channels);
-        if interleaved.len() % ch != 0 {
+        if !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut out = Vec::new();
@@ -759,11 +759,13 @@ mod tests {
     /// it as two channels at the full rate, and the v2 ASCs signal PS.
     #[test]
     fn parametric_stereo_frames_decode_as_stereo() {
-        assert!(HeAacEncoder::new(HeAacConfig {
-            channels: 1,
-            ..HeAacConfig::new_v2(44_100, 32_000)
-        })
-        .is_err());
+        assert!(
+            HeAacEncoder::new(HeAacConfig {
+                channels: 1,
+                ..HeAacConfig::new_v2(44_100, 32_000)
+            })
+            .is_err()
+        );
         let mut enc = HeAacEncoder::new(HeAacConfig::new_v2(44_100, 32_000)).unwrap();
         assert_eq!(enc.config().core_channels(), 1);
         let n = 4 * HE_FRAME_LEN;
@@ -815,7 +817,7 @@ mod tests {
             })
             .collect();
         let mut output = Vec::new();
-        for slot in input.chunks_exact(64) {
+        for slot in input.as_chunks::<64>().0 {
             let x = a.push_slot(slot).unwrap();
             output.extend_from_slice(&s.push_slot(&x).unwrap());
         }

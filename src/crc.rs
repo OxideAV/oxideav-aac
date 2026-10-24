@@ -190,11 +190,7 @@ impl CrcPoly {
     /// Mask of the low `k` bits: `(1 << k) - 1`.
     const fn mask(self) -> u64 {
         let k = self.width();
-        if k >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << k) - 1
-        }
+        if k >= 64 { u64::MAX } else { (1u64 << k) - 1 }
     }
 }
 
@@ -221,7 +217,7 @@ const fn bits(exponents: &[u32]) -> u64 {
 /// is inverted"). Only the low `poly.width()` bits are significant.
 pub fn crc_bits(poly: CrcPoly, message_bits: &[bool]) -> u64 {
     let k = poly.width();
-    let gen = poly.generator();
+    let r#gen = poly.generator();
     let mask = poly.mask();
     let top = 1u64 << (k - 1);
 
@@ -233,7 +229,7 @@ pub fn crc_bits(poly: CrcPoly, message_bits: &[bool]) -> u64 {
         let high = (reg & top) != 0;
         reg = (reg << 1) & mask;
         if high {
-            reg ^= gen;
+            reg ^= r#gen;
         }
         if bit {
             reg ^= 1; // fold the incoming message bit into x⁰
@@ -244,7 +240,7 @@ pub fn crc_bits(poly: CrcPoly, message_bits: &[bool]) -> u64 {
         let high = (reg & top) != 0;
         reg = (reg << 1) & mask;
         if high {
-            reg ^= gen;
+            reg ^= r#gen;
         }
     }
 
@@ -260,7 +256,7 @@ pub fn crc_bits(poly: CrcPoly, message_bits: &[bool]) -> u64 {
 /// big-endian bit order.
 pub fn crc_bytes(poly: CrcPoly, message: &[u8]) -> u64 {
     let k = poly.width();
-    let gen = poly.generator();
+    let r#gen = poly.generator();
     let mask = poly.mask();
     let top = 1u64 << (k - 1);
 
@@ -271,7 +267,7 @@ pub fn crc_bytes(poly: CrcPoly, message: &[u8]) -> u64 {
             let high = (reg & top) != 0;
             reg = (reg << 1) & mask;
             if high {
-                reg ^= gen;
+                reg ^= r#gen;
             }
             if bit {
                 reg ^= 1;
@@ -282,7 +278,7 @@ pub fn crc_bytes(poly: CrcPoly, message: &[u8]) -> u64 {
         let high = (reg & top) != 0;
         reg = (reg << 1) & mask;
         if high {
-            reg ^= gen;
+            reg ^= r#gen;
         }
     }
     (!reg) & mask
@@ -317,9 +313,9 @@ mod tests {
     fn reference_remainder(poly: CrcPoly, message_bits: &[bool]) -> u64 {
         let k = poly.width();
         let full_gen = poly.generator() | (1u64 << k); // include xᵏ
-                                                       // Build the dividend M(x)·xᵏ as a big sequence of bits.
+        // Build the dividend M(x)·xᵏ as a big sequence of bits.
         let mut dividend: Vec<bool> = message_bits.to_vec();
-        dividend.extend(std::iter::repeat(false).take(k as usize));
+        dividend.extend(std::iter::repeat_n(false, k as usize));
 
         // Long division over GF(2), MSB-first, tracking a window of the
         // most recent (k+1) bits implicitly via a running register.
@@ -350,8 +346,8 @@ mod tests {
         assert_eq!(CrcPoly::Crc8.generator(), 0b0001_1101); // x⁴+x³+x²+1
         assert_eq!(CrcPoly::Crc16.generator(), (1 << 15) | (1 << 2) | 1);
         assert_eq!(CrcPoly::Crc4.generator(), 0b1101); // x³+x²+1
-                                                       // Every generator must fit within its width and carry the x⁰
-                                                       // term (all listed polynomials have a constant 1).
+        // Every generator must fit within its width and carry the x⁰
+        // term (all listed polynomials have a constant 1).
         for p in [
             CrcPoly::Crc4,
             CrcPoly::Crc5,
@@ -429,7 +425,7 @@ mod tests {
             let mut bits = to_bits(m);
             let on_wire = crc_bits(p, &bits);
             let r = (!on_wire) & p.mask(); // undo inversion → true R(x)
-                                           // Append the k remainder bits (MSB-first) to the message.
+            // Append the k remainder bits (MSB-first) to the message.
             for i in (0..p.width()).rev() {
                 bits.push((r >> i) & 1 != 0);
             }

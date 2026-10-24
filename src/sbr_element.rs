@@ -340,9 +340,9 @@ fn read_flag(reader: &mut BitReader<'_>) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sbr_freq_bands::{k0, k2, master_table, HiLoTables};
+    use crate::sbr_freq_bands::{HiLoTables, k0, k2, master_table};
     use crate::sbr_grid::FrameClass;
-    use crate::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+    use crate::sbr_huffman::{SbrHuffContext, env_tables, noise_tables};
     use oxideav_core::bits::{BitReader, BitWriter};
 
     fn bands_44100() -> HiLoTables {
@@ -365,14 +365,14 @@ mod tests {
         let n_q = bands.n_q();
         let mut w = BitWriter::new();
         w.write_bit(false); // bs_data_extra
-                            // sbr_grid: FIXFIX, 2^0 = 1 env, freq_res high.
+        // sbr_grid: FIXFIX, 2^0 = 1 env, freq_res high.
         w.write_u32(FrameClass::FixFix.to_bits(), 2);
         w.write_u32(0, 2); // 1 env
         w.write_bit(true); // freq_res[0] = high
-                           // sbr_dtdf: 1 env flag + 1 noise flag, both freq (0).
+        // sbr_dtdf: 1 env flag + 1 noise flag, both freq (0).
         w.write_bit(false); // df_env[0]
         w.write_bit(false); // df_noise[0]
-                            // sbr_invf: n_q 2-bit modes.
+        // sbr_invf: n_q 2-bit modes.
         for _ in 0..n_q {
             w.write_u32(1, 2);
         }
@@ -464,7 +464,7 @@ mod tests {
         // Extended data: id = PS, one body byte 0xA5, then byte-align.
         w.write_bit(true); // bs_extended_data
         w.write_u32(1, 4); // bs_extension_size = 1 byte (8 bits)
-                           // 8 bits = id(2) + 6 fill bits; body has no full byte.
+        // 8 bits = id(2) + 6 fill bits; body has no full byte.
         w.write_u32(EXTENSION_ID_PS as u32, 2);
         w.write_u32(0, 6); // fill
         let bytes = w.finish();
@@ -487,7 +487,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bit(false); // data_extra
         w.write_bit(false); // bs_coupling = 0 (independent)
-                            // grid0: FIXFIX 1 env high.
+        // grid0: FIXFIX 1 env high.
         w.write_u32(FrameClass::FixFix.to_bits(), 2);
         w.write_u32(0, 2);
         w.write_bit(true);

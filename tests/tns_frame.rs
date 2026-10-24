@@ -14,13 +14,13 @@
 //! §4.6.9.3 pseudocode plus the Table 4.102 / 4.103 caps and the
 //! Table 4.140 / 4.141 `swb_offset` tables already in the crate.
 
+use oxideav_aac::Error;
 use oxideav_aac::ics_info::WindowSequence;
 use oxideav_aac::swb_offset::{long_window_offsets, short_window_offsets};
 use oxideav_aac::tns_coef::{tns_ar_filter, tns_decode_coef_to_lpc};
 use oxideav_aac::tns_data::{TnsData, TnsFilter, TnsWindow};
 use oxideav_aac::tns_frame::tns_decode_frame;
-use oxideav_aac::tns_max::{tns_max_bands, AOT_AAC_LC};
-use oxideav_aac::Error;
+use oxideav_aac::tns_max::{AOT_AAC_LC, tns_max_bands};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// 48 kHz: long window has 49 SWBs, short has 14.

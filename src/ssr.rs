@@ -34,12 +34,12 @@
 //! consulted — the full-pipeline tests below validate against the
 //! Annex C.2.1.1 analysis PQF and the §4.6.11 TDAC property.
 
-use crate::gain_control::{band_record, GainBandState};
+use crate::Result;
+use crate::gain_control::{GainBandState, band_record};
 use crate::gain_control_data::GainControlData;
 use crate::ics_info::{IcsInfo, WindowSequence};
 use crate::ipqf::{Ipqf, NUM_BANDS};
 use crate::ssr_filterbank::SsrSynthesis;
-use crate::Result;
 
 /// One channel's persistent SSR gain-control + IPQF state: the four
 /// per-band [`GainBandState`] carries plus the streaming [`Ipqf`].
@@ -226,10 +226,10 @@ mod tests {
 mod round_trip_tests {
     use super::*;
     use crate::filterbank::{forward_mdct, long_sequence_window_n, short_window_n};
-    use crate::gain_control::{band_record, pfmd_len, BandGainFunction};
+    use crate::gain_control::{BandGainFunction, band_record, pfmd_len};
     use crate::gain_control_data::{GainAdjust, GainBand, GainWindow};
     use crate::ics_info::{IcsInfo, WindowShape};
-    use crate::ssr_filterbank::pqf_test_support::{pqf_analysis, PQF_CASCADE_DELAY};
+    use crate::ssr_filterbank::pqf_test_support::{PQF_CASCADE_DELAY, pqf_analysis};
     use crate::ssr_filterbank::{SSR_LONG_TRANSFORM, SSR_SHORT_TRANSFORM};
     use core::f64::consts::PI;
 

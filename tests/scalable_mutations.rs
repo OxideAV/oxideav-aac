@@ -6,7 +6,7 @@
 
 use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, LtpData, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, LtpData, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::ms_stereo::MsMaskPresent;
 use oxideav_aac::scalable::{
     ScalableChannel, ScalableConfig, ScalableDecoder, ScalableFrame, ScalableLayer,
@@ -42,15 +42,17 @@ fn long_ics_info(max_sfb: u8) -> IcsInfo {
 }
 
 fn make_channel(sfb_cbs: &[u8], global_gain: u8, seed: u32) -> ScalableChannel {
-    let sections = vec![sfb_cbs
-        .iter()
-        .enumerate()
-        .map(|(sfb, &cb)| Section {
-            codebook: cb,
-            start: sfb as u8,
-            end: sfb as u8 + 1,
-        })
-        .collect()];
+    let sections = vec![
+        sfb_cbs
+            .iter()
+            .enumerate()
+            .map(|(sfb, &cb)| Section {
+                codebook: cb,
+                start: sfb as u8,
+                end: sfb as u8 + 1,
+            })
+            .collect(),
+    ];
     let mut first_noise = true;
     let entries: Vec<ScaleFactorEntry> = sfb_cbs
         .iter()

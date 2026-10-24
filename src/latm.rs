@@ -608,7 +608,7 @@ fn payload_mux(
 /// bit-by-bit assembly (MSB-first), with the trailing partial byte
 /// left-justified.
 fn read_payload_bytes(reader: &mut BitReader<'_>, bits: u32) -> Result<Vec<u8>> {
-    if bits % 8 == 0 && reader.is_byte_aligned() {
+    if bits.is_multiple_of(8) && reader.is_byte_aligned() {
         let n = (bits / 8) as usize;
         return reader.read_bytes(n).map_err(|_| Error::UnexpectedEnd);
     }
@@ -745,10 +745,10 @@ impl<'a> AudioSyncStream<'a> {
         let mut off = self.pos;
         while off + bytes_needed <= self.data.len() {
             let mut r = BitReader::new(&self.data[off..]);
-            if let Ok(v) = r.read_u32(n) {
-                if v == syncword {
-                    return Some(off);
-                }
+            if let Ok(v) = r.read_u32(n)
+                && v == syncword
+            {
+                return Some(off);
             }
             off += 1;
         }
@@ -1362,10 +1362,10 @@ pub fn decode_access_unit(
     // ASC's inline program_config_element(); install it so the
     // §8.5.2.2 canonical output reorder applies (an in-band PCE in
     // a later raw_data_block() still supersedes it).
-    if asc.channel_configuration == 0 {
-        if let Some(pce) = &asc.ga_body.pce {
-            dec.set_program_config(pce.clone());
-        }
+    if asc.channel_configuration == 0
+        && let Some(pce) = &asc.ga_body.pce
+    {
+        dec.set_program_config(pce.clone());
     }
     // The ER General-Audio object types use the §4.4.2.3 Table 4.19
     // fixed-sequence er_raw_data_block() instead of the tagged
@@ -1453,7 +1453,7 @@ mod tests {
         w.write_u32(0, 6); // numSubFrames = 0
         w.write_u32(0, 4); // numProgram = 0
         w.write_u32(0, 3); // numLayer = 0
-                           // (prog 0, lay 0): no useSameConfig bit; ASC inline.
+        // (prog 0, lay 0): no useSameConfig bit; ASC inline.
         write_aac_lc_asc(&mut w);
         w.write_u32(0, 3); // frameLengthType = 0
         w.write_u32(0xFF, 8); // latmBufferFullness = 0xFF
@@ -1557,11 +1557,11 @@ mod tests {
         w.write_u32(0, 6); // numSubFrames
         w.write_u32(0, 4); // numProgram = 0
         w.write_u32(1, 3); // numLayer = 1 -> two layers
-                           // layer 0: no useSameConfig bit; inline ASC.
+        // layer 0: no useSameConfig bit; inline ASC.
         write_aac_lc_asc(&mut w);
         w.write_u32(0, 3); // frameLengthType 0
         w.write_u32(0xFF, 8); // latmBufferFullness
-                              // layer 1: useSameConfig = 1.
+        // layer 1: useSameConfig = 1.
         w.write_bit(true); // useSameConfig
         w.write_u32(0, 3); // frameLengthType 0
         w.write_u32(0xFF, 8); // latmBufferFullness
@@ -1750,7 +1750,7 @@ mod tests {
         // PayloadLengthInfo + payload.
         let mut w = BitWriter::new();
         w.write_bit(false); // useSameStreamMux
-                            // StreamMuxConfig with numSubFrames = 1.
+        // StreamMuxConfig with numSubFrames = 1.
         w.write_bit(false); // audioMuxVersion = 0
         w.write_bit(true); // allStreamsSameTimeFraming
         w.write_u32(1, 6); // numSubFrames = 1
@@ -1761,7 +1761,7 @@ mod tests {
         w.write_u32(0xFF, 8); // latmBufferFullness
         w.write_bit(false); // otherDataPresent
         w.write_bit(false); // crcCheckPresent
-                            // subframe 0: 2 bytes.
+        // subframe 0: 2 bytes.
         w.write_u32(2, 8);
         w.write_byte(0x01);
         w.write_byte(0x02);

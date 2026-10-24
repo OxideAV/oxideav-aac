@@ -6,12 +6,11 @@
 //! the bit-exact inverse property of
 //! [`ExtensionPayload::parse`] / [`ExtensionPayload::write`].
 
-use oxideav_aac::extension_payload::{
-    excluded_group_count, DrcBandRecord, DrcBands, DynamicRangeInfo, ExcludedChannels,
-    ExtensionPayload, ExtensionType, PceTagFields, ProgRefLevelFields, FILL_DATA_BYTE,
-    FILL_DATA_NIBBLE,
-};
 use oxideav_aac::Error;
+use oxideav_aac::extension_payload::{
+    DrcBandRecord, DrcBands, DynamicRangeInfo, ExcludedChannels, ExtensionPayload, ExtensionType,
+    FILL_DATA_BYTE, FILL_DATA_NIBBLE, PceTagFields, ProgRefLevelFields, excluded_group_count,
+};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 // ---------------------------------------------------------------
@@ -847,7 +846,7 @@ use oxideav_aac::raw_data_block::IdSynEle;
 use oxideav_aac::sbr_freq_bands::HiLoTables;
 use oxideav_aac::sbr_grid::FrameClass;
 use oxideav_aac::sbr_header::SbrHeader;
-use oxideav_aac::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+use oxideav_aac::sbr_huffman::{SbrHuffContext, env_tables, noise_tables};
 
 const FS_SBR: u32 = 88_200;
 

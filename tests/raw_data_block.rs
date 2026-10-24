@@ -3,9 +3,9 @@
 //! `oxideav_core::bits::BitWriter` so the tests do not depend on any
 //! external AAC encoder.
 
+use oxideav_aac::Error;
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::raw_data_block::{Element, IdSynEle, Walker};
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Append a SCE header (id 0b000 + 4-bit element_instance_tag).
@@ -290,7 +290,7 @@ fn pce_is_parsed_in_raw_data_block() {
     bw.write_bit(false); // mono_mixdown_present
     bw.write_bit(false); // stereo_mixdown_present
     bw.write_bit(false); // matrix_mixdown_idx_present
-                         // (all per-element loops are empty)
+    // (all per-element loops are empty)
     bw.align_to_byte_zero(); // PCE Note 1 byte_alignment()
     bw.write_u32(0, 8); // comment_field_bytes = 0
     write_end(&mut bw);

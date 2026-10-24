@@ -56,7 +56,7 @@ fn report_only() -> bool {
 }
 
 macro_rules! check {
-    ($cond:expr, $($msg:tt)+) => {
+    ($cond:expr_2021, $($msg:tt)+) => {
         if $cond {
         } else if report_only() {
             eprintln!("REPORT-FAIL: {}", format_args!($($msg)+));
@@ -246,11 +246,15 @@ fn read_wav(path: &PathBuf) -> Option<(Vec<f64>, usize)> {
             let raw = &d[body..end];
             out = Some(match bits {
                 16 => raw
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| f64::from(i16::from_le_bytes([c[0], c[1]])))
                     .collect(),
                 24 => raw
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let v = (i32::from(c[2] as i8) << 16)
                             | (i32::from(c[1]) << 8)
@@ -728,7 +732,7 @@ fn bsac_vector(stem: &str, wav_name: &str) {
                 ours.extend(pcm.iter().map(|&s| f64::from(s)));
                 decoded += 1;
             }
-            Err(_) => ours.extend(std::iter::repeat(0.0).take(1024 * nch)),
+            Err(_) => ours.extend(std::iter::repeat_n(0.0, 1024 * nch)),
         }
     }
     eprintln!(

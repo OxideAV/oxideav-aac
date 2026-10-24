@@ -281,10 +281,10 @@ impl SbrExtensionData {
     /// [`Error::SbrCrcMismatch`] when the recomputed 10-bit `G10`
     /// (zero-init) CRC disagrees with the transmitted value.
     pub fn verify_crc(&self, data: &[u8]) -> Result<()> {
-        if let (Some(crc), Some((start, end))) = (self.crc, self.crc_region) {
-            if crate::adts_crc::sbr_crc(data, start, end) != crc {
-                return Err(Error::SbrCrcMismatch);
-            }
+        if let (Some(crc), Some((start, end))) = (self.crc, self.crc_region)
+            && crate::adts_crc::sbr_crc(data, start, end) != crc
+        {
+            return Err(Error::SbrCrcMismatch);
         }
         Ok(())
     }
@@ -305,7 +305,7 @@ mod tests {
     use super::*;
     use crate::sbr_freq_bands::HiLoTables;
     use crate::sbr_grid::FrameClass;
-    use crate::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+    use crate::sbr_huffman::{SbrHuffContext, env_tables, noise_tables};
     use oxideav_core::bits::BitWriter;
 
     const FS_SBR: u32 = 88_200; // 44.1 kHz core, doubled.

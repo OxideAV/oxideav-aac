@@ -6,6 +6,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95.
+
 ### Added
 
 - `adts_container`: the `"adts"` elementary-stream container (`.aac` /
@@ -35,6 +39,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   inline PCE for `channelConfiguration = 0` layouts) in
   `output_params().extradata`, so MP4 / Matroska muxers can write
   `esds` / `CodecPrivate`.
+- Parametric stereo: the first envelope region of a stereo frame now
+  interpolates the mixing coefficients from the previous frame's last
+  slot (border n₋₁ = −1, §8.6.5.4 / §8.6.5.6.2) with the same
+  1 / (nₑ − nₑ₋₁) step as every later region. The first region used
+  n / n₀, which repeated the previous frame's coefficients at slot 0 and
+  ran the ramp one slot late (#20, ropoctl). HE-AAC v2 streams from a
+  reference encoder now agree with that encoder's own decoder at
+  90–106 dB instead of 60–63 dB.
+- A `channel_pair_element()` without `common_window` (each channel its
+  own `ics_info()`, Table 4.5 / §4.5.2.1) is decoded channel by channel,
+  as an SCE is: the window sequence, grouping and `max_sfb` may differ
+  and no M/S mask exists. Such pairs failed with `MsStereoInvalid` (a
+  smaller right `max_sfb`) or `ElementDecodeInvalid` (differing window
+  sequences); ffmpeg's and Apple's encoders emit them on stereo material
+  with a transient in one channel (#21, ropoctl).
 
 - HE-AAC v2 (parametric stereo) encoder: `ps_analysis` (Annex 8.C.6.2
   stereo hybrid analysis + band excitations on the Table 8.C.2/8.C.3

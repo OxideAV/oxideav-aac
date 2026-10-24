@@ -39,8 +39,8 @@
 use oxideav_core::bits::BitReader;
 
 use crate::ps_huffman::{
-    ps_huff_dec, HUFF_ICC_DF, HUFF_ICC_DT, HUFF_IID_DF, HUFF_IID_DT, HUFF_IID_FINE_DF,
-    HUFF_IID_FINE_DT, HUFF_IPD_DF, HUFF_IPD_DT, HUFF_OPD_DF, HUFF_OPD_DT,
+    HUFF_ICC_DF, HUFF_ICC_DT, HUFF_IID_DF, HUFF_IID_DT, HUFF_IID_FINE_DF, HUFF_IID_FINE_DT,
+    HUFF_IPD_DF, HUFF_IPD_DT, HUFF_OPD_DF, HUFF_OPD_DT, ps_huff_dec,
 };
 use crate::{Error, Result};
 
@@ -114,11 +114,7 @@ impl PsConfig {
     /// The Table 8.24 IID index bound: 7 (default grid) or 15 (fine).
     #[must_use]
     pub fn iid_bound(&self) -> i32 {
-        if self.iid_quant_fine() {
-            15
-        } else {
-            7
-        }
+        if self.iid_quant_fine() { 15 } else { 7 }
     }
 }
 
@@ -606,8 +602,8 @@ mod tests {
         w.write_bit(false); // enable_ext = 0
         w.write_bit(false); // FIX
         w.write_u32(2, 2); // num_env = 2
-                           // env 0: freq deltas +1 ×7 then -1 ×3
-                           // (coarse df: +1 = `100`, -1 = `101`).
+        // env 0: freq deltas +1 ×7 then -1 ×3
+        // (coarse df: +1 = `100`, -1 = `101`).
         w.write_bit(false);
         for _ in 0..7 {
             w.write_u32(0b100, 3);

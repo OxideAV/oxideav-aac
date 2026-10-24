@@ -26,12 +26,12 @@
 
 use oxideav_core::bits::BitReader;
 
+use crate::Result;
 use crate::ps_data::{PsConfig, PsData, PsIndexState};
 use crate::ps_decorr::PsDecorr;
-use crate::ps_hybrid::{synthesize, HybridConfig, PsHybrid};
+use crate::ps_hybrid::{HybridConfig, PsHybrid, synthesize};
 use crate::ps_stereo::PsStereo;
 use crate::sbr_qmf::Complex;
-use crate::Result;
 
 /// A stereo pair of 64-band QMF matrices (`NUM_QMF_SLOTS` slots).
 pub type QmfPair = (Vec<[Complex; 64]>, Vec<[Complex; 64]>);

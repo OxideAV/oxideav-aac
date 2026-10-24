@@ -12,6 +12,7 @@
 //! past the 192-bit protection window) must leave the CRC check
 //! satisfied.
 
+use oxideav_aac::Error;
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::adts_crc::{
     adts_header_crc, adts_rdb_crc, adts_single_crc, collect_block_regions, protect_adts_stream,
@@ -19,12 +20,11 @@ use oxideav_aac::adts_crc::{
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::encoder::{EncoderConfig, StreamEncoder};
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 const AOT_LC: u8 = 2;
