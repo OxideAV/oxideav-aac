@@ -76,6 +76,29 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
     }
 }
 
+/// The permutation taking a block's element-order channels to the
+/// PCE's declaration order (`out[i] = channels[perm[i]]`); `None` unless
+/// the block carries exactly the PCE's elements.
+fn declaration_permutation(pce: &Pce, elements: &[(PceElementKind, u8, usize)]) -> Option<Vec<usize>> {
+    let declared = pce.front_elements.iter().chain(&pce.side_elements).chain(&pce.back_elements)
+        .map(|e| (if e.is_cpe { PceElementKind::Cpe } else { PceElementKind::Sce }, e.tag_select))
+        .chain(pce.lfe_element_tag_selects.iter().map(|&tag| (PceElementKind::Lfe, tag)));
+    let mut first = Vec::with_capacity(elements.len());
+    let mut at = 0;
+    for &(_, _, n) in elements {
+        first.push(at);
+        at += n;
+    }
+    let mut used = vec![false; elements.len()];
+    let mut perm = Vec::with_capacity(at);
+    for (kind, tag) in declared {
+        let i = (0..elements.len()).find(|&i| !used[i] && elements[i].0 == kind && elements[i].1 == tag)?;
+        used[i] = true;
+        perm.extend(first[i]..first[i] + elements[i].2);
+    }
+    used.iter().all(|&u| u).then_some(perm)
+}
+
 /// The §4.6.11 per-frame sample count for the default 1024-line
 /// transform family. The other §4.5.1.1 families emit 960 / 512 /
 /// 480 samples per frame per channel
@@ -152,6 +175,12 @@ pub struct StreamDecoder {
     /// `AudioSpecificConfig` installs the ASC-resolved family via
     /// [`Self::set_frame_family`] before the first block.
     family: FrameFamily,
+    /// Emit channels in the configuration's element order instead of
+    /// the canonical speaker order ([`Self::set_declaration_order`]).
+    declaration_order: bool,
+    // Local opt-in view of the most recent successfully decoded frame,
+    // in normalized canonical-order f64, before integer rendering.
+    float_pcm: Option<Vec<f64>>,
 }
 
 impl StreamDecoder {
@@ -159,6 +188,31 @@ impl StreamDecoder {
     #[must_use]
     pub fn new() -> Self {
         StreamDecoder::default()
+    }
+
+    /// Emit each block's channels in the order the configuration
+    /// declares its elements, as macOS's decoder does: a default
+    /// `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs,
+    /// LFE), or the active PCE's front, side, back and LFE lists, each
+    /// element found by its tag. A block whose elements do not match
+    /// the PCE fails with [`Error::ElementDecodeInvalid`].
+    pub fn set_declaration_order(&mut self, enabled: bool) {
+        self.declaration_order = enabled;
+    }
+
+    /// Capture raw-data-block and ER raw-data-block PCM before i16
+    /// rounding.
+    /// Disabled by default; enabling or disabling clears the previous view.
+    /// The view is replaced after each successful decoded frame. Decode
+    /// failures retain the previous successful view, not partial samples.
+    pub fn set_float_pcm_capture(&mut self, enabled: bool) {
+        self.float_pcm = if enabled { Some(Vec::new()) } else { None };
+    }
+
+    /// Borrow the last successful frame's PCM (full scale 1.0).
+    /// This does not compensate decoder delay or drain pending synthesis.
+    pub fn last_pcm_f64(&self) -> Option<&[f64]> {
+        self.float_pcm.as_deref()
     }
 
     /// Install the program configuration of a
@@ -486,6 +540,7 @@ impl StreamDecoder {
         // interleaved PCM (all blocks of a frame must agree on the
         // channel count).
         let mut pcm: Vec<i16> = Vec::new();
+        let mut float_pcm = self.float_pcm.as_ref().map(|_| Vec::new());
         let mut frame_channels: Option<usize> = None;
         for block in 0..num_raw_data_blocks {
             let mut channels: Vec<Vec<f64>> = Vec::new();
@@ -532,17 +587,24 @@ impl StreamDecoder {
             // active §8.5.2.2 PCE instead, when one is installed and it
             // maps onto canonical positions; otherwise element order is
             // kept.
-            let channels =
+            let channels = if self.declaration_order {
                 if channel_configuration == 0 {
-                    match self.program_config.as_ref().and_then(|pce| {
-                        crate::channel_map::pce_reorder_permutation(pce, &element_desc)
-                    }) {
-                        Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
-                        None => channels,
-                    }
+                    let pce = self.program_config.as_ref().ok_or(Error::ElementDecodeInvalid)?;
+                    let perm = declaration_permutation(pce, &element_desc).ok_or(Error::ElementDecodeInvalid)?;
+                    crate::channel_map::apply_permutation(&perm, channels)
                 } else {
-                    crate::channel_map::reorder_channels(channel_configuration, channels)
-                };
+                    channels
+                }
+            } else if channel_configuration == 0 {
+                match self.program_config.as_ref().and_then(|pce| {
+                    crate::channel_map::pce_reorder_permutation(pce, &element_desc)
+                }) {
+                    Some(perm) => crate::channel_map::apply_permutation(&perm, channels),
+                    None => channels,
+                }
+            } else {
+                crate::channel_map::reorder_channels(channel_configuration, channels)
+            };
 
             match frame_channels {
                 None => frame_channels = Some(channels.len()),
@@ -555,8 +617,19 @@ impl StreamDecoder {
                 Some(_) => {}
             }
             pcm.extend(interleave_s16(&channels)?);
+            if let Some(output) = &mut float_pcm {
+                // interleave_s16 above has already validated channel lengths.
+                if let Some(first) = channels.first() {
+                    for frame in 0..first.len() {
+                        for channel in &channels {
+                            output.push(channel[frame] / 32768.0);
+                        }
+                    }
+                }
+            }
         }
 
+        self.float_pcm = float_pcm;
         Ok(DecodedFrame {
             pcm,
             channels: frame_channels.unwrap_or(0),
@@ -783,7 +856,9 @@ impl StreamDecoder {
     ///
     /// Scope: the ER AAC LC (AOT 17), ER AAC LTP (AOT 19) and ER AAC
     /// LD (AOT 23) object types — the three §4.4.2.3 Table 4.19
-    /// payloads. ER AAC scalable (AOT 20) rides its own layered
+    /// payloads — and ER AAC ELD (AOT 39) without the resilience tools
+    /// or low-delay SBR (see [`Self::decode_eld_elements`]). ER AAC
+    /// scalable (AOT 20) rides its own layered
     /// `aac_scalable_main_element()` walk (see [`crate::scalable`])
     /// and is rejected here with [`Error::NotImplemented`]. For
     /// AOT 19 the §4.6.7 LTP tool is live: `ics_info()` carries the
@@ -814,14 +889,21 @@ impl StreamDecoder {
         // below already thread. ER AAC scalable (AOT 20) uses the
         // layered aac_scalable_main_element() walk instead and stays
         // out of this entry point.
-        if aot != 17 && aot != 19 && aot != 23 {
+        if aot != 17 && aot != 19 && aot != 23 && aot != 39 {
             return Err(Error::NotImplemented);
         }
-        // An LD stream must run an LD family and vice versa — a
+        // An LD or ELD stream must run an LD family and vice versa — a
         // mismatch means the caller never installed the ASC-resolved
         // family, which would silently mis-decode every band.
-        if (aot == 23) != self.family.is_ld() {
+        if (aot == 23 || aot == 39) != self.family.is_ld() {
             return Err(Error::ElementDecodeInvalid);
+        }
+        if aot == 39 {
+            // ELD with the resilience tools is not decoded.
+            if resilience.section_data || resilience.scalefactor_data || resilience.spectral_data {
+                return Err(Error::NotImplemented);
+            }
+            return self.decode_eld_elements(fs_index, sample_rate, channel_configuration, payload);
         }
         let fs = fs_index;
         let family = self.family;
@@ -992,9 +1074,24 @@ impl StreamDecoder {
         // Trailing extension_payload() loop + byte_alignment(): consumed
         // permissively (nothing this decoder acts on rides there yet).
 
-        // Table 1.19 canonical output reorder, same as the non-ER walk.
-        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
+        // Table 1.19 canonical output reorder, same as the non-ER walk
+        // (element order under declaration order).
+        let channels = if self.declaration_order {
+            channels
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
         let pcm = interleave_s16(&channels)?;
+        if let Some(output) = &mut self.float_pcm {
+            output.clear();
+            if let Some(first) = channels.first() {
+                for frame in 0..first.len() {
+                    for channel in &channels {
+                        output.push(channel[frame] / 32768.0);
+                    }
+                }
+            }
+        }
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),
@@ -1004,6 +1101,129 @@ impl StreamDecoder {
 
     // (the per-CPE parse lives in the free `parse_cpe` below so the
     // two-pass §4.6.8.3.3 coupling walk can defer decoding)
+
+    /// The ER AAC ELD (AOT 39) payload of [`Self::decode_er_raw_data_block`]:
+    /// the channel elements `channelConfiguration` fixes, without
+    /// element tags. A single channel (or LFE) is one
+    /// [`IcsBody::parse_eld`] stream; a channel pair transmits its ELD
+    /// `ics_info()` (`max_sfb`, 6 bits) and the Table 4.4
+    /// `ms_mask_present` / `ms_used` fields once, then its two streams.
+    /// Each stream is followed by its `spectral_data()`. Trailing
+    /// extension payloads are not decoded.
+    fn decode_eld_elements(
+        &mut self,
+        fs: u8,
+        sample_rate: u32,
+        channel_configuration: u8,
+        payload: &[u8],
+    ) -> Result<DecodedFrame> {
+        let family = self.family;
+        let sequence: &[IdSynEle] = match channel_configuration {
+            1 => &[IdSynEle::Sce],
+            2 => &[IdSynEle::Cpe],
+            3 => &[IdSynEle::Sce, IdSynEle::Cpe],
+            4 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Sce],
+            5 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Cpe],
+            6 => &[IdSynEle::Sce, IdSynEle::Cpe, IdSynEle::Cpe, IdSynEle::Lfe],
+            7 => &[
+                IdSynEle::Sce,
+                IdSynEle::Cpe,
+                IdSynEle::Cpe,
+                IdSynEle::Cpe,
+                IdSynEle::Lfe,
+            ],
+            _ => return Err(Error::ElementDecodeInvalid),
+        };
+        let mut reader = BitReader::new(payload);
+        let mut channels: Vec<Vec<f64>> = Vec::new();
+        for (index, &kind) in sequence.iter().enumerate() {
+            let key = (kind_id(kind), index as u8);
+            if !self.decoders.contains_key(&key) {
+                self.decoders
+                    .insert(key, ElementDecoder::new_low_delay(family)?);
+            }
+            match kind {
+                IdSynEle::Sce | IdSynEle::Lfe => {
+                    let body = IcsBody::parse_eld(&mut reader, family, fs, None)?;
+                    let ics = body.ics_info.clone().ok_or(Error::ElementDecodeInvalid)?;
+                    let spectral = SpectralData::parse(&mut reader, &ics, &body.section_data, fs)?;
+                    let ch = ChannelInput {
+                        body: &body,
+                        ics_info: &ics,
+                        spectral: &spectral,
+                    };
+                    let dec = self
+                        .decoders
+                        .get_mut(&key)
+                        .ok_or(Error::ElementDecodeInvalid)?;
+                    channels.push(dec.decode_sce(&ch, 39, fs)?);
+                }
+                IdSynEle::Cpe => {
+                    let max_sfb = reader.read_u32(6).map_err(|_| Error::UnexpectedEnd)? as u8;
+                    let ics = IcsInfo::eld(family, max_sfb, fs)?;
+                    let ms_bits = reader.read_u32(2).map_err(|_| Error::UnexpectedEnd)? as u8;
+                    let ms_mask_present = MsMaskPresent::from_bits(ms_bits)?;
+                    let mut ms_used: Vec<Vec<bool>> = Vec::new();
+                    if ms_mask_present == MsMaskPresent::Mask {
+                        let mut row = Vec::with_capacity(usize::from(max_sfb));
+                        for _ in 0..max_sfb {
+                            row.push(reader.read_bit().map_err(|_| Error::UnexpectedEnd)?);
+                        }
+                        ms_used.push(row);
+                    }
+                    let left_body = IcsBody::parse_eld(&mut reader, family, fs, Some(&ics))?;
+                    let left_spectral =
+                        SpectralData::parse(&mut reader, &ics, &left_body.section_data, fs)?;
+                    let right_body = IcsBody::parse_eld(&mut reader, family, fs, Some(&ics))?;
+                    let right_spectral =
+                        SpectralData::parse(&mut reader, &ics, &right_body.section_data, fs)?;
+                    let left = ChannelInput {
+                        body: &left_body,
+                        ics_info: &ics,
+                        spectral: &left_spectral,
+                    };
+                    let right = ChannelInput {
+                        body: &right_body,
+                        ics_info: &ics,
+                        spectral: &right_spectral,
+                    };
+                    let joint = CpeJointStereo {
+                        ms_mask_present,
+                        ms_used,
+                    };
+                    let dec = self
+                        .decoders
+                        .get_mut(&key)
+                        .ok_or(Error::ElementDecodeInvalid)?;
+                    let (l, r) = dec.decode_cpe(&left, &right, &joint, 39, fs)?;
+                    channels.push(l);
+                    channels.push(r);
+                }
+                _ => return Err(Error::ElementDecodeInvalid),
+            }
+        }
+        let channels = if self.declaration_order {
+            channels
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
+        let pcm = interleave_s16(&channels)?;
+        if let Some(output) = &mut self.float_pcm {
+            output.clear();
+            if let Some(first) = channels.first() {
+                for frame in 0..first.len() {
+                    for channel in &channels {
+                        output.push(channel[frame] / 32768.0);
+                    }
+                }
+            }
+        }
+        Ok(DecodedFrame {
+            pcm,
+            channels: channels.len(),
+            sample_rate,
+        })
+    }
 }
 
 /// A parsed `channel_pair_element()` awaiting decode: both channels'

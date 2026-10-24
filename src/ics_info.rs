@@ -387,6 +387,43 @@ pub struct IcsInfo {
 }
 
 impl IcsInfo {
+    /// The geometry of an ER AAC ELD channel (§4.6.20): ELD carries no
+    /// `ics_info()`, only `max_sfb` (6 bits, read by the caller); the
+    /// frame is one long block of the 512- or 480-line family.
+    pub fn eld(family: FrameFamily, max_sfb: u8, sampling_frequency_index: u8) -> Result<Self> {
+        if !family.is_ld() {
+            return Err(Error::ElementDecodeInvalid);
+        }
+        let (num_windows, num_window_groups, window_group_length, num_swb) =
+            derive_window_grouping_family(
+                family,
+                WindowSequence::OnlyLong,
+                None,
+                sampling_frequency_index,
+            )?;
+        if max_sfb > num_swb {
+            return Err(Error::ElementDecodeInvalid);
+        }
+        Ok(IcsInfo {
+            family,
+            ics_reserved_bit: false,
+            window_sequence: WindowSequence::OnlyLong,
+            window_shape: WindowShape::Sine,
+            max_sfb,
+            scale_factor_grouping: None,
+            predictor_data_present: false,
+            predictor_data: None,
+            ltp_data_present: false,
+            ltp_data: None,
+            ltp_data_present_pair: None,
+            ltp_data_pair: None,
+            num_windows,
+            num_window_groups,
+            window_group_length,
+            num_swb,
+        })
+    }
+
     /// Parse a single `ics_info()` from the bit-reader.
     ///
     /// * `audio_object_type` — the surrounding ASC's effective

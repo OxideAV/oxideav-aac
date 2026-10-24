@@ -12,6 +12,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StreamEncoder::new_eld`: an ER AAC ELD (AOT 39) encoder without the
+  resilience tools or low-delay SBR — 512 / 480 lines, the ELD channel
+  syntax, and the inverse of the §4.6.20 low-delay synthesis (the decoder
+  reconstructs the input `N/2` samples late); `IcsBody::write_eld`.
 - `adts_container`: the `"adts"` elementary-stream container (`.aac` /
   `.adts`) — demuxer (frame index, resync, duration, seeking, an
   equivalent `AudioSpecificConfig` in `extradata`, implicit-SBR / PS

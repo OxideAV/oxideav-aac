@@ -1056,3 +1056,72 @@ fn trailing_probe_full_he_aac_v2_implicit_chain_byte_aligned() {
     // Core inner rate untouched (16000 = sfi 8).
     assert_eq!(asc.sample_rate, 16000);
 }
+
+#[test]
+fn parses_eld_specific_config() {
+    // ER AAC ELD, 44.1 kHz stereo, 512-line frames, no resilience
+    // tools, no low-delay SBR, ELDEXT_TERM, epConfig 0.
+    let mut bw = BitWriter::new();
+    bw.write_u32(31, 5);
+    bw.write_u32(7, 6); // AOT 39
+    bw.write_u32(4, 4);
+    bw.write_u32(2, 4);
+    bw.write_u32(0, 5); // frameLengthFlag, three resilience flags, ldSbrPresentFlag
+    bw.write_u32(0, 4); // ELDEXT_TERM
+    bw.write_u32(0, 2); // epConfig
+    let buf = bw.finish();
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    assert_eq!(asc.aot, 39);
+    assert_eq!(asc.sample_rate, 44100);
+    assert_eq!(asc.channel_count(), 2);
+    let eld = asc.eld.as_ref().unwrap();
+    assert_eq!(eld.frame_length, FrameLength::Long1024);
+    assert_eq!(eld.resilience, AacResilienceFlags::default());
+    assert!(eld.ld_sbr.is_none() && eld.extensions.is_empty());
+    assert_eq!(
+        asc.ga_body.frame_length.family(39),
+        oxideav_aac::swb_offset::FrameFamily::Ld512
+    );
+    assert_eq!(asc.ep_config, Some(0));
+}
+
+#[test]
+fn parses_eld_with_low_delay_sbr_and_extension() {
+    // 22.05 kHz mono, 480-line frames, low-delay SBR (single rate, no
+    // CRC) with one sbr_header(), one 2-byte ELD extension.
+    let mut bw = BitWriter::new();
+    bw.write_u32(31, 5);
+    bw.write_u32(7, 6);
+    bw.write_u32(7, 4);
+    bw.write_u32(1, 4);
+    bw.write_bit(true); // frameLengthFlag: 480
+    bw.write_u32(0, 3);
+    bw.write_bit(true); // ldSbrPresentFlag
+    bw.write_bit(false); // ldSbrSamplingRate
+    bw.write_bit(false); // ldSbrCrcFlag
+                         // sbr_header(): amp_res, start_freq, stop_freq, xover_band, reserved, no extra headers
+    bw.write_u32(1, 1);
+    bw.write_u32(5, 4);
+    bw.write_u32(4, 4);
+    bw.write_u32(0, 3);
+    bw.write_u32(0, 2);
+    bw.write_u32(0, 2);
+    bw.write_u32(2, 4); // eldExtType
+    bw.write_u32(2, 4); // eldExtLen
+    bw.write_u32(0xabcd, 16);
+    bw.write_u32(0, 4); // ELDEXT_TERM
+    bw.write_u32(0, 2); // epConfig
+    let buf = bw.finish();
+    let (asc, _) = AudioSpecificConfig::parse(&buf).unwrap();
+    let eld = asc.eld.as_ref().unwrap();
+    assert_eq!(eld.frame_length, FrameLength::Long960);
+    let sbr = eld.ld_sbr.as_ref().unwrap();
+    assert!(!sbr.dual_rate && !sbr.crc);
+    assert_eq!(sbr.headers.len(), 1);
+    assert_eq!(sbr.headers[0].start_freq, 5);
+    assert_eq!(eld.extensions, vec![(2u8, vec![0xab, 0xcd])]);
+    assert_eq!(
+        asc.ga_body.frame_length.family(39),
+        oxideav_aac::swb_offset::FrameFamily::Ld480
+    );
+}
