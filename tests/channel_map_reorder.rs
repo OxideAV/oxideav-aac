@@ -22,7 +22,7 @@
 //! without hand-assembling a `channel_pair_element()`.
 
 use oxideav_aac::channel_map::{reorder_channels, reorder_permutation};
-use oxideav_aac::decode::{DecodedFrame, StreamDecoder, FRAME_LEN};
+use oxideav_aac::decode::{DecodedFrame, FRAME_LEN, StreamDecoder};
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use oxideav_aac::raw_data_block::IdSynEle;

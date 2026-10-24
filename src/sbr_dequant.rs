@@ -34,11 +34,7 @@ pub const NOISE_FLOOR_OFFSET: f64 = 6.0;
 #[inline]
 #[must_use]
 pub fn pan_offset(amp_res: bool) -> f64 {
-    if amp_res {
-        12.0
-    } else {
-        24.0
-    }
+    if amp_res { 12.0 } else { 24.0 }
 }
 
 /// The §4.6.18.3.5 amplitude-resolution divisor `a`: `2` for
@@ -46,11 +42,7 @@ pub fn pan_offset(amp_res: bool) -> f64 {
 #[inline]
 #[must_use]
 pub fn amp_divisor(amp_res: bool) -> f64 {
-    if amp_res {
-        1.0
-    } else {
-        2.0
-    }
+    if amp_res { 1.0 } else { 2.0 }
 }
 
 /// Dequantized (linear-energy) envelope and noise-floor scalefactors

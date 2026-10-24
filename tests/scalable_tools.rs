@@ -2,12 +2,13 @@
 //! rules, the §4.6.9.5 / Table 4.158 serial TNS layout, §4.6.7.5
 //! base-layer LTP, the `EIGHT_SHORT` and 960-line geometries.
 
+use oxideav_aac::Error;
 use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{
-    derive_window_grouping_family, IcsInfo, LtpData, WindowSequence, WindowShape,
-    NUM_SWB_LONG_WINDOW,
+    IcsInfo, LtpData, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape,
+    derive_window_grouping_family,
 };
 use oxideav_aac::ms_stereo::MsMaskPresent;
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
@@ -19,7 +20,6 @@ use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
 use oxideav_aac::swb_offset::FrameFamily;
 use oxideav_aac::tns_data::{TnsData, TnsFilter, TnsWindow};
-use oxideav_aac::Error;
 use oxideav_core::bits::BitWriter;
 
 const FS_INDEX: u8 = 4; // 44.1 kHz

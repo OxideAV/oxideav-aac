@@ -22,15 +22,15 @@
 //! vector to pin its arithmetic-PCM offset conventions.
 
 use crate::bsac_arith::{ArithDecoder, SegmentReader};
-use crate::bsac_layer::{BsacGeometry, LayerInfo, BSAC_FRAME_LEN};
+use crate::bsac_layer::{BSAC_FRAME_LEN, BsacGeometry, LayerInfo};
 use crate::bsac_tables::{
-    clamp_p0, context_position, spectral_p0, CBAND_SI_MODELS, CBAND_SI_MODEL_CBAND0,
-    CBAND_SI_MSB_PLANE, CBAND_SI_TYPES, MS_USED_MODEL, SCF_MODELS, SIGN_P0, STEREO_INFO_MODEL,
+    CBAND_SI_MODEL_CBAND0, CBAND_SI_MODELS, CBAND_SI_MSB_PLANE, CBAND_SI_TYPES, MS_USED_MODEL,
+    SCF_MODELS, SIGN_P0, STEREO_INFO_MODEL, clamp_p0, context_position, spectral_p0,
 };
 use crate::dequant::{inverse_quantize, scale_factor_gain};
 use crate::filterbank::Filterbank;
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
-use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
+use crate::ms_stereo::{ChannelPairSpectra, MsMaskPresent, apply_ms_stereo};
 use crate::pcm::channel_to_s16;
 use crate::swb_offset::FrameFamily;
 use crate::tns_data::TnsData;
@@ -639,11 +639,7 @@ pub fn decode_bsac_raw_data_block(
                 .zip(st.sign_neg.iter())
                 .map(|(&m, &neg)| {
                     let v = m as i32;
-                    if neg {
-                        -v
-                    } else {
-                        v
-                    }
+                    if neg { -v } else { v }
                 })
                 .collect();
             sample_ch.push(buf);

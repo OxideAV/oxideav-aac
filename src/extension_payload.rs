@@ -684,10 +684,10 @@ fn parse_dynamic_range(reader: &mut BitReader<'_>, cnt: u32) -> Result<Extension
 fn write_dynamic_range(writer: &mut BitWriter, drc: &DynamicRangeInfo) -> Result<u32> {
     // Caller-side invariant checks (every numeric field cap from
     // Table 4.52).
-    if let Some(p) = &drc.pce_tag {
-        if p.pce_instance_tag > 0x0f || p.reserved > 0x0f {
-            return Err(Error::ExtensionPayloadInvalid);
-        }
+    if let Some(p) = &drc.pce_tag
+        && (p.pce_instance_tag > 0x0f || p.reserved > 0x0f)
+    {
+        return Err(Error::ExtensionPayloadInvalid);
     }
     if let Some(b) = &drc.drc_bands {
         if b.band_incr > 0x0f || b.reserved > 0x0f {
@@ -697,10 +697,10 @@ fn write_dynamic_range(writer: &mut BitWriter, drc: &DynamicRangeInfo) -> Result
             return Err(Error::ExtensionPayloadInvalid);
         }
     }
-    if let Some(p) = &drc.prog_ref_level {
-        if p.level > 0x7f {
-            return Err(Error::ExtensionPayloadInvalid);
-        }
+    if let Some(p) = &drc.prog_ref_level
+        && p.level > 0x7f
+    {
+        return Err(Error::ExtensionPayloadInvalid);
     }
     let expected_bands = drc
         .drc_bands
@@ -777,7 +777,7 @@ fn parse_excluded_channels(reader: &mut BitReader<'_>) -> Result<ExcludedChannel
 }
 
 fn write_excluded_channels(writer: &mut BitWriter, ex: &ExcludedChannels) -> Result<()> {
-    if ex.exclude_mask.is_empty() || ex.exclude_mask.len() % 7 != 0 {
+    if ex.exclude_mask.is_empty() || !ex.exclude_mask.len().is_multiple_of(7) {
         // Table 4.53 emits exclude_mask bits in fixed groups of 7;
         // any non-multiple-of-7 length cannot round-trip through
         // [`parse_excluded_channels`].

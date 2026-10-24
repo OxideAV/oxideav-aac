@@ -230,11 +230,7 @@ pub fn field_widths_family(family: FrameFamily, seq: WindowSequence) -> (u32, u3
 /// `num_windows` for the given `window_sequence` per §4.5.2.3.4:
 /// `8` for `EIGHT_SHORT_SEQUENCE`, `1` otherwise.
 pub fn num_windows(seq: WindowSequence) -> usize {
-    if seq.is_eight_short() {
-        8
-    } else {
-        1
-    }
+    if seq.is_eight_short() { 8 } else { 1 }
 }
 
 /// Per-filter `coef_bits` width per §4.6.9.3:

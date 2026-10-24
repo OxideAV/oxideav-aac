@@ -7,12 +7,12 @@
 //! bytes. A handful of caller-side overflow cases on the writer
 //! exercise the [`Error::GainControlDataEncodeInvalid`] surface.
 
+use oxideav_aac::Error;
 use oxideav_aac::gain_control_data::{
-    aloccode_bits, num_windows, GainAdjust, GainBand, GainControlData, GainWindow, ADJUST_NUM_BITS,
-    ALEVCODE_BITS, MAX_BAND_BITS,
+    ADJUST_NUM_BITS, ALEVCODE_BITS, GainAdjust, GainBand, GainControlData, GainWindow,
+    MAX_BAND_BITS, aloccode_bits, num_windows,
 };
 use oxideav_aac::ics_info::WindowSequence;
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// `num_windows` table per Table 4.12.

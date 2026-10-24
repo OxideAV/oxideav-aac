@@ -11,10 +11,10 @@
 //! `window_sequence` 2 + `window_shape` 1 + `max_sfb` 4 / 6 + the
 //! per-branch tail) and the §4.6.7.2 / Table 4.55 LTP body.
 
-use oxideav_aac::ics_info::{
-    write_ltp_data, IcsInfo, LtpData, PredictorData, WindowSequence, WindowShape,
-};
 use oxideav_aac::Error;
+use oxideav_aac::ics_info::{
+    IcsInfo, LtpData, PredictorData, WindowSequence, WindowShape, write_ltp_data,
+};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Encode → parse → equality cycle. Returns the bit position the
@@ -1140,8 +1140,8 @@ fn long_lc_wire_layout_pin() {
 #[test]
 fn ltp_2001_short_windows_roundtrip() {
     use oxideav_aac::ics_info::{
-        parse_ltp_data_edition, write_ltp_data_edition, LtpEdition, LtpShortWindow,
-        SHORT_WINDOWS_PER_FRAME,
+        LtpEdition, LtpShortWindow, SHORT_WINDOWS_PER_FRAME, parse_ltp_data_edition,
+        write_ltp_data_edition,
     };
 
     // A representative mix: unused windows, used-without-lag, and
@@ -1225,7 +1225,7 @@ fn ltp_2001_short_windows_roundtrip() {
 
 #[test]
 fn ltp_2001_short_lag_is_twos_complement_on_the_wire() {
-    use oxideav_aac::ics_info::{parse_ltp_data_edition, LtpEdition};
+    use oxideav_aac::ics_info::{LtpEdition, parse_ltp_data_edition};
 
     // Hand-pack: lag = 0 (11 bits), coef = 0 (3 bits), then
     // window 0: used=1, lag_present=1, lag bits 1111 (= -1 two's
@@ -1257,7 +1257,7 @@ fn ltp_2001_short_lag_is_twos_complement_on_the_wire() {
 
 #[test]
 fn ltp_2009_short_branch_reads_nothing_after_coef() {
-    use oxideav_aac::ics_info::{parse_ltp_data_edition, LtpEdition};
+    use oxideav_aac::ics_info::{LtpEdition, parse_ltp_data_edition};
 
     let mut bw = BitWriter::new();
     bw.write_u32(123, 11);
@@ -1279,7 +1279,7 @@ fn ltp_2009_short_branch_reads_nothing_after_coef() {
 
 #[test]
 fn ltp_2001_write_rejects_inconsistent_short_records() {
-    use oxideav_aac::ics_info::{write_ltp_data_edition, LtpEdition, LtpShortWindow};
+    use oxideav_aac::ics_info::{LtpEdition, LtpShortWindow, write_ltp_data_edition};
 
     let base = |w: LtpShortWindow| {
         let mut v = vec![

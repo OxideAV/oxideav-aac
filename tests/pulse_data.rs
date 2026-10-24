@@ -16,8 +16,8 @@
 //! spec-defined wire field widths (2 + 6 + (5+4) × (1..=4) bits) and
 //! the `number_pulse + 1` loop bound semantics from Table 4.7.
 
-use oxideav_aac::pulse_data::{Pulse, PulseData, MAX_PULSES, PULSE_AMP_BITS, PULSE_OFFSET_BITS};
 use oxideav_aac::Error;
+use oxideav_aac::pulse_data::{MAX_PULSES, PULSE_AMP_BITS, PULSE_OFFSET_BITS, Pulse, PulseData};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Convenience: build a `PulseData` from a `(start_sfb, pulses)`

@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
-use oxideav_aac::ps_analysis::{band_stats, hybrid_config_for, BandStats, PsAnalysis};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
+use oxideav_aac::ps_analysis::{BandStats, PsAnalysis, band_stats, hybrid_config_for};
 use oxideav_aac::ps_encoder::{Election, PsBands, PsEncoderConfig};
 use oxideav_aac::ps_hybrid::{LOOKAHEAD, NUM_QMF_SLOTS};
 use oxideav_aac::sbr_qmf::{Complex, EncoderAnalysisQmf};
@@ -198,11 +198,15 @@ fn round_trip(pcm: &[i16], cfg: HeAacConfig) -> (HeAacEncoder, RoundTrip) {
         out.extend_from_slice(&f.pcm);
     }
     let sum_in: Vec<f64> = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f64::from(c[0]) + f64::from(c[1]))
         .collect();
     let sum_out: Vec<f64> = out
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f64::from(c[0]) + f64::from(c[1]))
         .collect();
     let lag = best_lag(&sum_in, &sum_out, 3 * HE_FRAME_LEN);
@@ -288,7 +292,10 @@ fn configuration_matrix_keeps_the_image() {
             let e = cue_error(&a, &b, phase);
             eprintln!(
                 "{bands:?} fine={fine} phase={phase}: IID err {:.2} dB (worst {:.2}), ICC err {:.3}, {} bytes",
-                e.iid_mean_db, e.iid_worst_db, e.icc_mean, rt.stream.len()
+                e.iid_mean_db,
+                e.iid_worst_db,
+                e.icc_mean,
+                rt.stream.len()
             );
             assert!(
                 e.iid_mean_db < 3.0,
@@ -340,7 +347,10 @@ fn cue_switch_is_time_aligned_with_the_audio() {
         .expect("switch seen");
     let expect = switch / 64;
     let delta = first_right as i64 - expect as i64;
-    eprintln!("switch at slot {expect}, decoded right-dominant from slot {first_right} (Δ {delta} slots, lag {})", rt.lag);
+    eprintln!(
+        "switch at slot {expect}, decoded right-dominant from slot {first_right} (Δ {delta} slots, lag {})",
+        rt.lag
+    );
     assert!(delta.abs() <= 6, "cue switch misaligned by {delta} slots");
     // Before the switch the image is hard left, after it hard right
     // (long-term, away from the transition).
@@ -384,9 +394,11 @@ fn loas_wrapped_he_aac_v2_decodes_as_stereo() {
         let mut dec = oxideav_aac::latm::LoasDecoder::new();
         let frames = dec.decode_all(&loas).expect("LOAS decode");
         assert!(!frames.is_empty());
-        assert!(frames
-            .iter()
-            .all(|f| f.sample_rate == 44_100 && f.channels == 2));
+        assert!(
+            frames
+                .iter()
+                .all(|f| f.sample_rate == 44_100 && f.channels == 2)
+        );
         let latm_pcm: Vec<i16> = frames.iter().flat_map(|f| f.pcm.iter().copied()).collect();
         assert_eq!(latm_pcm, adts_pcm, "hierarchical={hierarchical}");
     }
@@ -419,7 +431,9 @@ fn read_wav(path: &PathBuf) -> Option<(Vec<i16>, usize, u32)> {
         if cid == b"data" {
             let end = (body + sz).min(d.len());
             let pcm = d[body..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             return Some((pcm, channels.max(1), rate));
@@ -580,11 +594,15 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
             // the coherent phase bands against this crate's decode
             // (both aligned to the source).
             let sum_in: Vec<f64> = pcm
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f64::from(c[0]) + f64::from(c[1]))
                 .collect();
             let sum_ref: Vec<f64> = ref_pcm
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| f64::from(c[0]) + f64::from(c[1]))
                 .collect();
             let lag = best_lag(&sum_in, &sum_ref, 3 * HE_FRAME_LEN);

@@ -19,10 +19,11 @@
 //! * Tables 4.91–4.93 invalid tool combinations surface
 //!   [`Error::ScalableLayerCombination`].
 
+use oxideav_aac::Error;
 use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::ms_stereo::MsMaskPresent;
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::scalable::{
@@ -32,7 +33,6 @@ use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
 use oxideav_aac::swb_offset::FrameFamily;
-use oxideav_aac::Error;
 use oxideav_core::bits::BitWriter;
 
 const FS_INDEX: u8 = 4; // 44.1 kHz
@@ -65,15 +65,17 @@ fn long_ics_info(max_sfb: u8) -> IcsInfo {
 /// with a bounded pseudo-random spectrum, plus per-noise-band DPCM 0
 /// energies.
 fn make_channel(sfb_cbs: &[u8], global_gain: u8, seed: u32) -> ScalableChannel {
-    let sections = vec![sfb_cbs
-        .iter()
-        .enumerate()
-        .map(|(sfb, &cb)| Section {
-            codebook: cb,
-            start: sfb as u8,
-            end: sfb as u8 + 1,
-        })
-        .collect()];
+    let sections = vec![
+        sfb_cbs
+            .iter()
+            .enumerate()
+            .map(|(sfb, &cb)| Section {
+                codebook: cb,
+                start: sfb as u8,
+                end: sfb as u8 + 1,
+            })
+            .collect(),
+    ];
     let mut first_noise = true;
     let entries: Vec<ScaleFactorEntry> = sfb_cbs
         .iter()

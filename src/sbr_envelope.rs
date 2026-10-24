@@ -35,7 +35,7 @@
 //! the §4.6.18 dequantization to linear energies are downstream.
 
 use crate::sbr_grid::{SbrDtdf, SbrGrid};
-use crate::sbr_huffman::{env_tables, noise_tables, sbr_huff_dec, SbrHuffContext};
+use crate::sbr_huffman::{SbrHuffContext, env_tables, noise_tables, sbr_huff_dec};
 use crate::{Error, Result};
 use oxideav_core::bits::BitReader;
 
@@ -96,11 +96,7 @@ impl SbrEnvelopeData {
 
         // Start-value width per Table 4.72.
         let start_bits = if coupling && ch {
-            if amp_res {
-                5
-            } else {
-                6
-            }
+            if amp_res { 5 } else { 6 }
         } else if amp_res {
             6
         } else {
@@ -185,7 +181,7 @@ fn read(reader: &mut BitReader<'_>, n: u32) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sbr_freq_bands::{k0, k2, master_table, HiLoTables};
+    use crate::sbr_freq_bands::{HiLoTables, k0, k2, master_table};
     use crate::sbr_grid::FrameClass;
     use oxideav_core::bits::{BitReader, BitWriter};
 
@@ -232,7 +228,7 @@ mod tests {
         });
         let mut w = BitWriter::new();
         w.write_u32(40, 7); // start value
-                            // remaining n-1 bands: pick a few known indices.
+        // remaining n-1 bands: pick a few known indices.
         let chosen: Vec<usize> = (1..n)
             .map(|i| (i + f_lav as usize) % f_huff.len())
             .collect();

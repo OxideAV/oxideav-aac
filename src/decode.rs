@@ -401,10 +401,9 @@ impl StreamDecoder {
                             .map(|el| (el.kind, el.key));
                         if let Some(ext) =
                             self.consume_fill(&mut reader, payload, payload_bytes, fs_sbr, target)?
+                            && let Some(el) = pending.last_mut()
                         {
-                            if let Some(el) = pending.last_mut() {
-                                el.sbr = Some(ext);
-                            }
+                            el.sbr = Some(ext);
                         }
                     }
                     Element::Data { .. } => {}
@@ -665,10 +664,10 @@ impl StreamDecoder {
                             // and delay adjustment only (the None SBR
                             // slot below selects the §4.6.18.5 pure
                             // upsampling path). No header is threaded.
-                            if let (Some(crc), Some((s, e))) = (crc, crc_region) {
-                                if crate::adts_crc::sbr_crc(payload, s, e) != crc {
-                                    return Err(Error::SbrCrcMismatch);
-                                }
+                            if let (Some(crc), Some((s, e))) = (crc, crc_region)
+                                && crate::adts_crc::sbr_crc(payload, s, e) != crc
+                            {
+                                return Err(Error::SbrCrcMismatch);
                             }
                             self.sbr_active = true;
                             remaining = 0;
@@ -751,7 +750,7 @@ impl StreamDecoder {
             let start_byte = (reader.bit_position() / 8) as usize;
             let regions = crate::adts_crc::collect_block_regions(&mut reader, aot, fs)?;
             let end_bit = reader.bit_position();
-            if end_bit % 8 != 0 {
+            if !end_bit.is_multiple_of(8) {
                 // A block that did not end on its §4.4.2.1
                 // byte_alignment() cannot be followed by the
                 // byte-aligned CRC slot.
@@ -1304,6 +1303,46 @@ fn skip_id3v2(data: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw_data_block with one channel pair without common_window: each
+    /// channel an all-zero long-window ICS with its own window sequence
+    /// and max_sfb (one ZERO_HCB section), then END.
+    fn independent_cpe_block(left: (u32, u32), right: (u32, u32)) -> Vec<u8> {
+        let mut w = oxideav_core::bits::BitWriter::new();
+        w.write_u32(1, 3); // ID_CPE
+        w.write_u32(0, 4); // element_instance_tag
+        w.write_bit(false); // common_window
+        for (sequence, max_sfb) in [left, right] {
+            w.write_u32(100, 8); // global_gain
+            w.write_bit(false); // ics_reserved_bit
+            w.write_u32(sequence, 2);
+            w.write_bit(false); // window_shape
+            w.write_u32(max_sfb, 6);
+            w.write_bit(false); // predictor_data_present
+            if max_sfb > 0 {
+                w.write_u32(0, 4); // sect_cb = ZERO_HCB
+                w.write_u32(max_sfb, 5); // sect_len
+            }
+            w.write_bit(false); // pulse_data_present
+            w.write_bit(false); // tns_data_present
+            w.write_bit(false); // gain_control_data_present
+        }
+        w.write_u32(7, 3); // ID_END
+        w.finish()
+    }
+
+    #[test]
+    fn independent_cpe_channels_may_differ_in_max_sfb_and_window_sequence() {
+        for (left, right) in [((0, 1), (0, 0)), ((0, 1), (1, 1)), ((0, 0), (0, 2))] {
+            let block = independent_cpe_block(left, right);
+            let mut dec = StreamDecoder::new();
+            let frame = dec
+                .decode_raw_data_block(2, 4, 44_100, 2, 1, &block)
+                .unwrap_or_else(|e| panic!("{left:?} {right:?}: {e:?}"));
+            assert_eq!(frame.channels, 2);
+            assert!(frame.pcm.iter().all(|&v| v == 0));
+        }
+    }
 
     #[test]
     fn skip_id3v2_passes_through_non_id3() {

@@ -75,7 +75,9 @@ fn decode_all(dec: &mut dyn Decoder, pkts: &[Packet]) -> Vec<i16> {
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
             out.extend(
                 a.data[0]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| i16::from_le_bytes([b[0], b[1]])),
             );
         }
@@ -285,7 +287,9 @@ fn implicit_sbr_follows_the_container_declared_rate() {
         // far below the 11.025 kHz core Nyquist, so plain decimation is
         // a faithful reference for the band-limited output.
         let dec2: Vec<i16> = pcm
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| c[0])
             .flat_map(|l| [l, l])
             .collect();

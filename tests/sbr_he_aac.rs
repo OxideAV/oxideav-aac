@@ -31,7 +31,9 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body + sz).min(d.len());
             return Some(
                 d[body..end]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect(),
             );
@@ -275,8 +277,10 @@ fn he_aac_v1_sbr_low_power_decode() {
         // (b) Full-band energy envelope per 2048-sample frame.
         let mut worst = 0.0f64;
         for (fr, (b_ref, b_our)) in ref_ch
-            .chunks_exact(2048)
-            .zip(our_ch.chunks_exact(2048))
+            .as_chunks::<2048>()
+            .0
+            .iter()
+            .zip(our_ch.as_chunks::<2048>().0.iter())
             .enumerate()
             .skip(2)
         {

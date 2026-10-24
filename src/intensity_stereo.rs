@@ -76,7 +76,7 @@ use crate::ics_info::IcsInfo;
 use crate::section_data::{INTENSITY_HCB, INTENSITY_HCB2};
 #[cfg(test)]
 use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
+    LONG_WINDOW_LEN, SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets,
 };
 use crate::{Error, Result};
 

@@ -79,7 +79,7 @@
 
 use oxideav_core::bits::{BitReader, BitWriter};
 
-use crate::swb_offset::{long_window_offsets_family, short_window_offsets_family, FrameFamily};
+use crate::swb_offset::{FrameFamily, long_window_offsets_family, short_window_offsets_family};
 use crate::{Error, Result};
 
 /// Sentinel for the `EIGHT_SHORT_SEQUENCE` window-sequence value.

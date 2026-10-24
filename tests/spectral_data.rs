@@ -3,13 +3,13 @@
 //! its composition with [`oxideav_aac::ics_body::IcsBody`] into a
 //! complete Table 4.50 channel-element body parse / write cycle.
 
+use oxideav_aac::Error;
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData, ZERO_HCB};
-use oxideav_aac::spectral_data::{sect_sfb_offset, SpectralData, ESC_FLAG, PAIR_LEN, QUAD_LEN};
+use oxideav_aac::spectral_data::{ESC_FLAG, PAIR_LEN, QUAD_LEN, SpectralData, sect_sfb_offset};
 use oxideav_aac::swb_offset::{long_window_offsets, short_window_offsets};
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 // ===========================================================================

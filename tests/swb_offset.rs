@@ -7,12 +7,12 @@
 //! pseudocode (sign-dependent `±pulse_amp`, multi-pulse `k` chaining,
 //! malformed bitstream rejection).
 
+use oxideav_aac::Error;
 use oxideav_aac::pulse_data::{Pulse, PulseData};
 use oxideav_aac::swb_offset::{
-    apply_pulse_data, long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
-    SWB_OFFSET_LONG_WINDOW, SWB_OFFSET_SHORT_WINDOW,
+    LONG_WINDOW_LEN, SHORT_WINDOW_LEN, SWB_OFFSET_LONG_WINDOW, SWB_OFFSET_SHORT_WINDOW,
+    apply_pulse_data, long_window_offsets, short_window_offsets,
 };
-use oxideav_aac::Error;
 
 #[test]
 fn long_window_table_dispatch_matches_table_provenance() {

@@ -15,7 +15,7 @@ use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::hcr_decode::encode_reordered_spectral_data;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, LtpData, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, LtpData, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::latm::LoasDecoder;
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
@@ -89,15 +89,17 @@ fn with_ltp(ics: &mut IcsInfo, own: LtpData, pair: Option<LtpData>) {
 /// band) with bounded pseudo-random spectrum.
 fn make_channel(sfb_cbs: &[u8], global_gain: u8, seed: u32) -> (IcsBody, SpectralData) {
     let max_sfb = sfb_cbs.len() as u8;
-    let sections = vec![sfb_cbs
-        .iter()
-        .enumerate()
-        .map(|(sfb, &cb)| Section {
-            codebook: cb,
-            start: sfb as u8,
-            end: sfb as u8 + 1,
-        })
-        .collect()];
+    let sections = vec![
+        sfb_cbs
+            .iter()
+            .enumerate()
+            .map(|(sfb, &cb)| Section {
+                codebook: cb,
+                start: sfb as u8,
+                end: sfb as u8 + 1,
+            })
+            .collect(),
+    ];
     let entries: Vec<ScaleFactorEntry> = sfb_cbs
         .iter()
         .filter(|&&cb| cb != 0)
@@ -558,19 +560,22 @@ fn er_ltp_family_and_aot_guards() {
 
     let mut ld_dec = StreamDecoder::new();
     ld_dec.set_frame_family(oxideav_aac::swb_offset::FrameFamily::Ld512);
-    assert!(ld_dec
-        .decode_er_raw_data_block(
-            AOT_ER_LTP,
-            FS_INDEX,
-            SAMPLE_RATE,
-            1,
-            NO_RESILIENCE,
-            &payload
-        )
-        .is_err());
+    assert!(
+        ld_dec
+            .decode_er_raw_data_block(
+                AOT_ER_LTP,
+                FS_INDEX,
+                SAMPLE_RATE,
+                1,
+                NO_RESILIENCE,
+                &payload
+            )
+            .is_err()
+    );
 
     let mut dec = StreamDecoder::new();
-    assert!(dec
-        .decode_er_raw_data_block(20, FS_INDEX, SAMPLE_RATE, 1, NO_RESILIENCE, &payload)
-        .is_err());
+    assert!(
+        dec.decode_er_raw_data_block(20, FS_INDEX, SAMPLE_RATE, 1, NO_RESILIENCE, &payload)
+            .is_err()
+    );
 }

@@ -49,7 +49,7 @@ pub fn aliasing_degree(refl: &[f64]) -> Vec<f64> {
         deg[k] = 0.0;
         // Even subbands alias on a negative reflection, odd subbands
         // on a positive one; other orientations are alias-free.
-        let sign = if k % 2 == 0 && refl[k] < 0.0 {
+        let sign = if k.is_multiple_of(2) && refl[k] < 0.0 {
             1.0
         } else if k % 2 == 1 && refl[k] > 0.0 {
             -1.0

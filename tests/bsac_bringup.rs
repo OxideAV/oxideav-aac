@@ -85,7 +85,9 @@ fn read_ref_wav(path: &PathBuf) -> Vec<f64> {
     let wav = std::fs::read(path).unwrap();
     let data_pos = wav.windows(4).position(|w| w == b"data").unwrap() + 8;
     wav[data_pos..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f64::from(i16::from_le_bytes([c[0], c[1]])))
         .collect()
 }

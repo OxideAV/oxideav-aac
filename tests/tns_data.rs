@@ -22,13 +22,13 @@
 //! tests pin `coef_res` to `false` in that case to keep the
 //! equality check meaningful.
 
+use oxideav_aac::Error;
 use oxideav_aac::ics_info::WindowSequence;
 use oxideav_aac::tns_data::{
-    coef_bits, field_widths, num_windows, TnsData, TnsFilter, TnsWindow, COEF_COMPRESS_BITS,
-    COEF_RES_BITS, DIRECTION_BITS, LENGTH_BITS_LONG, LENGTH_BITS_SHORT, N_FILT_BITS_LONG,
-    N_FILT_BITS_SHORT, ORDER_BITS_LONG, ORDER_BITS_SHORT,
+    COEF_COMPRESS_BITS, COEF_RES_BITS, DIRECTION_BITS, LENGTH_BITS_LONG, LENGTH_BITS_SHORT,
+    N_FILT_BITS_LONG, N_FILT_BITS_SHORT, ORDER_BITS_LONG, ORDER_BITS_SHORT, TnsData, TnsFilter,
+    TnsWindow, coef_bits, field_widths, num_windows,
 };
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 // ----------------------------------------------------------------------------

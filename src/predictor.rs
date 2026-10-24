@@ -63,9 +63,9 @@
 //! `am05_*` conformance vectors (AAC Main with long prediction runs)
 //! are the empirical anchor.
 
-use crate::ics_info::{IcsInfo, PredictorData, WindowSequence, PRED_SFB_MAX};
-use crate::swb_offset::long_window_offsets;
 use crate::Error;
+use crate::ics_info::{IcsInfo, PRED_SFB_MAX, PredictorData, WindowSequence};
+use crate::swb_offset::long_window_offsets;
 
 type Result<T> = core::result::Result<T, Error>;
 
@@ -160,11 +160,7 @@ fn mnt_table(i: usize) -> f32 {
 
 fn exp_table(i: usize) -> f32 {
     let f = f32::from_bits((i as u32) << 23);
-    if f > 1.0 {
-        1.0 / f
-    } else {
-        0.0
-    }
+    if f > 1.0 { 1.0 / f } else { 0.0 }
 }
 
 /// `b / VAR` computed via the §4.6.6.3.2.4 table pair, keyed by the
@@ -488,12 +484,11 @@ impl PredictorBank {
 
         // §4.6.6.3.3 — the signalled group reset is applied *after* the
         // normal per-frame processing.
-        if let Some(p) = pred {
-            if p.reset {
-                if let Some(group) = p.reset_group_number {
-                    self.reset_group(group)?;
-                }
-            }
+        if let Some(p) = pred
+            && p.reset
+            && let Some(group) = p.reset_group_number
+        {
+            self.reset_group(group)?;
         }
 
         Ok(modified)

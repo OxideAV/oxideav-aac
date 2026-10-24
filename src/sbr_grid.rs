@@ -361,9 +361,9 @@ mod tests {
         w.write_u32(2, 2); // num_rel_1 = 2 → num_env = 3
         w.write_u32(0, 2); // rel_bord_1[0]
         w.write_u32(3, 2); // rel_bord_1[1]
-                           // ptr_bits(3) = 2.
+        // ptr_bits(3) = 2.
         w.write_u32(1, 2); // pointer
-                           // freq_res transmitted reversed: index 2, then 1, then 0.
+        // freq_res transmitted reversed: index 2, then 1, then 0.
         w.write_bit(true); // -> freq_res[2]
         w.write_bit(false); // -> freq_res[1]
         w.write_bit(true); // -> freq_res[0]
@@ -385,7 +385,7 @@ mod tests {
         w.write_u32(2, 2); // var_bord_0
         w.write_u32(1, 2); // num_rel_0 = 1 → num_env = 2
         w.write_u32(3, 2); // rel_bord_0[0]
-                           // ptr_bits(2) = 2.
+        // ptr_bits(2) = 2.
         w.write_u32(0, 2); // pointer
         w.write_bit(false); // freq_res[0]
         w.write_bit(true); // freq_res[1]
@@ -409,7 +409,7 @@ mod tests {
         w.write_u32(1, 2); // num_rel_1 = 1 → num_env = 3
         w.write_u32(0, 2); // rel_bord_0[0]
         w.write_u32(3, 2); // rel_bord_1[0]
-                           // ptr_bits(3) = 2.
+        // ptr_bits(3) = 2.
         w.write_u32(2, 2); // pointer
         w.write_bit(true);
         w.write_bit(false);

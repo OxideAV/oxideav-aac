@@ -10,9 +10,9 @@
 //! a whole `max_sfb`-band long frame with mixed positions and codebook
 //! phases, and that the per-band M/S mask flips the phase as specified.
 
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::intensity_stereo::{
-    apply_intensity_stereo, intensity_gain, is_intensity, IntensityPairSpectra,
+    IntensityPairSpectra, apply_intensity_stereo, intensity_gain, is_intensity,
 };
 use oxideav_aac::section_data::{INTENSITY_HCB, INTENSITY_HCB2};
 use oxideav_aac::swb_offset::long_window_offsets;

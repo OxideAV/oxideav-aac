@@ -20,15 +20,15 @@
 //! (transcribed verbatim in `src/rvlc.rs`) and the Table 4.53 RVLC
 //! wire layout.
 
+use oxideav_aac::Error;
 use oxideav_aac::ics_info::WindowSequence;
 use oxideav_aac::rvlc::{
-    rvlc_decode, rvlc_encode, rvlc_esc_decode, rvlc_esc_encode, RVLC_ESC_FLAG,
+    RVLC_ESC_FLAG, rvlc_decode, rvlc_encode, rvlc_esc_decode, rvlc_esc_encode,
 };
 use oxideav_aac::scale_factor_data::{
-    accumulate, ErScaleFactorData, ScaleFactorData, ScaleFactorEntry,
+    ErScaleFactorData, ScaleFactorData, ScaleFactorEntry, accumulate,
 };
 use oxideav_aac::section_data::{INTENSITY_HCB2, NOISE_HCB};
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Write `block` against `sfb_cb` / `window_sequence`, re-parse, and

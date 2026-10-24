@@ -7,7 +7,7 @@
 
 use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::latm::LoasDecoder;
 use oxideav_aac::ms_stereo::MsMaskPresent;
 use oxideav_aac::scalable::{
@@ -44,15 +44,17 @@ fn long_ics_info(max_sfb: u8) -> IcsInfo {
 }
 
 fn make_channel(sfb_cbs: &[u8], global_gain: u8, seed: u32) -> ScalableChannel {
-    let sections = vec![sfb_cbs
-        .iter()
-        .enumerate()
-        .map(|(sfb, &cb)| Section {
-            codebook: cb,
-            start: sfb as u8,
-            end: sfb as u8 + 1,
-        })
-        .collect()];
+    let sections = vec![
+        sfb_cbs
+            .iter()
+            .enumerate()
+            .map(|(sfb, &cb)| Section {
+                codebook: cb,
+                start: sfb as u8,
+                end: sfb as u8 + 1,
+            })
+            .collect(),
+    ];
     let entries: Vec<ScaleFactorEntry> = sfb_cbs
         .iter()
         .filter(|&&cb| cb != 0)
@@ -136,11 +138,11 @@ fn build_loas_two_layer(per_frame_payloads: &[[Vec<u8>; 2]]) -> Vec<u8> {
             w.write_u32(0, 6); // numSubFrames
             w.write_u32(0, 4); // numProgram
             w.write_u32(1, 3); // numLayer = 1 -> two layers
-                               // layer 0: mono base (no useSameConfig bit on (0,0)).
+            // layer 0: mono base (no useSameConfig bit on (0,0)).
             write_scalable_asc(&mut w, 1, 0);
             w.write_u32(0, 3); // frameLengthType = 0
             w.write_u32(0xFF, 8); // latmBufferFullness
-                                  // layer 1: stereo extension.
+            // layer 1: stereo extension.
             w.write_bit(false); // useSameConfig = 0
             write_scalable_asc(&mut w, 2, 1);
             w.write_u32(0, 3); // frameLengthType = 0

@@ -151,34 +151,34 @@
 //! [`crate::spectral_codebook::MAX_QUANT`] (8191, the §4.6.3.3 ESC
 //! ceiling), and `aac_frame_length` stays within its 13-bit field.
 
-use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ};
+use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ, AdtsHeader};
 use crate::encoder_tns::detect_and_apply_tns;
 use crate::filterbank::{
-    forward_mdct, long_sequence_window, short_window_j, SHORT_SEQ_HOP, SHORT_SEQ_START,
+    SHORT_SEQ_HOP, SHORT_SEQ_START, forward_mdct, long_sequence_window, short_window_j,
 };
 use crate::ics_body::IcsBody;
 use crate::ics_info::{
-    IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW,
+    IcsInfo, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW, WindowSequence, WindowShape,
 };
 use crate::pce::{ElementSelect, Pce};
-use crate::pulse_data::{Pulse, PulseData, MAX_PULSES};
+use crate::pulse_data::{MAX_PULSES, Pulse, PulseData};
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
 use crate::scale_factor_data::{
-    differentiate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET,
+    AbsoluteScaleFactorEntry, AbsoluteScaleFactors, NOISE_OFFSET, differentiate,
 };
 use crate::section_data::{
-    Section, SectionData, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, ZERO_HCB,
+    INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, Section, SectionData, ZERO_HCB,
 };
 use crate::spectral_codebook::MAX_QUANT;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::{
-    long_window_offsets, short_window_offsets, LONG_WINDOW_LEN, SHORT_WINDOW_LEN,
+    LONG_WINDOW_LEN, SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets,
 };
 use crate::tns_data::TnsData;
 use crate::{Error, Result};
 
-use oxideav_core::bits::BitWriter;
 use oxideav_core::ChannelPosition;
+use oxideav_core::bits::BitWriter;
 
 /// Historical direct-factory endpoint (the crate convention's
 /// `<crate>::encoder::make_encoder` path) — re-exported from
@@ -773,7 +773,7 @@ impl StreamEncoder {
     /// frame carries the overlap-add contribution of both.
     pub fn encode_frame(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
-        if interleaved.len() > FRAME_LEN * ch || interleaved.len() % ch != 0 {
+        if interleaved.len() > FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         // De-interleave onto the ±32768 axis the §4.6.11 output
@@ -817,7 +817,7 @@ impl StreamEncoder {
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
-        if interleaved.len() > FRAME_LEN * ch || interleaved.len() % ch != 0 {
+        if interleaved.len() > FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
@@ -837,7 +837,7 @@ impl StreamEncoder {
     /// is the [`StreamEncoder::finish`] flush).
     pub fn encode_all(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
-        if interleaved.len() % ch != 0 {
+        if !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut out = Vec::new();
@@ -1239,10 +1239,10 @@ impl StreamEncoder {
         } else {
             let mut ms_used = ms_decide(l_spec, r_spec, self.fs_index)?;
             for (sfb, band) in is_bands.iter().enumerate() {
-                if band.is_some() {
-                    if let Some(m) = ms_used.get_mut(sfb) {
-                        *m = false;
-                    }
+                if band.is_some()
+                    && let Some(m) = ms_used.get_mut(sfb)
+                {
+                    *m = false;
                 }
             }
             // A band either channel will noise-code is excluded
@@ -1819,11 +1819,7 @@ fn quantize_coef(x: f64, sf: i32) -> i32 {
     let gain = (0.25 * f64::from(sf - SF_OFFSET)).exp2();
     let mag = (x.abs() / gain).powf(0.75).round();
     let mag = mag.min(f64::from(MAX_QUANT)) as i32;
-    if x < 0.0 {
-        -mag
-    } else {
-        mag
-    }
+    if x < 0.0 { -mag } else { mag }
 }
 
 /// The masking-spread scalefactor for a band whose peak coefficient
@@ -2763,12 +2759,14 @@ mod tests {
 
     #[test]
     fn config_rejects_bad_parameters() {
-        assert!(StreamEncoder::new(EncoderConfig {
-            sample_rate: 44_100,
-            channels: 1,
-            bitrate: 64_000,
-        })
-        .is_ok());
+        assert!(
+            StreamEncoder::new(EncoderConfig {
+                sample_rate: 44_100,
+                channels: 1,
+                bitrate: 64_000,
+            })
+            .is_ok()
+        );
         assert!(matches!(
             StreamEncoder::new(EncoderConfig {
                 sample_rate: 44_056, // not a Table 1.18 rate

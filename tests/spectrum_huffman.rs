@@ -8,22 +8,22 @@
 //! already covered by [`oxideav_aac::spectral_codebook`].
 
 use oxideav_aac::{
+    Error,
     spectral_codebook::{
         decode_index_to_tuple, derive_sign_bits, encode_tuple_to_index, table_4_95,
     },
     spectrum_huffman::{
-        hcod10_decode, hcod10_encode, hcod10_write, hcod11_decode, hcod11_encode, hcod11_write,
-        hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode, hcod2_encode, hcod2_write,
-        hcod3_decode, hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write,
-        hcod5_decode, hcod5_encode, hcod5_write, hcod6_decode, hcod6_encode, hcod6_write,
-        hcod7_decode, hcod7_encode, hcod7_write, hcod8_decode, hcod8_encode, hcod8_write,
-        hcod9_decode, hcod9_encode, hcod9_write, HCOD10_MAX_LEN, HCOD10_NUM_ENTRIES,
-        HCOD11_MAX_LEN, HCOD11_NUM_ENTRIES, HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN,
-        HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN, HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES,
-        HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES, HCOD6_MAX_LEN, HCOD6_NUM_ENTRIES, HCOD7_MAX_LEN,
-        HCOD7_NUM_ENTRIES, HCOD8_MAX_LEN, HCOD8_NUM_ENTRIES, HCOD9_MAX_LEN, HCOD9_NUM_ENTRIES,
+        HCOD1_MAX_LEN, HCOD1_NUM_ENTRIES, HCOD2_MAX_LEN, HCOD2_NUM_ENTRIES, HCOD3_MAX_LEN,
+        HCOD3_NUM_ENTRIES, HCOD4_MAX_LEN, HCOD4_NUM_ENTRIES, HCOD5_MAX_LEN, HCOD5_NUM_ENTRIES,
+        HCOD6_MAX_LEN, HCOD6_NUM_ENTRIES, HCOD7_MAX_LEN, HCOD7_NUM_ENTRIES, HCOD8_MAX_LEN,
+        HCOD8_NUM_ENTRIES, HCOD9_MAX_LEN, HCOD9_NUM_ENTRIES, HCOD10_MAX_LEN, HCOD10_NUM_ENTRIES,
+        HCOD11_MAX_LEN, HCOD11_NUM_ENTRIES, hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode,
+        hcod2_encode, hcod2_write, hcod3_decode, hcod3_encode, hcod3_write, hcod4_decode,
+        hcod4_encode, hcod4_write, hcod5_decode, hcod5_encode, hcod5_write, hcod6_decode,
+        hcod6_encode, hcod6_write, hcod7_decode, hcod7_encode, hcod7_write, hcod8_decode,
+        hcod8_encode, hcod8_write, hcod9_decode, hcod9_encode, hcod9_write, hcod10_decode,
+        hcod10_encode, hcod10_write, hcod11_decode, hcod11_encode, hcod11_write,
     },
-    Error,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 

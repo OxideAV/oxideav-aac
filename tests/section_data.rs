@@ -4,12 +4,12 @@
 //! §6.3 Table 17 (= ISO/IEC 14496-3 §4.4.6) behaviour without any
 //! external AAC encoder.
 
+use oxideav_aac::Error;
 use oxideav_aac::ics_info::WindowSequence;
 use oxideav_aac::section_data::{
-    Codebook, Section, SectionData, ESC_HCB, FIRST_PAIR_HCB, INTENSITY_HCB, INTENSITY_HCB2,
-    NOISE_HCB, ZERO_HCB,
+    Codebook, ESC_HCB, FIRST_PAIR_HCB, INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB, Section,
+    SectionData, ZERO_HCB,
 };
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Long-sequence section: `sect_cb` (4 bits) + `sect_len_incr`

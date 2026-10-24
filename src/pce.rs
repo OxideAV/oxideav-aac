@@ -304,20 +304,20 @@ impl Pce {
                 return Err(Error::PceEncodeInvalid);
             }
         }
-        if let Some(n) = self.mono_mixdown_element_number {
-            if n > 0x0f {
-                return Err(Error::PceEncodeInvalid);
-            }
+        if let Some(n) = self.mono_mixdown_element_number
+            && n > 0x0f
+        {
+            return Err(Error::PceEncodeInvalid);
         }
-        if let Some(n) = self.stereo_mixdown_element_number {
-            if n > 0x0f {
-                return Err(Error::PceEncodeInvalid);
-            }
+        if let Some(n) = self.stereo_mixdown_element_number
+            && n > 0x0f
+        {
+            return Err(Error::PceEncodeInvalid);
         }
-        if let Some((idx, _)) = self.matrix_mixdown {
-            if idx > 0x03 {
-                return Err(Error::PceEncodeInvalid);
-            }
+        if let Some((idx, _)) = self.matrix_mixdown
+            && idx > 0x03
+        {
+            return Err(Error::PceEncodeInvalid);
         }
         if self.comment_field.len() > 0xff {
             return Err(Error::PceEncodeInvalid);

@@ -47,14 +47,14 @@
 //! the decode chain, so the spectrum passed in / out here is the
 //! pre-TNS reconstructed spectrum.
 
+use crate::Error;
 use crate::filterbank::{forward_mdct, long_only_window_family, short_window_j};
 use crate::ics_info::{IcsInfo, LtpData, WindowSequence, WindowShape};
 #[cfg(test)]
-use crate::swb_offset::long_window_offsets;
-#[cfg(test)]
 use crate::swb_offset::LONG_WINDOW_LEN;
-use crate::swb_offset::{short_window_offsets, FrameFamily, SHORT_WINDOW_LEN};
-use crate::Error;
+#[cfg(test)]
+use crate::swb_offset::long_window_offsets;
+use crate::swb_offset::{FrameFamily, SHORT_WINDOW_LEN, short_window_offsets};
 
 type Result<T> = core::result::Result<T, Error>;
 
@@ -673,21 +673,24 @@ mod tests {
         // Long sequence rejected.
         let mut spec = vec![0.0f64; 8 * SHORT_WINDOW_LEN as usize];
         let info = long_info(40);
-        assert!(st
-            .apply_short_2001(&mut spec, &info, &ltp, None, 3, &origins)
-            .is_err());
+        assert!(
+            st.apply_short_2001(&mut spec, &info, &ltp, None, 3, &origins)
+                .is_err()
+        );
         // Wrong spectrum length rejected.
         let sinfo = short_info(8);
         let mut bad = vec![0.0f64; 100];
-        assert!(st
-            .apply_short_2001(&mut bad, &sinfo, &ltp, None, 3, &origins)
-            .is_err());
+        assert!(
+            st.apply_short_2001(&mut bad, &sinfo, &ltp, None, 3, &origins)
+                .is_err()
+        );
         // Missing short records rejected.
         let mut no_short = short_ltp(0, 100, [Some(0); 8]);
         no_short.short = None;
-        assert!(st
-            .apply_short_2001(&mut spec, &sinfo, &no_short, None, 3, &origins)
-            .is_err());
+        assert!(
+            st.apply_short_2001(&mut spec, &sinfo, &no_short, None, 3, &origins)
+                .is_err()
+        );
     }
 
     #[test]

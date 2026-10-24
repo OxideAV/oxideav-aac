@@ -1,11 +1,11 @@
 //! Integration tests for the §4.6.9.3 / §C.6 TNS coefficient
 //! inverse-quantisation primitives.
 
+use oxideav_aac::Error;
 use oxideav_aac::tns_coef::{
     iqfac, iqfac_m, lpc_step_up, pack_coef, sign_extend_coef, tns_decode_coef,
     tns_decode_coef_to_lpc, tns_encode_coef,
 };
-use oxideav_aac::Error;
 
 // ---- iqfac vs iqfac_m ----
 

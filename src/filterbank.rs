@@ -37,9 +37,9 @@
 //! layout, so this module mirrors that and only implements the 2048
 //! transform family.
 
+use crate::Error;
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
 use crate::swb_offset::{FrameFamily, LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
-use crate::Error;
 
 /// `N` for a long-sequence transform (§4.6.11.3.1): 2 ×
 /// [`LONG_WINDOW_LEN`].
@@ -1490,8 +1490,8 @@ mod tests {
             let std = Filterbank::new()
                 .long_window(WindowShape::Sine, WindowShape::Sine, kind)
                 .unwrap();
-            let gen = build_long_window_n(2048, 256, WindowShape::Sine, WindowShape::Sine, kind);
-            assert_eq!(std, gen);
+            let r#gen = build_long_window_n(2048, 256, WindowShape::Sine, WindowShape::Sine, kind);
+            assert_eq!(std, r#gen);
         }
         // SSR LONG_START at (512, 64): 1.0 plateau over [256, 368),
         // short descent over [368, 400), zero over [400, 512).

@@ -36,7 +36,7 @@ use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{
-    derive_window_grouping_family, IcsInfo, LtpData, WindowSequence, WindowShape,
+    IcsInfo, LtpData, WindowSequence, WindowShape, derive_window_grouping_family,
 };
 use oxideav_aac::latm::LoasDecoder;
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
@@ -44,7 +44,7 @@ use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
 use oxideav_aac::swb_offset::{
-    long_window_offsets_family, short_window_offsets_family, FrameFamily,
+    FrameFamily, long_window_offsets_family, short_window_offsets_family,
 };
 use oxideav_aac::tns_data::{TnsData, TnsFilter, TnsWindow};
 use oxideav_core::bits::BitWriter;
@@ -920,7 +920,7 @@ fn sbr_on_960_family_decodes_at_fifteen_slots() {
 /// up to one common scale).
 #[test]
 fn he_aac_960_round_trips_and_core_band_matches_the_reference_binary() {
-    use oxideav_aac::sbr_encoder::{SbrEncoder, SbrEncoderConfig, NUM_TIME_SLOTS_960};
+    use oxideav_aac::sbr_encoder::{NUM_TIME_SLOTS_960, SbrEncoder, SbrEncoderConfig};
     use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
     use std::process::Command;
 
@@ -1023,7 +1023,7 @@ fn he_aac_960_round_trips_and_core_band_matches_the_reference_binary() {
             .collect();
         let mut bank = EncoderAnalysisQmf::new();
         let mut e = [0.0f64; 64];
-        for slot in mono.chunks_exact(64) {
+        for slot in mono.as_chunks::<64>().0 {
             for (k, v) in bank.push_slot(slot).unwrap().iter().enumerate() {
                 e[k] += v.norm_sqr();
             }
@@ -1092,7 +1092,9 @@ fn he_aac_960_round_trips_and_core_band_matches_the_reference_binary() {
         if cid == b"data" {
             let end = (body + sz).min(d.len());
             pcm = d[body..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             break;
