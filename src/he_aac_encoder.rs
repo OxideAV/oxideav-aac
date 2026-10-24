@@ -476,6 +476,23 @@ impl HeAacEncoder {
         })
     }
 
+    /// Emit bare `raw_data_block()`s (MP4 / CAF access units) instead
+    /// of ADTS frames; see [`StreamEncoder::set_raw`]. The stream is then
+    /// described by [`Self::audio_specific_config`] (explicit SBR / PS
+    /// signalling).
+    pub fn set_raw(&mut self, raw: bool) {
+        self.core.set_raw(raw);
+    }
+
+    /// Change the target total bitrate from the next frame on. The SBR
+    /// crossover keeps the value chosen at construction. Errors with
+    /// [`Error::EncoderInvalidConfig`] for 0.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
+        self.core.set_bitrate(bitrate)?;
+        self.config.bitrate = bitrate;
+        Ok(())
+    }
+
     /// The configuration.
     pub fn config(&self) -> &HeAacConfig {
         &self.config
@@ -715,6 +732,30 @@ mod tests {
         {
             assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
         }
+    }
+
+    #[test]
+    fn raw_blocks_are_adts_payloads_with_the_header_budget() {
+        // 64 kb/s at a 24 kHz core is a 334-byte ADTS payload budget,
+        // the whole budget of a raw block at 62 625 b/s.
+        let pcm: Vec<f64> = (0..HE_FRAME_LEN * 2 * 4)
+            .map(|i| (i as f64 * 0.017).sin() * 0.3 + (i as f64 * 0.9).sin() * 0.05)
+            .collect();
+        let config = |bitrate| HeAacConfig {
+            crossover_hz: Some(8_000.0),
+            ..HeAacConfig::new(48_000, 2, bitrate)
+        };
+        let mut adts = HeAacEncoder::new(config(64_000)).unwrap();
+        let mut raw = HeAacEncoder::new(config(62_625)).unwrap();
+        raw.set_raw(true);
+        for hop in pcm.chunks(HE_FRAME_LEN * 2) {
+            let a = adts.encode_frame_f64(hop).unwrap();
+            assert_eq!(&a[..2], &[0xff, 0xf1]);
+            assert_eq!(raw.encode_frame_f64(hop).unwrap(), &a[7..]);
+        }
+        raw.set_bitrate(32_000).unwrap();
+        assert_eq!(raw.config().bitrate, 32_000);
+        assert!(raw.set_bitrate(0).is_err());
     }
 
     #[test]

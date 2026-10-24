@@ -307,13 +307,14 @@ impl EncoderConfig {
     }
 
     /// Per-frame payload byte budget from the bitrate:
-    /// `bitrate · 1024 / sample_rate` bits, minus the 7-byte ADTS
-    /// header, floored at a minimum that always allows a syntactically
-    /// valid (silent) frame.
-    fn frame_budget_bytes(&self) -> usize {
+    /// `bitrate · 1024 / sample_rate` bits, minus `header` bytes of
+    /// framing (the 7-byte ADTS header, or none for raw blocks),
+    /// floored at a minimum that always allows a syntactically valid
+    /// (silent) frame.
+    fn frame_budget_bytes(&self, header: usize) -> usize {
         let bits = (self.bitrate as u64 * FRAME_LEN as u64) / self.sample_rate.max(1) as u64;
         let bytes = (bits / 8) as usize;
-        bytes.saturating_sub(ADTS_HEADER_BYTES_NO_CRC).max(16)
+        bytes.saturating_sub(header).max(16)
     }
 
     /// The Table 1.19 default `channelConfiguration` for this channel
@@ -575,6 +576,8 @@ pub struct StreamEncoder {
     is_enabled: bool,
     /// Coded bandwidth (`None` = full band); see [`Self::set_bandwidth`].
     bandwidth_hz: Option<f64>,
+    /// Emit bare `raw_data_block()`s; see [`Self::set_raw`].
+    raw: bool,
 }
 
 impl StreamEncoder {
@@ -672,6 +675,7 @@ impl StreamEncoder {
             tns_enabled: true,
             is_enabled: false,
             bandwidth_hz: Some(config.default_bandwidth_hz()),
+            raw: false,
         })
     }
 
@@ -757,6 +761,27 @@ impl StreamEncoder {
     /// transparent transcodes.
     pub fn set_intensity_stereo(&mut self, enabled: bool) {
         self.is_enabled = enabled;
+    }
+
+    /// Emit each frame as a bare `raw_data_block()` (an MP4 / CAF
+    /// access unit) instead of an ADTS frame (default **off**). The
+    /// configuration then travels out of band in the
+    /// `AudioSpecificConfig` (a PCE layout's `program_config_element()`
+    /// included, so it is not repeated in the blocks), and the 7-byte
+    /// ADTS header no longer comes out of the frame budget.
+    pub fn set_raw(&mut self, raw: bool) {
+        self.raw = raw;
+    }
+
+    /// Change the target bitrate from the next frame on (the coded
+    /// bandwidth keeps its setting). Errors with
+    /// [`Error::EncoderInvalidConfig`] for 0.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
+        if bitrate == 0 {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        self.config.bitrate = bitrate;
+        Ok(())
     }
 
     /// The configuration this encoder was built with.
@@ -971,7 +996,12 @@ impl StreamEncoder {
             .filter(|f| !f.is_empty())
             .map(|f| f.len() + if f.len() >= 15 { 2 } else { 1 })
             .sum();
-        let budget = self.config.frame_budget_bytes().max(fill_bytes + 16);
+        let header = if self.raw {
+            0
+        } else {
+            ADTS_HEADER_BYTES_NO_CRC
+        };
+        let budget = self.config.frame_budget_bytes(header).max(fill_bytes + 16);
         let mut sf_offset = 0i32;
         let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
         let mut iterations = 0usize;
@@ -1006,6 +1036,9 @@ impl StreamEncoder {
             }
         }
 
+        if self.raw {
+            return Ok(raw_block);
+        }
         // ADTS wrap. aac_frame_length is 13 bits; the budget floor
         // (16 bytes) and MAX_RATE_ITERATIONS guarantee headroom for
         // every realistic configuration, but validate regardless.
@@ -1047,7 +1080,7 @@ impl StreamEncoder {
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
-        if let Some(pce) = &self.program_config {
+        if let (Some(pce), false) = (&self.program_config, self.raw) {
             asm.push_pce(pce)?;
         }
         let mut sce_tag = 0u8;
