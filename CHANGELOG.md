@@ -33,6 +33,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   diverge — the structure Apple's decoder renders (#23, ropoctl). The
   default keeps one generator per pair, so independent noise bands
   decode decorrelated (the §4.6.13.3 default process).
+- `StreamDecoder::set_float_pcm_capture` / `last_pcm_f64` (off by
+  default): the last successfully decoded `raw_data_block()` frame's PCM
+  as interleaved f64 (full scale 1.0, the i16 output's channel order)
+  before integer rounding (#25, ropoctl). Agrees with Apple's float
+  decoder output at about 135 dB where the i16 output stops near 90 dB.
+  The ER entry point does not fill it.
 
 ### Fixed
 
