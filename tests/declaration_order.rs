@@ -29,7 +29,13 @@ fn five_one_in_element_order() {
     const FROM: [usize; 6] = [2, 0, 1, 4, 5, 3];
     for (c, d) in canonical.iter().zip(&declared) {
         assert_eq!(d.channels, 6);
-        for (cf, df) in c.pcm.chunks_exact(6).zip(d.pcm.chunks_exact(6)) {
+        for (cf, df) in c
+            .pcm
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .zip(d.pcm.as_chunks::<6>().0)
+        {
             for k in 0..6 {
                 assert_eq!(df[k], cf[FROM[k]]);
             }
