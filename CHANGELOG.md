@@ -6,6 +6,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-aac/compare/v0.1.7...v0.2.0) - 2026-10-24
+
+### Fixed
+
+- fixup for #28: CHANGELOG entry for the core-only decode option
+- fixup for #27: CHANGELOG entry for the coupling-element rejection option
+- fixup for #26: a config-0 stream with no PCE keeps its element order
+- fixup for #25: CHANGELOG entry for the f64 PCM view
+- fixup for #24: CHANGELOG entry for the PS index clamp
+- fixup for #23: per-channel PNS generators are opt-in; the default stays one generator per pair
+- fixup for #22: the sine-shaped block before the first is opt-in
+- fixup for #21: CHANGELOG entry for independent decoding of non-common_window pairs
+- fixup for #20: CHANGELOG entry for the first-envelope PS interpolation fix
+
+### Other
+
+- rustfmt
+- opt-in core-only decode
+- rustfmt
+- opt-in rejection of coupling channel elements
+- declaration_order test: as_chunks for the fixed six-channel frames (clippy)
+- rustfmt
+- opt-in declaration channel order
+- rustfmt
+- opt-in float PCM view before i16 rounding
+- clamp a parameter index that leaves its range
+- one noise generator per channel, both from the same seed
+- the block before the first is sine-shaped
+- a channel pair without common_window decodes its channels independently
+- first envelope interpolates from border n_-1 = -1
+- edition 2024, MSRV 1.95
+- implicit HE-AAC follows the container-declared core rate (downsampled SBR)
+- AAC in containers: decode bare access units from extradata ASC, ADTS container, encoder ASC
+- measured SBR crossover rule (0.35 Hz per bit/s of core-channel rate)
+- price fill elements once — HE-AAC streams land on their target rate
+- sbr_encoder_frame target + fuzz-found coupled balance overflow fix
+- equal-rate psy harness vs the black-box reference encoders + rate-derived coded bandwidth (the measured lever)
+- measured elections — fine IID grid, phase layer (Auto default), per-frame enable_ipdopd
+- 960-line core layout (numTimeSlots = 15) + writer-assembled HE-AAC 960 round trip
+- SBR + PS decode over the 960-line core (numTimeSlots = 15)
+- three-onset VARVAR grids via a general border solver + per-envelope bs_freq_res election
+- advertise the PCE layout's channel_layout on the output parameters
+- rustfmt reflow of the phase-layer test
+- PS phase layer end to end — an eight-sample inter-channel delay's per-band IPD reproduced to 0.13 rad (0.83 rad phase-less control)
+- PCE-described speaker sets (channelConfiguration = 0) + registry channel_layout routing
+- VARVAR grids — late onsets after a variable lead, two onsets per frame (five envelopes)
+- HE-AAC v2 (parametric stereo) encoder section, encoder-remainders truth, CHANGELOG
+- ps_data() writer↔parser + PS encoder targets, Fuzz workflow; two fuzz-found fixes
+- HE-AAC v2 encoder validation — own subpart-8 decoder oracle + reference-binary black box
+- HE-AAC v2 — QMF-domain energy-preserving downmix, PS carriage, v2 signalling, registry factory
+- Annex 8.C.6 parameter estimation, border election, quantisation, closed-loop delta coding
+- forward ps_data() writer (Tables 8.9-8.14) + Annex 8.B codebook encoder
+- Annex 8.C.6.2 stereo hybrid analysis front end + band excitations
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
