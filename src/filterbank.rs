@@ -587,11 +587,7 @@ impl Filterbank {
             } else {
                 -x[base - shift]
             };
-            if m < 2 * n {
-                value
-            } else {
-                -value
-            }
+            if m < 2 * n { value } else { -value }
         };
         // z[m] for m < window.len(); the window is zero beyond.
         let z: Vec<f64> = window.iter().enumerate().map(|(m, &w)| w * y(m)).collect();

@@ -1099,7 +1099,7 @@ fn parses_eld_with_low_delay_sbr_and_extension() {
     bw.write_bit(true); // ldSbrPresentFlag
     bw.write_bit(false); // ldSbrSamplingRate
     bw.write_bit(false); // ldSbrCrcFlag
-                         // sbr_header(): amp_res, start_freq, stop_freq, xover_band, reserved, no extra headers
+    // sbr_header(): amp_res, start_freq, stop_freq, xover_band, reserved, no extra headers
     bw.write_u32(1, 1);
     bw.write_u32(5, 4);
     bw.write_u32(4, 4);

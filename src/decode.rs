@@ -1164,9 +1164,8 @@ impl StreamDecoder {
         let mut channels: Vec<Vec<f64>> = Vec::new();
         for (index, &kind) in sequence.iter().enumerate() {
             let key = (kind_id(kind), index as u8);
-            if !self.decoders.contains_key(&key) {
-                self.decoders
-                    .insert(key, ElementDecoder::new_low_delay(family)?);
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.decoders.entry(key) {
+                slot.insert(ElementDecoder::new_low_delay(family)?);
             }
             match kind {
                 IdSynEle::Sce | IdSynEle::Lfe => {
