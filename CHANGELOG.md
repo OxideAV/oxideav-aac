@@ -51,6 +51,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `UnsupportedElementSkip(2)` before the element is parsed, as Apple's
   decoder refuses such streams (#27, ropoctl). Coupling decodes as
   before otherwise.
+- `StreamDecoder::set_core_only` (off by default): fill elements, and
+  with them SBR / PS extension payloads, are skipped, so an HE-AAC v1 /
+  v2 stream decodes as its AAC-LC core at the core rate (1024 samples
+  per channel per block), as Apple's decoder does for a stream
+  described as AAC-LC (#28, ropoctl).
 
 ### Fixed
 
