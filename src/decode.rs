@@ -163,12 +163,15 @@ pub struct StreamDecoder {
 struct ElementOptions {
     /// [`StreamDecoder::set_sine_before_first_block`].
     sine_before_first_block: bool,
+    /// [`StreamDecoder::set_shared_pns_seed`].
+    shared_pns_seed: bool,
 }
 
 impl ElementOptions {
     fn element_decoder(self, family: FrameFamily) -> ElementDecoder {
         let mut dec = ElementDecoder::new_family(family);
         dec.set_sine_before_first_block(self.sine_before_first_block);
+        dec.set_shared_pns_seed(self.shared_pns_seed);
         dec
     }
 
@@ -254,6 +257,21 @@ impl StreamDecoder {
     /// then on; select before decoding.
     pub fn set_sine_before_first_block(&mut self, enabled: bool) {
         self.element_options.sine_before_first_block = enabled;
+    }
+
+    /// Draw each channel's PNS noise from its own generator started
+    /// from the common seed (off by default): the two channels of a
+    /// pair then carry identical noise in bands that are noise in both,
+    /// until their noise histories diverge — the structure Apple's
+    /// decoder renders. The default keeps one generator per channel
+    /// pair, so bands coded as independent noise decode decorrelated
+    /// (the §4.6.13.3 default process). Applies to every channel
+    /// element, including those already decoding.
+    pub fn set_shared_pns_seed(&mut self, shared: bool) {
+        self.element_options.shared_pns_seed = shared;
+        for dec in self.decoders.values_mut() {
+            dec.set_shared_pns_seed(shared);
+        }
     }
 
     /// Decode one ADTS frame's `raw_data_block()` payload to interleaved

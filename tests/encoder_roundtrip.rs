@@ -1048,10 +1048,9 @@ fn identical_noise_channels_emit_correlated_pns() {
     }
 }
 
-#[test]
-fn independent_noise_channels_share_seeded_noise() {
-    // Fully independent noise per channel: pair PNS still fires but
-    // the correlation flag must (essentially) never be set.
+/// Fully independent noise per channel, PNS on: pair PNS still fires
+/// but the correlation flag must (essentially) never be set.
+fn independent_noise_stream() -> Vec<u8> {
     let n = 5 * FRAME_LEN;
     let l = noise_pcm(n, 8_000.0, 0xAAAA_1111);
     let r = noise_pcm(n, 8_000.0, 0x5555_9999);
@@ -1077,12 +1076,12 @@ fn independent_noise_channels_share_seeded_noise() {
         correlated * 10 <= both,
         "independent noise must (almost) never flag correlation: {correlated}/{both}"
     );
+    stream
+}
 
-    // Decoded: both channels draw their noise from generators started
-    // from the same seed, so bands that are noise in both channels carry
-    // the same noise until the channels' noise histories diverge.
-    let mut dec = StreamDecoder::new();
-    let frames = dec.decode_all(&stream).expect("decodes");
+/// Normalised L/R correlation of `dec`'s output past the first frame.
+fn decoded_lr_correlation(dec: &mut StreamDecoder, stream: &[u8]) -> f64 {
+    let frames = dec.decode_all(stream).expect("decodes");
     let mut out = Vec::new();
     for f in &frames {
         out.extend_from_slice(&f.pcm);
@@ -1095,8 +1094,33 @@ fn independent_noise_channels_share_seeded_noise() {
         el += a * a;
         er += b * b;
     }
-    let corr = dot / (el * er).sqrt().max(1.0);
+    dot / (el * er).sqrt().max(1.0)
+}
+
+#[test]
+fn independent_noise_channels_stay_uncorrelated() {
+    // Decoded channels stay decorrelated by default: independent draws
+    // from one generator (the §4.6.13.3 default process).
+    let stream = independent_noise_stream();
+    let corr = decoded_lr_correlation(&mut StreamDecoder::new(), &stream);
     eprintln!("decoded L/R correlation = {corr:.4}");
+    assert!(
+        corr.abs() < 0.3,
+        "independent noise must decode decorrelated: {corr:.4}"
+    );
+}
+
+#[test]
+fn independent_noise_channels_share_seeded_noise_when_opted_in() {
+    // With set_shared_pns_seed both channels draw from generators
+    // started from the same seed, so bands that are noise in both
+    // channels carry the same noise until the channels' noise histories
+    // diverge.
+    let stream = independent_noise_stream();
+    let mut dec = StreamDecoder::new();
+    dec.set_shared_pns_seed(true);
+    let corr = decoded_lr_correlation(&mut dec, &stream);
+    eprintln!("decoded L/R correlation (shared seed) = {corr:.4}");
     assert!(
         corr > 0.5,
         "same-seed channel noise must decode correlated: {corr:.4}"

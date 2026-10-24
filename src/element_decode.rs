@@ -583,11 +583,16 @@ pub struct ElementDecoder {
     /// persists across frames. Same channel-slot indexing as
     /// `filterbanks`.
     ssr_decoders: [Option<Box<SsrChannelDecoder>>; 2],
-    /// §4.6.13.3 default generator state, advanced across every noise
-    /// band of every frame so the noise is reproducible per decode run.
-    // one noise generator per channel, from the same seed: matching
-    // channels draw matching noise, as macOS's decoder does
+    /// §4.6.13.3 generator state, advanced across every noise band of
+    /// every frame so the noise is reproducible per decode run. By
+    /// default only slot 0 is used: one generator serves both channels
+    /// of a pair, so bands that are noise in both channels draw
+    /// independent vectors (the §4.6.13.3 default process). With
+    /// `shared_pns_seed` each channel advances its own slot, both
+    /// started from the common seed.
     pns_state: [u32; 2],
+    /// [`Self::set_shared_pns_seed`].
+    shared_pns_seed: bool,
 }
 
 impl Default for ElementDecoder {
@@ -619,6 +624,7 @@ impl ElementDecoder {
             // independent of the seed, so this choice only fixes the
             // (spec-undefined) per-coefficient phase.
             pns_state: [0x0001_2345; 2],
+            shared_pns_seed: false,
         }
     }
 
@@ -640,7 +646,19 @@ impl ElementDecoder {
             predictor_banks: [None, None],
             ssr_decoders: [None, None],
             pns_state: [seed; 2],
+            shared_pns_seed: false,
         }
+    }
+
+    /// Draw each channel's PNS noise from its own generator, both
+    /// started from the same seed (off by default). Bands that are
+    /// noise in both channels of a pair then carry identical noise
+    /// until the channels' noise histories diverge, as Apple's decoder
+    /// renders them. The default keeps one generator for both channels,
+    /// so independent noise bands decode decorrelated (the §4.6.13.3
+    /// default process).
+    pub fn set_shared_pns_seed(&mut self, shared: bool) {
+        self.shared_pns_seed = shared;
     }
 
     /// Decode one single-channel element (SCE) or LFE channel to PCM.
@@ -687,7 +705,9 @@ impl ElementDecoder {
 
         // §4.6.13 PNS on the single channel (no pair correlation).
         let noise_nrg = noise_nrg_table(&abs, &ch.body.section_data.sfb_cb, max_sfb)?;
-        let state = &mut self.pns_state[slot];
+        // One generator per pair by default (the §4.6.13.3 default
+        // process); the channel's own slot with set_shared_pns_seed.
+        let state = &mut self.pns_state[if self.shared_pns_seed { slot } else { 0 }];
         let mut pns_chan = PnsChannel {
             spec: &mut spec,
             sfb_cb: &ch.body.section_data.sfb_cb,
@@ -851,6 +871,7 @@ impl ElementDecoder {
                 sfb_cb: &right.body.section_data.sfb_cb,
                 noise_nrg: &right_nrg,
             };
+            let shared_seed = self.shared_pns_seed;
             let states = &mut self.pns_state;
             apply_pns_pair_channels(
                 &mut left_chan,
@@ -861,7 +882,11 @@ impl ElementDecoder {
                 geom,
                 fs_index,
                 |channel, out| {
-                    if channel == 2 {
+                    if !shared_seed {
+                        // The default process: one generator serves the
+                        // left, right and shared vectors alike.
+                        gen_rand_vector(out, &mut states[0]);
+                    } else if channel == 2 {
                         // a shared vector: both channels' noise histories
                         // advance by it
                         let [left, right] = states;

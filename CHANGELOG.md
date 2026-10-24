@@ -26,6 +26,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   halves share its own `window_shape`. Only the first frame of a stream
   whose first block is KBD-shaped changes; the LTP analysis window
   follows the same previous shape (#22, ropoctl).
+- `StreamDecoder::set_shared_pns_seed` (and the element decoder's; off
+  by default): each channel of a pair draws its PNS noise from its own
+  generator started from the common seed, so bands that are noise in
+  both channels carry identical noise until the channels' histories
+  diverge — the structure Apple's decoder renders (#23, ropoctl). The
+  default keeps one generator per pair, so independent noise bands
+  decode decorrelated (the §4.6.13.3 default process).
 
 ### Fixed
 
