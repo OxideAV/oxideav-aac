@@ -8,17 +8,23 @@ fn tone(n: usize, channels: usize) -> Vec<i16> {
     (0..n * channels)
         .map(|i| {
             let t = (i / channels) as f64 / 44_100.0;
-            (8000.0 * (2.0 * std::f64::consts::PI * (440.0 + 110.0 * (i % channels) as f64) * t).sin()) as i16
+            (8000.0
+                * (2.0 * std::f64::consts::PI * (440.0 + 110.0 * (i % channels) as f64) * t).sin())
+                as i16
         })
         .collect()
 }
 
 #[test]
 fn float_view_is_the_frame_before_rounding() {
-    let stream = StreamEncoder::new(EncoderConfig { sample_rate: 44_100, channels: 2, bitrate: 128_000 })
-        .unwrap()
-        .encode_all(&tone(8 * 1024, 2))
-        .unwrap();
+    let stream = StreamEncoder::new(EncoderConfig {
+        sample_rate: 44_100,
+        channels: 2,
+        bitrate: 128_000,
+    })
+    .unwrap()
+    .encode_all(&tone(8 * 1024, 2))
+    .unwrap();
     let mut dec = StreamDecoder::new();
     assert!(dec.last_pcm_f64().is_none(), "off by default");
     dec.set_float_pcm_capture(true);
