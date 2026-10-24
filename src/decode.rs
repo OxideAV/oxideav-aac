@@ -200,8 +200,8 @@ impl StreamDecoder {
         self.declaration_order = enabled;
     }
 
-    /// Capture normal raw-data-block PCM before i16 rounding.
-    /// The separate ER decode entry point does not populate this view.
+    /// Capture raw-data-block and ER raw-data-block PCM before i16
+    /// rounding.
     /// Disabled by default; enabling or disabling clears the previous view.
     /// The view is replaced after each successful decoded frame. Decode
     /// failures retain the previous successful view, not partial samples.
@@ -209,7 +209,7 @@ impl StreamDecoder {
         self.float_pcm = if enabled { Some(Vec::new()) } else { None };
     }
 
-    /// Borrow the last successful normal raw-data-block PCM (full scale 1.0).
+    /// Borrow the last successful frame's PCM (full scale 1.0).
     /// This does not compensate decoder delay or drain pending synthesis.
     pub fn last_pcm_f64(&self) -> Option<&[f64]> {
         self.float_pcm.as_deref()
@@ -1065,9 +1065,24 @@ impl StreamDecoder {
         // Trailing extension_payload() loop + byte_alignment(): consumed
         // permissively (nothing this decoder acts on rides there yet).
 
-        // Table 1.19 canonical output reorder, same as the non-ER walk.
-        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
+        // Table 1.19 canonical output reorder, same as the non-ER walk
+        // (element order under declaration order).
+        let channels = if self.declaration_order {
+            channels
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
         let pcm = interleave_s16(&channels)?;
+        if let Some(output) = &mut self.float_pcm {
+            output.clear();
+            if let Some(first) = channels.first() {
+                for frame in 0..first.len() {
+                    for channel in &channels {
+                        output.push(channel[frame] / 32768.0);
+                    }
+                }
+            }
+        }
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),
