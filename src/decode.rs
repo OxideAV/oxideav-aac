@@ -76,6 +76,50 @@ fn pce_kind(kind: IdSynEle) -> Option<PceElementKind> {
     }
 }
 
+/// The permutation taking a block's element-order channels to the
+/// PCE's declaration order (`out[i] = channels[perm[i]]`); `None` unless
+/// the block carries exactly the PCE's elements.
+fn declaration_permutation(
+    pce: &Pce,
+    elements: &[(PceElementKind, u8, usize)],
+) -> Option<Vec<usize>> {
+    let declared = pce
+        .front_elements
+        .iter()
+        .chain(&pce.side_elements)
+        .chain(&pce.back_elements)
+        .map(|e| {
+            (
+                if e.is_cpe {
+                    PceElementKind::Cpe
+                } else {
+                    PceElementKind::Sce
+                },
+                e.tag_select,
+            )
+        })
+        .chain(
+            pce.lfe_element_tag_selects
+                .iter()
+                .map(|&tag| (PceElementKind::Lfe, tag)),
+        );
+    let mut first = Vec::with_capacity(elements.len());
+    let mut at = 0;
+    for &(_, _, n) in elements {
+        first.push(at);
+        at += n;
+    }
+    let mut used = vec![false; elements.len()];
+    let mut perm = Vec::with_capacity(at);
+    for (kind, tag) in declared {
+        let i = (0..elements.len())
+            .find(|&i| !used[i] && elements[i].0 == kind && elements[i].1 == tag)?;
+        used[i] = true;
+        perm.extend(first[i]..first[i] + elements[i].2);
+    }
+    used.iter().all(|&u| u).then_some(perm)
+}
+
 /// The §4.6.11 per-frame sample count for the default 1024-line
 /// transform family. The other §4.5.1.1 families emit 960 / 512 /
 /// 480 samples per frame per channel
@@ -152,6 +196,12 @@ pub struct StreamDecoder {
     /// `AudioSpecificConfig` installs the ASC-resolved family via
     /// [`Self::set_frame_family`] before the first block.
     family: FrameFamily,
+    /// Emit channels in the configuration's element order instead of
+    /// the canonical speaker order ([`Self::set_declaration_order`]).
+    declaration_order: bool,
+    // Local opt-in view of the most recent successfully decoded frame,
+    // in normalized canonical-order f64, before integer rendering.
+    float_pcm: Option<Vec<f64>>,
 }
 
 impl StreamDecoder {
@@ -159,6 +209,31 @@ impl StreamDecoder {
     #[must_use]
     pub fn new() -> Self {
         StreamDecoder::default()
+    }
+
+    /// Emit each block's channels in the order the configuration
+    /// declares its elements, as macOS's decoder does: a default
+    /// `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs,
+    /// LFE), or the active PCE's front, side, back and LFE lists, each
+    /// element found by its tag. A block whose elements do not match
+    /// the PCE fails with [`Error::ElementDecodeInvalid`].
+    pub fn set_declaration_order(&mut self, enabled: bool) {
+        self.declaration_order = enabled;
+    }
+
+    /// Capture raw-data-block and ER raw-data-block PCM before i16
+    /// rounding.
+    /// Disabled by default; enabling or disabling clears the previous view.
+    /// The view is replaced after each successful decoded frame. Decode
+    /// failures retain the previous successful view, not partial samples.
+    pub fn set_float_pcm_capture(&mut self, enabled: bool) {
+        self.float_pcm = if enabled { Some(Vec::new()) } else { None };
+    }
+
+    /// Borrow the last successful frame's PCM (full scale 1.0).
+    /// This does not compensate decoder delay or drain pending synthesis.
+    pub fn last_pcm_f64(&self) -> Option<&[f64]> {
+        self.float_pcm.as_deref()
     }
 
     /// Install the program configuration of a
@@ -486,6 +561,7 @@ impl StreamDecoder {
         // interleaved PCM (all blocks of a frame must agree on the
         // channel count).
         let mut pcm: Vec<i16> = Vec::new();
+        let mut float_pcm = self.float_pcm.as_ref().map(|_| Vec::new());
         let mut frame_channels: Option<usize> = None;
         for block in 0..num_raw_data_blocks {
             let mut channels: Vec<Vec<f64>> = Vec::new();
@@ -533,7 +609,19 @@ impl StreamDecoder {
             // maps onto canonical positions; otherwise element order is
             // kept.
             let channels =
-                if channel_configuration == 0 {
+                if self.declaration_order {
+                    if channel_configuration == 0 {
+                        let pce = self
+                            .program_config
+                            .as_ref()
+                            .ok_or(Error::ElementDecodeInvalid)?;
+                        let perm = declaration_permutation(pce, &element_desc)
+                            .ok_or(Error::ElementDecodeInvalid)?;
+                        crate::channel_map::apply_permutation(&perm, channels)
+                    } else {
+                        channels
+                    }
+                } else if channel_configuration == 0 {
                     match self.program_config.as_ref().and_then(|pce| {
                         crate::channel_map::pce_reorder_permutation(pce, &element_desc)
                     }) {
@@ -555,8 +643,19 @@ impl StreamDecoder {
                 Some(_) => {}
             }
             pcm.extend(interleave_s16(&channels)?);
+            if let Some(output) = &mut float_pcm {
+                // interleave_s16 above has already validated channel lengths.
+                if let Some(first) = channels.first() {
+                    for frame in 0..first.len() {
+                        for channel in &channels {
+                            output.push(channel[frame] / 32768.0);
+                        }
+                    }
+                }
+            }
         }
 
+        self.float_pcm = float_pcm;
         Ok(DecodedFrame {
             pcm,
             channels: frame_channels.unwrap_or(0),
@@ -992,9 +1091,24 @@ impl StreamDecoder {
         // Trailing extension_payload() loop + byte_alignment(): consumed
         // permissively (nothing this decoder acts on rides there yet).
 
-        // Table 1.19 canonical output reorder, same as the non-ER walk.
-        let channels = crate::channel_map::reorder_channels(channel_configuration, channels);
+        // Table 1.19 canonical output reorder, same as the non-ER walk
+        // (element order under declaration order).
+        let channels = if self.declaration_order {
+            channels
+        } else {
+            crate::channel_map::reorder_channels(channel_configuration, channels)
+        };
         let pcm = interleave_s16(&channels)?;
+        if let Some(output) = &mut self.float_pcm {
+            output.clear();
+            if let Some(first) = channels.first() {
+                for frame in 0..first.len() {
+                    for channel in &channels {
+                        output.push(channel[frame] / 32768.0);
+                    }
+                }
+            }
+        }
         Ok(DecodedFrame {
             pcm,
             channels: channels.len(),

@@ -58,6 +58,10 @@
 //! }
 //! ```
 //!
+//! The ER AAC LD families (512/480-line frames) place the
+//! `tns_data()` body after `gain_control_data_present` and its body;
+//! `tns_data_present` keeps its position.
+//!
 //! Per Table 4.50 the `common_window` flag is set by the surrounding
 //! `channel_pair_element()` (Table 4.4) when the two channels of the
 //! CPE share the `ics_info()`; in that case the *first* call to
@@ -726,15 +730,19 @@ impl IcsBody {
             return Err(Error::PulseDataEncodeInvalid);
         }
 
-        // tns_data_present + body (family-aware widths — the LD
-        // families emit the reduced 1 / 4 / 3-bit column, mirroring
-        // the parse side).
+        // tns_data_present; the body follows here, or after the
+        // gain-control fields for the ER AAC LD families.
         writer.write_bit(self.tns_data_present);
-        if self.tns_data_present {
-            let td = self.tns_data.as_ref().ok_or(Error::TnsDataEncodeInvalid)?;
-            td.write_family(writer, ics_info.family, ics_info.window_sequence)?;
+        let tns = if self.tns_data_present {
+            Some(self.tns_data.as_ref().ok_or(Error::TnsDataEncodeInvalid)?)
         } else if self.tns_data.is_some() {
             return Err(Error::TnsDataEncodeInvalid);
+        } else {
+            None
+        };
+        let tns_after_gain_control = ics_info.family.is_ld();
+        if let Some(td) = tns.filter(|_| !tns_after_gain_control) {
+            td.write_family(writer, ics_info.family, ics_info.window_sequence)?;
         }
 
         // gain_control_data_present + body. The §4.6.12 normative
@@ -751,6 +759,9 @@ impl IcsBody {
             gc.write(writer, ics_info.window_sequence)?;
         } else if self.gain_control_data.is_some() {
             return Err(Error::GainControlDataEncodeInvalid);
+        }
+        if let Some(td) = tns.filter(|_| tns_after_gain_control) {
+            td.write_family(writer, ics_info.family, ics_info.window_sequence)?;
         }
         Ok(())
     }
@@ -796,12 +807,10 @@ fn parse_tools(
     };
 
     let tns_data_present = reader.read_bit().map_err(|_| Error::UnexpectedEnd)?;
-    let tns_data = if tns_data_present {
-        // Family-aware widths: the ER AAC LD families read the
-        // reduced 1 / 4 / 3-bit Table 4.155 column (the
-        // corpus-resolved AOT-23 wire — see
-        // docs/audio/aac/er-ld-tns-divergence.md §0); everything
-        // else takes the literal window_sequence dispatch.
+    // The ER AAC LD families carry the tns_data() body after the
+    // gain-control fields; every other family right after its flag.
+    let tns_after_gain_control = ics_info.family.is_ld();
+    let mut tns_data = if tns_data_present && !tns_after_gain_control {
         Some(TnsData::parse_family(
             reader,
             ics_info.family,
@@ -823,6 +832,13 @@ fn parse_tools(
     } else {
         None
     };
+    if tns_data_present && tns_after_gain_control {
+        tns_data = Some(TnsData::parse_family(
+            reader,
+            ics_info.family,
+            ics_info.window_sequence,
+        )?);
+    }
 
     let spectral_data_bit_offset = reader.bit_position() - start;
     Ok(ToolDispatch {
