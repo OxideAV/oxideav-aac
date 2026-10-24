@@ -87,7 +87,7 @@ impl LoasWriter {
         w.write_u32(0, 6); // numSubFrames = 0
         w.write_u32(0, 4); // numProgram = 0
         w.write_u32(0, 3); // numLayer = 0
-                           // ascLen = LatmGetValue(); AudioSpecificConfig(); fillBits.
+        // ascLen = LatmGetValue(); AudioSpecificConfig(); fillBits.
         write_latm_value(w, self.asc_bits);
         let mut left = self.asc_bits as usize;
         for &b in &self.asc {
@@ -108,7 +108,7 @@ impl LoasWriter {
     /// frame (`0x2B7` + length + `AudioMuxElement(1)`).
     pub fn write_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let mut w = BitWriter::new();
-        let send_config = self.frames % u64::from(self.mux_interval) == 0;
+        let send_config = self.frames.is_multiple_of(u64::from(self.mux_interval));
         w.write_bit(!send_config); // useSameStreamMux
         if send_config {
             self.write_stream_mux_config(&mut w);

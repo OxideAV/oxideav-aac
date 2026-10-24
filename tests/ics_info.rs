@@ -3,11 +3,11 @@
 //! `oxideav_core::bits::BitWriter` so the tests do not depend on
 //! any external AAC encoder.
 
-use oxideav_aac::ics_info::{
-    derive_window_grouping, IcsInfo, LtpData, WindowSequence, WindowShape, MAX_LTP_LONG_SFB,
-    NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW, PRED_SFB_MAX,
-};
 use oxideav_aac::Error;
+use oxideav_aac::ics_info::{
+    IcsInfo, LtpData, MAX_LTP_LONG_SFB, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW, PRED_SFB_MAX,
+    WindowSequence, WindowShape, derive_window_grouping,
+};
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Build a minimal long-sequence ics_info for AOT 2 (LC):
@@ -167,7 +167,7 @@ fn main_predictor_branch_reset_false() {
     bw.write_u32(10, 6); // max_sfb
     bw.write_bit(true); // predictor_data_present
     bw.write_bit(false); // predictor_reset = 0
-                         // 10 prediction_used bits, alternating 1010101010
+    // 10 prediction_used bits, alternating 1010101010
     for i in 0..10u32 {
         bw.write_bit(i % 2 == 0);
     }
@@ -221,7 +221,7 @@ fn ltp_branch_aot4_long_sequence() {
     bw.write_u32(20, 6);
     bw.write_bit(true); // predictor_data_present
     bw.write_bit(true); // Table 4.6 nested ltp_data_present
-                        // ltp_data() — non-LD branch
+    // ltp_data() — non-LD branch
     bw.write_u32(0x123, 11); // ltp_lag
     bw.write_u32(5, 3); // ltp_coef
     for _ in 0..20 {
@@ -253,7 +253,7 @@ fn ltp_branch_aot4_eight_short_skips_long_used_loop() {
     let mut bw = BitWriter::new();
     bw.write_u32(0x7FE, 11); // ltp_lag
     bw.write_u32(2, 3); // ltp_coef
-                        // No ltp_long_used in short branch.
+    // No ltp_long_used in short branch.
     let buf = bw.finish();
     let mut br = BitReader::new(&buf);
     let ltp = parse_ltp_data(&mut br, 4, WindowSequence::EightShort, 14).unwrap();
@@ -327,7 +327,7 @@ fn common_window_reads_second_ltp_present_flag_and_body() {
     bw.write_u32(8, 6);
     bw.write_bit(true); // predictor_data_present
     bw.write_bit(true); // Table 4.6 nested ltp_data_present
-                        // first ltp_data
+    // first ltp_data
     bw.write_u32(0x111, 11);
     bw.write_u32(1, 3);
     for _ in 0..8 {
@@ -486,7 +486,7 @@ fn unexpected_end_in_long_branch_surfaces_error() {
     let raw = bw.finish();
     // Use exactly the 10 bits — truncate.
     let buf = vec![raw[0], raw[1] & 0xC0]; // 2 bytes, last 6 bits already 0 but unused.
-                                           // Actually, easier: use just one byte (8 bits) and read 10 → underflow.
+    // Actually, easier: use just one byte (8 bits) and read 10 → underflow.
     let one_byte = vec![raw[0]];
     let mut br = BitReader::new(&one_byte);
     let res = IcsInfo::parse(&mut br, 2, 4, false);

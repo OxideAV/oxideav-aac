@@ -53,7 +53,9 @@ fuzz_target!(|data: &[u8]| {
                 r[n][k] = Complex::new(val(it.next().unwrap()), val(it.next().unwrap()));
             }
         }
-        let fr = enc.encode_frame(&l, &r).expect("encoder never fails on shaped input");
+        let fr = enc
+            .encode_frame(&l, &r)
+            .expect("encoder never fails on shaped input");
         let mut rd = BitReader::new(&fr.payload);
         let back = PsData::parse(&mut rd, dec_cfg.as_ref())
             .expect("payload parses")

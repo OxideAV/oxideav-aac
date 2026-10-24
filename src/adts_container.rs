@@ -42,7 +42,7 @@ use oxideav_core::{
     Packet, ProbeData, ReadSeek, Result, SampleFormat, StreamInfo, TimeBase, WriteSeek,
 };
 
-use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ};
+use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ, AdtsHeader};
 use crate::asc::AudioSpecificConfig;
 use crate::codec_decoder::CODEC_ID_STR;
 
@@ -99,11 +99,7 @@ pub fn probe(p: &ProbeData) -> u8 {
         {
             // Two chained frames: still leave headroom for containers
             // with a real magic number.
-            if ext_ok {
-                100
-            } else {
-                90
-            }
+            if ext_ok { 100 } else { 90 }
         }
         // The probe window ended inside the first frame.
         None if next >= p.buf.len() => {
@@ -399,7 +395,7 @@ impl AdtsMuxer {
                 c => {
                     return Err(Error::invalid(format!(
                         "adts muxer: {c} channels have no ADTS channel_configuration"
-                    )))
+                    )));
                 }
             };
             (2u8, rate, cfg)

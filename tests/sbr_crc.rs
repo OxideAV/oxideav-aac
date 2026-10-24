@@ -16,19 +16,19 @@
 //! * a corrupted *covered* payload bit (the structurally inert
 //!   `bs_reserved` header field) surfaces `Error::SbrCrcMismatch`.
 
+use oxideav_aac::Error;
 use oxideav_aac::adts_crc::sbr_crc;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::sbr_freq_bands::HiLoTables;
 use oxideav_aac::sbr_grid::FrameClass;
 use oxideav_aac::sbr_header::SbrHeader;
-use oxideav_aac::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+use oxideav_aac::sbr_huffman::{SbrHuffContext, env_tables, noise_tables};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::spectral_data::SpectralData;
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 const AOT_LC: u8 = 2;
@@ -292,7 +292,7 @@ fn corrupt_bs_fill_bit_is_rejected() {
     write_minimal_sce_sbr(&mut sw, &bands);
     let used = 4 + 10 + sw.bit_position(); // ext type + CRC + SBR bits
     assert!(
-        used % 8 != 0,
+        !used.is_multiple_of(8),
         "recipe must leave bs_fill_bits to exercise the covered tail"
     );
     let fil = build_sbr_fil_payload(true, false);

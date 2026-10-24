@@ -5,6 +5,7 @@
 //! gain_control_data) into a single channel-element body parse /
 //! write cycle, stopping just before `spectral_data()`.
 
+use oxideav_aac::Error;
 use oxideav_aac::gain_control_data::{GainAdjust, GainBand, GainControlData, GainWindow};
 use oxideav_aac::ics_body::IcsBody;
 use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape};
@@ -12,7 +13,6 @@ use oxideav_aac::pulse_data::{Pulse, PulseData};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
 use oxideav_aac::section_data::{Section, SectionData};
 use oxideav_aac::tns_data::{TnsData, TnsFilter, TnsWindow};
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 // ===========================================================================

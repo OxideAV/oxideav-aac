@@ -79,14 +79,14 @@ use crate::extension_payload::ExtensionPayload;
 use crate::filterbank::Filterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::{
-    derive_window_grouping_family, parse_ltp_data, write_ltp_data, IcsInfo, LtpData,
-    WindowSequence, WindowShape,
+    IcsInfo, LtpData, WindowSequence, WindowShape, derive_window_grouping_family, parse_ltp_data,
+    write_ltp_data,
 };
-use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
+use crate::intensity_stereo::{IntensityPairSpectra, apply_intensity_stereo};
 use crate::ltp::LtpState;
-use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
-use crate::pns::{apply_pns, apply_pns_pair, gen_rand_vector, PnsChannel};
-use crate::scale_factor_data::{accumulate, AbsoluteScaleFactors};
+use crate::ms_stereo::{ChannelPairSpectra, MsMaskPresent, apply_ms_stereo};
+use crate::pns::{PnsChannel, apply_pns, apply_pns_pair, gen_rand_vector};
+use crate::scale_factor_data::{AbsoluteScaleFactors, accumulate};
 use crate::section_data::{INTENSITY_HCB, INTENSITY_HCB2, NOISE_HCB};
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::FrameFamily;
@@ -229,11 +229,7 @@ impl ScalableConfig {
     }
 
     fn channels_of_layer(&self, lay: usize) -> usize {
-        if self.layer_stereo[lay] {
-            2
-        } else {
-            1
-        }
+        if self.layer_stereo[lay] { 2 } else { 1 }
     }
 }
 
@@ -1328,10 +1324,10 @@ fn combine_layers(
         }
         // First mono layer's TNS serves the M output (Table 4.158).
         let first_mono = (0..n_layers).find(|&l| !cfg.layer_stereo[l]);
-        if let Some(l0) = first_mono {
-            if let Some(tns) = frame.layers[l0].tns.first().and_then(|t| t.as_ref()) {
-                tns_decode_frame_ics(&mut m_acc, tns, &frame.layers[l0].ics, cfg.aot, fs)?;
-            }
+        if let Some(l0) = first_mono
+            && let Some(tns) = frame.layers[l0].tns.first().and_then(|t| t.as_ref())
+        {
+            tns_decode_frame_ics(&mut m_acc, tns, &frame.layers[l0].ics, cfg.aot, fs)?;
         }
         return Ok(CombinedSpectra { chans: vec![m_acc] });
     }

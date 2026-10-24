@@ -458,7 +458,7 @@ impl HiLoTables {
 
         // fTableLow(k) = fTableHigh(i(k)):
         //   i(0) = 0; i(k) = 2*k - ((1 - (-1)^NHigh)/2)  for k != 0.
-        let parity = (1 - if n_high % 2 == 0 { 1 } else { -1 }) / 2; // 0 if NHigh even, 1 if odd
+        let parity = (1 - if n_high.is_multiple_of(2) { 1 } else { -1 }) / 2; // 0 if NHigh even, 1 if odd
         let mut f_table_low = Vec::with_capacity(n_low + 1);
         for k in 0..=n_low {
             let i_k = if k == 0 {
@@ -561,7 +561,7 @@ mod tests {
         // bs_stop_freq == 14 -> min(64, 2*k0).
         assert_eq!(k2(88200, 14, 10).unwrap(), 20);
         assert_eq!(k2(88200, 14, 40).unwrap(), 64); // capped
-                                                    // bs_stop_freq == 15 -> min(64, 3*k0).
+        // bs_stop_freq == 15 -> min(64, 3*k0).
         assert_eq!(k2(88200, 15, 10).unwrap(), 30);
         assert_eq!(k2(88200, 15, 30).unwrap(), 64); // capped
     }
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(*fm.first().unwrap(), 5);
         assert_eq!(*fm.last().unwrap(), 12);
         assert_eq!(fm.len(), 7); // numBands + 1
-                                 // Strictly increasing (all vDk > 0).
+        // Strictly increasing (all vDk > 0).
         assert!(fm.windows(2).all(|w| w[1] > w[0]));
     }
 

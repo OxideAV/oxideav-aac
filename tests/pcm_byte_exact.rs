@@ -54,7 +54,9 @@ fn read_wav_s16(path: &PathBuf) -> Option<Vec<i16>> {
             let end = (body_start + sz).min(d.len());
             return Some(
                 d[body_start..end]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect(),
             );

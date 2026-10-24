@@ -75,10 +75,10 @@ use oxideav_core::{
     Confidence, Decoder, Error, Frame, Packet, ProbeContext, Result, SampleFormat,
 };
 
-use crate::adts::{AdtsHeader, ADTS_HEADER_BYTES_NO_CRC};
+use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, AdtsHeader};
 use crate::asc::AudioSpecificConfig;
 use crate::decode::{DecodedFrame, StreamDecoder};
-use crate::latm::{LoasDecoder, AUDIO_SYNC_STREAM_SYNCWORD};
+use crate::latm::{AUDIO_SYNC_STREAM_SYNCWORD, LoasDecoder};
 
 /// Codec id under which [`register_codecs`] installs this decoder.
 pub const CODEC_ID_STR: &str = "aac";
@@ -382,7 +382,7 @@ impl AacDecoder {
             None => {
                 return Err(Error::invalid(
                     "oxideav-aac: raw access unit without config",
-                ))
+                ));
             }
         };
         let decoded = if asc.aot == 6 || asc.aot == 20 {
@@ -432,7 +432,7 @@ impl AacDecoder {
                     return Err(Error::invalid(format!(
                         "oxideav-aac: bare access units without AudioSpecificConfig and \
                          {channels} channels (no Table 1.19 default layout)"
-                    )))
+                    )));
                 }
             };
             if !crate::adts::ADTS_SAMPLE_RATES_HZ.contains(&rate) {
@@ -815,7 +815,7 @@ mod tests {
         dec.send_packet(&pkt).expect("send_packet");
         let mut trait_pcm: Vec<i16> = Vec::new();
         while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            for c in a.data[0].chunks_exact(2) {
+            for c in a.data[0].as_chunks::<2>().0 {
                 trait_pcm.push(i16::from_le_bytes([c[0], c[1]]));
             }
         }
@@ -919,7 +919,7 @@ mod tests {
         for pkt in &packets {
             dec.send_packet(pkt).expect("send_packet");
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for c in a.data[0].chunks_exact(2) {
+                for c in a.data[0].as_chunks::<2>().0 {
                     trait_pcm.push(i16::from_le_bytes([c[0], c[1]]));
                 }
             }

@@ -830,8 +830,8 @@ mod tests {
         let mut st = EnvAdjustState::new();
         let y = adjust(&x, &p, &mut st).unwrap();
         let s = 64.0f64.sqrt() * MAX_BOOST; // SM boosted (ECurr = 0)
-                                            // m + kx = 11 (odd) → imaginary part sign-flipped.
-                                            // c = 0: φ = (1, 0); c = 1: φ = (0, 1) → im = −s.
+        // m + kx = 11 (odd) → imaginary part sign-flipped.
+        // c = 0: φ = (1, 0); c = 1: φ = (0, 1) → im = −s.
         let y0 = y[T_HF_ADJ][11];
         let y1 = y[T_HF_ADJ + 1][11];
         assert!((y0.re - s).abs() < 1e-9 && y0.im.abs() < 1e-12, "{y0:?}");

@@ -211,10 +211,10 @@ fn witness_overlap(
     key: (u8, u8),
     pcm: &[f64],
 ) {
-    if let Some(prev) = prev_pcm.get(&key) {
-        if prev != pcm {
-            stats.saw_overlap_coupling = true;
-        }
+    if let Some(prev) = prev_pcm.get(&key)
+        && prev != pcm
+    {
+        stats.saw_overlap_coupling = true;
     }
     prev_pcm.insert(key, pcm.to_vec());
 }

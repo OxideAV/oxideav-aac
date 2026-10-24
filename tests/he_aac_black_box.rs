@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::he_aac_encoder::{HeAacConfig, HeAacEncoder, HE_FRAME_LEN};
+use oxideav_aac::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
 use oxideav_aac::sbr_qmf::EncoderAnalysisQmf;
 
 fn ffmpeg() -> Option<&'static str> {
@@ -48,7 +48,9 @@ fn read_wav(path: &PathBuf) -> Option<(Vec<i16>, usize, u32)> {
         if cid == b"data" {
             let end = (body + sz).min(d.len());
             let pcm = d[body..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             return Some((pcm, channels.max(1), rate));
@@ -68,7 +70,7 @@ fn band_energies(pcm: &[i16], channels: usize, c: usize) -> [f64; 64] {
         .collect();
     let mut bank = EncoderAnalysisQmf::new();
     let mut e = [0.0f64; 64];
-    for slot in mono.chunks_exact(64) {
+    for slot in mono.as_chunks::<64>().0 {
         let cols = bank.push_slot(slot).unwrap();
         for (k, v) in cols.iter().enumerate() {
             e[k] += v.norm_sqr();
@@ -406,7 +408,9 @@ fn reference_binary_accepts_triple_onset_varvar_frames() {
         }
     }
     stream.extend_from_slice(&enc.finish().unwrap());
-    eprintln!("five-envelope frames {five}, three-onset frames {three_onsets}, mixed-resolution frames {mixed_res}");
+    eprintln!(
+        "five-envelope frames {five}, three-onset frames {three_onsets}, mixed-resolution frames {mixed_res}"
+    );
     assert!(five > 0, "no five-envelope frame");
     assert!(three_onsets > 0, "no frame with three onset envelopes");
     assert!(mixed_res > 0, "no frame with per-envelope resolution");

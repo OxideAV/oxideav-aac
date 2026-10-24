@@ -85,12 +85,12 @@ use crate::dequant::rescale_spectrum;
 use crate::filterbank::Filterbank;
 use crate::ics_body::IcsBody;
 use crate::ics_info::IcsInfo;
-use crate::intensity_stereo::{apply_intensity_stereo, IntensityPairSpectra};
+use crate::intensity_stereo::{IntensityPairSpectra, apply_intensity_stereo};
 use crate::ltp::LtpState;
-use crate::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
-use crate::pns::{apply_pns, apply_pns_pair, gen_rand_vector, PnsChannel};
+use crate::ms_stereo::{ChannelPairSpectra, MsMaskPresent, apply_ms_stereo};
+use crate::pns::{PnsChannel, apply_pns, apply_pns_pair, gen_rand_vector};
 use crate::predictor::PredictorBank;
-use crate::scale_factor_data::{accumulate, AbsoluteScaleFactorEntry, AbsoluteScaleFactors};
+use crate::scale_factor_data::{AbsoluteScaleFactorEntry, AbsoluteScaleFactors, accumulate};
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
 use crate::ssr::SsrChannelDecoder;
@@ -155,10 +155,10 @@ where
             // Every non-ZERO_HCB band consumes exactly one wire record,
             // in lock-step with the accumulate() walk.
             let entry = rec.next().ok_or(Error::ElementDecodeInvalid)?;
-            if sfb < max_sfb {
-                if let Some(v) = pick(entry) {
-                    row[sfb] = v;
-                }
+            if sfb < max_sfb
+                && let Some(v) = pick(entry)
+            {
+                row[sfb] = v;
             }
         }
         out.push(row);
@@ -652,6 +652,20 @@ impl ElementDecoder {
         fs_index: u8,
         coupling: &[CouplingApply<'_>],
     ) -> Result<Vec<f64>> {
+        self.decode_channel(0, ch, aot, fs_index, coupling)
+    }
+
+    /// One channel through PNS, LTP, TNS and the filterbank of slot
+    /// `slot`, with no pair tools: an SCE, or a CPE channel without
+    /// `common_window`.
+    fn decode_channel(
+        &mut self,
+        slot: usize,
+        ch: &ChannelInput<'_>,
+        aot: u8,
+        fs_index: u8,
+        coupling: &[CouplingApply<'_>],
+    ) -> Result<Vec<f64>> {
         let (mut spec, abs) = reconstruct_pre_pair(ch, fs_index)?;
         let max_sfb = ch.ics_info.max_sfb as usize;
 
@@ -675,10 +689,10 @@ impl ElementDecoder {
             ltp,
             aot,
             fs_index,
-            &mut self.filterbanks[0],
-            &mut self.ltp_states[0],
-            &mut self.predictor_banks[0],
-            &mut self.ssr_decoders[0],
+            &mut self.filterbanks[slot],
+            &mut self.ltp_states[slot],
+            &mut self.predictor_banks[slot],
+            &mut self.ssr_decoders[slot],
             coupling,
         )
     }
@@ -729,6 +743,23 @@ impl ElementDecoder {
         left_coupling: &[CouplingApply<'_>],
         right_coupling: &[CouplingApply<'_>],
     ) -> Result<(Vec<f64>, Vec<f64>)> {
+        // Without common_window each channel carries its own ics_info
+        // (window sequence, grouping and max_sfb may differ) and no M/S
+        // mask: the channels decode independently. Intensity bands still
+        // need the shared geometry below.
+        if left.ics_info != right.ics_info
+            && !right
+                .body
+                .section_data
+                .sfb_cb
+                .iter()
+                .flatten()
+                .any(|&cb| crate::section_data::Codebook::from_value(cb).is_intensity())
+        {
+            let out_left = self.decode_channel(0, left, aot, fs_index, left_coupling)?;
+            let out_right = self.decode_channel(1, right, aot, fs_index, right_coupling)?;
+            return Ok((out_left, out_right));
+        }
         // The §4.6.8 joint-stereo tools de-matrix the two channels
         // band-for-band, so they require a shared window geometry. The
         // shared-info CPE form guarantees this; reject a mismatch the
@@ -866,10 +897,8 @@ impl ElementDecoder {
 ///   its own `ics_info()` with the side info in `ltp_data` and
 ///   `ltp_data_pair == None`; the fall-through keeps that case working.
 fn ltp_for_channel(ics_info: &IcsInfo, is_pair_slot: bool) -> Option<&crate::ics_info::LtpData> {
-    if is_pair_slot {
-        if let Some(pair) = ics_info.ltp_data_pair.as_ref() {
-            return Some(pair);
-        }
+    if is_pair_slot && let Some(pair) = ics_info.ltp_data_pair.as_ref() {
+        return Some(pair);
     }
     ics_info.ltp_data.as_ref()
 }
@@ -897,7 +926,7 @@ mod tests {
     use super::*;
     use crate::ics_info::{WindowSequence, WindowShape};
     use crate::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
-    use crate::section_data::{Section, SectionData, INTENSITY_HCB, NOISE_HCB};
+    use crate::section_data::{INTENSITY_HCB, NOISE_HCB, Section, SectionData};
 
     // ---- band-indexed track expansion ----
 
@@ -1243,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_cpe_rejects_window_sequence_mismatch() {
+    fn decode_cpe_decodes_differing_window_sequences_independently() {
         let left_body = make_body(4, 2, &[0, 0, 0, 0]);
         let mut right_body = make_body(4, 2, &[0, 0, 0, 0]);
         // Give the right channel a different window sequence.
@@ -1263,12 +1292,12 @@ mod tests {
             ics_info: &right_ics,
             spectral: &right_spec,
         };
+        // No common_window: no joint-stereo tool runs, and each channel
+        // decodes with its own ics_info.
         let joint = CpeJointStereo::default();
         let mut dec = ElementDecoder::new();
-        assert!(matches!(
-            dec.decode_cpe(&left, &right, &joint, 2, 4),
-            Err(Error::ElementDecodeInvalid)
-        ));
+        let (l, r) = dec.decode_cpe(&left, &right, &joint, 2, 4).unwrap();
+        assert_eq!((l.len(), r.len()), (1024, 1024));
     }
 
     #[test]

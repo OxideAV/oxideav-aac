@@ -623,9 +623,9 @@ mod tests {
         assert_eq!(tns_max_bands_ld_512(3).unwrap(), 31); // 48000
         assert_eq!(tns_max_bands_ld_512(4).unwrap(), 32); // 44100
         assert_eq!(tns_max_bands_ld_512(5).unwrap(), 37); // 32000
-                                                          // The 512-sample row for 24 kHz / 22.05 kHz is 31 (one
-                                                          // higher than the 480 row); this is the row-by-row
-                                                          // contrast that justifies the two tables existing.
+        // The 512-sample row for 24 kHz / 22.05 kHz is 31 (one
+        // higher than the 480 row); this is the row-by-row
+        // contrast that justifies the two tables existing.
         assert_eq!(tns_max_bands_ld_512(6).unwrap(), 31); // 24000
         assert_eq!(tns_max_bands_ld_512(7).unwrap(), 31); // 22050
     }

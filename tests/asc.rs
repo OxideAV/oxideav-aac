@@ -2,12 +2,12 @@
 //! ASC buffers constructed via `oxideav_core::bits::BitWriter` so
 //! the tests do not depend on any external AAC encoder.
 
+use oxideav_aac::Error;
 use oxideav_aac::asc::{
     AacResilienceFlags, AudioSpecificConfig, BsacLayerSpec, FrameLength, SYNC_EXTENSION_TYPE_BITS,
     SYNC_EXTENSION_TYPE_PS, SYNC_EXTENSION_TYPE_SBR, TRAILING_EXTENSION_AOT_BSAC,
     TRAILING_EXTENSION_AOT_SBR,
 };
-use oxideav_aac::Error;
 use oxideav_core::bits::{BitReader, BitWriter};
 
 /// Build a minimal AAC-LC ASC: outer AOT = 2, channel config, frame
@@ -135,7 +135,7 @@ fn parses_he_aac_v1_explicit_sbr() {
     bw.write_u32(2, 4); // chan_cfg = stereo
     bw.write_u32(4, 4); // extension_sampling_frequency_index = 44100
     bw.write_u32(2, 5); // inner audioObjectType = LC
-                        // GASpecificConfig (inner)
+    // GASpecificConfig (inner)
     bw.write_bit(false);
     bw.write_bit(false);
     bw.write_bit(false);
@@ -184,11 +184,11 @@ fn channel_configuration_zero_requires_inline_pce() {
     bw.write_u32(2, 5); // AOT = LC
     bw.write_u32(4, 4); // sfi = 44100
     bw.write_u32(0, 4); // chan_cfg = 0 (PCE-defined)
-                        // GASpecificConfig start
+    // GASpecificConfig start
     bw.write_bit(false); // frameLengthFlag
     bw.write_bit(false); // dependsOnCoreCoder
     bw.write_bit(false); // extensionFlag
-                         // Inline PCE
+    // Inline PCE
     bw.write_u32(0, 4); // element_instance_tag
     bw.write_u32(1, 2); // object_type = LC
     bw.write_u32(4, 4); // sampling_frequency_index
@@ -300,13 +300,13 @@ fn build_er_aac_lc_asc(
     bw.write_bit(false); // frameLengthFlag
     bw.write_bit(false); // dependsOnCoreCoder
     bw.write_bit(true); // extensionFlag = 1 (shall be 1 for ER AOTs)
-                        // Extension body: no numOfSubFrame (AOT != 22),
-                        // resilience triplet for AOTs ∈ {17,19,20,23}.
+    // Extension body: no numOfSubFrame (AOT != 22),
+    // resilience triplet for AOTs ∈ {17,19,20,23}.
     bw.write_bit(section);
     bw.write_bit(scalefactor);
     bw.write_bit(spectral);
     bw.write_bit(false); // extensionFlag3
-                         // Tail epConfig — 2 bits.
+    // Tail epConfig — 2 bits.
     bw.write_u32(ep_config, 2);
     bw.finish()
 }
@@ -419,11 +419,11 @@ fn er_bsac_aot_22_has_num_of_sub_frame_and_layer_length() {
     bw.write_u32(22, 5); // outer AOT = ER BSAC
     bw.write_u32(4, 4); // sfi = 44100
     bw.write_u32(0, 4); // chan_cfg = 0 (BSAC carries an inline PCE)
-                        // GASpecificConfig
+    // GASpecificConfig
     bw.write_bit(false); // frameLengthFlag
     bw.write_bit(false); // dependsOnCoreCoder
     bw.write_bit(true); // extensionFlag = 1
-                        // Inline PCE because chan_cfg == 0.
+    // Inline PCE because chan_cfg == 0.
     bw.write_u32(0, 4); // element_instance_tag
     bw.write_u32(1, 2); // object_type
     bw.write_u32(4, 4); // sampling_frequency_index
@@ -438,11 +438,11 @@ fn er_bsac_aot_22_has_num_of_sub_frame_and_layer_length() {
     bw.write_bit(false); // matrix_mixdown_present
     bw.align_to_byte_zero(); // PCE byte_alignment()
     bw.write_u32(0, 8); // comment_field_bytes
-                        // Extension body:
+    // Extension body:
     bw.write_u32(7, 5); // numOfSubFrame
     bw.write_u32(0x123, 11); // layer_length
     bw.write_bit(false); // extensionFlag3
-                         // epConfig = 0.
+    // epConfig = 0.
     bw.write_u32(0, 2);
     let buf = bw.finish();
 
@@ -506,7 +506,7 @@ fn er_aac_scalable_aot_20_emits_both_layer_nr_and_resilience() {
     bw.write_bit(false);
     bw.write_bit(true); // extensionFlag = 1
     bw.write_u32(3, 3); // layerNr
-                        // Extension body resilience triplet.
+    // Extension body resilience triplet.
     bw.write_bit(false); // section
     bw.write_bit(true); // scalefactor
     bw.write_bit(false); // spectral
@@ -909,7 +909,7 @@ fn trailing_probe_not_run_on_outer_sbr_wrapper() {
     bw.write_u32(2, 4); // chan_cfg
     bw.write_u32(4, 4); // extension_sampling_frequency_index
     bw.write_u32(2, 5); // inner AOT = LC
-                        // inner GASpecificConfig
+    // inner GASpecificConfig
     bw.write_bit(false);
     bw.write_bit(false);
     bw.write_bit(false);

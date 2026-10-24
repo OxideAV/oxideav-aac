@@ -10,7 +10,7 @@
 
 use oxideav_aac::adts::AdtsHeader;
 use oxideav_aac::decode::StreamDecoder;
-use oxideav_aac::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
+use oxideav_aac::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
 
 /// Encode `pcm` and decode it back, returning the interleaved
 /// decoder output.
@@ -182,12 +182,14 @@ fn every_supported_sample_rate_produces_a_decodable_stream() {
     // 12 (7350 Hz) has no long-window band table and is rejected at
     // config time (7350 Hz content conventionally ships under index
     // 11 — see the staged corpus notes on the 8 kHz fixture).
-    assert!(StreamEncoder::new(EncoderConfig {
-        sample_rate: 7_350,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .is_err());
+    assert!(
+        StreamEncoder::new(EncoderConfig {
+            sample_rate: 7_350,
+            channels: 1,
+            bitrate: 96_000,
+        })
+        .is_err()
+    );
     for &rate in &[
         96_000u32, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
         8_000,
@@ -309,7 +311,9 @@ fn identical_channels_engage_ms_and_shrink_the_stream() {
     // Channel coherence: decoded L and R stay near-identical.
     let steady = &out[FRAME_LEN * 2..];
     let max_lr_diff = steady
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| (i32::from(p[0]) - i32::from(p[1])).abs())
         .max()
         .unwrap();
@@ -405,11 +409,7 @@ fn transient_input_switches_to_short_windows() {
             let quiet = (300.0 * (0.02 * i as f64).sin()) as i16;
             if (3 * FRAME_LEN..3 * FRAME_LEN + 400).contains(&i) {
                 // Sharp burst.
-                if i % 2 == 0 {
-                    28_000
-                } else {
-                    -28_000
-                }
+                if i % 2 == 0 { 28_000 } else { -28_000 }
             } else {
                 quiet
             }
@@ -476,11 +476,7 @@ fn stereo_transient_stream_roundtrips() {
     for i in 0..n {
         let base = (400.0 * (0.025 * i as f64).sin()) as i16;
         let burst = if (2 * FRAME_LEN..2 * FRAME_LEN + 300).contains(&i) {
-            if i % 2 == 0 {
-                24_000
-            } else {
-                -24_000
-            }
+            if i % 2 == 0 { 24_000 } else { -24_000 }
         } else {
             0
         };
@@ -719,7 +715,7 @@ fn anti_correlated_pair_uses_out_of_phase_book() {
     }
     let steady = &out[FRAME_LEN * 2..];
     let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
-    for p in steady.chunks_exact(2) {
+    for p in steady.as_chunks::<2>().0 {
         let (l, r) = (f64::from(p[0]), f64::from(p[1]));
         dot += l * r;
         el += l * l;
@@ -1026,7 +1022,9 @@ fn identical_noise_channels_emit_correlated_pns() {
     // Shared vectors + equal energies ⇒ near-identical channels.
     let steady = &out[FRAME_LEN * 2..];
     let max_lr_diff = steady
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| (i32::from(p[0]) - i32::from(p[1])).abs())
         .max()
         .unwrap();
@@ -1090,7 +1088,7 @@ fn independent_noise_channels_stay_uncorrelated() {
     }
     let steady = &out[FRAME_LEN * 2..];
     let (mut dot, mut el, mut er) = (0.0f64, 0.0f64, 0.0f64);
-    for p in steady.chunks_exact(2) {
+    for p in steady.as_chunks::<2>().0 {
         let (a, b) = (f64::from(p[0]), f64::from(p[1]));
         dot += a * b;
         el += a * a;

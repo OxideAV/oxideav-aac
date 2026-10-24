@@ -9,8 +9,8 @@
 //! no-op, and that the operation is its own structural inverse
 //! (`l' = m+s`, `r' = m-s`).
 
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
-use oxideav_aac::ms_stereo::{apply_ms_stereo, ChannelPairSpectra, MsMaskPresent};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
+use oxideav_aac::ms_stereo::{ChannelPairSpectra, MsMaskPresent, apply_ms_stereo};
 use oxideav_aac::swb_offset::long_window_offsets;
 
 const FS_44100: u8 = 4;

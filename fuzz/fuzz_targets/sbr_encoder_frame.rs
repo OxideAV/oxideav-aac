@@ -12,7 +12,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_aac::raw_data_block::IdSynEle;
-use oxideav_aac::sbr_encoder::{SbrEncoder, SbrEncoderConfig, NUM_TIME_SLOTS, NUM_TIME_SLOTS_960};
+use oxideav_aac::sbr_encoder::{NUM_TIME_SLOTS, NUM_TIME_SLOTS_960, SbrEncoder, SbrEncoderConfig};
 use oxideav_aac::sbr_extension::SbrExtensionData;
 use oxideav_aac::sbr_qmf::Complex;
 use oxideav_aac::sbr_time_grid::derive_time_grid;

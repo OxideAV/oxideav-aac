@@ -53,7 +53,7 @@ use crate::sbr_extension::SBR_CRC_BITS;
 use crate::sbr_freq_bands::HiLoTables;
 use crate::sbr_grid::{FrameClass, SbrDtdf, SbrGrid, SbrInvf};
 use crate::sbr_header::SbrHeader;
-use crate::sbr_huffman::{env_tables, noise_tables, SbrHuffContext};
+use crate::sbr_huffman::{SbrHuffContext, env_tables, noise_tables};
 use crate::{Error, Result};
 
 /// Write `sbr_header()` (Table 4.63). The extra blocks are emitted
@@ -235,11 +235,7 @@ pub fn sbr_huff_enc(w: &mut BitWriter, table: &[(u8, u32)], lav: i32, value: i32
 /// The Table 4.72 start-value width for an envelope.
 fn env_start_bits(coupling: bool, ch: bool, amp_res: bool) -> u32 {
     if coupling && ch {
-        if amp_res {
-            5
-        } else {
-            6
-        }
+        if amp_res { 5 } else { 6 }
     } else if amp_res {
         6
     } else {

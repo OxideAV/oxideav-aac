@@ -75,11 +75,7 @@ pub struct NoiseScalefactors {
 /// `1` otherwise.
 #[inline]
 fn inv_delta(coupling: bool, ch: bool) -> i32 {
-    if coupling && ch {
-        2
-    } else {
-        1
-    }
+    if coupling && ch { 2 } else { 1 }
 }
 
 /// `i(k)` for `r(l) = 1, g(l) = 0` (current high-res band `k` → ref
@@ -247,7 +243,7 @@ impl NoiseScalefactors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sbr_freq_bands::{k0, k2, master_table, HiLoTables};
+    use crate::sbr_freq_bands::{HiLoTables, k0, k2, master_table};
     use crate::sbr_grid::FrameClass;
 
     fn bands_44100() -> HiLoTables {

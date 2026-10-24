@@ -12,7 +12,7 @@ use oxideav_aac::asc::AacResilienceFlags;
 use oxideav_aac::decode::StreamDecoder;
 use oxideav_aac::hcr_decode::encode_reordered_spectral_data;
 use oxideav_aac::ics_body::IcsBody;
-use oxideav_aac::ics_info::{IcsInfo, WindowSequence, WindowShape, NUM_SWB_LONG_WINDOW};
+use oxideav_aac::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use oxideav_aac::latm::LoasDecoder;
 use oxideav_aac::raw_data_block::{FrameAssembler, IdSynEle};
 use oxideav_aac::scale_factor_data::{ScaleFactorData, ScaleFactorEntry};
@@ -50,15 +50,17 @@ fn long_ics_info(max_sfb: u8) -> IcsInfo {
 /// band) with bounded pseudo-random spectrum.
 fn make_channel(sfb_cbs: &[u8], global_gain: u8, seed: u32) -> (IcsBody, SpectralData) {
     let max_sfb = sfb_cbs.len() as u8;
-    let sections = vec![sfb_cbs
-        .iter()
-        .enumerate()
-        .map(|(sfb, &cb)| Section {
-            codebook: cb,
-            start: sfb as u8,
-            end: sfb as u8 + 1,
-        })
-        .collect()];
+    let sections = vec![
+        sfb_cbs
+            .iter()
+            .enumerate()
+            .map(|(sfb, &cb)| Section {
+                codebook: cb,
+                start: sfb as u8,
+                end: sfb as u8 + 1,
+            })
+            .collect(),
+    ];
     let entries: Vec<ScaleFactorEntry> = sfb_cbs
         .iter()
         .filter(|&&cb| cb != 0)
@@ -365,7 +367,7 @@ fn loas_er_stream_decodes() {
     w.write_u32(0xFF, 8); // latmBufferFullness
     w.write_bit(false); // otherDataPresent
     w.write_bit(false); // crcCheckPresent
-                        // PayloadLengthInfo: MuxSlotLengthBytes with 255-escapes.
+    // PayloadLengthInfo: MuxSlotLengthBytes with 255-escapes.
     let mut rem = er_payload.len();
     while rem >= 255 {
         w.write_u32(255, 8);

@@ -71,7 +71,9 @@ fn read_wav(path: &Path) -> Option<(Vec<i16>, usize, u32)> {
         if cid == b"data" {
             let end = (body + sz).min(d.len());
             let pcm = d[body..end]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             return Some((pcm, channels.max(1), rate));
@@ -144,7 +146,9 @@ fn transients(seconds: f64, fs: u32) -> Vec<i16> {
 }
 
 fn mono_sum(pcm: &[i16]) -> Vec<f64> {
-    pcm.chunks_exact(2)
+    pcm.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| f64::from(c[0]) + f64::from(c[1]))
         .collect()
 }
@@ -196,7 +200,12 @@ fn band_noise(input: &[i16], out: &[i16]) -> BandNoise {
             .collect();
         let mut qa = EncoderAnalysisQmf::new();
         let mut qb = EncoderAnalysisQmf::new();
-        for (sa, sb) in a.chunks_exact(64).zip(b.chunks_exact(64)) {
+        for (sa, sb) in a
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .zip(b.as_chunks::<64>().0.iter())
+        {
             let xa = qa.push_slot(sa).unwrap();
             let xb = qb.push_slot(sb).unwrap();
             for k in 0..64 {
@@ -311,7 +320,7 @@ fn decoder_parity(a: &[i16], b: &[i16]) -> (f64, f64) {
                 .map(|&v| f64::from(v))
                 .collect();
             let mut q = EncoderAnalysisQmf::new();
-            for slot in mono.chunks_exact(64) {
+            for slot in mono.as_chunks::<64>().0 {
                 for (k, v) in q.push_slot(slot).unwrap().iter().enumerate() {
                     e[k] += v.norm_sqr();
                 }
