@@ -46,6 +46,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Apple's decoder emits them (#26, ropoctl). A block that does not carry
   exactly the PCE's elements fails with `ElementDecodeInvalid`; a
   `channelConfiguration == 0` stream with no PCE keeps its element order.
+- `StreamDecoder::set_reject_coupling` (off by default): a block that
+  carries a coupling channel element fails with
+  `UnsupportedElementSkip(2)` before the element is parsed, as Apple's
+  decoder refuses such streams (#27, ropoctl). Coupling decodes as
+  before otherwise.
 
 ### Fixed
 
