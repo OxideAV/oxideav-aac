@@ -575,6 +575,23 @@ impl HeAacEncoder {
         self.encode_hops(&hops)
     }
 
+    /// [`HeAacEncoder::encode_frame`] for float PCM: `interleaved`
+    /// holds at most `2048 × channels` samples normalised to ±1.0 (1.0
+    /// is 32768 on the `i16` axis), coded without rounding to 16 bits.
+    pub fn encode_frame_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        let ch = usize::from(self.config.channels);
+        if interleaved.len() > HE_FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut hops: Vec<Vec<f64>> = vec![vec![0.0; HE_FRAME_LEN]; ch];
+        for (j, hop) in hops.iter_mut().enumerate() {
+            for (n, v) in hop.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *v = interleaved[n * ch + j] * 32768.0;
+            }
+        }
+        self.encode_hops(&hops)
+    }
+
     fn encode_hops(&mut self, hops: &[Vec<f64>]) -> Result<Vec<u8>> {
         // HE-AAC v2: stereo analysis + downmix, the mono hop feeding
         // the v1 path below; the PS payload rides in the SBR
@@ -611,15 +628,9 @@ impl HeAacEncoder {
         let sbr_frame = self.sbr.encode_frame_with_extension(&refs, extension)?;
         let fills = vec![sbr_frame.payload.clone()];
         self.last_sbr = Some(sbr_frame);
-        // Core encode (interleaved S16 on the ±32768 axis).
-        let mut inter = Vec::with_capacity(FRAME_LEN * ch);
-        for n in 0..FRAME_LEN {
-            for pcm in core_pcm.iter() {
-                inter.push(crate::pcm::to_s16(pcm[n]));
-            }
-        }
+        // Core encode (planar, on the ±32768 axis).
         self.frames += 1;
-        self.core.encode_frame_with_fills(&inter, &fills)
+        self.core.encode_planar_with_fills(&core_pcm, &fills)
     }
 
     /// Flush: one trailing frame covering the final core overlap (and
@@ -689,6 +700,22 @@ impl HeAacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_input_codes_like_i16_input() {
+        let pcm: Vec<i16> = (0..HE_FRAME_LEN * 2 * 3)
+            .map(|i| ((i as f64 * 0.013).sin() * 9000.0 + (i as f64 * 0.31).cos() * 3000.0) as i16)
+            .collect();
+        let float: Vec<f64> = pcm.iter().map(|&v| f64::from(v) / 32768.0).collect();
+        let mut a = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+        let mut b = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+        for (x, y) in pcm
+            .chunks(HE_FRAME_LEN * 2)
+            .zip(float.chunks(HE_FRAME_LEN * 2))
+        {
+            assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
+        }
+    }
 
     #[test]
     fn config_validation() {

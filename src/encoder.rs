@@ -804,18 +804,11 @@ impl StreamEncoder {
         Ok(frame)
     }
 
-    /// [`StreamEncoder::encode_frame`] with `extension_payload()` fill
-    /// elements interleaved into the `raw_data_block()`: `fills[i]` is
-    /// emitted as a `fill_element()` immediately after the `i`-th
-    /// element of the Table 1.19 plan (an empty entry emits nothing).
-    /// The fill bytes are charged against the frame's byte budget so
-    /// the rate loop leaves room for them. This is how the HE-AAC
-    /// encoder attaches its SBR payload to each SCE / CPE.
-    pub(crate) fn encode_frame_with_fills(
-        &mut self,
-        interleaved: &[i16],
-        fills: &[Vec<u8>],
-    ) -> Result<Vec<u8>> {
+    /// [`StreamEncoder::encode_frame`] for float PCM: `interleaved`
+    /// holds at most `1024 × channels` samples normalised to ±1.0
+    /// (1.0 is 32768 on the `i16` axis), which are coded as they are,
+    /// without rounding to 16 bits.
+    pub fn encode_frame_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
         if interleaved.len() > FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
@@ -824,9 +817,35 @@ impl StreamEncoder {
         for (j, chan) in cur.iter_mut().enumerate() {
             let src = self.element_src[j];
             for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
-                *slot = f64::from(interleaved[n * ch + src]);
+                *slot = interleaved[n * ch + src] * 32768.0;
             }
         }
+        let frame = self.encode_hop(&cur, &[])?;
+        self.history = cur;
+        Ok(frame)
+    }
+
+    /// One hop of planar PCM on the `i16` axis (one `FRAME_LEN` hop per
+    /// channel in canonical input order, coded without rounding to 16
+    /// bits) with `extension_payload()` fill elements interleaved into
+    /// the `raw_data_block()`: `fills[i]` is emitted as a
+    /// `fill_element()` immediately after the `i`-th element of the
+    /// Table 1.19 plan (an empty entry emits nothing). The fill bytes
+    /// are charged against the frame's byte budget so the rate loop
+    /// leaves room for them. This is how the HE-AAC encoder attaches its
+    /// SBR payload to each SCE / CPE.
+    pub(crate) fn encode_planar_with_fills(
+        &mut self,
+        planar: &[Vec<f64>],
+        fills: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
+        let ch = self.config.channels as usize;
+        if planar.len() != ch || planar.iter().any(|hop| hop.len() != FRAME_LEN) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let cur: Vec<Vec<f64>> = (0..ch)
+            .map(|j| planar[self.element_src[j]].clone())
+            .collect();
         let frame = self.encode_hop(&cur, fills)?;
         self.history = cur;
         Ok(frame)
@@ -2702,6 +2721,24 @@ fn quantize_channel_short_grouped(
 mod tests {
     use super::*;
     use crate::dequant::{inverse_quantize, scale_factor_gain};
+
+    #[test]
+    fn float_input_codes_like_i16_input() {
+        let pcm: Vec<i16> = (0..FRAME_LEN * 2 * 3)
+            .map(|i| ((i as f64 * 0.021).sin() * 12000.0) as i16)
+            .collect();
+        let float: Vec<f64> = pcm.iter().map(|&v| f64::from(v) / 32768.0).collect();
+        let config = EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+        };
+        let mut a = StreamEncoder::new(config).unwrap();
+        let mut b = StreamEncoder::new(config).unwrap();
+        for (x, y) in pcm.chunks(FRAME_LEN * 2).zip(float.chunks(FRAME_LEN * 2)) {
+            assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
+        }
+    }
 
     #[test]
     fn quantize_coef_inverts_dequant_within_rounding() {
