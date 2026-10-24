@@ -8,6 +8,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `forward_mdct` / `imdct` run in `O(N log N)` through a DCT-IV on an
+  `N/4`-point FFT instead of the direct `O(N²)` sums, which had every
+  encode and decode spending its time in `cos` (a 5.1 encode ran at a
+  tenth of real time). The direct sums stay as the test oracle.
 - edition 2024, MSRV 1.95.
 
 ### Added
