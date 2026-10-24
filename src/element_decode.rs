@@ -614,6 +614,17 @@ impl ElementDecoder {
         }
     }
 
+    /// A fresh element decoder whose channels run the ER AAC ELD
+    /// low-delay filterbank (§4.6.20) of the 512- or 480-line family.
+    pub fn new_low_delay(family: crate::swb_offset::FrameFamily) -> Result<Self> {
+        let mut decoder = Self::new_family(family);
+        decoder.filterbanks = [
+            Filterbank::new_low_delay(family)?,
+            Filterbank::new_low_delay(family)?,
+        ];
+        Ok(decoder)
+    }
+
     /// A fresh element decoder with an explicit PNS generator seed.
     /// Per §4.6.13.3 the seed only affects the noise *phase*, not the
     /// (spec-determined) per-band energy.

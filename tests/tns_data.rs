@@ -785,7 +785,7 @@ fn explicit_width_roundtrip_1_6_5() {
 
 /// The family dispatch is exactly the explicit-width call with
 /// [`field_widths`]-style triples: a wire written by `write_widths`
-/// with the reduced `1 / 4 / 3` column parses identically through
+/// with the long-window `2 / 6 / 5` column parses identically through
 /// `parse_family` under an LD family.
 #[test]
 fn family_dispatch_equals_explicit_widths() {
@@ -797,7 +797,7 @@ fn family_dispatch_equals_explicit_widths() {
         }],
     };
     let mut bw = BitWriter::new();
-    td.write_widths(&mut bw, (1, 4, 3), WindowSequence::OnlyLong)
+    td.write_widths(&mut bw, (2, 6, 5), WindowSequence::OnlyLong)
         .unwrap();
     let buf_explicit = bw.finish();
 
