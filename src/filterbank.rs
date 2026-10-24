@@ -436,6 +436,10 @@ pub struct Filterbank {
     /// frame: per §4.6.11.3.2 the first block's left and right halves
     /// share its own `window_shape`.
     prev_shape: Option<WindowShape>,
+    /// The ER AAC ELD low-delay filterbank (§4.6.20) in place of the
+    /// MDCT one: `overlap` then holds the windowed contributions of
+    /// the three previous blocks to the next `3N` output samples.
+    low_delay: bool,
 }
 
 impl Default for Filterbank {
@@ -461,7 +465,22 @@ impl Filterbank {
             family,
             overlap: vec![0.0f64; family.frame_len()],
             prev_shape: None,
+            low_delay: false,
         }
+    }
+
+    /// A fresh ER AAC ELD low-delay filterbank (§4.6.20) for the
+    /// 512- or 480-line family.
+    pub fn new_low_delay(family: FrameFamily) -> Result<Self> {
+        if !family.is_ld() {
+            return Err(Error::FilterbankInvalid);
+        }
+        Ok(Filterbank {
+            family,
+            overlap: vec![0.0f64; 3 * family.frame_len()],
+            prev_shape: None,
+            low_delay: true,
+        })
     }
 
     /// The [`FrameFamily`] this filterbank was constructed for.
@@ -519,6 +538,9 @@ impl Filterbank {
         if ics_info.family != self.family {
             return Err(Error::FilterbankInvalid);
         }
+        if self.low_delay {
+            return self.synthesize_low_delay(spec);
+        }
         let z = self.windowed_signal(spec, ics_info)?;
         debug_assert_eq!(z.len(), self.family.long_transform_len());
 
@@ -537,6 +559,49 @@ impl Filterbank {
         // §4.6.11.3.2: the left-half shape of the *next* block is this
         // block's window_shape.
         self.prev_shape = Some(ics_info.window_shape);
+        Ok(out)
+    }
+
+    /// §4.6.20 — the ELD low-delay synthesis of one `N`-line block:
+    /// the inverse transform with phase `n0 = (-N/2 + 1)/2` and scale
+    /// `-2/N` (the MDCT transform's output delayed by `3N/4`), extended
+    /// to `4N` samples by `y[n + 2N] = -y[n]`, windowed by the `4N`
+    /// low-delay window, and overlap-added with the three previous
+    /// blocks: `out[n] = z[i][n] + z[i-1][n + N] + z[i-2][n + 2N] +
+    /// z[i-3][n + 3N]`.
+    fn synthesize_low_delay(&mut self, spec: &[f64]) -> Result<Vec<f64>> {
+        let n = self.family.frame_len();
+        if spec.len() != n {
+            return Err(Error::FilterbankInvalid);
+        }
+        let window: &[f64] = match self.family {
+            FrameFamily::Ld512 => &crate::eld_window::LD_WINDOW_512,
+            _ => &crate::eld_window::LD_WINDOW_480,
+        };
+        let x = imdct(spec, 2 * n);
+        let shift = 3 * n / 4;
+        let y = |m: usize| -> f64 {
+            let base = m % (2 * n);
+            let value = if base < shift {
+                x[base + 2 * n - shift]
+            } else {
+                -x[base - shift]
+            };
+            if m < 2 * n { value } else { -value }
+        };
+        // z[m] for m < window.len(); the window is zero beyond.
+        let z: Vec<f64> = window.iter().enumerate().map(|(m, &w)| w * y(m)).collect();
+        let out: Vec<f64> = (0..n).map(|m| z[m] + self.overlap[m]).collect();
+        let mut next = vec![0.0f64; 3 * n];
+        for (k, slot) in next.iter_mut().enumerate() {
+            let carried = if k + n < 3 * n {
+                self.overlap[k + n]
+            } else {
+                0.0
+            };
+            *slot = carried + z.get(k + n).copied().unwrap_or(0.0);
+        }
+        self.overlap = next;
         Ok(out)
     }
 
@@ -1545,5 +1610,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The ELD low-delay synthesis: one block's coefficients reach the
+    /// output over four blocks (the window's 4N span, its last N/4
+    /// zero), and the overlap state carries the three later blocks.
+    #[test]
+    fn low_delay_block_spans_four_frames() {
+        for family in [
+            crate::swb_offset::FrameFamily::Ld512,
+            crate::swb_offset::FrameFamily::Ld480,
+        ] {
+            let n = family.frame_len();
+            let mut fb = Filterbank::new_low_delay(family).unwrap();
+            let mut info = long_info(WindowShape::Sine, WindowSequence::OnlyLong);
+            info.family = family;
+            let mut spec = vec![0.0f64; n];
+            spec[7] = 1000.0;
+            let silent = vec![0.0f64; n];
+            let mut frames = vec![fb.synthesize(&spec, &info).unwrap()];
+            for _ in 0..4 {
+                frames.push(fb.synthesize(&silent, &info).unwrap());
+            }
+            let energy = |f: &[f64]| f.iter().map(|v| v * v).sum::<f64>();
+            for f in &frames[..4] {
+                assert!(energy(f) > 1e-6, "every block of the window carries signal");
+            }
+            assert!(
+                frames[3][3 * n / 4..].iter().all(|&v| v == 0.0),
+                "the window's last N/4 are zero"
+            );
+            assert_eq!(energy(&frames[4]), 0.0, "nothing beyond four blocks");
+        }
+        assert!(Filterbank::new_low_delay(crate::swb_offset::FrameFamily::Lc1024).is_err());
     }
 }
