@@ -527,7 +527,9 @@ impl StreamDecoder {
                         return Err(unsupported_element(kind));
                     }
                     Element::Fill { payload_bytes } if self.core_only => {
-                        reader.skip(payload_bytes * 8).map_err(|_| Error::UnexpectedEnd)?;
+                        reader
+                            .skip(payload_bytes * 8)
+                            .map_err(|_| Error::UnexpectedEnd)?;
                     }
                     Element::Fill { payload_bytes } => {
                         // The FIL body was left unconsumed: walk the

@@ -13,7 +13,10 @@ fn an_he_aac_stream_decodes_its_core_only() {
                 + 2000.0 * (2.0 * std::f64::consts::PI * 12_000.0 * t).sin()) as i16
         })
         .collect();
-    let stream = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap().encode_all(&pcm).unwrap();
+    let stream = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000))
+        .unwrap()
+        .encode_all(&pcm)
+        .unwrap();
     let full = StreamDecoder::new().decode_all(&stream).unwrap();
     let mut dec = StreamDecoder::new();
     dec.set_core_only(true);
