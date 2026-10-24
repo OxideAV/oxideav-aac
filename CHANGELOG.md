@@ -36,6 +36,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Parametric stereo: a delta-coded IID / ICC index whose sum leaves the
+  Table 8.24–8.26 range is clamped into it instead of failing the whole
+  frame with `PsDataInvalid` (#24, ropoctl). A continuous conformant
+  stream never produces such a sum, so its decode is unchanged; a
+  decoder entering mid-stream, whose previous indices are the reset
+  values, no longer drops frames on the first time-differential
+  `ps_data()`. The spec is silent on out-of-range sums.
 - AAC from MP4 / Matroska failed to decode ("packet has neither an ADTS
   nor a LOAS syncword"): the registry decoder now parses the
   `AudioSpecificConfig` from `extradata` (`esds` DecoderSpecificInfo /
