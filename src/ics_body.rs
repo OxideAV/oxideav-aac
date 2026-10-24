@@ -764,6 +764,42 @@ impl IcsBody {
         self.write_tools(writer, ics_info, audio_object_type)
     }
 
+    /// Write an ER AAC ELD `individual_channel_stream()` without the
+    /// resilience tools — the inverse of [`IcsBody::parse_eld`]:
+    /// `global_gain`, the ELD `ics_info()` (`max_sfb`, 6 bits) unless
+    /// the surrounding channel pair transmitted it (`shared`),
+    /// `section_data()`, `scale_factor_data()`, `tns_data_present`
+    /// and `tns_data()`. ELD has no pulse or gain-control data; the
+    /// trailing `spectral_data()` is the caller's responsibility.
+    pub fn write_eld(
+        &self,
+        writer: &mut BitWriter,
+        ics_info: &IcsInfo,
+        shared: bool,
+    ) -> Result<()> {
+        if self.pulse_data_present || self.gain_control_data_present {
+            return Err(Error::IcsInfoEncodeInvalid);
+        }
+        writer.write_u32(u32::from(self.global_gain), GLOBAL_GAIN_BITS);
+        if !shared {
+            writer.write_u32(u32::from(ics_info.max_sfb), 6);
+        }
+        self.section_data
+            .write(writer, ics_info.window_sequence, ics_info.max_sfb)?;
+        self.scale_factor_data
+            .write(writer, &self.section_data.sfb_cb)?;
+        writer.write_bit(self.tns_data_present);
+        if self.tns_data_present {
+            self.tns_data
+                .as_ref()
+                .ok_or(Error::TnsDataEncodeInvalid)?
+                .write_family(writer, ics_info.family, ics_info.window_sequence)?;
+        } else if self.tns_data.is_some() {
+            return Err(Error::TnsDataEncodeInvalid);
+        }
+        Ok(())
+    }
+
     fn write_tools(
         &self,
         writer: &mut BitWriter,

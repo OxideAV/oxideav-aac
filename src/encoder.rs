@@ -583,6 +583,10 @@ pub struct StreamEncoder {
     /// lines, long windows only, `er_raw_data_block()` syntax); see
     /// [`Self::new_ld`].
     family: FrameFamily,
+    /// ER AAC ELD (AOT 39): the low-delay filterbank of §4.6.20 in
+    /// place of LD's MDCT, `history` holding the three previous hops,
+    /// and the ELD channel syntax; see [`Self::new_eld`].
+    eld: bool,
 }
 
 impl StreamEncoder {
@@ -646,6 +650,30 @@ impl StreamEncoder {
         encoder.raw = true;
         encoder.tns_enabled = false;
         encoder.bandwidth_hz = Some(config.default_bandwidth_hz());
+        Ok(encoder)
+    }
+
+    /// Build an ER AAC ELD (AOT 39) encoder without low-delay SBR:
+    /// `frame_len` 512 or 480 spectral lines per frame
+    /// (`frameLengthFlag` 0 / 1), the LD band tables, and each frame
+    /// an `er_raw_data_block()` of untagged ELD channel elements
+    /// (§4.6.20: `max_sfb` instead of `ics_info()`, no pulse or
+    /// gain-control data), for an `ELDSpecificConfig` without the
+    /// resilience tools or extensions. The analysis is the inverse of
+    /// the §4.6.20 low-delay synthesis: block `m`'s coefficients are
+    ///
+    /// `X[k] = -2 · Σ w[4N-1-p] · x[p] · cos(π/N · (p - 5N/2 + n0) · (k + 1/2))`
+    ///
+    /// over the `4N` samples `x` that end with block `m`'s input hop
+    /// (`w` the synthesis window, `n0 = (-N/2 + 1)/2`), so the decoder
+    /// reconstructs the input `N/2` samples late. TNS, PNS and
+    /// intensity stereo stay off.
+    ///
+    /// Errors as [`Self::new_ld`].
+    pub fn new_eld(config: EncoderConfig, frame_len: usize) -> Result<Self> {
+        let mut encoder = Self::new_ld(config, frame_len)?;
+        encoder.eld = true;
+        encoder.history = vec![vec![0.0; 3 * frame_len]; usize::from(config.channels)];
         Ok(encoder)
     }
 
@@ -721,6 +749,7 @@ impl StreamEncoder {
             bandwidth_hz: Some(config.default_bandwidth_hz()),
             raw: false,
             family: FrameFamily::Lc1024,
+            eld: false,
         })
     }
 
@@ -861,7 +890,7 @@ impl StreamEncoder {
             }
         }
         let frame = self.encode_hop(&cur, &[])?;
-        self.history = cur;
+        self.remember(cur);
         Ok(frame)
     }
 
@@ -872,7 +901,7 @@ impl StreamEncoder {
         let frame_len = self.frame_len();
         let zeros: Vec<Vec<f64>> = vec![vec![0.0; frame_len]; ch];
         let frame = self.encode_hop(&zeros, &[])?;
-        self.history = zeros;
+        self.remember(zeros);
         Ok(frame)
     }
 
@@ -894,7 +923,7 @@ impl StreamEncoder {
             }
         }
         let frame = self.encode_hop(&cur, &[])?;
-        self.history = cur;
+        self.remember(cur);
         Ok(frame)
     }
 
@@ -921,7 +950,7 @@ impl StreamEncoder {
             .map(|j| planar[self.element_src[j]].clone())
             .collect();
         let frame = self.encode_hop(&cur, fills)?;
-        self.history = cur;
+        self.remember(cur);
         Ok(frame)
     }
 
@@ -946,6 +975,20 @@ impl StreamEncoder {
         }
         out.extend_from_slice(&self.finish()?);
         Ok(out)
+    }
+
+    /// Keep a coded hop as the analysis history: the previous hop, or
+    /// for ELD the three previous hops.
+    fn remember(&mut self, cur: Vec<Vec<f64>>) {
+        if !self.eld {
+            self.history = cur;
+            return;
+        }
+        let n = self.frame_len();
+        for (hist, hop) in self.history.iter_mut().zip(cur) {
+            hist.drain(..n);
+            hist.extend(hop);
+        }
     }
 
     /// Window `[history | cur]`, transform, quantize under the rate
@@ -997,7 +1040,9 @@ impl StreamEncoder {
             .zip(self.lfe_slot.iter())
         {
             let ch_seq = if lfe { WindowSequence::OnlyLong } else { seq };
-            let mut spec = if self.family.is_ld() {
+            let mut spec = if self.eld {
+                analyze_channel_eld(hist, chan, self.family)
+            } else if self.family.is_ld() {
                 analyze_channel_ld(hist, chan)
             } else {
                 analyze_channel(hist, chan, ch_seq)?
@@ -1188,7 +1233,10 @@ impl StreamEncoder {
     /// A channel element's header: `id_syn_ele` + `element_instance_tag`,
     /// or the tag alone in an `er_raw_data_block()`.
     fn push_element_header(&self, asm: &mut FrameAssembler, kind: IdSynEle, tag: u8) -> Result<()> {
-        if self.family.is_ld() {
+        if self.eld {
+            // ELD channel elements carry no element_instance_tag.
+            Ok(())
+        } else if self.family.is_ld() {
             asm.push_er_channel_header(tag)
         } else {
             asm.push_channel_header(kind, tag)
@@ -1219,6 +1267,7 @@ impl StreamEncoder {
                 peak,
                 pns_bands,
                 is_bands,
+                !self.eld,
             )
         }
     }
@@ -1247,8 +1296,7 @@ impl StreamEncoder {
         };
         let mut chan = self.quantize_seq(spec, seq, sf_offset, peak, &pns_bands, &[])?;
         attach_tns(&mut chan, tns);
-        chan.body
-            .write(body_bits, self.aot(), self.fs_index, false)?;
+        self.write_single(body_bits, &chan)?;
         chan.spectral.write(
             body_bits,
             &chan.info,
@@ -1257,10 +1305,26 @@ impl StreamEncoder {
         )
     }
 
-    /// The audio object type the elements are written for: 2 (AAC LC)
-    /// or 23 (ER AAC LD).
+    /// A single channel's stream before its `spectral_data()`: the
+    /// ELD form, or `individual_channel_stream()` with its `ics_info()`.
+    fn write_single(&self, body_bits: &mut BitWriter, chan: &QuantizedChannel) -> Result<()> {
+        if self.eld {
+            chan.body.write_eld(body_bits, &chan.info, false)
+        } else {
+            chan.body.write(body_bits, self.aot(), self.fs_index, false)
+        }
+    }
+
+    /// The audio object type the elements are written for: 2 (AAC LC),
+    /// 23 (ER AAC LD) or 39 (ER AAC ELD).
     fn aot(&self) -> u8 {
-        if self.family.is_ld() { 23 } else { 2 }
+        if self.eld {
+            39
+        } else if self.family.is_ld() {
+            23
+        } else {
+            2
+        }
     }
 
     /// One LFE body under the §4.5.2.1.3 restrictions: the element is
@@ -1282,8 +1346,7 @@ impl StreamEncoder {
             &[],
             &[],
         )?;
-        chan.body
-            .write(body_bits, self.aot(), self.fs_index, false)?;
+        self.write_single(body_bits, &chan)?;
         chan.spectral.write(
             body_bits,
             &chan.info,
@@ -1419,10 +1482,15 @@ impl StreamEncoder {
 
         // §4.4.2.3: common_window = 1, one shared ics_info,
         // then the two-bit ms_mask_present (+ mask when 1: one bit
-        // per (window group, sfb), group-major — Table 4.5).
-        body_bits.write_bit(true);
-        left.info
-            .write(body_bits, self.aot(), self.fs_index, true)?;
+        // per (window group, sfb), group-major — Table 4.5). An ELD
+        // pair has no common_window bit and transmits only max_sfb.
+        if self.eld {
+            body_bits.write_u32(u32::from(left.info.max_sfb), 6);
+        } else {
+            body_bits.write_bit(true);
+            left.info
+                .write(body_bits, self.aot(), self.fs_index, true)?;
+        }
         let any_ms = ms_rows.iter().flatten().any(|&b| b);
         let all_ms = !ms_rows.is_empty()
             && ms_rows.iter().all(|row| !row.is_empty())
@@ -1438,8 +1506,12 @@ impl StreamEncoder {
             body_bits.write_u32(0, 2);
         }
         for chan in [&left, &right] {
-            chan.body
-                .write_with_ics_info(body_bits, &chan.info, self.aot(), false)?;
+            if self.eld {
+                chan.body.write_eld(body_bits, &chan.info, true)?;
+            } else {
+                chan.body
+                    .write_with_ics_info(body_bits, &chan.info, self.aot(), false)?;
+            }
             chan.spectral.write(
                 body_bits,
                 &chan.info,
@@ -1652,6 +1724,35 @@ fn analyze_channel_ld(hist: &[f64], cur: &[f64]) -> Vec<f64> {
         .map(|(i, &v)| v * (core::f64::consts::PI * (i as f64 + 0.5) / n as f64).sin())
         .collect();
     forward_mdct(&z, n)
+}
+
+/// The ER AAC ELD analysis (see [`StreamEncoder::new_eld`]): the `4N`
+/// samples `[hist (3N) | cur (N)]` weighted by the time-reversed
+/// synthesis window, folded onto `2N` (each `2N` period of the
+/// modulation flips its sign) and transformed by the `2N`-point MDCT,
+/// whose phase `(N + 1)/2` is ELD's `n0` advanced by `3N/4`.
+fn analyze_channel_eld(hist: &[f64], cur: &[f64], family: FrameFamily) -> Vec<f64> {
+    let n = cur.len();
+    let window: &[f64] = match family {
+        FrameFamily::Ld512 => &crate::eld_window::LD_WINDOW_512,
+        _ => &crate::eld_window::LD_WINDOW_480,
+    };
+    let mut folded = vec![0.0f64; 2 * n];
+    for (p, &x) in hist.iter().chain(cur.iter()).enumerate() {
+        // The window's last N/4 coefficients (p < N/4) are zero.
+        let Some(&w) = window.get(4 * n - 1 - p) else {
+            continue;
+        };
+        // q = p - 13N/4, brought into [0, 2N).
+        let q = p as isize - (13 * n / 4) as isize;
+        let wraps = q.div_euclid(2 * n as isize);
+        let sign = if wraps % 2 == 0 { 1.0 } else { -1.0 };
+        folded[q.rem_euclid(2 * n as isize) as usize] += sign * w * x;
+    }
+    forward_mdct(&folded, 2 * n)
+        .into_iter()
+        .map(|v| -v)
+        .collect()
 }
 
 /// One quantized channel, ready for wire assembly.
@@ -2604,6 +2705,7 @@ fn quantize_channel(
     frame_peak: f64,
     pns_bands: &[bool],
     is_bands: &[IsBand],
+    pulses: bool,
 ) -> Result<QuantizedChannel> {
     debug_assert_eq!(spec.len(), family.frame_len());
     debug_assert!(seq != WindowSequence::EightShort);
@@ -2622,7 +2724,8 @@ fn quantize_channel(
     if !is_bands.is_empty() {
         apply_is_overrides(&mut group, is_bands, offsets);
     }
-    let pulse_candidate = extract_pulse_candidate(&group.x_quant, &group.sfb_cb, offsets);
+    let pulse_candidate =
+        extract_pulse_candidate(&group.x_quant, &group.sfb_cb, offsets).filter(|_| pulses);
     let info = IcsInfo {
         family,
         ics_reserved_bit: false,
@@ -2901,6 +3004,103 @@ mod tests {
                 }
                 let snr = 10.0 * (energy / error).log10();
                 assert!(snr > 25.0, "LD {frame_len} ch={channels}: {snr} dB");
+            }
+        }
+    }
+
+    /// The ELD analysis inverts the decoder's §4.6.20 low-delay
+    /// synthesis: unquantised coefficients reconstruct the input
+    /// `N/2` samples late, to the precision of the window table.
+    #[test]
+    fn eld_analysis_inverts_synthesis() {
+        use crate::filterbank::Filterbank;
+        use crate::ics_info::IcsInfo;
+        for family in [FrameFamily::Ld512, FrameFamily::Ld480] {
+            let n = family.frame_len();
+            let info = IcsInfo::eld(family, 0, 3).unwrap();
+            let mut fb = Filterbank::new_low_delay(family).unwrap();
+            let mut hist = vec![0.0f64; 3 * n];
+            let mut seed = 7u32;
+            let input: Vec<f64> = (0..12 * n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    f64::from(seed >> 8) / 16_777_216.0 - 0.5
+                })
+                .collect();
+            let mut out = Vec::new();
+            for hop in input.chunks(n) {
+                let spec = analyze_channel_eld(&hist, hop, family);
+                out.extend(fb.synthesize(&spec, &info).unwrap());
+                hist.drain(..n);
+                hist.extend_from_slice(hop);
+            }
+            let (mut energy, mut error) = (0.0, 0.0);
+            for i in 4 * n..out.len() {
+                let x = input[i - n / 2];
+                energy += x * x;
+                error += (out[i] - x) * (out[i] - x);
+            }
+            let snr = 10.0 * (energy / error).log10();
+            assert!(snr > 100.0, "ELD {n}: {snr} dB");
+        }
+    }
+
+    /// ER AAC ELD round trip through the crate's ELD decoder: 512 and
+    /// 480 lines, one to six channels; the decoder reconstructs the
+    /// input `N/2` samples late.
+    #[test]
+    fn eld_round_trip() {
+        use crate::asc::AacResilienceFlags;
+        use crate::decode::StreamDecoder;
+        for (frame_len, family) in [(512, FrameFamily::Ld512), (480, FrameFamily::Ld480)] {
+            for (channels, configuration) in [(1u8, 1u8), (2, 2), (6, 6)] {
+                let ch = usize::from(channels);
+                let config = EncoderConfig {
+                    sample_rate: 48_000,
+                    channels,
+                    bitrate: 96_000 * u32::from(channels),
+                };
+                let mut enc = StreamEncoder::new_eld(config, frame_len).unwrap();
+                let frames = 40;
+                let input: Vec<f64> = (0..frame_len * frames * ch)
+                    .map(|i| {
+                        let t = (i / ch) as f64 / 48_000.0;
+                        0.4 * (2.0 * core::f64::consts::PI * (440.0 + 220.0 * (i % ch) as f64) * t)
+                            .sin()
+                    })
+                    .collect();
+                let mut dec = StreamDecoder::new();
+                dec.set_frame_family(family);
+                dec.set_declaration_order(false);
+                let mut out: Vec<f64> = Vec::new();
+                for hop in input.chunks(frame_len * ch) {
+                    let au = enc.encode_frame_f64(hop).unwrap();
+                    let frame = dec
+                        .decode_er_raw_data_block(
+                            39,
+                            3,
+                            48_000,
+                            configuration,
+                            AacResilienceFlags::default(),
+                            &au,
+                        )
+                        .unwrap();
+                    out.extend(frame.pcm.iter().map(|&v| f64::from(v)));
+                }
+                let delay = frame_len / 2 * ch;
+                // LFE channels carry only the lowest lines: score the others.
+                let lfe = |i: usize| channels == 6 && i % ch == 3;
+                let (mut energy, mut error) = (0.0, 0.0);
+                for i in 4 * frame_len * ch..out.len() {
+                    if lfe(i) {
+                        continue;
+                    }
+                    let x = input[i - delay] * 32768.0;
+                    energy += x * x;
+                    error += (out[i] - x) * (out[i] - x);
+                }
+                let snr = 10.0 * (energy / error).log10();
+                assert!(snr > 25.0, "ELD {frame_len} ch={channels}: {snr} dB");
             }
         }
     }
@@ -3539,6 +3739,7 @@ mod tests {
             1.0,
             &[],
             &[],
+            true,
         )
         .unwrap();
         let plain = quantize_group(
