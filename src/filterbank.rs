@@ -69,7 +69,8 @@ type Result<T> = core::result::Result<T, Error>;
 /// scale and the half-coefficient phase are the only normalization
 /// the spec attaches to the inverse transform; the energy-correcting
 /// window then follows in the per-sequence windowing step.
-pub(crate) fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
+#[cfg(test)]
+pub(crate) fn imdct_direct(spec: &[f64], n_transform: usize) -> Vec<f64> {
     let half = n_transform / 2;
     debug_assert_eq!(spec.len(), half);
     let n0 = (half + 1) as f64 / 2.0;
@@ -100,7 +101,8 @@ pub(crate) fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
 /// the windowed-and-overlap-added round trip is unity for a
 /// power-complementary §4.6.11.3.2 window. The same transform is the
 /// `MDCT(x_est)` of the §4.6.7.3 Long-Term-Prediction loop.
-pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
+#[cfg(test)]
+pub(crate) fn forward_mdct_direct(time: &[f64], n_transform: usize) -> Vec<f64> {
     let half = n_transform / 2;
     debug_assert_eq!(time.len(), n_transform);
     let n0 = (half + 1) as f64 / 2.0;
@@ -114,6 +116,174 @@ pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
                 .sum::<f64>()
         })
         .collect()
+}
+
+/// A complex value as `(re, im)`.
+type Complex = (f64, f64);
+
+/// In-place radix-2 decimation-in-time FFT, `X[k] = Σ x[n]·e^(-2πi·nk/N)`,
+/// for a power-of-two length. Twiddles come straight from `cos`/`sin`
+/// per butterfly column rather than a recurrence, so the result holds
+/// to a few ulps at the lengths used here (16 to 512 points).
+fn fft_in_place(buf: &mut [Complex]) {
+    let n = buf.len();
+    debug_assert!(n.is_power_of_two());
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            buf.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let half = len / 2;
+        let step = -2.0 * core::f64::consts::PI / len as f64;
+        for k in 0..half {
+            let angle = step * k as f64;
+            let (wr, wi) = (angle.cos(), angle.sin());
+            for start in (0..n).step_by(len) {
+                let (ar, ai) = buf[start + k];
+                let (br, bi) = buf[start + k + half];
+                let (tr, ti) = (br * wr - bi * wi, br * wi + bi * wr);
+                buf[start + k] = (ar + tr, ai + ti);
+                buf[start + k + half] = (ar - tr, ai - ti);
+            }
+        }
+        len <<= 1;
+    }
+}
+
+/// `a · b` for complex values.
+fn cmul((ar, ai): Complex, (br, bi): Complex) -> Complex {
+    (ar * br - ai * bi, ar * bi + ai * br)
+}
+
+/// Forward DFT of any length. A power-of-two length goes straight to
+/// [`fft_in_place`]; any other (the 960-sample frame families need 480,
+/// 240, 60 and 30 points) goes through Bluestein's chirp-z identity
+/// `nk = (n² + k² − (k − n)²) / 2`, which turns the DFT into one
+/// convolution with the chirp `e^(−iπn²/L)`, evaluated by three
+/// power-of-two FFTs of a length at least `2L − 1`.
+fn fft(input: &[Complex]) -> Vec<Complex> {
+    let l = input.len();
+    if l.is_power_of_two() {
+        let mut out = input.to_vec();
+        fft_in_place(&mut out);
+        return out;
+    }
+    let p = (2 * l - 1).next_power_of_two();
+    let chirp: Vec<Complex> = (0..l)
+        .map(|n| {
+            // `n²` taken modulo `2L` keeps the angle small and exact.
+            let angle = -core::f64::consts::PI * ((n * n) % (2 * l)) as f64 / l as f64;
+            (angle.cos(), angle.sin())
+        })
+        .collect();
+    let mut a = vec![(0.0f64, 0.0f64); p];
+    let mut b = vec![(0.0f64, 0.0f64); p];
+    for n in 0..l {
+        a[n] = cmul(input[n], chirp[n]);
+        let conj = (chirp[n].0, -chirp[n].1);
+        b[n] = conj;
+        b[(p - n) % p] = conj;
+    }
+    fft_in_place(&mut a);
+    fft_in_place(&mut b);
+    // The inverse FFT of the product, as a forward FFT of the conjugate.
+    for (x, y) in a.iter_mut().zip(&b) {
+        let (re, im) = cmul(*x, *y);
+        *x = (re, -im);
+    }
+    fft_in_place(&mut a);
+    let scale = 1.0 / p as f64;
+    (0..l)
+        .map(|k| cmul((a[k].0 * scale, -a[k].1 * scale), chirp[k]))
+        .collect()
+}
+
+/// DCT-IV of an even length `M`, `y[k] = Σ x[n]·cos((π/M)(n + 1/2)(k + 1/2))`,
+/// through one `M/2`-point complex FFT: the even-indexed inputs and the
+/// reversed odd-indexed inputs pair up as `v[m] = x[2m] + i·x[M−1−2m]`,
+/// a pre-twiddle by `e^(−iπm/M)` and a post-twiddle by `e^(−iπ(k + 1/4)/M)`
+/// turn the FFT into `t[k]` with `y[2k] = Re t[k]` and `y[M−1−2k] = −Im t[k]`.
+fn dct_iv(x: &[f64]) -> Vec<f64> {
+    let m = x.len();
+    let half = m / 2;
+    debug_assert_eq!(m % 2, 0);
+    let v: Vec<Complex> = (0..half)
+        .map(|n| {
+            let (re, im) = (x[2 * n], x[m - 1 - 2 * n]);
+            let angle = -core::f64::consts::PI * n as f64 / m as f64;
+            let (c, s) = (angle.cos(), angle.sin());
+            (re * c - im * s, re * s + im * c)
+        })
+        .collect();
+    let v = fft(&v);
+    let mut y = vec![0.0f64; m];
+    for (k, &(re, im)) in v.iter().enumerate() {
+        let angle = -core::f64::consts::PI * (k as f64 + 0.25) / m as f64;
+        let (c, s) = (angle.cos(), angle.sin());
+        y[2 * k] = re * c - im * s;
+        y[m - 1 - 2 * k] = -(re * s + im * c);
+    }
+    y
+}
+
+/// §4.6.11.3.1 — inverse MDCT for a length-`n_transform` window.
+///
+/// `spec` holds the `N/2` transmitted coefficients; the returned
+/// vector holds the `N` time-domain values
+/// `x[n] = (2/N) · Σ_k spec[k] · cos((2π/N)·(n + n0)·(k + 1/2))`,
+/// `n0 = (N/2 + 1)/2` (the §4.6.11.3.1 phase offset), computed as the
+/// DCT-IV of the coefficients unfolded onto the four quarters of the
+/// window (the transpose of [`forward_mdct`]'s fold), so the cost is
+/// `O(N log N)` instead of the direct sum's `O(N²)`. `imdct_direct`
+/// (test only) is that sum and the oracle for this.
+pub(crate) fn imdct(spec: &[f64], n_transform: usize) -> Vec<f64> {
+    let m = n_transform / 2;
+    let q = m / 2;
+    debug_assert_eq!(spec.len(), m);
+    let y = dct_iv(spec);
+    let scale = 2.0 / n_transform as f64;
+    let mut out = vec![0.0f64; n_transform];
+    for n in 0..q {
+        out[n] = scale * y[q + n];
+        out[m - 1 - n] = -scale * y[q + n];
+        out[3 * q - 1 - n] = -scale * y[n];
+        out[3 * q + n] = -scale * y[n];
+    }
+    out
+}
+
+/// §4.6.15.3.3 / §4.6.11.3.1 — the forward (analysis) MDCT for a
+/// length-`n_transform` window.
+///
+/// `time` holds the `N` windowed time-domain values `z[n]`; the
+/// returned vector holds the `N/2` spectral coefficients
+/// `X[k] = 2 · Σ_n z[n] · cos((2π/N)·(n + n0)·(k + 1/2))`,
+/// `0 ≤ k < N/2`, with the §4.6.11.3.1 phase `n0 = (N/2 + 1)/2`. With
+/// the window split into quarters `a b c d`, that is twice the DCT-IV of
+/// the folded sequence `(−c_r − d, a − b_r)` (`_r` reverses a quarter),
+/// `O(N log N)` through [`dct_iv`]; `forward_mdct_direct` (test only) is
+/// the defining sum and the oracle for this. The scale pairs with
+/// [`imdct`] as before: the windowed-and-overlap-added round trip is
+/// unity for a power-complementary §4.6.11.3.2 window.
+pub(crate) fn forward_mdct(time: &[f64], n_transform: usize) -> Vec<f64> {
+    let m = n_transform / 2;
+    let q = m / 2;
+    debug_assert_eq!(time.len(), n_transform);
+    let mut folded = vec![0.0f64; m];
+    for n in 0..q {
+        folded[n] = -time[3 * q - 1 - n] - time[3 * q + n];
+        folded[q + n] = time[n] - time[m - 1 - n];
+    }
+    dct_iv(&folded).into_iter().map(|y| 2.0 * y).collect()
 }
 
 /// §4.6.11.3.2 — build the `ONLY_LONG_SEQUENCE` analysis window
@@ -1579,6 +1749,69 @@ mod tests {
                     n + 256
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_transform_tests {
+    //! The FFT-based transforms against the direct §4.6.11.3.1 sums they
+    //! replace, at every transform length the crate uses: the long and
+    //! short windows of the 1024 and 960 frame families, the LD 480
+    //! family, and the SSR filterbank's two lengths. The 960 and 480
+    //! lengths are not powers of two and exercise the Bluestein path.
+    use super::{forward_mdct, forward_mdct_direct, imdct, imdct_direct};
+
+    const LENGTHS: [usize; 8] = [64, 120, 240, 256, 512, 960, 1920, 2048];
+
+    /// Deterministic pseudo-random samples in [-1, 1) (a 64-bit LCG).
+    fn noise(len: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_close(got: &[f64], want: &[f64], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        let scale = want.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst <= 1e-9 * scale,
+            "{what}: worst difference {worst:e} against a full scale of {scale:e}"
+        );
+    }
+
+    #[test]
+    fn forward_mdct_matches_the_direct_sum() {
+        for (i, &n) in LENGTHS.iter().enumerate() {
+            let time = noise(n, 11 + i as u64);
+            assert_close(
+                &forward_mdct(&time, n),
+                &forward_mdct_direct(&time, n),
+                &format!("forward MDCT N = {n}"),
+            );
+        }
+    }
+
+    #[test]
+    fn imdct_matches_the_direct_sum() {
+        for (i, &n) in LENGTHS.iter().enumerate() {
+            let spec = noise(n / 2, 97 + i as u64);
+            assert_close(
+                &imdct(&spec, n),
+                &imdct_direct(&spec, n),
+                &format!("IMDCT N = {n}"),
+            );
         }
     }
 }
