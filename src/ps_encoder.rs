@@ -59,6 +59,7 @@ use crate::{Error, Result};
 
 /// The stereo parameter band count (Tables 8.24 / 8.27 `nr_*_par`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PsBands {
     /// 10 parameters (`iid_mode` / `icc_mode` 0 or 3).
     Ten,
@@ -93,6 +94,7 @@ impl PsBands {
 /// the measured signal at every header frame (see
 /// [`PsEncoderConfig::fine_iid`] / [`PsEncoderConfig::phase`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Election {
     /// Never.
     Off,
@@ -112,6 +114,7 @@ impl From<bool> for Election {
 
 /// Configuration of one [`PsEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PsEncoderConfig {
     /// Stereo band count for IID and ICC.
     pub bands: PsBands,
@@ -142,6 +145,52 @@ pub struct PsEncoderConfig {
     /// Elect VAR_BORDERS on cue-changing transients; off keeps
     /// FIX_BORDERS grids only.
     pub variable_borders: bool,
+}
+
+/// `with_*` builders: each returns the configuration with one field
+/// replaced (the record is `#[non_exhaustive]`).
+impl PsEncoderConfig {
+    /// This configuration with [`Self::bands`] set to `bands`.
+    #[must_use]
+    pub const fn with_bands(mut self, bands: PsBands) -> Self {
+        self.bands = bands;
+        self
+    }
+
+    /// This configuration with [`Self::fine_iid`] set to `fine_iid`.
+    #[must_use]
+    pub const fn with_fine_iid(mut self, fine_iid: Election) -> Self {
+        self.fine_iid = fine_iid;
+        self
+    }
+
+    /// This configuration with [`Self::icc`] set to `icc`.
+    #[must_use]
+    pub const fn with_icc(mut self, icc: bool) -> Self {
+        self.icc = icc;
+        self
+    }
+
+    /// This configuration with [`Self::phase`] set to `phase`.
+    #[must_use]
+    pub const fn with_phase(mut self, phase: Election) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// This configuration with [`Self::header_interval`] set to `header_interval`.
+    #[must_use]
+    pub const fn with_header_interval(mut self, header_interval: u32) -> Self {
+        self.header_interval = header_interval;
+        self
+    }
+
+    /// This configuration with [`Self::variable_borders`] set to `variable_borders`.
+    #[must_use]
+    pub const fn with_variable_borders(mut self, variable_borders: bool) -> Self {
+        self.variable_borders = variable_borders;
+        self
+    }
 }
 
 impl Default for PsEncoderConfig {
@@ -215,9 +264,11 @@ const PHASE_MIN_COHERENCE: f64 = 0.6;
 /// `Election::Auto` phase layer: the fraction of the IPD/OPD bands'
 /// energy that must sit in coherent bands with an inter-channel
 /// phase beyond half a Table 8.31 step (π/8).
+#[doc(hidden)]
 pub const PHASE_ELECT_FRACTION: f64 = 0.1;
 /// `Election::Auto` fine IID: the energy-weighted mean error (dB) of
 /// the coarse Table 8.25 grid that elects the fine Table 8.26 grid.
+#[doc(hidden)]
 pub const FINE_IID_ELECT_DB: f64 = 0.75;
 /// Bands below this fraction of the frame's loudest band do not vote
 /// in the phase / fine-IID elections and do not keep `enable_ipdopd`
@@ -243,6 +294,7 @@ struct ElectionStats {
 
 /// One encoded frame with its diagnostics.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PsFrame {
     /// The `ps_data()` bytes (zero-padded to a whole byte) — the
     /// `sbr_extension()` body behind `bs_extension_id =
@@ -788,6 +840,7 @@ fn cues_close(a: &[BandStats], b: &[BandStats], n_a: &[usize], n_b: &[usize], ph
 
 /// Annex 8.C.6.3 — nearest Table 8.25 / 8.26 index.
 #[must_use]
+#[doc(hidden)]
 pub fn quantise_iid(iid_db: f64, fine: bool) -> i32 {
     let grid: &[f64] = if fine { &IID_DB_FINE } else { &IID_DB_COARSE };
     let bound = (grid.len() / 2) as i32;
@@ -812,6 +865,7 @@ pub fn quantise_iid(iid_db: f64, fine: bool) -> i32 {
 
 /// Annex 8.C.6.4 — nearest Table 8.28 index.
 #[must_use]
+#[doc(hidden)]
 pub fn quantise_icc(rho: f64) -> i32 {
     let v = if rho.is_finite() { rho } else { 1.0 };
     let mut best = 0usize;
@@ -828,6 +882,7 @@ pub fn quantise_icc(rho: f64) -> i32 {
 
 /// Annex 8.C.6.5 — nearest Table 8.31 `π/4` step, index 8 folded to 0.
 #[must_use]
+#[doc(hidden)]
 pub fn quantise_phase(rad: f64) -> i32 {
     if !rad.is_finite() {
         return 0;

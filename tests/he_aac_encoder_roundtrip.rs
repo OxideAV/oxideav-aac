@@ -225,10 +225,7 @@ fn synthetic(seconds: f64, fs: u32, channels: usize) -> Vec<i16> {
 fn synthetic_mono_44100_reconstructs_the_high_band_envelope() {
     let pcm = synthetic(2.0, 44_100, 1);
     for interp in [true, false] {
-        let cfg = HeAacConfig {
-            interpol_freq: interp,
-            ..HeAacConfig::new(44_100, 1, 32_000)
-        };
+        let cfg = HeAacConfig::new(44_100, 1, 32_000).with_interpol_freq(interp);
         let m = round_trip(&pcm, cfg);
         eprintln!(
             "mono 32k interp={interp}: lag {} low-SNR {:.1} dB env-err {:.2} dB (worst {:.1}) HF ratio {:.2} dB, {} bytes",
@@ -251,11 +248,9 @@ fn synthetic_mono_44100_reconstructs_the_high_band_envelope() {
 fn synthetic_stereo_48000_with_crc_and_coupling() {
     let pcm = synthetic(1.5, 48_000, 2);
     for coupling in [false, true] {
-        let cfg = HeAacConfig {
-            sbr_crc: true,
-            coupling,
-            ..HeAacConfig::new(48_000, 2, 64_000)
-        };
+        let cfg = HeAacConfig::new(48_000, 2, 64_000)
+            .with_sbr_crc(true)
+            .with_coupling(coupling);
         let m = round_trip(&pcm, cfg);
         eprintln!(
             "stereo 64k coupling={coupling}: lag {} low-SNR {:.1} dB env-err {:.2} dB (worst {:.1}) HF ratio {:.2} dB, {} bytes",

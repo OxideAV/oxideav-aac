@@ -66,11 +66,7 @@ fn round_trip(positions: &[ChannelPosition]) -> RoundTrip {
     let n = 6 * FRAME_LEN;
     let pcm = per_channel_tones(n, &canonical);
     let mut enc = StreamEncoder::with_layout(
-        EncoderConfig {
-            sample_rate: 44_100,
-            channels: channels as u8,
-            bitrate: 64_000 * channels as u32,
-        },
+        EncoderConfig::new(44_100, channels as u8, 64_000 * channels as u32),
         positions,
     )
     .unwrap();
@@ -173,15 +169,8 @@ fn pce_lists_follow_the_speaker_conventions() {
         BackLeft,
         BackRight,
     ];
-    let enc = StreamEncoder::with_layout(
-        EncoderConfig {
-            sample_rate: 48_000,
-            channels: 11,
-            bitrate: 640_000,
-        },
-        &positions,
-    )
-    .unwrap();
+    let enc =
+        StreamEncoder::with_layout(EncoderConfig::new(48_000, 11, 640_000), &positions).unwrap();
     let pce = enc.program_config().unwrap();
     assert_eq!(pce.sampling_frequency_index, 3); // 48 kHz
     assert_eq!(pce.object_type, 1);
@@ -219,11 +208,7 @@ fn pce_lists_follow_the_speaker_conventions() {
 #[test]
 fn unrepresentable_sets_are_rejected() {
     use ChannelPosition::*;
-    let cfg = |n: u8| EncoderConfig {
-        sample_rate: 44_100,
-        channels: n,
-        bitrate: 64_000 * u32::from(n),
-    };
+    let cfg = |n: u8| EncoderConfig::new(44_100, n, 64_000 * u32::from(n));
     // Lone left.
     assert!(StreamEncoder::with_layout(cfg(2), &[FrontLeft, FrontCenter]).is_err());
     // Inner pair without the outer pair.

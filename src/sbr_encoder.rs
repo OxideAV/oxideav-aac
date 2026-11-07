@@ -84,15 +84,19 @@ pub const NUM_TIME_SLOTS: usize = 16;
 /// `numTimeSlots` for the 960-line core (§4.6.18.2.6).
 pub const NUM_TIME_SLOTS_960: usize = 15;
 /// `RATE = 2` — QMF columns per SBR time slot.
+#[doc(hidden)]
 pub const RATE: usize = 2;
 /// `tHFAdj = 2` — the envelope adjuster's column offset into `XLow`.
+#[doc(hidden)]
 pub const T_HF_ADJ: usize = 2;
 /// `tHFGen = 8` — the slots of the previous core block that lead the
 /// decoder's `XLow` buffer.
+#[doc(hidden)]
 pub const T_HF_GEN: usize = 8;
 /// Analysis columns [`SbrEncoder::encode_frame`] consumes per channel:
 /// the furthest trailing border `tE(LE) = numTimeSlots + 8` maps to
 /// column `RATE·24 + tHFAdj = 50`.
+#[doc(hidden)]
 pub const SBR_ENC_COLS: usize = RATE * (NUM_TIME_SLOTS + 8) + T_HF_ADJ;
 
 /// `NOISE_FLOOR_OFFSET = 6` (§4.6.18.2.5).
@@ -104,6 +108,7 @@ const FREQ_RES_SPREAD_DB: f64 = 6.0;
 
 /// Configuration of one [`SbrEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SbrEncoderConfig {
     /// The SBR internal rate (the output rate; twice the core rate).
     /// Must be one of the §4.6.18.3.2.1 tabulated rates.
@@ -161,6 +166,129 @@ pub struct SbrEncoderConfig {
     /// then spans `RATE · numTimeSlots` analysis columns and the
     /// grids are laid out over that many slots.
     pub num_time_slots: usize,
+}
+
+/// `with_*` builders: each returns the configuration with one field
+/// replaced (the record is `#[non_exhaustive]`).
+impl SbrEncoderConfig {
+    /// This configuration with [`Self::fs_sbr`] set to `fs_sbr`.
+    #[must_use]
+    pub const fn with_fs_sbr(mut self, fs_sbr: u32) -> Self {
+        self.fs_sbr = fs_sbr;
+        self
+    }
+
+    /// This configuration with [`Self::channels`] set to `channels`.
+    #[must_use]
+    pub const fn with_channels(mut self, channels: usize) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// This configuration with [`Self::start_freq`] set to `start_freq`.
+    #[must_use]
+    pub const fn with_start_freq(mut self, start_freq: u8) -> Self {
+        self.start_freq = start_freq;
+        self
+    }
+
+    /// This configuration with [`Self::stop_freq`] set to `stop_freq`.
+    #[must_use]
+    pub const fn with_stop_freq(mut self, stop_freq: u8) -> Self {
+        self.stop_freq = stop_freq;
+        self
+    }
+
+    /// This configuration with [`Self::xover_band`] set to `xover_band`.
+    #[must_use]
+    pub const fn with_xover_band(mut self, xover_band: u8) -> Self {
+        self.xover_band = xover_band;
+        self
+    }
+
+    /// This configuration with [`Self::freq_scale`] set to `freq_scale`.
+    #[must_use]
+    pub const fn with_freq_scale(mut self, freq_scale: u8) -> Self {
+        self.freq_scale = freq_scale;
+        self
+    }
+
+    /// This configuration with [`Self::alter_scale`] set to `alter_scale`.
+    #[must_use]
+    pub const fn with_alter_scale(mut self, alter_scale: bool) -> Self {
+        self.alter_scale = alter_scale;
+        self
+    }
+
+    /// This configuration with [`Self::noise_bands`] set to `noise_bands`.
+    #[must_use]
+    pub const fn with_noise_bands(mut self, noise_bands: u8) -> Self {
+        self.noise_bands = noise_bands;
+        self
+    }
+
+    /// This configuration with [`Self::amp_res`] set to `amp_res`.
+    #[must_use]
+    pub const fn with_amp_res(mut self, amp_res: bool) -> Self {
+        self.amp_res = amp_res;
+        self
+    }
+
+    /// This configuration with [`Self::crc`] set to `crc`.
+    #[must_use]
+    pub const fn with_crc(mut self, crc: bool) -> Self {
+        self.crc = crc;
+        self
+    }
+
+    /// This configuration with [`Self::header_interval`] set to `header_interval`.
+    #[must_use]
+    pub const fn with_header_interval(mut self, header_interval: u32) -> Self {
+        self.header_interval = header_interval;
+        self
+    }
+
+    /// This configuration with [`Self::add_harmonic`] set to `add_harmonic`.
+    #[must_use]
+    pub const fn with_add_harmonic(mut self, add_harmonic: bool) -> Self {
+        self.add_harmonic = add_harmonic;
+        self
+    }
+
+    /// This configuration with [`Self::variable_borders`] set to `variable_borders`.
+    #[must_use]
+    pub const fn with_variable_borders(mut self, variable_borders: bool) -> Self {
+        self.variable_borders = variable_borders;
+        self
+    }
+
+    /// This configuration with [`Self::coupling`] set to `coupling`.
+    #[must_use]
+    pub const fn with_coupling(mut self, coupling: bool) -> Self {
+        self.coupling = coupling;
+        self
+    }
+
+    /// This configuration with [`Self::interpol_freq`] set to `interpol_freq`.
+    #[must_use]
+    pub const fn with_interpol_freq(mut self, interpol_freq: bool) -> Self {
+        self.interpol_freq = interpol_freq;
+        self
+    }
+
+    /// This configuration with [`Self::limiter_gains`] set to `limiter_gains`.
+    #[must_use]
+    pub const fn with_limiter_gains(mut self, limiter_gains: u8) -> Self {
+        self.limiter_gains = limiter_gains;
+        self
+    }
+
+    /// This configuration with [`Self::num_time_slots`] set to `num_time_slots`.
+    #[must_use]
+    pub const fn with_num_time_slots(mut self, num_time_slots: usize) -> Self {
+        self.num_time_slots = num_time_slots;
+        self
+    }
 }
 
 impl SbrEncoderConfig {
@@ -240,6 +368,7 @@ fn band_hz(fs_sbr: u32) -> f64 {
 
 /// The `bs_start_freq` whose `k0` (§4.6.18.3.2.1) lies closest to
 /// `crossover_hz`.
+#[doc(hidden)]
 pub fn pick_start_freq(fs_sbr: u32, crossover_hz: f64) -> Result<u8> {
     let target = crossover_hz / band_hz(fs_sbr);
     let mut best = None::<(f64, u8)>;
@@ -255,6 +384,7 @@ pub fn pick_start_freq(fs_sbr: u32, crossover_hz: f64) -> Result<u8> {
 
 /// The `bs_stop_freq` whose `k2` lies closest to `stop_hz` (never
 /// below `k0 + 1`, and never above 64 subbands).
+#[doc(hidden)]
 pub fn pick_stop_freq(fs_sbr: u32, start_freq: u8, stop_hz: f64) -> Result<u8> {
     let k0v = k0(fs_sbr, start_freq)?;
     let target = (stop_hz / band_hz(fs_sbr)).min(64.0);
@@ -288,6 +418,7 @@ struct ChannelState {
 /// Per-frame diagnostics of one channel, returned alongside the
 /// payload for tests and tuning.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SbrChannelReport {
     /// The elected grid's envelope borders `tE(0..=LE)` in slots.
     pub t_e: Vec<i32>,
@@ -305,6 +436,7 @@ pub struct SbrChannelReport {
 
 /// One frame's output.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SbrFrame {
     /// The complete `extension_payload()` bytes for a `fill_element()`
     /// following the core channel element.
@@ -1728,6 +1860,7 @@ fn compensate_noise_loss(
 
 /// §4.B.18.6 envelope quantisation: `E_Q = INT(a·max(log2(E/64), 0)
 /// + 0.5)`.
+#[doc(hidden)]
 pub fn quantise_envelopes(energy: &[Vec<f64>], amp_res: bool) -> Vec<Vec<i32>> {
     let a = if amp_res { 1.0 } else { 2.0 };
     let max = if amp_res { 63 } else { 127 };
@@ -1750,6 +1883,7 @@ pub fn quantise_envelopes(energy: &[Vec<f64>], amp_res: bool) -> Vec<Vec<i32>> {
 
 /// §4.B.18.6 noise-floor quantisation: `Q_Q = INT(NOISE_FLOOR_OFFSET −
 /// log2(Q) + 0.5)` limited to `[0, 30]`.
+#[doc(hidden)]
 pub fn quantise_noise(q: &[Vec<f64>]) -> Vec<Vec<i32>> {
     q.iter()
         .map(|row| {

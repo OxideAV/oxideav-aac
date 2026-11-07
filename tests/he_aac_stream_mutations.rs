@@ -42,10 +42,7 @@ fn material(frames: usize) -> Vec<i16> {
 #[test]
 fn damaged_streams_never_panic_the_decoder() {
     let pcm = material(12);
-    let cfg = HeAacConfig {
-        sbr_crc: true,
-        ..HeAacConfig::new(44_100, 1, 40_000)
-    };
+    let cfg = HeAacConfig::new(44_100, 1, 40_000).with_sbr_crc(true);
     let stream = HeAacEncoder::new(cfg).unwrap().encode_all(&pcm).unwrap();
     let frame_offsets: Vec<usize> = {
         let mut offs = Vec::new();
@@ -103,10 +100,7 @@ fn band_energies(pcm: &[i16]) -> [f64; 64] {
 #[test]
 fn joining_at_a_header_frame_converges_to_the_full_decode() {
     let pcm = material(24);
-    let cfg = HeAacConfig {
-        header_interval: 8,
-        ..HeAacConfig::new(44_100, 1, 40_000)
-    };
+    let cfg = HeAacConfig::new(44_100, 1, 40_000).with_header_interval(8);
     let mut enc = HeAacEncoder::new(cfg).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     let k_x = enc.sbr().bands().k_x as usize;

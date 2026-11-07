@@ -58,10 +58,8 @@ fn decode(stream: &[u8]) -> Vec<i16> {
 
 #[test]
 fn default_bandwidth_follows_the_per_channel_rate() {
-    let cfg = |bitrate: u32, channels: u8, sample_rate: u32| EncoderConfig {
-        sample_rate,
-        channels,
-        bitrate,
+    let cfg = |bitrate: u32, channels: u8, sample_rate: u32| {
+        EncoderConfig::new(sample_rate, channels, bitrate)
     };
     assert!((cfg(64_000, 2, 44_100).default_bandwidth_hz() - 8_320.0).abs() < 1e-9);
     assert!((cfg(96_000, 2, 48_000).default_bandwidth_hz() - 12_480.0).abs() < 1e-9);
@@ -86,11 +84,7 @@ fn cull_moves_the_bits_below_the_cutoff() {
     let fs = 44_100u32;
     let n = 2 * 44_100;
     let pcm = noise_stereo(n);
-    let cfg = EncoderConfig {
-        sample_rate: fs,
-        channels: 2,
-        bitrate: 64_000,
-    };
+    let cfg = EncoderConfig::new(fs, 2, 64_000);
     let cutoff = cfg.default_bandwidth_hz();
     let (in_lo, in_hi) = split_energy(&pcm, fs, cutoff);
 

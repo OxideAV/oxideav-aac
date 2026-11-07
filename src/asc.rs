@@ -170,6 +170,7 @@ impl FrameLength {
 
 /// Parsed `GASpecificConfig` body (Table 4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GaSpecificConfig {
     /// Resolved frame length (1024 vs 960 lines).
     pub frame_length: FrameLength,
@@ -195,6 +196,7 @@ pub struct GaSpecificConfig {
 /// (Table 4.1). Carries AOT-dependent subfields plus the always-present
 /// `extensionFlag3` bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GaExtensionBody {
     /// `numOfSubFrame` (5 bits) + `layer_length` (11 bits). Only
     /// present when `audioObjectType == 22` (ER BSAC).
@@ -286,6 +288,7 @@ pub struct SbrExtensionProbe {
 
 /// Parsed `AudioSpecificConfig`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AudioSpecificConfig {
     /// Outer `audioObjectType` *as encoded on the wire* (before any
     /// SBR/PS unwrap). For HE-AAC v1 signalled hierarchically this
@@ -370,6 +373,7 @@ pub const ELD_AOT: u8 = 39;
 
 /// `ELDSpecificConfig(channelConfiguration)` (AOT 39).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EldSpecificConfig {
     /// `frameLengthFlag`: 512 lines ([`FrameLength::Long1024`]) or 480
     /// ([`FrameLength::Long960`]).
@@ -386,6 +390,7 @@ pub struct EldSpecificConfig {
 
 /// The low-delay SBR fields of `ELDSpecificConfig()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LdSbrConfig {
     /// `ldSbrSamplingRate`: SBR runs at twice the core rate.
     pub dual_rate: bool,

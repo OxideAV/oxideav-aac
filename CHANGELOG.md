@@ -38,6 +38,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- API hygiene (breaking): the configuration records `EncoderConfig`,
+  `HeAacConfig`, `SbrEncoderConfig` and `PsEncoderConfig` are
+  `#[non_exhaustive]` — build them with `EncoderConfig::new`,
+  `HeAacConfig::new` / `new_v2`, `SbrEncoderConfig::new`,
+  `PsEncoderConfig::default()` and the new per-field `with_*`
+  builders. The report / parse records `DecodedFrame`,
+  `AudioSpecificConfig`, `GaSpecificConfig`, `GaExtensionBody`,
+  `EldSpecificConfig`, `LdSbrConfig`, `SbrFrame`, `SbrChannelReport`,
+  `PsFrame`, `BandStats` and the enums `Error`, `FrameFamily`,
+  `ExtensionType`, `ExtensionPayload`, `ExtensionPayloadOrSbr`,
+  `PsBands`, `Election` are `#[non_exhaustive]` too. `FrameFamily` is
+  re-exported at the crate root; encoder tuning constants and helpers
+  (`he_aac_encoder::FIR_*` / `QMF_PAIR_DELAY` / `PS_*` /
+  `CROSSOVER_HZ_PER_BPS`, `sbr_encoder::RATE` / `T_HF_*` /
+  `SBR_ENC_COLS` / `pick_*_freq` / `quantise_*`, `ps_encoder::
+  quantise_*` / `*_ELECT_*`, `encoder::IS_CORR_MIN` / `PNS_CORR_MIN`)
+  are `#[doc(hidden)]`.
 - Every full-range channel element of a frame judges its bands' masking
   spread against the frame's loudest coefficient, the way the two
   channels of a pair already judged theirs against the pair's peak,

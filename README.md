@@ -485,7 +485,34 @@ carry the default 1024-line family):
   in shape (one common scale). An SBR payload on an LD stream is
   still rejected before its body is parsed
   (`Error::SbrUnsupportedFrameFamily`) — the §4.6.19 LD SBR tool
-  belongs to ELD (out of scope).
+  belongs to ELD and is not implemented (ELD decodes without it).
+
+### ER AAC ELD (AOT 39) and the LD / ELD encoders
+
+- **ELD decode** (`decode_er_raw_data_block` with AOT 39): the
+  Table 4.180 `ELDSpecificConfig` (`AudioSpecificConfig::eld`), the
+  Table 4.75–4.79 untagged ELD channel elements, and the §4.6.20.2
+  low-delay synthesis — the phase-`(-N/2 + 1)/2` inverse transform
+  extended to `4N`, the Table 4.A.15 / 4.A.16 window, four-block
+  overlap-add — for 512 and 480 lines. Streams without the resilience
+  tools or low-delay SBR; `afconvert` AAC-ELD streams (16–48 kHz,
+  1 / 2 / 6 channels) decode within 1 LSB of the `afconvert` decode.
+- **LD / ELD encoders**: `StreamEncoder::new_ld` (AOT 23) and
+  `new_eld` (AOT 39), 512 / 480 lines, bare `er_raw_data_block()`
+  access units with their `AudioSpecificConfig`
+  (`asc_writer::er_ld_asc`). LD writes its channel streams in the
+  §4.5.2.4.2 category order; ELD analyses with the inverse of the
+  §4.6.20.2 synthesis (the decoder reconstructs the input `N/2`
+  samples late). TNS, PNS and intensity stereo stay off. `afconvert`
+  decodes both encoders' MP4-carried streams (22.05–48 kHz, 1 / 2
+  channels, both frame lengths) within 1 LSB of this crate's decode.
+- Every encoder takes float input (`encode_frame_f64` /
+  `encode_access_unit_f64`), emits bare access units on request
+  (`set_raw`), and retargets its bitrate mid-stream (`set_bitrate`).
+- **Transforms**: the MDCT / IMDCT run as a DCT-IV on an `N/4`-point
+  FFT (Bluestein's chirp-z for the 960 / 480 families), `O(N log N)`:
+  on one core, 48 kHz stereo AAC-LC encodes at ~320x and decodes at
+  ~200x real time, 5.1 at ~117x / ~72x.
 
 ### Scalable AAC (AOT 6) / ER AAC scalable (AOT 20) — §4.4.2.2 / §4.5.2.2
 
@@ -1056,8 +1083,9 @@ the EP section below).
   per-band scalefactors follow a masking-spread rule (band target
   magnitude `42·(peak_b/peak_frame)^½`, sub-step bands culled to
   `ZERO_HCB`) with the DPCM ±60 track threaded across window groups;
-  a bidirectional rate loop (±4 scalefactor ladder + ±1..3 fine pass)
-  fits each frame to the bitrate-derived byte budget; codebooks and
+  a rate search (from the previous frame's scalefactor offset,
+  galloping then bisecting to the least offset that fits) fits each
+  frame to the bitrate-derived byte budget; codebooks and
   sections come from a **measured-bit-cost dynamic program** (every
   candidate same-class run priced at its `section_data()` header
   overhead plus the cheapest Table 4.95 book, actual codeword +

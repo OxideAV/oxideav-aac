@@ -199,6 +199,7 @@ impl PsAnalysis {
 /// The Annex 8.C.6.2 excitations of one stereo band over one
 /// parameter region.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct BandStats {
     /// `e_l(b)` — left excitation.
     pub el: f64,

@@ -40,11 +40,11 @@ fn per_channel_tones(n: usize, channels: usize, lfe: Option<usize>) -> Vec<i16> 
 fn roundtrip_ratios(channels: usize, lfe: Option<usize>, expected_config: u8) -> Vec<f64> {
     let n = 6 * FRAME_LEN;
     let pcm = per_channel_tones(n, channels, lfe);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: channels as u8,
-        bitrate: 64_000 * channels as u32,
-    })
+    let mut enc = StreamEncoder::new(EncoderConfig::new(
+        44_100,
+        channels as u8,
+        64_000 * channels as u32,
+    ))
     .unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     let (header, _) = AdtsHeader::parse(&stream).unwrap();
@@ -137,12 +137,7 @@ fn lfe_element_is_band_limited() {
             pcm.push((9000.0 * (0.5 * t).sin()).round() as i16);
         }
     }
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: channels as u8,
-        bitrate: 384_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44_100, channels as u8, 384_000)).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
     let mut dec = StreamDecoder::new();
     let frames = dec.decode_all(&stream).unwrap();
@@ -210,12 +205,7 @@ fn film_like_five_one(seconds: usize) -> Vec<i16> {
 /// Encode → decode → per-channel SNR in dB for `pcm` at `rate` with `bitrate` over all channels.
 fn roundtrip_snr_db(pcm: &[i16], channels: usize, rate: u32, bitrate: u32) -> Vec<f64> {
     let n = pcm.len() / channels;
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: rate,
-        channels: channels as u8,
-        bitrate,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(rate, channels as u8, bitrate)).unwrap();
     let stream = enc.encode_all(pcm).unwrap();
     let mut dec = StreamDecoder::new();
     let frames = dec.decode_all(&stream).unwrap();

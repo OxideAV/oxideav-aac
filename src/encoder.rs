@@ -299,8 +299,10 @@ const PNS_MIN_WIDTH: usize = 8;
 /// coding.
 const PNS_DENSITY_MIN: f64 = 0.4;
 
-/// Configuration for [`StreamEncoder`].
+/// Configuration for [`StreamEncoder`]. Build it with
+/// [`EncoderConfig::new`] (fields may be added in later releases).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderConfig {
     /// Output sample rate in Hz. Must be one of the ISO/IEC 14496-3
     /// Table 1.18 rates expressible in an ADTS header (index 0..=12).
@@ -327,6 +329,38 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
+    /// A configuration for `channels` channels at `sample_rate` Hz and
+    /// a target of `bitrate` bits per second.
+    #[must_use]
+    pub const fn new(sample_rate: u32, channels: u8, bitrate: u32) -> Self {
+        EncoderConfig {
+            sample_rate,
+            channels,
+            bitrate,
+        }
+    }
+
+    /// This configuration at another sample rate.
+    #[must_use]
+    pub const fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// This configuration with another channel count.
+    #[must_use]
+    pub const fn with_channels(mut self, channels: u8) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// This configuration at another target bitrate.
+    #[must_use]
+    pub const fn with_bitrate(mut self, bitrate: u32) -> Self {
+        self.bitrate = bitrate;
+        self
+    }
+
     /// The default coded bandwidth for this rate (see
     /// [`BANDWIDTH_HZ_PER_BPS`]): `0.26 Hz` per bit/s of per-channel
     /// rate — 8.3 kHz at 32 kbps per channel, 12.5 kHz at 48,
@@ -2143,6 +2177,7 @@ const IS_MIN_SPECTRAL_FRACTION: usize = 4;
 /// measured correlating as high as 0.93 on synthetic two-tone
 /// content; IS-coding those would substitute the wrong (if masked)
 /// waveform for no bit win over the cull they get anyway.
+#[doc(hidden)]
 pub const IS_CORR_MIN: f64 = 0.95;
 
 /// Relative peak floor for the intensity decision: a band whose
@@ -2221,6 +2256,7 @@ fn is_decide(l_spec: &[f64], r_spec: &[f64], geom: Geom) -> Result<Vec<IsBand>> 
 /// correlation only — the shared vector reproduces positively
 /// correlated noise, so anti-correlated noise stays on independent
 /// draws.
+#[doc(hidden)]
 pub const PNS_CORR_MIN: f64 = 0.5;
 
 /// Per-band §4.6.13 PNS decision for a channel pair (encode side).

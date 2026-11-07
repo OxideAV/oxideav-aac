@@ -123,12 +123,7 @@ struct Coded {
 }
 
 fn encode(pcm: &[i16], bitrate: u32, family: FrameFamily) -> Coded {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: FS,
-        channels: 2,
-        bitrate,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(FS, 2, bitrate)).unwrap();
     enc.set_frame_family(family).unwrap();
     let aus = enc.encode_all_access_units(pcm).unwrap();
     Coded {
@@ -253,12 +248,7 @@ fn lc960_matches_the_1024_path_nmr_at_equal_rate() {
 
 #[test]
 fn adts_entry_points_reject_the_960_family() {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: FS,
-        channels: 1,
-        bitrate: 64_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(FS, 1, 64_000)).unwrap();
     enc.set_frame_family(FrameFamily::Lc960).unwrap();
     assert_eq!(enc.frame_len(), 960);
     assert!(enc.encode_frame(&[0; 960]).is_err());
@@ -397,11 +387,11 @@ fn black_box_decoder_reads_the_960_streams() {
 /// err/sig of channel 0 for one encode → decode under `family`
 /// with PNS and intensity stereo on.
 fn tool_round_trip(pcm: &[i16], channels: u8, family: FrameFamily) -> f64 {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: FS,
+    let mut enc = StreamEncoder::new(EncoderConfig::new(
+        FS,
         channels,
-        bitrate: 48_000 * u32::from(channels),
-    })
+        48_000 * u32::from(channels),
+    ))
     .unwrap();
     enc.set_frame_family(family).unwrap();
     enc.set_pns(true);

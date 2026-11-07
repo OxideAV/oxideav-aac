@@ -248,6 +248,7 @@ pub fn short_window_offsets(fs_index: u8) -> Result<&'static [u16]> {
 ///   `frameLengthFlag == 1` a single 480-line one; there is no block
 ///   switching (§4.6.17.2.2), hence no short-window geometry at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FrameFamily {
     /// 1024 spectral lines per long frame, 128 per short window
     /// (`frameLengthFlag == 0`, all GA AOTs except SSR / LD).

@@ -16,14 +16,10 @@ fn mid_stream_frames() -> Vec<u8> {
             (8000.0 * (2.0 * std::f64::consts::PI * f * t).sin()) as i16
         })
         .collect();
-    let stream = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap()
-    .encode_all(&pcm)
-    .unwrap();
+    let stream = StreamEncoder::new(EncoderConfig::new(44_100, 2, 128_000))
+        .unwrap()
+        .encode_all(&pcm)
+        .unwrap();
     let mut pos = 0;
     for _ in 0..4 {
         let len = (usize::from(stream[pos + 3] & 3) << 11)

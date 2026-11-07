@@ -37,12 +37,7 @@ fn tone_pcm(samples: usize) -> Vec<i16> {
 }
 
 fn encode_tone(frames: usize) -> Vec<u8> {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44100,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44100, 1, 96_000)).unwrap();
     enc.encode_all(&tone_pcm(1024 * frames)).unwrap()
 }
 
@@ -296,12 +291,7 @@ fn cpe_second_ics_corruption_is_rejected_end_to_end() {
             (6000.0 * (0.017 * n + 0.4 * ch).sin()) as i16
         })
         .collect();
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44100, 2, 128_000)).unwrap();
     let plain = enc.encode_all(&pcm).unwrap();
     let protected = protect_adts_stream(&plain).unwrap();
 

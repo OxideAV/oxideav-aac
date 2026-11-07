@@ -45,12 +45,7 @@ fn chord(frames: usize) -> Vec<i16> {
 /// started every frame from zero and took at least three.)
 #[test]
 fn a_steady_signal_settles_each_frame_in_about_two_passes() {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: RATE,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(RATE, 2, 128_000)).unwrap();
     let pcm = chord(80);
     let warm = 20;
     for f in 0..warm {
@@ -73,12 +68,7 @@ fn a_steady_signal_settles_each_frame_in_about_two_passes() {
 #[test]
 fn every_frame_of_the_search_fits_the_budget() {
     for &bitrate in &[64_000u32, 128_000, 256_000] {
-        let mut enc = StreamEncoder::new(EncoderConfig {
-            sample_rate: RATE,
-            channels: 2,
-            bitrate,
-        })
-        .unwrap();
+        let mut enc = StreamEncoder::new(EncoderConfig::new(RATE, 2, bitrate)).unwrap();
         let pcm = chord(60);
         let stream = enc.encode_all(&pcm).unwrap();
         let budget = bitrate as usize * FRAME / RATE as usize / 8;

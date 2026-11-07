@@ -74,12 +74,7 @@ fn pulse_prone_signal(n: usize) -> Vec<i16> {
 #[test]
 fn pulse_bearing_stream_roundtrips_and_parses() {
     let pcm = pulse_prone_signal(16 * FRAME_LEN);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 48_000,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(48_000, 1, 96_000)).unwrap();
     let stream = enc.encode_all(&pcm).unwrap();
 
     // At least one frame must have chosen the measured pulse

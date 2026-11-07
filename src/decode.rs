@@ -129,6 +129,7 @@ pub const FRAME_LEN: usize = 1024;
 /// One decoded ADTS frame: the interleaved 16-bit PCM plus the geometry
 /// needed to interpret it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// Interleaved 16-bit PCM, `channels` samples per time index. For a
     /// default `channelConfiguration` (Table 1.19, values 1–6) the

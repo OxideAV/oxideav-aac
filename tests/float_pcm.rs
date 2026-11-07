@@ -17,14 +17,10 @@ fn tone(n: usize, channels: usize) -> Vec<i16> {
 
 #[test]
 fn float_view_is_the_frame_before_rounding() {
-    let stream = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44_100,
-        channels: 2,
-        bitrate: 128_000,
-    })
-    .unwrap()
-    .encode_all(&tone(8 * 1024, 2))
-    .unwrap();
+    let stream = StreamEncoder::new(EncoderConfig::new(44_100, 2, 128_000))
+        .unwrap()
+        .encode_all(&tone(8 * 1024, 2))
+        .unwrap();
     let mut dec = StreamDecoder::new();
     assert!(dec.last_pcm_f64().is_none(), "off by default");
     dec.set_float_pcm_capture(true);
@@ -47,11 +43,11 @@ fn float_view_is_the_frame_before_rounding() {
 #[test]
 fn float_view_survives_a_configuration_change_and_covers_er() {
     let encode = |channels: u8| {
-        StreamEncoder::new(EncoderConfig {
-            sample_rate: 44_100,
+        StreamEncoder::new(EncoderConfig::new(
+            44_100,
             channels,
-            bitrate: 64_000 * u32::from(channels),
-        })
+            64_000 * u32::from(channels),
+        ))
         .unwrap()
         .encode_all(&tone(4 * 1024, usize::from(channels)))
         .unwrap()
@@ -69,15 +65,7 @@ fn float_view_survives_a_configuration_change_and_covers_er() {
     assert_eq!(pcm.len(), last.pcm.len());
 
     // ER AAC LD through decode_er_raw_data_block.
-    let mut enc = StreamEncoder::new_ld(
-        EncoderConfig {
-            sample_rate: 48_000,
-            channels: 2,
-            bitrate: 128_000,
-        },
-        512,
-    )
-    .unwrap();
+    let mut enc = StreamEncoder::new_ld(EncoderConfig::new(48_000, 2, 128_000), 512).unwrap();
     let aus = enc.encode_all_access_units(&tone(4 * 512, 2)).unwrap();
     let mut dec = StreamDecoder::new();
     dec.set_frame_family(oxideav_aac::swb_offset::FrameFamily::Ld512);

@@ -464,12 +464,7 @@ fn lc_equal_rate_noise_tables() {
         ("transients", transients(2.0, fs)),
     ] {
         for kbps in [64u32, 96, 128] {
-            let mut enc = StreamEncoder::new(EncoderConfig {
-                sample_rate: fs,
-                channels: 2,
-                bitrate: kbps * 1000,
-            })
-            .unwrap();
+            let mut enc = StreamEncoder::new(EncoderConfig::new(fs, 2, kbps * 1000)).unwrap();
             let ours = Coded {
                 label: format!("lc_{sig_name}_{kbps}k_ours"),
                 stream: enc.encode_all(&input).unwrap(),

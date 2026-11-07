@@ -28,11 +28,11 @@ fn tone(rate: u32, channels: u8, seconds: f64) -> Vec<i16> {
 }
 
 fn lc(rate: u32, channels: u8) -> Vec<u8> {
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: rate,
+    let mut enc = StreamEncoder::new(EncoderConfig::new(
+        rate,
         channels,
-        bitrate: 64_000 * u32::from(channels),
-    })
+        64_000 * u32::from(channels),
+    ))
     .unwrap();
     enc.encode_all(&tone(rate, channels, 0.25)).unwrap()
 }

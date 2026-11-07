@@ -42,12 +42,7 @@ fn set_adts_profile(stream: &[u8], profile: u8) -> Vec<u8> {
 #[test]
 fn ssr_profile_stream_decodes_through_gain_control_pipeline() {
     let pcm = tone_pcm(1024 * 12, 1);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 44100,
-        channels: 1,
-        bitrate: 96_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(44100, 1, 96_000)).unwrap();
     let adts_lc = enc.encode_all(&pcm).unwrap();
 
     // Sanity: the encoder emitted the LC profile.
@@ -84,12 +79,7 @@ fn ssr_profile_stream_decodes_through_gain_control_pipeline() {
 #[test]
 fn ssr_profile_stereo_stream_decodes() {
     let pcm = tone_pcm(1024 * 8, 2);
-    let mut enc = StreamEncoder::new(EncoderConfig {
-        sample_rate: 48000,
-        channels: 2,
-        bitrate: 192_000,
-    })
-    .unwrap();
+    let mut enc = StreamEncoder::new(EncoderConfig::new(48000, 2, 192_000)).unwrap();
     let adts_ssr = set_adts_profile(&enc.encode_all(&pcm).unwrap(), 2);
     let frames = StreamDecoder::new().decode_all(&adts_ssr).unwrap();
     assert!(!frames.is_empty());

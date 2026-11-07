@@ -275,15 +275,12 @@ fn configuration_matrix_keeps_the_image() {
     let pcm = synthetic_stereo(1.2, 48_000);
     for bands in [PsBands::Ten, PsBands::Twenty, PsBands::ThirtyFour] {
         for (fine, phase) in [(false, false), (true, true)] {
-            let cfg = HeAacConfig {
-                ps: PsEncoderConfig {
-                    bands,
-                    fine_iid: fine.into(),
-                    phase: phase.into(),
-                    ..PsEncoderConfig::default()
-                },
-                ..HeAacConfig::new_v2(48_000, 40_000)
-            };
+            let cfg = HeAacConfig::new_v2(48_000, 40_000).with_ps(
+                PsEncoderConfig::default()
+                    .with_bands(bands)
+                    .with_fine_iid(fine.into())
+                    .with_phase(phase.into()),
+            );
             let (_enc, rt) = round_trip(&pcm, cfg);
             let n = rt.aligned.len().min(pcm.len());
             let n_pars = bands.count();
@@ -494,12 +491,10 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
             "v2_48k_34fine_phase",
             48_000,
             48_000,
-            PsEncoderConfig {
-                bands: PsBands::ThirtyFour,
-                fine_iid: Election::On,
-                phase: Election::On,
-                ..PsEncoderConfig::default()
-            },
+            PsEncoderConfig::default()
+                .with_bands(PsBands::ThirtyFour)
+                .with_fine_iid(Election::On)
+                .with_phase(Election::On),
             false,
         ),
         // The delayed pair under the default `Auto` elections: the
@@ -517,10 +512,7 @@ fn reference_binary_decodes_our_he_aac_v2_as_stereo() {
         } else {
             synthetic_stereo(1.5, fs_out)
         };
-        let cfg = HeAacConfig {
-            ps,
-            ..HeAacConfig::new_v2(fs_out, bitrate)
-        };
+        let cfg = HeAacConfig::new_v2(fs_out, bitrate).with_ps(ps);
         let (enc, rt) = round_trip(&pcm, cfg);
         if delayed {
             assert!(
@@ -695,13 +687,8 @@ fn phase_layer_reproduces_the_inter_channel_phase() {
     let src = cues_of(&pcm, 20);
     let mut errors = Vec::new();
     for phase in [Election::Off, Election::On, Election::Auto] {
-        let cfg = HeAacConfig {
-            ps: PsEncoderConfig {
-                phase,
-                ..PsEncoderConfig::default()
-            },
-            ..HeAacConfig::new_v2(fs, 40_000)
-        };
+        let cfg =
+            HeAacConfig::new_v2(fs, 40_000).with_ps(PsEncoderConfig::default().with_phase(phase));
         let (enc, rt) = round_trip(&pcm, cfg);
         assert_eq!(
             enc.ps().unwrap().phase_on(),

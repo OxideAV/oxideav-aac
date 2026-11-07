@@ -2,6 +2,7 @@
 
 /// Errors returned by `oxideav-aac` Phase 1 surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Decode / encode body is not implemented yet (Phase 1 skeleton).
     NotImplemented,

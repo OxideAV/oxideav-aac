@@ -445,8 +445,9 @@ pub mod he_aac_encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod encoder_tns;
-// internal — exposed for tests/fuzz; not part of the stable API
+// The §4.6.20.2 ELD low-delay windows (Tables 4.A.15 / 4.A.16).
 mod eld_window;
+// internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod extension_payload;
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -540,11 +541,11 @@ pub mod sbr_dequant;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod sbr_element;
+pub mod sbr_encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod sbr_env_adjust;
 // internal — exposed for tests/fuzz; not part of the stable API
-pub mod sbr_encoder;
 #[doc(hidden)]
 pub mod sbr_envelope;
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -586,7 +587,6 @@ pub mod sbr_time_grid;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod sbr_writer;
-// internal — exposed for tests/fuzz; not part of the stable API
 pub mod scalable;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -639,6 +639,11 @@ pub mod tns_max;
 mod error;
 
 pub use error::Error;
+/// The §4.5.1.1 frame-length family a stream runs (1024 / 960-line
+/// AAC, 512 / 480-line ER AAC LD and ELD), as taken by
+/// [`decode::StreamDecoder::set_frame_family`] and
+/// [`encoder::StreamEncoder::set_frame_family`].
+pub use swb_offset::FrameFamily;
 
 /// Result alias used throughout the crate.
 pub type Result<T> = core::result::Result<T, Error>;

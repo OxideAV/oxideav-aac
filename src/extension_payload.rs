@@ -100,6 +100,7 @@ pub const EXTENSION_TYPE_BITS: u32 = 4;
 /// Every variant maps to a single 4-bit wire value; the raw value
 /// is exposed via [`ExtensionType::as_u8`] for round-tripping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtensionType {
     /// `EXT_FILL` (`0b0000`) — bitstream filler.
     Fill,
@@ -188,6 +189,7 @@ pub const FILL_DATA_NIBBLE: u8 = 0b0000;
 /// returned by Table 4.51) so the surrounding FIL `cnt` can be
 /// decremented in lockstep with the spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtensionPayload {
     /// `EXT_FILL` — opaque filler. Carries the raw `8 * (cnt - 1) + 4`
     /// "other_bits" packed MSB-first into a byte vector. The last
@@ -215,6 +217,7 @@ pub enum ExtensionPayload {
 /// The result of [`ExtensionPayload::parse_with_sbr`]: either a standard
 /// (non-SBR) extension payload, or a decoded SBR side-info element.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtensionPayloadOrSbr {
     /// A non-SBR extension payload (`EXT_FILL` / `EXT_FILL_DATA` /
     /// `EXT_DYNAMIC_RANGE`).

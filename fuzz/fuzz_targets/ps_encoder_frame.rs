@@ -18,14 +18,15 @@ fuzz_target!(|data: &[u8]| {
     if data.len() < 4 {
         return;
     }
-    let cfg = PsEncoderConfig {
-        bands: [PsBands::Ten, PsBands::Twenty, PsBands::ThirtyFour][usize::from(data[0] % 3)],
-        fine_iid: [Election::Off, Election::On, Election::Auto][usize::from((data[0] >> 2) % 3)],
-        icc: data[0] & 8 != 0,
-        phase: [Election::Off, Election::On, Election::Auto][usize::from((data[0] >> 4) % 3)],
-        header_interval: u32::from(data[1] % 4),
-        variable_borders: data[0] & 32 != 0,
-    };
+    let cfg = PsEncoderConfig::default()
+        .with_bands([PsBands::Ten, PsBands::Twenty, PsBands::ThirtyFour][usize::from(data[0] % 3)])
+        .with_fine_iid(
+            [Election::Off, Election::On, Election::Auto][usize::from((data[0] >> 2) % 3)],
+        )
+        .with_icc(data[0] & 8 != 0)
+        .with_phase([Election::Off, Election::On, Election::Auto][usize::from((data[0] >> 4) % 3)])
+        .with_header_interval(u32::from(data[1] % 4))
+        .with_variable_borders(data[0] & 32 != 0);
     let frames = usize::from(1 + data[2] % 3);
     let mut enc = PsEncoder::new(cfg).unwrap();
     let mut dec_cfg = None;

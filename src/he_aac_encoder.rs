@@ -93,22 +93,27 @@ pub const HE_FRAME_LEN: usize = 2 * FRAME_LEN;
 /// Taps of the downsampling low-pass (odd, so the group delay
 /// `(FIR_TAPS − 1) / 2` is a whole number of full-rate samples — and
 /// even, so it is a whole number of core samples too).
+#[doc(hidden)]
 pub const FIR_TAPS: usize = 65;
 
 /// The FIR group delay in full-rate samples.
+#[doc(hidden)]
 pub const FIR_DELAY: usize = (FIR_TAPS - 1) / 2;
 
 /// Delay of the 64-band analysis → synthesis QMF pair
 /// ([`EncoderAnalysisQmf`] into [`SynthesisQmf`]) in samples — nine
 /// columns, measured on the pair (near-perfect reconstruction).
+#[doc(hidden)]
 pub const QMF_PAIR_DELAY: usize = 576;
 
 /// Extra delay on the PS downmix so that `FIR_DELAY + QMF_PAIR_DELAY
 /// + PS_MONO_PAD` is a whole number of QMF columns.
+#[doc(hidden)]
 pub const PS_MONO_PAD: usize = 64 - (FIR_DELAY + QMF_PAIR_DELAY) % 64;
 
 /// The mono path's analysis column `j` covers the same input samples
 /// as the stereo analysis column `j − PS_ALIGN_COLS`.
+#[doc(hidden)]
 pub const PS_ALIGN_COLS: usize = (FIR_DELAY + QMF_PAIR_DELAY + PS_MONO_PAD) / 64;
 
 /// Cap on the PS downmix gain (`+12 dB`): anti-phase content whose
@@ -117,6 +122,7 @@ const PS_DOWNMIX_GAIN_MAX: f64 = 4.0;
 
 /// Configuration for [`HeAacEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct HeAacConfig {
     /// Output (SBR) sample rate in Hz. Its half must be a Table 1.18
     /// ADTS rate with a §4.5.4 band table, and the rate itself one of
@@ -145,6 +151,87 @@ pub struct HeAacConfig {
     pub parametric_stereo: bool,
     /// The PS encoder's configuration (used when `parametric_stereo`).
     pub ps: PsEncoderConfig,
+}
+
+/// `with_*` builders: each returns the configuration with one field
+/// replaced (the record is `#[non_exhaustive]`).
+impl HeAacConfig {
+    /// This configuration with [`Self::sample_rate`] set to `sample_rate`.
+    #[must_use]
+    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// This configuration with [`Self::channels`] set to `channels`.
+    #[must_use]
+    pub fn with_channels(mut self, channels: u8) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// This configuration with [`Self::bitrate`] set to `bitrate`.
+    #[must_use]
+    pub fn with_bitrate(mut self, bitrate: u32) -> Self {
+        self.bitrate = bitrate;
+        self
+    }
+
+    /// This configuration with [`Self::crossover_hz`] set to `crossover_hz`.
+    #[must_use]
+    pub fn with_crossover_hz(mut self, crossover_hz: Option<f64>) -> Self {
+        self.crossover_hz = crossover_hz;
+        self
+    }
+
+    /// This configuration with [`Self::sbr_crc`] set to `sbr_crc`.
+    #[must_use]
+    pub fn with_sbr_crc(mut self, sbr_crc: bool) -> Self {
+        self.sbr_crc = sbr_crc;
+        self
+    }
+
+    /// This configuration with [`Self::add_harmonic`] set to `add_harmonic`.
+    #[must_use]
+    pub fn with_add_harmonic(mut self, add_harmonic: bool) -> Self {
+        self.add_harmonic = add_harmonic;
+        self
+    }
+
+    /// This configuration with [`Self::coupling`] set to `coupling`.
+    #[must_use]
+    pub fn with_coupling(mut self, coupling: bool) -> Self {
+        self.coupling = coupling;
+        self
+    }
+
+    /// This configuration with [`Self::header_interval`] set to `header_interval`.
+    #[must_use]
+    pub fn with_header_interval(mut self, header_interval: u32) -> Self {
+        self.header_interval = header_interval;
+        self
+    }
+
+    /// This configuration with [`Self::interpol_freq`] set to `interpol_freq`.
+    #[must_use]
+    pub fn with_interpol_freq(mut self, interpol_freq: bool) -> Self {
+        self.interpol_freq = interpol_freq;
+        self
+    }
+
+    /// This configuration with [`Self::parametric_stereo`] set to `parametric_stereo`.
+    #[must_use]
+    pub fn with_parametric_stereo(mut self, parametric_stereo: bool) -> Self {
+        self.parametric_stereo = parametric_stereo;
+        self
+    }
+
+    /// This configuration with [`Self::ps`] set to `ps`.
+    #[must_use]
+    pub fn with_ps(mut self, ps: PsEncoderConfig) -> Self {
+        self.ps = ps;
+        self
+    }
 }
 
 impl HeAacConfig {
@@ -218,6 +305,7 @@ impl HeAacConfig {
 
 /// Default SBR crossover per bit of core-channel rate (see
 /// [`HeAacConfig::crossover`]).
+#[doc(hidden)]
 pub const CROSSOVER_HZ_PER_BPS: f64 = 0.35;
 
 /// Windowed-sinc low-pass FIR with cutoff `fc` (cycles per sample,
