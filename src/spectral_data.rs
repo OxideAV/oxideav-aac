@@ -115,14 +115,15 @@ use oxideav_core::bits::{BitReader, BitWriter};
 use crate::ics_info::IcsInfo;
 use crate::section_data::{Codebook, Section, SectionData};
 use crate::spectral_codebook::{
-    MAX_QUANT, apply_sign_bits, decode_esc_value, decode_index_to_tuple, derive_sign_bits,
-    encode_esc_value, encode_tuple_to_index, table_4_95,
+    MAX_QUANT, apply_sign_bits, decode_esc_value, decode_index_to_tuple, encode_esc_value,
+    encode_tuple_to_index, table_4_95,
 };
 use crate::spectrum_huffman::{
-    hcod1_decode, hcod1_write, hcod2_decode, hcod2_write, hcod3_decode, hcod3_write, hcod4_decode,
-    hcod4_write, hcod5_decode, hcod5_write, hcod6_decode, hcod6_write, hcod7_decode, hcod7_write,
-    hcod8_decode, hcod8_write, hcod9_decode, hcod9_write, hcod10_decode, hcod10_write,
-    hcod11_decode, hcod11_write,
+    hcod1_decode, hcod1_encode, hcod1_write, hcod2_decode, hcod2_encode, hcod2_write, hcod3_decode,
+    hcod3_encode, hcod3_write, hcod4_decode, hcod4_encode, hcod4_write, hcod5_decode, hcod5_encode,
+    hcod5_write, hcod6_decode, hcod6_encode, hcod6_write, hcod7_decode, hcod7_encode, hcod7_write,
+    hcod8_decode, hcod8_encode, hcod8_write, hcod9_decode, hcod9_encode, hcod9_write,
+    hcod10_decode, hcod10_encode, hcod10_write, hcod11_decode, hcod11_encode, hcod11_write,
 };
 #[cfg(test)]
 use crate::swb_offset::{long_window_offsets, short_window_offsets};
@@ -414,6 +415,26 @@ pub(crate) fn decode_codeword(reader: &mut BitReader<'_>, cb: u8) -> Result<u32>
 }
 
 /// Dispatch one `hcod[cb]` codeword write onto the per-book writer.
+/// Length in bits of spectrum book `cb`'s codeword for `idx`, read
+/// from the same Table 4.A.x row the writer emits.
+fn codeword_bits(cb: u8, idx: u32) -> Result<u32> {
+    let (len, _) = match cb {
+        1 => hcod1_encode(idx),
+        2 => hcod2_encode(idx),
+        3 => hcod3_encode(idx),
+        4 => hcod4_encode(idx),
+        5 => hcod5_encode(idx),
+        6 => hcod6_encode(idx),
+        7 => hcod7_encode(idx),
+        8 => hcod8_encode(idx),
+        9 => hcod9_encode(idx),
+        10 => hcod10_encode(idx),
+        11 => hcod11_encode(idx),
+        _ => Err(Error::SpectralDataInvalid),
+    }?;
+    Ok(u32::from(len))
+}
+
 fn write_codeword(writer: &mut BitWriter, cb: u8, idx: u32) -> Result<()> {
     match cb {
         1 => hcod1_write(writer, idx),
@@ -479,16 +500,12 @@ pub(crate) fn read_escape_sequence(reader: &mut BitReader<'_>) -> Result<u32> {
 
 /// Write one n-tuple: the Huffman codeword, the sign bits (unsigned
 /// books), and the escape sequences (ESC book, magnitudes ≥ 16).
-pub(crate) fn write_tuple(
-    writer: &mut BitWriter,
-    cb: u8,
-    dim: usize,
-    coeffs: &[i32],
-) -> Result<()> {
-    // Build the in-band tuple: for the ESC book, magnitudes >= 16
-    // are clamped to the ESC_FLAG (signed, so the sign survives for
-    // derive_sign_bits); §4.6.1.3 bounds the true magnitude at
-    // MAX_QUANT.
+/// One tuple's in-band form and codeword index: for the ESC book,
+/// magnitudes >= 16 are clamped to the `ESC_FLAG` (signed, so the
+/// sign bit survives); §4.6.1.3 bounds the true magnitude at
+/// `MAX_QUANT`. Fixed-size scratch, no allocation: the encoder's
+/// rate loop measures every band under every book through here.
+fn tuple_index(cb: u8, dim: usize, coeffs: &[i32]) -> Result<([i32; 4], u32, bool)> {
     let mut tuple = [0i32; 4];
     for (slot, &v) in tuple.iter_mut().zip(coeffs.iter()) {
         if cb == 11 && v.abs() >= ESC_FLAG {
@@ -500,19 +517,52 @@ pub(crate) fn write_tuple(
             *slot = v;
         }
     }
+    let unsigned = table_4_95(cb)?.is_unsigned();
+    let mut index_tuple = tuple;
+    if unsigned {
+        for v in &mut index_tuple[..dim] {
+            *v = v.abs();
+        }
+    }
+    let idx = encode_tuple_to_index(cb, &index_tuple[..dim])?;
+    Ok((tuple, idx, unsigned))
+}
 
-    let row = table_4_95(cb)?;
-    let index_tuple: Vec<i32> = if row.is_unsigned() {
-        tuple.iter().take(dim).map(|v| v.abs()).collect()
-    } else {
-        tuple[..dim].to_vec()
-    };
-    let idx = encode_tuple_to_index(cb, &index_tuple)?;
+/// Exact bit cost of [`write_tuple`] for the same arguments, without
+/// writing: the codeword length from the book's table, one sign bit
+/// per nonzero coefficient of an unsigned book, and for each ESC
+/// escape its unary prefix, separator and `prefix + 4` word.
+pub(crate) fn tuple_bits(cb: u8, dim: usize, coeffs: &[i32]) -> Result<u32> {
+    let (tuple, idx, unsigned) = tuple_index(cb, dim, coeffs)?;
+    let mut bits = codeword_bits(cb, idx)?;
+    if unsigned {
+        bits += tuple[..dim].iter().filter(|&&v| v != 0).count() as u32;
+    }
+    if cb == 11 {
+        for (&clamped, &v) in tuple.iter().zip(coeffs.iter()).take(dim) {
+            if clamped.abs() == ESC_FLAG {
+                let (prefix_len, _) = encode_esc_value(v.unsigned_abs())?;
+                bits += 2 * prefix_len + 5;
+            }
+        }
+    }
+    Ok(bits)
+}
+
+pub(crate) fn write_tuple(
+    writer: &mut BitWriter,
+    cb: u8,
+    dim: usize,
+    coeffs: &[i32],
+) -> Result<()> {
+    let (tuple, idx, unsigned) = tuple_index(cb, dim, coeffs)?;
     write_codeword(writer, cb, idx)?;
 
-    if row.is_unsigned() {
-        for neg in derive_sign_bits(cb, &tuple[..dim])? {
-            writer.write_bit(neg);
+    if unsigned {
+        for &v in &tuple[..dim] {
+            if v != 0 {
+                writer.write_bit(v < 0);
+            }
         }
     }
 
@@ -536,6 +586,61 @@ mod tests {
     use super::*;
     use crate::ics_info::WindowSequence;
     use crate::section_data::ZERO_HCB;
+
+    /// [`tuple_bits`] counts exactly what [`write_tuple`] writes, over
+    /// every book's whole in-band domain (quads at LAV 1 and 2, pairs
+    /// at LAV 4, 7 and 12, both signed and unsigned siblings) and, for
+    /// the ESC book, every magnitude at a prefix-length boundary with
+    /// each sign.
+    #[test]
+    fn tuple_bits_counts_what_the_tuple_writer_writes() {
+        fn check(cb: u8, dim: usize, tuple: &[i32]) {
+            let mut bw = BitWriter::new();
+            let written = write_tuple(&mut bw, cb, dim, tuple).map(|()| bw.bit_position() as u32);
+            let counted = tuple_bits(cb, dim, tuple);
+            assert_eq!(counted.ok(), written.ok(), "cb {cb} tuple {tuple:?}");
+        }
+        for cb in 1u8..=4 {
+            let lav = if cb <= 2 { 1 } else { 2 };
+            let lo = if cb % 2 == 1 { -lav } else { 0 };
+            for w in lo..=lav {
+                for x in lo..=lav {
+                    for y in lo..=lav {
+                        for z in lo..=lav {
+                            check(cb, 4, &[w, x, y, z]);
+                        }
+                    }
+                }
+            }
+        }
+        for cb in 5u8..=10 {
+            let lav = match cb {
+                5 | 6 => 4,
+                7 | 8 => 7,
+                _ => 12,
+            };
+            let lo = if cb <= 6 { -lav } else { 0 };
+            for y in lo..=lav {
+                for z in lo..=lav {
+                    check(cb, 2, &[y, z]);
+                }
+            }
+        }
+        let mut magnitudes: Vec<i32> = (0..=17).collect();
+        for shift in 5..=13 {
+            magnitudes.push((1 << shift) - 1);
+            magnitudes.push(1 << shift);
+        }
+        for &y in &magnitudes {
+            for &z in &magnitudes {
+                for sy in [1, -1] {
+                    for sz in [1, -1] {
+                        check(11, 2, &[sy * y, sz * z]);
+                    }
+                }
+            }
+        }
+    }
 
     /// Build a long-window IcsInfo for fs_index 4 (44.1 kHz) with
     /// the given max_sfb.

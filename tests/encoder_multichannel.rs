@@ -170,3 +170,106 @@ fn lfe_element_is_band_limited() {
     );
     assert!(full > 0.0);
 }
+
+/// Deterministic noise in [-1, 1): a 32-bit LCG, so the fixture is the same on every run.
+fn noise(state: &mut u32) -> f64 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    f64::from(*state >> 8) / f64::from(1u32 << 24) * 2.0 - 1.0
+}
+
+/// A film-like 5.1 mix at 48 kHz (canonical `L R C LFE Ls Rs`): dialogue-like content on the
+/// center at -25 dBFS RMS, room tone on the four other speakers 35 dB below it, a silent LFE.
+fn film_like_five_one(seconds: usize) -> Vec<i16> {
+    let n = seconds * 48_000;
+    let mut out = Vec::with_capacity(n * 6);
+    let mut state = 0x2545_F491u32;
+    let center_rms = 32768.0 * 10f64.powf(-25.0 / 20.0);
+    let quiet_rms = 32768.0 * 10f64.powf(-60.0 / 20.0);
+    for i in 0..n {
+        let t = i as f64 / 48_000.0;
+        // Dialogue stand-in: a buzzing harmonic series around 180 Hz under a slow envelope, with
+        // a little broadband noise so every band carries something.
+        let env = 0.6 + 0.4 * (2.0 * std::f64::consts::PI * 3.0 * t).sin();
+        let mut voice = 0.0;
+        for h in 1..=12 {
+            voice += (2.0 * std::f64::consts::PI * 180.0 * f64::from(h) * t).sin() / f64::from(h);
+        }
+        let center = center_rms * (0.9 * env * voice / 1.3 + 0.3 * noise(&mut state));
+        for c in 0..6 {
+            let v = match c {
+                2 => center,
+                3 => 0.0,
+                _ => quiet_rms * noise(&mut state) * 1.7,
+            };
+            out.push(v.round().clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    out
+}
+
+/// Encode → decode → per-channel SNR in dB for `pcm` at `rate` with `bitrate` over all channels.
+fn roundtrip_snr_db(pcm: &[i16], channels: usize, rate: u32, bitrate: u32) -> Vec<f64> {
+    let n = pcm.len() / channels;
+    let mut enc = StreamEncoder::new(EncoderConfig {
+        sample_rate: rate,
+        channels: channels as u8,
+        bitrate,
+    })
+    .unwrap();
+    let stream = enc.encode_all(pcm).unwrap();
+    let mut dec = StreamDecoder::new();
+    let frames = dec.decode_all(&stream).unwrap();
+    let mut decoded = Vec::new();
+    for f in &frames {
+        decoded.extend_from_slice(&f.pcm);
+    }
+    let aligned = &decoded[FRAME_LEN * channels..];
+    (0..channels)
+        .map(|c| {
+            let (mut err, mut sig) = (0.0f64, 0.0f64);
+            for i in 0..n.min(aligned.len() / channels) {
+                let x = f64::from(pcm[i * channels + c]);
+                let y = f64::from(aligned[i * channels + c]);
+                err += (x - y) * (x - y);
+                sig += x * x;
+            }
+            if err == 0.0 {
+                f64::INFINITY
+            } else {
+                10.0 * (sig / err).log10()
+            }
+        })
+        .collect()
+}
+
+/// A 5.1 film mix puts nearly all the sound on one speaker, with room tone 35 dB down on the
+/// others and nothing on the LFE. The rate must follow the sound: the loud channel at
+/// 6 x 96 kbit/s should come back at least as clean as a mono encode of it at 96 kbit/s does,
+/// while the quiet channels, judged against the frame's loudest peak as the two channels of a
+/// pair already are against each other, get the precision that leaves (their room tone, white
+/// noise here, comes back a little noisier than itself: measured 6 dB, 7 dB before the rule).
+/// Judged each against its own peak the center read 9.2 dB here against 13.1 dB alone, and a
+/// library excerpt's center read 15 dB against 38 dB from a reference encoder at the same rate.
+#[test]
+fn five_one_rate_follows_the_loud_channel() {
+    let pcm = film_like_five_one(6);
+    let snr = roundtrip_snr_db(&pcm, 6, 48_000, 6 * 96_000);
+    let center_alone: Vec<i16> = pcm.chunks_exact(6).map(|f| f[2]).collect();
+    let mono = roundtrip_snr_db(&center_alone, 1, 48_000, 96_000)[0];
+    eprintln!(
+        "5.1 film-like per-channel SNR dB = {snr:.1?}; center alone at 96 kbit/s = {mono:.1}"
+    );
+    assert!(
+        snr[2] >= mono - 3.0,
+        "center {:.1} dB in the 5.1 mix against {mono:.1} dB alone",
+        snr[2]
+    );
+    assert!(
+        snr[3].is_infinite(),
+        "a silent LFE comes back silent: {:.1}",
+        snr[3]
+    );
+    for c in [0usize, 1, 4, 5] {
+        assert!(snr[c] >= 3.0, "quiet channel {c} at {:.1} dB", snr[c]);
+    }
+}
