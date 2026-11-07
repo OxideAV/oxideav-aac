@@ -34,6 +34,16 @@ use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 const FS: u32 = 48_000;
 const FS_INDEX: u8 = 3;
 
+/// Material length and the rate matrix: the full 2 s × three-rate
+/// measurement under an optimised build, a 1 s single-rate pass under
+/// a debug build (the analysis transform is a direct O(N²) MDCT).
+const SECONDS: f64 = if cfg!(debug_assertions) { 1.0 } else { 2.0 };
+const RATES: &[u32] = if cfg!(debug_assertions) {
+    &[96_000]
+} else {
+    &[64_000, 96_000, 128_000]
+};
+
 /// Tonal mix + noise bed + click train + sweep (stereo).
 fn mixed(seconds: f64) -> Vec<i16> {
     let n = (seconds * f64::from(FS)) as usize;
@@ -201,11 +211,11 @@ fn mean_nmr(input: &[i16], decoded: &[i16], frame_len: usize) -> f64 {
 #[test]
 fn lc960_matches_the_1024_path_nmr_at_equal_rate() {
     for (name, pcm) in [
-        ("mixed", mixed(2.0)),
-        ("transients", transients(2.0)),
-        ("attacks", attacks(2.0)),
+        ("mixed", mixed(SECONDS)),
+        ("transients", transients(SECONDS)),
+        ("attacks", attacks(SECONDS)),
     ] {
-        for bitrate in [64_000u32, 96_000, 128_000] {
+        for &bitrate in RATES {
             let c960 = encode(&pcm, bitrate, FrameFamily::Lc960);
             let c1024 = encode(&pcm, bitrate, FrameFamily::Lc1024);
             assert_eq!(
@@ -230,7 +240,8 @@ fn lc960_matches_the_1024_path_nmr_at_equal_rate() {
                 let short = |c: &Coded| c.aus.iter().filter(|au| (au[1] >> 5) & 3 == 2).count();
                 eprintln!("EIGHT_SHORT: 960 {} / 1024 {}", short(&c960), short(&c1024));
                 // One short run per attack after the stream start.
-                assert!(short(&c960) >= 6, "{} EIGHT_SHORT frames", short(&c960));
+                let runs = (SECONDS * 4.0) as usize - 1;
+                assert!(short(&c960) >= runs, "{} EIGHT_SHORT frames", short(&c960));
             }
             assert!(
                 n960 <= n1024 + 0.75,
@@ -325,9 +336,9 @@ fn black_box_decoder_reads_the_960_streams() {
     let dir = std::env::temp_dir().join("oxideav-aac-encoder-960");
     fs::create_dir_all(&dir).unwrap();
     for (name, pcm) in [
-        ("mixed", mixed(1.0)),
-        ("transients", transients(1.0)),
-        ("attacks", attacks(1.0)),
+        ("mixed", mixed(SECONDS / 2.0)),
+        ("transients", transients(SECONDS / 2.0)),
+        ("attacks", attacks(SECONDS / 2.0)),
     ] {
         let c = encode(&pcm, 96_000, FrameFamily::Lc960);
         let mut lw = LoasWriter::new(c.asc.clone(), 16, 1).unwrap();
