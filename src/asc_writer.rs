@@ -89,6 +89,40 @@ pub fn ga_asc(audio_object_type: u8, sample_rate: u32, channel_configuration: u8
     w.finish()
 }
 
+/// The `AudioSpecificConfig` of an ER AAC LD (`audio_object_type`
+/// 23) or ER AAC ELD (39) stream without the error-resilience tools:
+/// for LD the Table 4.1 `GASpecificConfig()` with `frameLengthFlag`
+/// (`frame_480` — 480 rather than 512 lines), `dependsOnCoreCoder`
+/// 0, `extensionFlag` 1 and the three `aac*ResilienceFlag`s clear;
+/// for ELD the Table 4.180 `ELDSpecificConfig()` with
+/// `frameLengthFlag`, the three resilience flags clear, no low-delay
+/// SBR and `ELDEXT_TERM`. Both end with `epConfig` 0 (Table 1.15).
+pub fn er_ld_asc(
+    audio_object_type: u8,
+    sample_rate: u32,
+    channel_configuration: u8,
+    frame_480: bool,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    write_aot(&mut w, audio_object_type);
+    write_sampling_frequency(&mut w, sample_rate);
+    w.write_u32(u32::from(channel_configuration & 0xf), 4);
+    w.write_bit(frame_480); // frameLengthFlag
+    if audio_object_type == 39 {
+        w.write_u32(0, 3); // aacSection/Scalefactor/SpectralDataResilienceFlag
+        w.write_bit(false); // ldSbrPresentFlag
+        w.write_u32(0, 4); // eldExtType = ELDEXT_TERM
+    } else {
+        w.write_bit(false); // dependsOnCoreCoder
+        w.write_bit(true); // extensionFlag
+        w.write_u32(0, 3); // aacSection/Scalefactor/SpectralDataResilienceFlag
+        w.write_bit(false); // extensionFlag3
+    }
+    w.write_u32(0, 2); // epConfig
+    w.align_to_byte_zero();
+    w.finish()
+}
+
 /// The AAC-LC `AudioSpecificConfig` for a PCE-described layout:
 /// `channelConfiguration = 0` with the §8.5.2.2
 /// `program_config_element()` inline in the Table 4.1

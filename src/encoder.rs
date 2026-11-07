@@ -155,6 +155,7 @@
 //! ceiling), and `aac_frame_length` stays within its 13-bit field.
 
 use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ, AdtsHeader};
+use crate::asc::AacResilienceFlags;
 use crate::encoder_tns::detect_and_apply_tns_family;
 use crate::filterbank::{forward_mdct, long_sequence_window_n, short_window_n};
 use crate::ics_body::IcsBody;
@@ -348,13 +349,14 @@ impl EncoderConfig {
     }
 
     /// Per-frame payload byte budget from the bitrate:
-    /// `bitrate · 1024 / sample_rate` bits, minus the 7-byte ADTS
-    /// header, floored at a minimum that always allows a syntactically
-    /// valid (silent) frame.
-    fn frame_budget_bytes(&self, frame_len: usize) -> usize {
+    /// `bitrate · frame_len / sample_rate` bits, minus `header` bytes of
+    /// framing (the 7-byte ADTS header, or none for bare access units),
+    /// floored at a minimum that always allows a syntactically valid
+    /// (silent) frame.
+    fn frame_budget_bytes(&self, frame_len: usize, header: usize) -> usize {
         let bits = (self.bitrate as u64 * frame_len as u64) / self.sample_rate.max(1) as u64;
         let bytes = (bits / 8) as usize;
-        bytes.saturating_sub(ADTS_HEADER_BYTES_NO_CRC).max(16)
+        bytes.saturating_sub(header).max(16)
     }
 
     /// The Table 1.19 default `channelConfiguration` for this channel
@@ -616,8 +618,14 @@ pub struct StreamEncoder {
     is_enabled: bool,
     /// Coded bandwidth (`None` = full band); see [`Self::set_bandwidth`].
     bandwidth_hz: Option<f64>,
-    /// §4.5.1.1 frame-length family; see [`Self::set_frame_family`].
+    /// §4.5.1.1 frame-length family: 1024 / 960-line AAC-LC (see
+    /// [`Self::set_frame_family`]), or ER AAC LD's 512 / 480 lines
+    /// (long windows only, `er_raw_data_block()` syntax; see
+    /// [`Self::new_ld`]).
     family: FrameFamily,
+    /// Emit bare access units from the frame entry points; see
+    /// [`Self::set_raw`].
+    raw: bool,
 }
 
 impl StreamEncoder {
@@ -716,7 +724,37 @@ impl StreamEncoder {
             is_enabled: false,
             bandwidth_hz: Some(config.default_bandwidth_hz()),
             family: FrameFamily::Lc1024,
+            raw: false,
         })
+    }
+
+    /// Build an ER AAC LD (AOT 23) encoder: `frame_len` 512 or 480
+    /// spectral lines per frame (`frameLengthFlag` 0 / 1), long windows
+    /// with the sine shape only (§4.6.17.2.2: no block switching), and
+    /// each frame an `er_raw_data_block()` (§4.4.2.3 Table 4.19: the
+    /// channel configuration's fixed element sequence without
+    /// `id_syn_ele`, no `END`) — the access unit an MP4 / CAF sample
+    /// carries, described by [`Self::audio_specific_config`] (no
+    /// resilience tools, `epConfig` 0). TNS, PNS and intensity stereo
+    /// stay off.
+    ///
+    /// Errors with [`Error::EncoderInvalidConfig`] for another frame
+    /// length, a rate without an LD band table, a channel count
+    /// without a Table 1.19 configuration, or bitrate 0.
+    pub fn new_ld(config: EncoderConfig, frame_len: usize) -> Result<Self> {
+        let family = match frame_len {
+            512 => FrameFamily::Ld512,
+            480 => FrameFamily::Ld480,
+            _ => return Err(Error::EncoderInvalidConfig),
+        };
+        let mut encoder = Self::new(config)?;
+        long_window_offsets_family(family, encoder.fs_index)
+            .map_err(|_| Error::EncoderInvalidConfig)?;
+        encoder.family = family;
+        encoder.history = vec![vec![0.0; frame_len]; usize::from(config.channels)];
+        encoder.raw = true;
+        encoder.tns_enabled = false;
+        Ok(encoder)
     }
 
     /// Select the §4.5.1.1 frame-length family: `Lc1024` (the
@@ -765,6 +803,17 @@ impl StreamEncoder {
     /// the `channelConfiguration` (with the `program_config_element()`
     /// inline for a PCE layout) and `frameLengthFlag` per the family.
     pub fn audio_specific_config(&self) -> Result<Vec<u8>> {
+        if self.family.is_ld() {
+            return match &self.program_config {
+                Some(_) => Err(Error::EncoderInvalidConfig),
+                None => Ok(crate::asc_writer::er_ld_asc(
+                    self.aot(),
+                    self.config.sample_rate,
+                    self.channel_configuration,
+                    self.family == FrameFamily::Ld480,
+                )),
+            };
+        }
         let mut asc = match &self.program_config {
             Some(pce) => crate::asc_writer::aac_lc_asc_with_pce(self.config.sample_rate, pce)?,
             None => {
@@ -803,13 +852,40 @@ impl StreamEncoder {
         Ok(cur)
     }
 
+    /// [`Self::deinterleave`] for float PCM normalised to ±1.0 (1.0
+    /// is 32768 on the `i16` axis), without rounding to 16 bits.
+    fn deinterleave_f64(&self, interleaved: &[f64]) -> Result<Vec<Vec<f64>>> {
+        let ch = self.config.channels as usize;
+        let n = self.frame_len();
+        if interleaved.len() > n * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; n]; ch];
+        for (j, chan) in cur.iter_mut().enumerate() {
+            let src = self.element_src[j];
+            for (k, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *slot = interleaved[k * ch + src] * 32768.0;
+            }
+        }
+        Ok(cur)
+    }
+
     /// Encode one hop (at most [`Self::frame_len`] samples per
-    /// channel, zero-padded) into one bare `raw_data_block()` access
-    /// unit — the MP4 / Matroska / LATM payload, configured by
-    /// [`Self::audio_specific_config`]. Works under both families.
+    /// channel, zero-padded) into one bare access unit — a
+    /// `raw_data_block()` (or, for ER AAC LD, an `er_raw_data_block()`),
+    /// the MP4 / Matroska / LATM payload, configured by
+    /// [`Self::audio_specific_config`]. Works under every family.
     pub fn encode_access_unit(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
         let cur = self.deinterleave(interleaved)?;
-        let au = self.encode_hop_raw(&cur, &[])?;
+        let au = self.encode_hop_raw(&cur, &[], true)?;
+        self.history = cur;
+        Ok(au)
+    }
+
+    /// [`Self::encode_access_unit`] for float PCM normalised to ±1.0.
+    pub fn encode_access_unit_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        let cur = self.deinterleave_f64(interleaved)?;
+        let au = self.encode_hop_raw(&cur, &[], true)?;
         self.history = cur;
         Ok(au)
     }
@@ -818,7 +894,7 @@ impl StreamEncoder {
     /// (the access-unit counterpart of [`Self::finish`]).
     pub fn finish_access_unit(&mut self) -> Result<Vec<u8>> {
         let zeros = vec![vec![0.0; self.frame_len()]; self.config.channels as usize];
-        let au = self.encode_hop_raw(&zeros, &[])?;
+        let au = self.encode_hop_raw(&zeros, &[], true)?;
         self.history = zeros;
         Ok(au)
     }
@@ -841,9 +917,10 @@ impl StreamEncoder {
         Ok(out)
     }
 
-    /// ADTS carries only the 1024-line family.
+    /// ADTS carries only the 1024-line family (the frame entry points
+    /// under [`Self::set_raw`] emit bare access units for any family).
     fn require_adts_family(&self) -> Result<()> {
-        if self.family == FrameFamily::Lc1024 {
+        if self.raw || self.family == FrameFamily::Lc1024 {
             Ok(())
         } else {
             Err(Error::EncoderInvalidConfig)
@@ -875,7 +952,7 @@ impl StreamEncoder {
     /// Turning the default on awaits a cross-frame tonality /
     /// predictability measure.
     pub fn set_pns(&mut self, enabled: bool) {
-        self.pns_enabled = enabled;
+        self.pns_enabled = enabled && !self.family.is_ld();
     }
 
     /// Set the coded bandwidth: spectral lines above `hz` are zeroed
@@ -907,7 +984,7 @@ impl StreamEncoder {
     /// envelope. Safe to leave on: windows without a clear envelope
     /// simply carry no filter.
     pub fn set_tns(&mut self, enabled: bool) {
-        self.tns_enabled = enabled;
+        self.tns_enabled = enabled && !self.family.is_ld();
     }
 
     /// Enable / disable §4.6.8.2 intensity-stereo emission (default
@@ -931,7 +1008,31 @@ impl StreamEncoder {
     /// perceptual trade appropriate for low-rate coding but not for
     /// transparent transcodes.
     pub fn set_intensity_stereo(&mut self, enabled: bool) {
-        self.is_enabled = enabled;
+        self.is_enabled = enabled && !self.family.is_ld();
+    }
+
+    /// Make the frame entry points ([`Self::encode_frame`],
+    /// [`Self::encode_frame_f64`], [`Self::finish`], [`Self::encode_all`])
+    /// emit bare access units — what [`Self::encode_access_unit`]
+    /// produces — instead of ADTS frames (default **off**; always on
+    /// for ER AAC LD). The configuration then travels out of band in
+    /// [`Self::audio_specific_config`] (a PCE layout's
+    /// `program_config_element()` included, so it is not repeated in
+    /// the blocks), and the 7-byte ADTS header no longer comes out of
+    /// the frame budget.
+    pub fn set_raw(&mut self, raw: bool) {
+        self.raw = raw || self.family.is_ld();
+    }
+
+    /// Change the target bitrate from the next frame on (the coded
+    /// bandwidth keeps its setting). Errors with
+    /// [`Error::EncoderInvalidConfig`] for 0.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
+        if bitrate == 0 {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        self.config.bitrate = bitrate;
+        Ok(())
     }
 
     /// The configuration this encoder was built with.
@@ -965,26 +1066,47 @@ impl StreamEncoder {
     pub fn finish(&mut self) -> Result<Vec<u8>> {
         self.require_adts_family()?;
         let ch = self.config.channels as usize;
-        let zeros: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
+        let zeros: Vec<Vec<f64>> = vec![vec![0.0; self.frame_len()]; ch];
         let frame = self.encode_hop(&zeros, &[])?;
         self.history = zeros;
         Ok(frame)
     }
 
-    /// [`StreamEncoder::encode_frame`] with `extension_payload()` fill
-    /// elements interleaved into the `raw_data_block()`: `fills[i]` is
-    /// emitted as a `fill_element()` immediately after the `i`-th
-    /// element of the Table 1.19 plan (an empty entry emits nothing).
-    /// The fill bytes are charged against the frame's byte budget so
-    /// the rate loop leaves room for them. This is how the HE-AAC
-    /// encoder attaches its SBR payload to each SCE / CPE.
-    pub(crate) fn encode_frame_with_fills(
+    /// [`StreamEncoder::encode_frame`] for float PCM: `interleaved`
+    /// holds at most [`Self::frame_len`]` × channels` samples
+    /// normalised to ±1.0 (1.0 is 32768 on the `i16` axis), which are
+    /// coded as they are, without rounding to 16 bits.
+    pub fn encode_frame_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
+        let cur = self.deinterleave_f64(interleaved)?;
+        let frame = self.encode_hop(&cur, &[])?;
+        self.history = cur;
+        Ok(frame)
+    }
+
+    /// One hop of planar PCM on the `i16` axis (one `frame_len` hop per
+    /// channel in canonical input order, coded without rounding to 16
+    /// bits) with `extension_payload()` fill elements interleaved into
+    /// the `raw_data_block()`: `fills[i]` is emitted as a
+    /// `fill_element()` immediately after the `i`-th element of the
+    /// Table 1.19 plan (an empty entry emits nothing). The fill bytes
+    /// are charged against the frame's byte budget so the rate loop
+    /// leaves room for them. This is how the HE-AAC encoder attaches its
+    /// SBR payload to each SCE / CPE.
+    pub(crate) fn encode_planar_with_fills(
         &mut self,
-        interleaved: &[i16],
+        planar: &[Vec<f64>],
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
         self.require_adts_family()?;
-        let cur = self.deinterleave(interleaved)?;
+        let ch = self.config.channels as usize;
+        let frame_len = self.frame_len();
+        if planar.len() != ch || planar.iter().any(|hop| hop.len() != frame_len) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let cur: Vec<Vec<f64>> = (0..ch)
+            .map(|j| planar[self.element_src[j]].clone())
+            .collect();
         let frame = self.encode_hop(&cur, fills)?;
         self.history = cur;
         Ok(frame)
@@ -1000,7 +1122,7 @@ impl StreamEncoder {
             return Err(Error::EncoderInvalidConfig);
         }
         let mut out = Vec::new();
-        let hop = FRAME_LEN * ch;
+        let hop = self.frame_len() * ch;
         let mut chunks = interleaved.chunks(hop);
         // Always emit at least one content frame (an empty input
         // yields one silent frame + the flush frame).
@@ -1016,7 +1138,10 @@ impl StreamEncoder {
     /// Window `[history | cur]`, transform, quantize under the rate
     /// loop, and wrap the raw data block in an ADTS header.
     fn encode_hop(&mut self, cur: &[Vec<f64>], fills: &[Vec<u8>]) -> Result<Vec<u8>> {
-        let raw_block = self.encode_hop_raw(cur, fills)?;
+        if self.raw {
+            return self.encode_hop_raw(cur, fills, true);
+        }
+        let raw_block = self.encode_hop_raw(cur, fills, false)?;
         // ADTS wrap. aac_frame_length is 13 bits; the budget floor
         // (16 bytes) and MAX_RATE_ITERATIONS guarantee headroom for
         // every realistic configuration, but validate regardless.
@@ -1041,8 +1166,15 @@ impl StreamEncoder {
     }
 
     /// Window `[history | cur]`, transform, and quantize under the
-    /// rate loop into one `raw_data_block()`.
-    fn encode_hop_raw(&mut self, cur: &[Vec<f64>], fills: &[Vec<u8>]) -> Result<Vec<u8>> {
+    /// rate loop into one `raw_data_block()`: a `bare` access unit
+    /// (the configuration out of band — no PCE in the block, no
+    /// framing out of the budget), or the payload of an ADTS frame.
+    fn encode_hop_raw(
+        &mut self,
+        cur: &[Vec<f64>],
+        fills: &[Vec<u8>],
+        bare: bool,
+    ) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
         let geom = self.geom();
 
@@ -1055,12 +1187,14 @@ impl StreamEncoder {
         // exits through LONG_STOP.
         // LFE channels neither trigger nor follow block switching —
         // §4.5.2.1.3 fixes their window_sequence to ONLY_LONG.
-        let transient = self
-            .history
-            .iter()
-            .zip(cur.iter())
-            .zip(self.lfe_slot.iter())
-            .any(|((h, c), &lfe)| !lfe && detect_transient(h, c, geom.short_len()));
+        // ER AAC LD has no block switching (§4.6.17.2.2).
+        let transient = !self.family.is_ld()
+            && self
+                .history
+                .iter()
+                .zip(cur.iter())
+                .zip(self.lfe_slot.iter())
+                .any(|((h, c), &lfe)| !lfe && detect_transient(h, c, geom.short_len()));
         let seq = if self.short_pending {
             WindowSequence::EightShort
         } else if transient && self.prev_seq != WindowSequence::EightShort {
@@ -1088,7 +1222,11 @@ impl StreamEncoder {
             .zip(self.lfe_slot.iter())
         {
             let ch_seq = if lfe { WindowSequence::OnlyLong } else { seq };
-            let mut spec = analyze_channel(hist, chan, ch_seq, geom)?;
+            let mut spec = if self.family.is_ld() {
+                analyze_channel_ld(hist, chan)
+            } else {
+                analyze_channel(hist, chan, ch_seq, geom)?
+            };
             if let (Some(hz), false) = (self.bandwidth_hz, lfe) {
                 cull_bandwidth(&mut spec, ch_seq, hz, self.config.sample_rate, geom);
             }
@@ -1148,20 +1286,24 @@ impl StreamEncoder {
             .sum();
         let budget = self
             .config
-            .frame_budget_bytes(geom.frame_len())
+            .frame_budget_bytes(
+                geom.frame_len(),
+                if bare { 0 } else { ADTS_HEADER_BYTES_NO_CRC },
+            )
             .max(fill_bytes + 16);
         let mut sf_offset = 0i32;
-        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
+        let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills, bare)?;
         let mut iterations = 0usize;
         if raw_block.len() > budget {
             while raw_block.len() > budget && iterations < MAX_RATE_ITERATIONS {
                 sf_offset += 4;
-                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
+                raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills, bare)?;
                 iterations += 1;
             }
         } else {
             while sf_offset > -MAX_REFINE_OFFSET && iterations < MAX_RATE_ITERATIONS {
-                let finer = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, fills)?;
+                let finer =
+                    self.assemble_raw_block(seq, &spectra, &tns, sf_offset - 4, fills, bare)?;
                 if finer.len() > budget {
                     break;
                 }
@@ -1176,7 +1318,8 @@ impl StreamEncoder {
         // once). Try the intermediate offsets, finest first.
         if raw_block.len() <= budget && sf_offset > -MAX_REFINE_OFFSET {
             for fine in [3i32, 2, 1] {
-                let cand = self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine, fills)?;
+                let cand =
+                    self.assemble_raw_block(seq, &spectra, &tns, sf_offset - fine, fills, bare)?;
                 if cand.len() <= budget {
                     raw_block = cand;
                     break;
@@ -1203,9 +1346,11 @@ impl StreamEncoder {
         tns: &[Option<TnsData>],
         sf_offset: i32,
         fills: &[Vec<u8>],
+        bare: bool,
     ) -> Result<Vec<u8>> {
         let mut asm = FrameAssembler::new();
-        if let Some(pce) = &self.program_config {
+        // A bare access unit's PCE travels in the AudioSpecificConfig.
+        if let (Some(pce), false) = (&self.program_config, bare) {
             asm.push_pce(pce)?;
         }
         let mut sce_tag = 0u8;
@@ -1215,17 +1360,17 @@ impl StreamEncoder {
             let mut body_bits = BitWriter::new();
             match elem {
                 ElementPlan::Sce(ch) => {
-                    asm.push_channel_header(IdSynEle::Sce, sce_tag)?;
+                    self.push_element_header(&mut asm, IdSynEle::Sce, sce_tag)?;
                     sce_tag += 1;
                     self.assemble_sce(&mut body_bits, &spectra[ch], &tns[ch], seq, sf_offset)?;
                 }
                 ElementPlan::Lfe(ch) => {
-                    asm.push_channel_header(IdSynEle::Lfe, lfe_tag)?;
+                    self.push_element_header(&mut asm, IdSynEle::Lfe, lfe_tag)?;
                     lfe_tag += 1;
                     self.assemble_lfe(&mut body_bits, &spectra[ch], sf_offset)?;
                 }
                 ElementPlan::Cpe(l, r) => {
-                    asm.push_channel_header(IdSynEle::Cpe, cpe_tag)?;
+                    self.push_element_header(&mut asm, IdSynEle::Cpe, cpe_tag)?;
                     cpe_tag += 1;
                     self.assemble_cpe(
                         &mut body_bits,
@@ -1244,7 +1389,44 @@ impl StreamEncoder {
                 asm.push_fill(fill)?;
             }
         }
-        Ok(asm.push_end())
+        Ok(if self.family.is_ld() {
+            asm.finish_er()
+        } else {
+            asm.push_end()
+        })
+    }
+
+    /// A channel element's header: `id_syn_ele` + `element_instance_tag`,
+    /// or the tag alone in an `er_raw_data_block()`.
+    fn push_element_header(&self, asm: &mut FrameAssembler, kind: IdSynEle, tag: u8) -> Result<()> {
+        if self.family.is_ld() {
+            asm.push_er_channel_header(tag)
+        } else {
+            asm.push_channel_header(kind, tag)
+        }
+    }
+
+    /// The audio object type the elements are written for: 2 (AAC LC)
+    /// or 23 (ER AAC LD).
+    fn aot(&self) -> u8 {
+        if self.family.is_ld() { 23 } else { 2 }
+    }
+
+    /// A single channel's stream before its `spectral_data()`: the
+    /// Table 4.50 `individual_channel_stream()` with its `ics_info()`,
+    /// for ER AAC LD in its §4.5.2.4.2 category order (no resilience
+    /// tools).
+    fn write_single(&self, body_bits: &mut BitWriter, chan: &QuantizedChannel) -> Result<()> {
+        if self.family.is_ld() {
+            chan.body.write_er(
+                body_bits,
+                self.aot(),
+                self.fs_index,
+                AacResilienceFlags::default(),
+            )
+        } else {
+            chan.body.write(body_bits, 2, self.fs_index, false)
+        }
     }
 
     /// Quantize a spectrum for this frame: the grouped short-window
@@ -1290,7 +1472,7 @@ impl StreamEncoder {
         };
         let mut chan = self.quantize_seq(spec, seq, sf_offset, peak, &pns_bands, &[])?;
         attach_tns(&mut chan, tns);
-        chan.body.write(body_bits, 2, self.fs_index, false)?;
+        self.write_single(body_bits, &chan)?;
         chan.spectral.write(
             body_bits,
             &chan.info,
@@ -1318,7 +1500,7 @@ impl StreamEncoder {
             &[],
             &[],
         )?;
-        chan.body.write(body_bits, 2, self.fs_index, false)?;
+        self.write_single(body_bits, &chan)?;
         chan.spectral.write(
             body_bits,
             &chan.info,
@@ -1456,7 +1638,8 @@ impl StreamEncoder {
         // then the two-bit ms_mask_present (+ mask when 1: one bit
         // per (window group, sfb), group-major — Table 4.5).
         body_bits.write_bit(true);
-        left.info.write(body_bits, 2, self.fs_index, true)?;
+        left.info
+            .write(body_bits, self.aot(), self.fs_index, true)?;
         let any_ms = ms_rows.iter().flatten().any(|&b| b);
         let all_ms = !ms_rows.is_empty()
             && ms_rows.iter().all(|row| !row.is_empty())
@@ -1472,8 +1655,17 @@ impl StreamEncoder {
             body_bits.write_u32(0, 2);
         }
         for chan in [&left, &right] {
-            chan.body
-                .write_with_ics_info(body_bits, &chan.info, 2, false)?;
+            if self.family.is_ld() {
+                chan.body.write_with_ics_info_er(
+                    body_bits,
+                    &chan.info,
+                    self.aot(),
+                    AacResilienceFlags::default(),
+                )?;
+            } else {
+                chan.body
+                    .write_with_ics_info(body_bits, &chan.info, 2, false)?;
+            }
             chan.spectral.write(
                 body_bits,
                 &chan.info,
@@ -1675,6 +1867,20 @@ fn analyze_channel(hist: &[f64], cur: &[f64], seq: WindowSequence, geom: Geom) -
         let z: Vec<f64> = (0..n_l).map(|m| region(m) * w[m]).collect();
         Ok(forward_mdct(&z, n_l))
     }
+}
+
+/// The ER AAC LD analysis transform (§4.6.17.2): one `2N`-point MDCT
+/// over `[hist | cur]` (`N` = the frame length) under the sine window
+/// `w(n) = sin(π (n + ½) / 2N)` (`window_shape` 0).
+fn analyze_channel_ld(hist: &[f64], cur: &[f64]) -> Vec<f64> {
+    let n = 2 * hist.len();
+    let z: Vec<f64> = hist
+        .iter()
+        .chain(cur.iter())
+        .enumerate()
+        .map(|(i, &v)| v * (core::f64::consts::PI * (i as f64 + 0.5) / n as f64).sin())
+        .collect();
+    forward_mdct(&z, n)
 }
 
 /// One quantized channel, ready for wire assembly.
@@ -2880,6 +3086,119 @@ mod tests {
     use crate::dequant::{inverse_quantize, scale_factor_gain};
     use crate::ics_info::NUM_SWB_SHORT_WINDOW;
     use crate::swb_offset::{SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets};
+
+    /// ER AAC LD round trip through the crate's ER decoder: 512 and 480
+    /// lines, mono and stereo, at the delay of one frame; the
+    /// `AudioSpecificConfig` parses back to the stream's parameters.
+    #[test]
+    fn ld_round_trip() {
+        use crate::asc::{AacResilienceFlags, AudioSpecificConfig};
+        use crate::decode::StreamDecoder;
+        for (frame_len, family) in [(512, FrameFamily::Ld512), (480, FrameFamily::Ld480)] {
+            for channels in [1u8, 2] {
+                let ch = usize::from(channels);
+                let config = EncoderConfig {
+                    sample_rate: 48_000,
+                    channels,
+                    bitrate: 96_000 * u32::from(channels),
+                };
+                let mut enc = StreamEncoder::new_ld(config, frame_len).unwrap();
+                assert_eq!(enc.frame_len(), frame_len);
+                let (asc, _) =
+                    AudioSpecificConfig::parse(&enc.audio_specific_config().unwrap()).unwrap();
+                assert_eq!(asc.aot, 23);
+                assert_eq!(asc.channel_configuration, channels);
+                assert_eq!(asc.ga_body.frame_length.family(asc.aot), family);
+                let frames = 40;
+                let input: Vec<f64> = (0..frame_len * frames * ch)
+                    .map(|i| {
+                        let t = (i / ch) as f64 / 48_000.0;
+                        0.4 * (2.0 * core::f64::consts::PI * (440.0 + 220.0 * (i % ch) as f64) * t)
+                            .sin()
+                    })
+                    .collect();
+                let mut dec = StreamDecoder::new();
+                dec.set_frame_family(family);
+                let mut out: Vec<f64> = Vec::new();
+                for hop in input.chunks(frame_len * ch) {
+                    let au = enc.encode_frame_f64(hop).unwrap();
+                    let frame = dec
+                        .decode_er_raw_data_block(
+                            23,
+                            3,
+                            48_000,
+                            channels,
+                            AacResilienceFlags::default(),
+                            &au,
+                        )
+                        .unwrap();
+                    out.extend(frame.pcm.iter().map(|&v| f64::from(v)));
+                }
+                // Decoded frame f reconstructs input hop f - 1.
+                let (mut energy, mut error) = (0.0, 0.0);
+                for i in frame_len * ch..out.len() {
+                    let x = input[i - frame_len * ch] * 32768.0;
+                    energy += x * x;
+                    error += (out[i] - x) * (out[i] - x);
+                }
+                let snr = 10.0 * (energy / error).log10();
+                assert!(snr > 25.0, "LD {frame_len} ch={channels}: {snr} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn float_input_codes_like_i16_input() {
+        let pcm: Vec<i16> = (0..FRAME_LEN * 2 * 3)
+            .map(|i| ((i as f64 * 0.021).sin() * 12000.0) as i16)
+            .collect();
+        let float: Vec<f64> = pcm.iter().map(|&v| f64::from(v) / 32768.0).collect();
+        let config = EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate: 128_000,
+        };
+        let mut a = StreamEncoder::new(config).unwrap();
+        let mut b = StreamEncoder::new(config).unwrap();
+        for (x, y) in pcm.chunks(FRAME_LEN * 2).zip(float.chunks(FRAME_LEN * 2)) {
+            assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
+        }
+    }
+
+    /// Under `set_raw` the frame entry points emit what the
+    /// access-unit entry points do, and an ADTS frame's payload is a
+    /// bare unit coded at the bitrate whose budget equals the ADTS
+    /// payload budget.
+    #[test]
+    fn raw_frames_are_access_units() {
+        let pcm: Vec<i16> = (0..FRAME_LEN * 2 * 4)
+            .map(|i| ((i as f64 * 0.017).sin() * 9000.0 + (i as f64 * 0.9).sin() * 1500.0) as i16)
+            .collect();
+        let config = |bitrate| EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate,
+        };
+        // 128 kb/s: 333 bytes per frame, 326 after the ADTS header —
+        // the whole budget of a bare unit at 326·8·48000/1024 b/s.
+        let mut adts = StreamEncoder::new(config(128_000)).unwrap();
+        let mut raw = StreamEncoder::new(config(122_250)).unwrap();
+        let mut au = StreamEncoder::new(config(122_250)).unwrap();
+        raw.set_raw(true);
+        // The default bandwidth follows the bitrate; pin it.
+        for enc in [&mut adts, &mut raw, &mut au] {
+            enc.set_bandwidth(Some(15_000.0));
+        }
+        for hop in pcm.chunks(FRAME_LEN * 2) {
+            let a = adts.encode_frame(hop).unwrap();
+            let r = raw.encode_frame(hop).unwrap();
+            assert_eq!(r, &a[7..]);
+            assert_eq!(au.encode_access_unit(hop).unwrap(), r);
+        }
+        raw.set_bitrate(32_000).unwrap();
+        assert_eq!(raw.config().bitrate, 32_000);
+        assert!(raw.set_bitrate(0).is_err());
+    }
 
     #[test]
     fn quantize_coef_inverts_dequant_within_rounding() {

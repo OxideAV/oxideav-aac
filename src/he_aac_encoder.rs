@@ -476,6 +476,23 @@ impl HeAacEncoder {
         })
     }
 
+    /// Emit bare `raw_data_block()`s (MP4 / CAF access units) instead
+    /// of ADTS frames; see [`StreamEncoder::set_raw`]. The stream is then
+    /// described by [`Self::audio_specific_config`] (explicit SBR / PS
+    /// signalling).
+    pub fn set_raw(&mut self, raw: bool) {
+        self.core.set_raw(raw);
+    }
+
+    /// Change the target total bitrate from the next frame on. The SBR
+    /// crossover keeps the value chosen at construction. Errors with
+    /// [`Error::EncoderInvalidConfig`] for 0.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
+        self.core.set_bitrate(bitrate)?;
+        self.config.bitrate = bitrate;
+        Ok(())
+    }
+
     /// The configuration.
     pub fn config(&self) -> &HeAacConfig {
         &self.config
@@ -575,6 +592,23 @@ impl HeAacEncoder {
         self.encode_hops(&hops)
     }
 
+    /// [`HeAacEncoder::encode_frame`] for float PCM: `interleaved`
+    /// holds at most `2048 × channels` samples normalised to ±1.0 (1.0
+    /// is 32768 on the `i16` axis), coded without rounding to 16 bits.
+    pub fn encode_frame_f64(&mut self, interleaved: &[f64]) -> Result<Vec<u8>> {
+        let ch = usize::from(self.config.channels);
+        if interleaved.len() > HE_FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut hops: Vec<Vec<f64>> = vec![vec![0.0; HE_FRAME_LEN]; ch];
+        for (j, hop) in hops.iter_mut().enumerate() {
+            for (n, v) in hop.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *v = interleaved[n * ch + j] * 32768.0;
+            }
+        }
+        self.encode_hops(&hops)
+    }
+
     fn encode_hops(&mut self, hops: &[Vec<f64>]) -> Result<Vec<u8>> {
         // HE-AAC v2: stereo analysis + downmix, the mono hop feeding
         // the v1 path below; the PS payload rides in the SBR
@@ -611,15 +645,9 @@ impl HeAacEncoder {
         let sbr_frame = self.sbr.encode_frame_with_extension(&refs, extension)?;
         let fills = vec![sbr_frame.payload.clone()];
         self.last_sbr = Some(sbr_frame);
-        // Core encode (interleaved S16 on the ±32768 axis).
-        let mut inter = Vec::with_capacity(FRAME_LEN * ch);
-        for n in 0..FRAME_LEN {
-            for pcm in core_pcm.iter() {
-                inter.push(crate::pcm::to_s16(pcm[n]));
-            }
-        }
+        // Core encode (planar, on the ±32768 axis).
         self.frames += 1;
-        self.core.encode_frame_with_fills(&inter, &fills)
+        self.core.encode_planar_with_fills(&core_pcm, &fills)
     }
 
     /// Flush: one trailing frame covering the final core overlap (and
@@ -689,6 +717,46 @@ impl HeAacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_input_codes_like_i16_input() {
+        let pcm: Vec<i16> = (0..HE_FRAME_LEN * 2 * 3)
+            .map(|i| ((i as f64 * 0.013).sin() * 9000.0 + (i as f64 * 0.31).cos() * 3000.0) as i16)
+            .collect();
+        let float: Vec<f64> = pcm.iter().map(|&v| f64::from(v) / 32768.0).collect();
+        let mut a = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+        let mut b = HeAacEncoder::new(HeAacConfig::new(44_100, 2, 48_000)).unwrap();
+        for (x, y) in pcm
+            .chunks(HE_FRAME_LEN * 2)
+            .zip(float.chunks(HE_FRAME_LEN * 2))
+        {
+            assert_eq!(a.encode_frame(x).unwrap(), b.encode_frame_f64(y).unwrap());
+        }
+    }
+
+    #[test]
+    fn raw_blocks_are_adts_payloads_with_the_header_budget() {
+        // 64 kb/s at a 24 kHz core is a 334-byte ADTS payload budget,
+        // the whole budget of a raw block at 62 625 b/s.
+        let pcm: Vec<f64> = (0..HE_FRAME_LEN * 2 * 4)
+            .map(|i| (i as f64 * 0.017).sin() * 0.3 + (i as f64 * 0.9).sin() * 0.05)
+            .collect();
+        let config = |bitrate| HeAacConfig {
+            crossover_hz: Some(8_000.0),
+            ..HeAacConfig::new(48_000, 2, bitrate)
+        };
+        let mut adts = HeAacEncoder::new(config(64_000)).unwrap();
+        let mut raw = HeAacEncoder::new(config(62_625)).unwrap();
+        raw.set_raw(true);
+        for hop in pcm.chunks(HE_FRAME_LEN * 2) {
+            let a = adts.encode_frame_f64(hop).unwrap();
+            assert_eq!(&a[..2], &[0xff, 0xf1]);
+            assert_eq!(raw.encode_frame_f64(hop).unwrap(), &a[7..]);
+        }
+        raw.set_bitrate(32_000).unwrap();
+        assert_eq!(raw.config().bitrate, 32_000);
+        assert!(raw.set_bitrate(0).is_err());
+    }
 
     #[test]
     fn config_validation() {

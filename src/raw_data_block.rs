@@ -483,6 +483,21 @@ impl FrameAssembler {
         Ok(())
     }
 
+    /// Emit a channel element's header in an §4.4.2.3 Table 4.19
+    /// `er_raw_data_block()`: the 4-bit `element_instance_tag` alone
+    /// (the element kind follows from `channelConfiguration`, so there
+    /// is no `id_syn_ele`).
+    ///
+    /// Returns [`Error::RawDataBlockEncodeInvalid`] when
+    /// `element_instance_tag > 0x0f`.
+    pub fn push_er_channel_header(&mut self, element_instance_tag: u8) -> Result<()> {
+        if element_instance_tag > 0x0f {
+            return Err(Error::RawDataBlockEncodeInvalid);
+        }
+        self.writer.write_u32(element_instance_tag as u32, 4);
+        Ok(())
+    }
+
     /// Append `bit_count` raw bits from `bits` (read MSB-first) to
     /// the frame — the channel-element body that follows a
     /// [`FrameAssembler::push_channel_header`].
@@ -660,6 +675,13 @@ impl FrameAssembler {
     /// fully populated.
     pub fn push_end(mut self) -> Vec<u8> {
         self.writer.write_u32(IdSynEle::End as u32, 3);
+        self.writer.align_to_byte();
+        self.writer.finish()
+    }
+
+    /// Finish an `er_raw_data_block()`, which has no `END` element:
+    /// pad to the byte boundary and return the bytes.
+    pub fn finish_er(mut self) -> Vec<u8> {
         self.writer.align_to_byte();
         self.writer.finish()
     }
