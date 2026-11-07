@@ -345,7 +345,11 @@ impl StreamDecoder {
             self.sbr.clear();
             self.sbr_prev_header.clear();
             self.sbr_active = false;
-            self.float_pcm = None;
+            // The float view of the old stream is stale, but capture
+            // stays enabled.
+            if let Some(view) = &mut self.float_pcm {
+                view.clear();
+            }
         }
         self.stream_config = Some(cfg);
     }

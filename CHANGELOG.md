@@ -19,7 +19,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   within 1 LSB of a reference decoder binary on every access unit
   (err/sig 1.5–2.8 on TNS frames and 5 failed AUs before).
   `tns_data::field_widths_family` now returns the literal widths for
-  every family.
+  every family. #29 (ropoctl) reached the same placement and widths
+  independently, validated on black-box LD streams up to 8 channels.
+- `set_float_pcm_capture` stayed enabled only until the first
+  configuration change of a stream (a splice restarted the decoder and
+  switched capture off); the view is now cleared and capture kept.
 - `pulse_data()` on a 960-line or ER AAC LD long frame was applied
   through the 1024-line band table and rejected (the frame failed to
   decode); the §4.6.3.3 fix-up now uses the frame's own family table.
@@ -43,11 +47,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   5.1 film excerpt at 6 x 96 kbit/s the center goes from 33 dB SNR to
   54 (a reference encoder reads 42 at the same rate) while the room
   tone channels go from 30 to 26-28 dB (the reference reads 27-29).
-  The LFE keeps its own anchor.
+  The LFE keeps its own anchor (#34, pmarreck).
 - `forward_mdct` / `imdct` run in `O(N log N)` through a DCT-IV on an
-  `N/4`-point FFT instead of the direct `O(N²)` sums, which had every
-  encode and decode spending its time in `cos` (a 5.1 encode ran at a
-  tenth of real time). The direct sums stay as the test oracle.
+  `N/4`-point FFT (Bluestein's chirp-z for the 960 / 480 families)
+  instead of the direct `O(N²)` sums, which had every encode and decode
+  spending its time in `cos`. Measured on 4 s of 48 kHz audio: stereo
+  AAC-LC encode 1.7x → 320x real time and decode 1.8x → 207x, 5.1
+  encode / decode 0.57x → 117x / 72x, with stereo LC / LD / ELD output
+  byte- and PCM-identical. The direct sums stay as the test oracle
+  (#34, pmarreck).
+- The rate loop prices a band's bits per spectrum book from the
+  codeword-length tables (`spectral_data::tuple_bits`) instead of
+  writing it into a scratch writer, and searches each frame's
+  scalefactor offset from the previous frame's (gallop + bisect)
+  instead of a ladder from zero; same streams, fewer passes
+  (`StreamEncoder::rate_passes`) (#34, pmarreck).
 - edition 2024, MSRV 1.95.
 
 ### Added
@@ -65,6 +79,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reads it within 1 LSB of this crate's decode. The 1024-line output is
   unchanged byte for byte.
 - `encoder_tns::detect_and_apply_tns_family`.
+- ER AAC ELD decoding (AOT 39) without low-delay SBR or the resilience
+  tools: the `ELDSpecificConfig` parse (`AudioSpecificConfig::eld`), the
+  Table 4.75–4.79 ELD channel syntax (`IcsBody::parse_eld`,
+  `IcsInfo::eld`), and the §4.6.20.2 low-delay synthesis
+  (`Filterbank::new_low_delay`, the 4N window of Tables 4.A.15 /
+  4.A.16) for 512 and 480 lines (#31, ropoctl). Black-box: AAC-ELD
+  streams from `afconvert` (16–48 kHz, 1 / 2 / 6 channels) decode within
+  1 LSB of the `afconvert` decode.
+- Encoder float input and bare access units: `StreamEncoder::
+  encode_frame_f64` / `encode_access_unit_f64` and
+  `HeAacEncoder::encode_frame_f64` (PCM normalised to ±1.0, no 16-bit
+  rounding; the HE-AAC core is fed planar f64); `set_raw` (the frame
+  entry points emit bare access units — no PCE in the block, no ADTS
+  header out of the budget — as the access-unit entry points now do)
+  and `set_bitrate` on both encoders (#32, ropoctl).
+- `StreamEncoder::new_ld`: an ER AAC LD (AOT 23) encoder, 512 / 480
+  lines, no block switching, `er_raw_data_block()` access units with
+  their `AudioSpecificConfig` (`asc_writer::er_ld_asc`) (#32, ropoctl);
+  `StreamEncoder::new_eld`: an ER AAC ELD (AOT 39) encoder without
+  low-delay SBR — the inverse of the §4.6.20.2 low-delay synthesis and
+  the ELD channel syntax (`IcsBody::write_eld`) (#33, ropoctl). Black
+  box: `afconvert` decodes both encoders' MP4-carried streams (512 and
+  480 lines, 22.05–48 kHz, 1 / 2 channels) within 1 LSB of this crate's
+  decode.
 - The runtime decoder implements `Decoder::output_params` /
   `output_params_generation` and emits one `Frame::StreamParams` event
   immediately before the first frame of each new output shape (sample
@@ -101,7 +139,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   as interleaved f64 (full scale 1.0, the i16 output's channel order)
   before integer rounding (#25, ropoctl). Agrees with Apple's float
   decoder output at about 135 dB where the i16 output stops near 90 dB.
-  The ER entry point does not fill it.
+  `decode_er_raw_data_block` fills it too and honours
+  `set_declaration_order` (#30, ropoctl).
 - `StreamDecoder::set_declaration_order` (off by default): channels in
   the order the configuration declares its elements — a default
   `channelConfiguration`'s element order (5.1: C, L, R, Ls, Rs, LFE), or
