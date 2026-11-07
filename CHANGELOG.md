@@ -20,6 +20,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (err/sig 1.5–2.8 on TNS frames and 5 failed AUs before).
   `tns_data::field_widths_family` now returns the literal widths for
   every family.
+- A change of `(audioObjectType, samplingFrequencyIndex,
+  channelConfiguration)` between blocks (a spliced / concatenated ADTS
+  stream) restarts the `StreamDecoder`'s per-stream state; before, an
+  HE-AAC segment's SBR (and PS) latch kept upsampling every later
+  segment (a 44.1 kHz AAC-LC segment came out at 88.2 kHz, a 48 kHz mono
+  one at 96 kHz stereo).
 
 ### Changed
 
@@ -27,6 +33,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The runtime decoder implements `Decoder::output_params` /
+  `output_params_generation` and emits one `Frame::StreamParams` event
+  immediately before the first frame of each new output shape (sample
+  rate / channel count: a concatenated stream, SBR appearing under
+  implicit signalling), never for the first shape; the rule holds while
+  draining after `flush` and after `reset`, relative to the last frame
+  returned.
 - `IcsBody::write_er` / `write_with_ics_info_er`: the ER channel-stream
   writers (resilience branches + category-ordered TNS), inverse of
   `parse_er_family` / `parse_with_ics_info_er`.

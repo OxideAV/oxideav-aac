@@ -86,6 +86,21 @@ ISO-copyright bitstreams are never committed). Measured state:
   prefix (upsampling-only state) and the whole-payload coverage
   region (`bs_fill_bits` included).
 
+### Runtime decoder output shape
+
+`Decoder::output_params()` answers the sample rate / channel count of
+the frame most recently returned (resolved from the first decoded
+frame before any is returned); a later shape change — a spliced ADTS
+stream switching rate or channel configuration, SBR appearing under
+implicit signalling — is announced by exactly one
+`Frame::StreamParams` event right before its first frame, with
+`output_params_generation()` bumped. A new block configuration
+restarts the per-stream state, so an HE-AAC segment's SBR / PS latch
+does not leak into the segments after it (`tests/stream_params_concat.rs`;
+on a black-box-encoded six-segment splice — AAC-LC 44.1 kHz stereo,
+48 kHz mono, HE-AAC 32 kHz, AAC-LC 44.1 kHz, HE-AAC v2 44.1 kHz, 48 kHz
+mono — four events for the four real changes).
+
 ### Bitstream parsing
 
 - **ADTS fixed header** (`adts`) — ISO/IEC 13818-7 §1.A.2: sync,

@@ -210,6 +210,13 @@ pub struct StreamDecoder {
     reject_coupling: bool,
     /// Skip SBR and PS extension payloads ([`Self::set_core_only`]).
     core_only: bool,
+    /// `(audioObjectType, samplingFrequencyIndex,
+    /// channelConfiguration)` of the last decoded block. A change —
+    /// a concatenated stream, an ADTS splice — starts a new stream:
+    /// every per-element slot, the SBR back-ends and the SBR latch
+    /// restart (an overlap tail, LTP history or SBR state of a
+    /// different configuration has no meaning for the new one).
+    stream_config: Option<(u8, u8, u8)>,
 }
 
 /// Per-element decoder settings a [`StreamDecoder`] installs on every
@@ -328,6 +335,21 @@ impl StreamDecoder {
         self.family = family;
     }
 
+    /// Restart the per-stream state when the block configuration
+    /// differs from the previous block's (see `stream_config`).
+    fn track_stream_config(&mut self, aot: u8, fs_index: u8, channel_configuration: u8) {
+        let cfg = (aot, fs_index, channel_configuration);
+        if self.stream_config.is_some_and(|prev| prev != cfg) {
+            self.decoders.clear();
+            self.cce_decoders.clear();
+            self.sbr.clear();
+            self.sbr_prev_header.clear();
+            self.sbr_active = false;
+            self.float_pcm = None;
+        }
+        self.stream_config = Some(cfg);
+    }
+
     /// The active §4.5.1.1 frame-length family.
     pub fn frame_family(&self) -> FrameFamily {
         self.family
@@ -420,6 +442,7 @@ impl StreamDecoder {
         num_raw_data_blocks: u8,
         payload: &[u8],
     ) -> Result<DecodedFrame> {
+        self.track_stream_config(aot, fs_index, channel_configuration);
         let fs = fs_index;
         let family = self.family;
         let element_options = self.element_options;
@@ -1007,6 +1030,7 @@ impl StreamDecoder {
         if (aot == 23) != self.family.is_ld() {
             return Err(Error::ElementDecodeInvalid);
         }
+        self.track_stream_config(aot, fs_index, channel_configuration);
         let fs = fs_index;
         let family = self.family;
         let element_options = self.element_options;
