@@ -202,29 +202,20 @@ pub fn field_widths(seq: WindowSequence) -> (u32, u32, u32) {
 /// `(n_filt_bits, length_bits, order_bits)` triple for the given
 /// frame family and `window_sequence`.
 ///
-/// For the ER AAC LD families (§4.6.17, 512/480-line long-only
-/// frames) the normative ISO/IEC 14496-26 conformance bitstreams
-/// transmit the *reduced* Table 4.155 column — `n_filt` in **1 bit**
-/// — even though the literal table keying (window size ≠ 128) selects
-/// the 2-bit column. The resolution is corpus-empirical: across all
-/// 173 `er_ad*_ep0` conformance vectors, every TNS-bearing access
-/// unit parses with the 1-bit width and the 2-bit reading
-/// desynchronises `spectral_data()` (792 hard failures of 2 017 TNS
-/// records). `length` / `order` take the rest of the same reduced
-/// column (4 / 3 bits); the corpus never transmits either field
-/// (`n_filt == 0` throughout), so those two widths follow the only
-/// hypothesis with a consistent selection mechanism. See
-/// `docs/audio/aac/er-ld-tns-divergence.md` §0 (resolution of issue
-/// #292).
-///
-/// Every non-LD family keeps the literal Table 4.155 dispatch of
-/// [`field_widths`].
+/// Table 4.155 keys the widths on the window size alone, so every
+/// family follows the literal [`field_widths`] dispatch — the ER AAC
+/// LD families (§4.6.17, long-only 512/480-line frames) included:
+/// `2 / 6 / 5` on every long window. On the ER wire the record sits at
+/// its §4.5.2.4.2 category-3 position (after the category-1 run of
+/// the channel stream — see [`crate::ics_body::IcsBody::parse_er`]);
+/// read there, black-box-encoded LD streams carry filters with
+/// `n_filt == 2`, `length` up to 29 and `order` up to 7 that only
+/// these widths express. (A reduced `1 / 4 / 3` reading at the
+/// syntax-order position merely consumed the always-zero
+/// `gain_control_data_present` bit as `n_filt`.)
 pub fn field_widths_family(family: FrameFamily, seq: WindowSequence) -> (u32, u32, u32) {
-    if family.is_ld() {
-        (N_FILT_BITS_SHORT, LENGTH_BITS_SHORT, ORDER_BITS_SHORT)
-    } else {
-        field_widths(seq)
-    }
+    let _ = family;
+    field_widths(seq)
 }
 
 /// `num_windows` for the given `window_sequence` per §4.5.2.3.4:
@@ -264,11 +255,8 @@ impl TnsData {
     /// [`TnsData::parse`] under an explicit §4.5.1.1 frame family.
     ///
     /// The family selects the per-window field widths via
-    /// [`field_widths_family`]: the ER AAC LD families read the
-    /// reduced 1 / 4 / 3-bit column (the corpus-resolved AOT-23 wire,
-    /// `docs/audio/aac/er-ld-tns-divergence.md` §0), every other
-    /// family follows the literal Table 4.155 `window_sequence`
-    /// dispatch.
+    /// [`field_widths_family`] (the literal Table 4.155
+    /// `window_sequence` dispatch for every family).
     pub fn parse_family(
         reader: &mut BitReader<'_>,
         family: FrameFamily,
@@ -284,16 +272,9 @@ impl TnsData {
     /// [`TnsData::parse`] under an **explicit**
     /// `(n_filt_bits, length_bits, order_bits)` width triple.
     ///
-    /// This is the configurability hook
-    /// `docs/audio/aac/er-ld-tns-divergence.md` §0.6 recommends: the
-    /// LD `n_filt` width is corpus-settled at 1 bit, but the LD
-    /// `length` / `order` widths are only *preferred* at 4 / 3 (the
-    /// rest of the reduced Table 4.155 column) — the ISO/IEC 14496-26
-    /// corpus transmits `n_filt == 0` in every LD TNS record, so it
-    /// cannot discriminate 4 / 3 from 6 / 5. A caller confronted with
-    /// evidence for a mixed wire (e.g. 1 / 6 / 5) can drive this entry
-    /// point directly instead of forking [`Self::parse_family`]'s
-    /// dispatch. Each width must be `1..=8`
+    /// A caller handling a non-conforming wire with other widths can
+    /// drive this entry point directly instead of forking
+    /// [`Self::parse_family`]'s dispatch. Each width must be `1..=8`
     /// ([`Error::TnsDataEncodeInvalid`] otherwise — the widths are
     /// caller configuration, not wire data).
     pub fn parse_widths(
@@ -371,10 +352,7 @@ impl TnsData {
     }
 
     /// [`TnsData::write`] under an explicit §4.5.1.1 frame family —
-    /// the bit-exact inverse of [`TnsData::parse_family`]. The LD
-    /// families emit the reduced 1 / 4 / 3-bit widths, capping
-    /// `filters.len()` at 1, `length` at 15 and `order` at 7 per
-    /// window.
+    /// the bit-exact inverse of [`TnsData::parse_family`].
     pub fn write_family(
         &self,
         writer: &mut BitWriter,

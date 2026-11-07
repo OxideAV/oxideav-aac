@@ -1,11 +1,12 @@
 //! Conformance validation against the normative ISO/IEC 14496-26
 //! MPEG-4 Audio corpus (2nd ed.), covering three r439 subsystems:
 //!
-//! 1. **ER AAC LD `tns_data()`** — the corpus-resolved 1-bit `n_filt`
-//!    wire (`docs/audio/aac/er-ld-tns-divergence.md` §0, issue #292):
-//!    the `er_ad1103*` family switches TNS on in ~10% of its access
-//!    units, so a wrong width desynchronises `spectral_data()`
-//!    immediately; the `er_ad1000*` family is the TNS-free control.
+//! 1. **ER AAC LD `tns_data()`** — the §4.5.2.4.2 category-3 record
+//!    (after the channel stream's category-1 run, literal Table 4.155
+//!    widths; see `tests/er_tns_category_order.rs`): the `er_ad1103*`
+//!    family switches TNS on in ~10% of its access units, so a wrong
+//!    placement or width desynchronises `spectral_data()` immediately;
+//!    the `er_ad1000*` family is the TNS-free control.
 //!    The 32 kHz members additionally pin the §4.5.4 Table 4.144 /
 //!    4.145 LD scalefactor-band tables end-to-end at both frame
 //!    lengths (480 and 512).
@@ -322,10 +323,10 @@ fn rms_ratios(ours: &[f64], reference: &[f64], ch: usize, max_lag: usize) -> (us
 
 /// Decode one `er_ad*_ep0.mp4` vector AU-by-AU; assert every access
 /// unit decodes (`allowed_failures` tolerates the one corpus AU that
-/// the staged screen records as failing under *every* TNS width
-/// hypothesis — er_ad1103_22_ep0 AU 367,
-/// `er-ld-tns-divergence.md` §0.3), then bound the PCM error against
-/// the normative reference waveform when present.
+/// the staged screen records as failing under every syntax-order TNS
+/// hypothesis — er_ad1103_22_ep0 AU 367, `er-ld-tns-divergence.md`
+/// §0.3), then bound the PCM error against the normative reference
+/// waveform when present.
 fn er_ld_vector(stem: &str, wav_stem: &str, allowed_failures: usize) {
     let Some(m4a) = load_vector(&format!("compressedMp4/{stem}.mp4")) else {
         return;
@@ -352,11 +353,11 @@ fn er_ld_vector(stem: &str, wav_stem: &str, allowed_failures: usize) {
     let mut tns_aus: Vec<(bool, bool, bool)> = Vec::with_capacity(samples.len());
     for (i, &(off, len)) in samples.iter().enumerate() {
         let au = &m4a[off..off + len];
-        // Record which AUs carry a tns_data() record (excluded from
-        // the reference comparison pending the LD TNS wire trace)
-        // or a PNS band (noise phase is generator-defined — band
-        // energy is normative, sample-exactness is precluded by the
-        // standard itself; see docs/audio/aac/pns-gen-rand-vector.md).
+        // Record which AUs carry a tns_data() record (counted) or a
+        // PNS band (excluded from the reference comparison: noise
+        // phase is generator-defined — band energy is normative,
+        // sample-exactness is precluded by the standard itself; see
+        // docs/audio/aac/pns-gen-rand-vector.md).
         tns_aus.push(au_tools(au, family, &asc, resilience));
         match dec.decode_er_raw_data_block(
             asc.aot,
@@ -401,19 +402,14 @@ fn er_ld_vector(stem: &str, wav_stem: &str, allowed_failures: usize) {
         return;
     };
     assert_eq!(wav_ch, ch, "{stem}: reference channel count");
-    // Mask out the TNS-bearing AUs (and their overlap-add successor)
-    // plus any decode-failed AU: the deployed LD tns_data() wire is
-    // not the staged-text record (docs/audio/aac/er-ld-tns-divergence.md
-    // §0 resolves only the structural width; the reference PCM shows
-    // the record carries a real filter whose layout is still
-    // untraced), so those AUs cannot be PCM-conformant yet. The
-    // masked comparison still pins every non-TNS AU of the stream.
+    // Mask out the PNS-bearing AUs (and their overlap-add successor)
+    // plus any decode-failed AU; TNS-bearing AUs are compared.
     let n_tns = tns_aus.iter().filter(|&&(t, _, _)| t).count();
     let n_pns = tns_aus.iter().filter(|&&(_, p, _)| p).count();
     let ltp_in_stream = tns_aus.iter().any(|&(_, _, l)| l);
     let mut mask: Vec<bool> = vec![true; samples.len()];
     for i in 0..samples.len() {
-        if tns_aus[i].0 || tns_aus[i].1 || failed.contains(&i) {
+        if tns_aus[i].1 || failed.contains(&i) {
             mask[i] = false;
             if i + 1 < mask.len() {
                 mask[i + 1] = false;
@@ -439,12 +435,12 @@ fn er_ld_vector(stem: &str, wav_stem: &str, allowed_failures: usize) {
         let ratio = (err_sse[c] / sig_sse[c].max(1.0)).sqrt();
         eprintln!(
             "{stem} ch{c}: err/sig RMS = {ratio:.6} over unmasked AUs \
-             ({n_tns} TNS / {n_pns} PNS AUs masked)"
+             ({n_tns} TNS AUs compared, {n_pns} PNS AUs masked)"
         );
         // The er_ad1103 (non-np) setups run §4.6.7 LD LTP, whose
-        // prediction history includes the TNS-bearing AUs the mask
-        // excludes — until the deployed LD TNS wire is traced, their
-        // history is provably polluted and only a coarse bound holds.
+        // prediction history includes the PNS-bearing AUs the mask
+        // excludes (generator-defined noise phase), so only a coarse
+        // bound holds there.
         let bound = if ltp_in_stream { 0.35 } else { 1e-3 };
         check!(
             ratio < bound,

@@ -739,19 +739,16 @@ fn back_to_back_tns_blocks_roundtrip() {
 }
 
 // ----------------------------------------------------------------------------
-// Explicit-width entry points (er-ld-tns-divergence.md §0.6 hook)
+// Explicit-width entry points
 // ----------------------------------------------------------------------------
 
-/// `parse_widths` / `write_widths` under the corpus-undetermined
-/// alternative LD hypothesis `1 / 6 / 5` round-trip bit-exactly —
-/// the configurability `docs/audio/aac/er-ld-tns-divergence.md` §0.6
-/// recommends while the corpus (`n_filt == 0` in every LD TNS
-/// record) cannot discriminate `length` / `order` widths.
+/// `parse_widths` / `write_widths` under a non-table width triple
+/// (`1 / 6 / 5`) round-trip bit-exactly.
 #[test]
 fn explicit_width_roundtrip_1_6_5() {
     let widths = (1u32, 6u32, 5u32);
-    // length 40 and order 11 overflow the default LD 4/3-bit caps but
-    // fit 6/5 — exactly the records only this hypothesis can carry.
+    // length 40 and order 11 overflow the reduced 4/3-bit caps but
+    // fit 6/5.
     let td = TnsData {
         windows: vec![TnsWindow {
             coef_res: true,
@@ -774,7 +771,7 @@ fn explicit_width_roundtrip_1_6_5() {
     assert_eq!(br.bit_position(), total_bits);
     assert_eq!(parsed, td);
 
-    // The same record must be rejected by the default LD widths (the
+    // The same record must be rejected by the reduced widths (the
     // 4-bit length / 3-bit order caps).
     let mut bw = BitWriter::new();
     assert_eq!(
@@ -783,33 +780,38 @@ fn explicit_width_roundtrip_1_6_5() {
     );
 }
 
-/// The family dispatch is exactly the explicit-width call with
-/// [`field_widths`]-style triples: a wire written by `write_widths`
-/// with the reduced `1 / 4 / 3` column parses identically through
-/// `parse_family` under an LD family.
+/// The family dispatch is exactly the explicit-width call with the
+/// literal Table 4.155 triple: the ER AAC LD families (long-only) read
+/// the `2 / 6 / 5` "other window size" column like every other long
+/// window — the corpus-era reduced `1 / 4 / 3` reading was an artefact
+/// of looking for the record at its syntax-order position instead of
+/// its §4.5.2.4.2 category-3 position (see `tests/er_tns_category_order.rs`).
 #[test]
 fn family_dispatch_equals_explicit_widths() {
     use oxideav_aac::swb_offset::FrameFamily;
     let td = TnsData {
         windows: vec![TnsWindow {
             coef_res: false,
-            filters: vec![filter(10, 2, false, false, &[2, 5])],
+            filters: vec![
+                filter(29, 7, false, false, &[2, 5, 1, 0, 7, 3, 4]),
+                filter(4, 2, true, true, &[3, 1]),
+            ],
         }],
     };
     let mut bw = BitWriter::new();
-    td.write_widths(&mut bw, (1, 4, 3), WindowSequence::OnlyLong)
+    td.write_widths(&mut bw, (2, 6, 5), WindowSequence::OnlyLong)
         .unwrap();
     let buf_explicit = bw.finish();
 
-    let mut bw = BitWriter::new();
-    td.write_family(&mut bw, FrameFamily::Ld512, WindowSequence::OnlyLong)
-        .unwrap();
-    assert_eq!(bw.finish(), buf_explicit, "identical wire");
-
-    let mut br = BitReader::new(&buf_explicit);
-    let parsed =
-        TnsData::parse_family(&mut br, FrameFamily::Ld480, WindowSequence::OnlyLong).unwrap();
-    assert_eq!(parsed, td);
+    for family in [FrameFamily::Ld512, FrameFamily::Ld480, FrameFamily::Lc960] {
+        let mut bw = BitWriter::new();
+        td.write_family(&mut bw, family, WindowSequence::OnlyLong)
+            .unwrap();
+        assert_eq!(bw.finish(), buf_explicit, "{family:?}: identical wire");
+        let mut br = BitReader::new(&buf_explicit);
+        let parsed = TnsData::parse_family(&mut br, family, WindowSequence::OnlyLong).unwrap();
+        assert_eq!(parsed, td, "{family:?}");
+    }
 }
 
 /// Width triples outside `1..=8` are caller-configuration errors,

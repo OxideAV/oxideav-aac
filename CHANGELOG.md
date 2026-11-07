@@ -6,12 +6,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- ER channel streams (AOTs 17 / 19 / 23) read `tns_data()` at its
+  §4.5.2.4.2 error-sensitivity-category position — after the stream's
+  category-1 run (`gain_control_data_present` and the HCR length fields
+  included), directly before the spectral payload — at the literal
+  Table 4.155 widths (2 / 6 / 5 on long windows, LD included). The
+  previous syntax-order 1 / 4 / 3 LD reading consumed the always-zero
+  `gain_control_data_present` bit as `n_filt` and mis-decoded every
+  TNS-bearing ER AAC LD frame: black-box LD-512 streams now decode
+  within 1 LSB of a reference decoder binary on every access unit
+  (err/sig 1.5–2.8 on TNS frames and 5 failed AUs before).
+  `tns_data::field_widths_family` now returns the literal widths for
+  every family.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
 
 ### Added
 
+- `IcsBody::write_er` / `write_with_ics_info_er`: the ER channel-stream
+  writers (resilience branches + category-ordered TNS), inverse of
+  `parse_er_family` / `parse_with_ics_info_er`.
 - `adts_container`: the `"adts"` elementary-stream container (`.aac` /
   `.adts`) — demuxer (frame index, resync, duration, seeking, an
   equivalent `AudioSpecificConfig` in `extradata`, implicit-SBR / PS
