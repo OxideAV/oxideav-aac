@@ -55,8 +55,9 @@ use oxideav_core::{
 };
 
 use crate::codec_decoder::CODEC_ID_STR;
-use crate::encoder::{EncoderConfig, FRAME_LEN, StreamEncoder};
+use crate::encoder::{EncoderConfig, StreamEncoder};
 use crate::he_aac_encoder::{HE_FRAME_LEN, HeAacConfig, HeAacEncoder};
+use crate::swb_offset::FrameFamily;
 
 /// Default target bitrate (bits/second) when `params.bit_rate` is
 /// absent: 64 kbps per channel, the conventional "good quality"
@@ -89,6 +90,7 @@ pub const DEFAULT_BITRATE_PER_CHANNEL: u32 = 64_000;
 /// [`Error::invalid`] at construction time, per the registry's
 /// init-time-fallback contract.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut frame_family = FrameFamily::Lc1024;
     let sample_rate = params.sample_rate.unwrap_or(44_100);
     let channels = params.channels.unwrap_or(2);
     if let Some(fmt) = params.sample_format
@@ -144,7 +146,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             }
             return make_he_aac_encoder(&p);
         }
-        // A plain AAC ASC: fall through to the LC encoder.
+        // A plain AAC ASC: fall through to the LC encoder, under the
+        // ASC's §4.5.1.1 frame-length family (frameLengthFlag).
+        frame_family = asc.ga_body.frame_length.family(asc.aot);
     }
     // A named non-default speaker set (or the 7-channel count with no
     // Table 1.19 default) goes through a PCE-described layout.
@@ -175,11 +179,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         channels: channels as u8,
         bitrate,
     };
-    let stream = match &positions {
+    let mut stream = match &positions {
         Some(p) => StreamEncoder::with_layout(config, p),
         None => StreamEncoder::new(config),
     }
     .map_err(|e| Error::invalid(format!("oxideav-aac encoder config: {e}")))?;
+    if frame_family != FrameFamily::Lc1024 {
+        stream
+            .set_frame_family(frame_family)
+            .map_err(|e| Error::unsupported(format!("oxideav-aac encoder frame length: {e}")))?;
+    }
 
     let mut out_params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
     out_params.sample_rate = Some(sample_rate);
@@ -189,14 +198,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     // The out-of-band AudioSpecificConfig (§1.6.2.1) every
     // non-ADTS carrier needs up front: the MP4 `esds`
     // DecoderSpecificInfo, the Matroska `CodecPrivate`.
-    out_params.extradata = match stream.program_config() {
-        Some(pce) => crate::asc_writer::aac_lc_asc_with_pce(sample_rate, pce)
-            .map_err(|e| Error::invalid(format!("oxideav-aac encoder ASC: {e}")))?,
-        None => crate::asc_writer::aac_lc_asc(
-            sample_rate,
-            if channels == 8 { 7 } else { channels as u8 },
-        ),
-    };
+    out_params.extradata = stream
+        .audio_specific_config()
+        .map_err(|e| Error::invalid(format!("oxideav-aac encoder ASC: {e}")))?;
     // Advertise the speaker set: the caller's named layout, or the
     // 6.1 default a bare 7-channel count was mapped onto.
     out_params.channel_layout = params
@@ -212,6 +216,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         packets: VecDeque::new(),
         samples_emitted: 0,
         flushed: false,
+        raw: frame_family != FrameFamily::Lc1024,
     }))
 }
 
@@ -426,6 +431,13 @@ impl Encoder for HeAacPacketEncoder {
         }
         let audio = match frame {
             Frame::Audio(a) => a,
+            // A mid-stream input shape change: the rate loop, band
+            // tables and element plan are fixed at construction.
+            Frame::StreamParams(_) => {
+                return Err(Error::unsupported(
+                    "oxideav-aac encoder cannot re-configure mid-stream",
+                ));
+            }
             _ => return Err(Error::invalid("oxideav-aac encoder accepts audio frames")),
         };
         let plane = match audio.data.as_slice() {
@@ -497,30 +509,41 @@ struct AacEncoder {
     /// drives `pts`.
     samples_emitted: i64,
     flushed: bool,
+    /// Packets are bare access units (the 960-line family, which ADTS
+    /// cannot signal) configured by the advertised extradata ASC,
+    /// instead of ADTS frames.
+    raw: bool,
 }
 
 impl AacEncoder {
     /// Encode every complete hop sitting in `pending_pcm`.
     fn drain_hops(&mut self) -> Result<()> {
         let ch = usize::from(self.out_params.channels.unwrap_or(1)).max(1);
-        let hop = FRAME_LEN * ch;
+        let hop = self.stream.frame_len() * ch;
         while self.pending_pcm.len() >= hop {
             let chunk: Vec<i16> = self.pending_pcm.drain(..hop).collect();
-            let bytes = self
-                .stream
-                .encode_frame(&chunk)
-                .map_err(|e| Error::invalid(format!("oxideav-aac encode: {e}")))?;
+            let bytes = self.encode_hop(&chunk)?;
             self.push_packet(bytes);
         }
         Ok(())
     }
 
+    fn encode_hop(&mut self, chunk: &[i16]) -> Result<Vec<u8>> {
+        if self.raw {
+            self.stream.encode_access_unit(chunk)
+        } else {
+            self.stream.encode_frame(chunk)
+        }
+        .map_err(|e| Error::invalid(format!("oxideav-aac encode: {e}")))
+    }
+
     fn push_packet(&mut self, bytes: Vec<u8>) {
+        let n = self.stream.frame_len() as i64;
         let pkt = Packet::new(0, self.time_base, bytes)
             .with_pts(self.samples_emitted)
-            .with_duration(FRAME_LEN as i64)
+            .with_duration(n)
             .with_keyframe(true);
-        self.samples_emitted += FRAME_LEN as i64;
+        self.samples_emitted += n;
         self.packets.push_back(pkt);
     }
 }
@@ -540,6 +563,13 @@ impl Encoder for AacEncoder {
         }
         let audio = match frame {
             Frame::Audio(a) => a,
+            // A mid-stream input shape change: the rate loop, band
+            // tables and element plan are fixed at construction.
+            Frame::StreamParams(_) => {
+                return Err(Error::unsupported(
+                    "oxideav-aac encoder cannot re-configure mid-stream",
+                ));
+            }
             _ => return Err(Error::invalid("oxideav-aac encoder accepts audio frames")),
         };
         let plane = match audio.data.as_slice() {
@@ -581,17 +611,16 @@ impl Encoder for AacEncoder {
         // Zero-pad any partial hop into a final content frame…
         if !self.pending_pcm.is_empty() {
             let chunk: Vec<i16> = std::mem::take(&mut self.pending_pcm);
-            let bytes = self
-                .stream
-                .encode_frame(&chunk)
-                .map_err(|e| Error::invalid(format!("oxideav-aac encode: {e}")))?;
+            let bytes = self.encode_hop(&chunk)?;
             self.push_packet(bytes);
         }
         // …then emit the overlap-flush frame.
-        let bytes = self
-            .stream
-            .finish()
-            .map_err(|e| Error::invalid(format!("oxideav-aac flush: {e}")))?;
+        let bytes = if self.raw {
+            self.stream.finish_access_unit()
+        } else {
+            self.stream.finish()
+        }
+        .map_err(|e| Error::invalid(format!("oxideav-aac flush: {e}")))?;
         self.push_packet(bytes);
         self.flushed = true;
         Ok(())
@@ -601,6 +630,7 @@ impl Encoder for AacEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::FRAME_LEN;
     use oxideav_core::AudioFrame;
 
     fn params(rate: u32, channels: u16, bitrate: Option<u64>) -> CodecParameters {
@@ -861,5 +891,51 @@ mod tests {
         }
         // n/1024 content frames + 1 flush frame, 1024 samples each.
         assert_eq!(decoded_samples, n + FRAME_LEN);
+    }
+
+    #[test]
+    fn frame_length_flag_extradata_selects_the_960_line_core() {
+        // AOT 2, 48 kHz, mono, frameLengthFlag = 1.
+        let mut p = params(48_000, 1, Some(64_000));
+        let mut asc = crate::asc_writer::aac_lc_asc(48_000, 1);
+        asc[1] |= 0x04;
+        p.extradata = asc.clone();
+        let mut enc = make_encoder(&p).unwrap();
+        assert_eq!(enc.output_params().extradata, asc);
+        enc.send_frame(&tone_frame(3 * 960, 1)).unwrap();
+        enc.flush().unwrap();
+        let mut dec = crate::codec_decoder::make_decoder(&p).unwrap();
+        let mut decoded = 0usize;
+        let mut packets = 0;
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => {
+                    assert_eq!(pkt.duration, Some(960));
+                    // A bare access unit, not an ADTS frame.
+                    assert!(!(pkt.data[0] == 0xFF && pkt.data[1] & 0xF0 == 0xF0));
+                    packets += 1;
+                    dec.send_packet(&pkt).unwrap();
+                    while let Ok(f) = dec.receive_frame() {
+                        if let Frame::Audio(a) = f {
+                            assert_eq!(a.samples, 960);
+                            decoded += 960;
+                        }
+                    }
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert_eq!(packets, 4);
+        assert_eq!(decoded, 4 * 960);
+    }
+
+    #[test]
+    fn stream_params_event_is_unsupported() {
+        let mut enc = make_encoder(&params(48_000, 1, None)).unwrap();
+        let ev = Frame::StreamParams(Box::new(params(44_100, 2, None)));
+        assert!(matches!(enc.send_frame(&ev), Err(Error::Unsupported(_))));
+        let mut he = make_he_aac_encoder(&params(48_000, 1, None)).unwrap();
+        assert!(matches!(he.send_frame(&ev), Err(Error::Unsupported(_))));
     }
 }

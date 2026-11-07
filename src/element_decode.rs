@@ -94,7 +94,7 @@ use crate::scale_factor_data::{AbsoluteScaleFactorEntry, AbsoluteScaleFactors, a
 use crate::section_data::ZERO_HCB;
 use crate::spectral_data::SpectralData;
 use crate::ssr::SsrChannelDecoder;
-use crate::swb_offset::apply_pulse_data;
+use crate::swb_offset::apply_pulse_data_family;
 use crate::tns_frame::{tns_analysis_frame_ics, tns_decode_frame_ics};
 use crate::{Error, Result};
 
@@ -209,7 +209,7 @@ fn reconstruct_pre_pair(
     let x_quant: SpectralData = if let Some(pd) = &ch.body.pulse_data {
         let mut patched = ch.spectral.clone();
         let group0 = patched.x_quant.first_mut().ok_or(Error::DequantInvalid)?;
-        apply_pulse_data(group0, fs_index, pd)?;
+        apply_pulse_data_family(group0, ch.ics_info.family, fs_index, pd)?;
         patched
     } else {
         ch.spectral.clone()

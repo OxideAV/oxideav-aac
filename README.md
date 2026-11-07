@@ -409,6 +409,26 @@ carry the default 1024-line family):
   chain; 960 PCM samples per channel per frame. Verified **bit-exact
   against a black-box decoder binary** on writer-assembled streams,
   and staged with mutation coverage as `aac-lc-960-writer-loas`.
+- **960-line AAC-LC encoder core** — `StreamEncoder::set_frame_family(
+  FrameFamily::Lc960)` runs the whole analysis / quantization chain
+  (block switching on the 120-sample short grid at
+  `(N_l − N_s)/4 + j·N_s/2 = 420 + 120·j`, grouping, M/S, TNS on the
+  960-family tables, PNS / intensity / pulse, every channel layout)
+  over the `N = 1920 / 240` transform pair and emits bare access units
+  (`encode_access_unit` / `encode_all_access_units`) configured by
+  `audio_specific_config()` (`frameLengthFlag = 1`; ADTS cannot carry
+  the family, so the ADTS entry points refuse it). The registry
+  encoder selects it from a `frameLengthFlag` extradata ASC
+  (960-sample packets). Measured on the equal-rate harness metric
+  (per-QMF-band NMR under the 10 dB / 12 dB-per-band spreading
+  masker), 48 kHz stereo at 64 / 96 / 128 kbps: tonal mix
+  −0.09 / −0.07 / −0.12 dB, dense burst train +0.11 / +0.11 /
+  +0.09 dB, isolated attacks (7 short runs per 2 s on both families)
+  −0.06 / +0.13 / −1.34 dB against the 1024-line path at the same
+  rate; a black-box decoder binary (`ffmpeg -f loas`) reads the
+  LOAS-wrapped streams without diagnostics **within 1 LSB** of this
+  crate's decode (`tests/encoder_960.rs`). The 1024-line output is
+  byte-identical to the pre-refactor encoder.
 - **ER AAC LD at 512/480 lines** (AOT 23, §4.6.17) — Tables
   4.142–4.147 (with the §4.5.1.1 nearest-defined-table rule for the
   rates those tables omit), long-only frames (a non-`ONLY_LONG`

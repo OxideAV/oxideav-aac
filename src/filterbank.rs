@@ -39,10 +39,13 @@
 
 use crate::Error;
 use crate::ics_info::{IcsInfo, WindowSequence, WindowShape};
-use crate::swb_offset::{FrameFamily, LONG_WINDOW_LEN, SHORT_WINDOW_LEN};
+#[cfg(test)]
+use crate::swb_offset::LONG_WINDOW_LEN;
+use crate::swb_offset::{FrameFamily, SHORT_WINDOW_LEN};
 
 /// `N` for a long-sequence transform (§4.6.11.3.1): 2 ×
 /// [`LONG_WINDOW_LEN`].
+#[cfg(test)]
 const LONG_TRANSFORM_LEN: usize = 2 * LONG_WINDOW_LEN as usize; // 2048
 /// `N` for a single short-sequence transform: 2 ×
 /// [`SHORT_WINDOW_LEN`].
@@ -51,6 +54,7 @@ const SHORT_TRANSFORM_LEN: usize = 2 * SHORT_WINDOW_LEN as usize; // 256
 /// sequence.
 const NUM_SHORT_WINDOWS: usize = 8;
 /// `N_l` — the long transform length, used as the frame's PCM stride.
+#[cfg(test)]
 const N_L: usize = LONG_TRANSFORM_LEN; // 2048
 /// `N_s` — the short transform length.
 const N_S: usize = SHORT_TRANSFORM_LEN; // 256
@@ -145,24 +149,13 @@ pub(crate) fn long_only_window_family(
     w
 }
 
-/// §4.6.11.3.2 — assemble the length-2048 window for any of the
-/// three long-transform sequences. The window is shared between the
-/// decoder's synthesis ([`Filterbank::long_window`] delegates here)
-/// and the encoder's analysis (the §4.6.11 filterbank is its own
-/// transpose up to the TDAC fold, so the same window applies on both
-/// sides). Returns [`Error::FilterbankInvalid`] for
-/// `EIGHT_SHORT_SEQUENCE` — use [`short_window_j`] per short window
-/// instead.
-pub(crate) fn long_sequence_window(
-    sequence: WindowSequence,
-    left_shape: WindowShape,
-    right_shape: WindowShape,
-) -> Result<Vec<f64>> {
-    long_sequence_window_n(N_L, N_S, sequence, left_shape, right_shape)
-}
-
-/// §4.6.11.3.2 — the [`long_sequence_window`] construction generalized
-/// to an arbitrary `(n_l, n_s)` transform family. The SSR gain-control
+/// §4.6.11.3.2 — the window for any of the three long-transform
+/// sequences at an arbitrary `(n_l, n_s)` transform family (2048 / 256,
+/// the 960-line family's 1920 / 240). The window is shared between the
+/// decoder's synthesis and the encoder's analysis (the §4.6.11
+/// filterbank is its own transpose up to the TDAC fold). Returns
+/// [`Error::FilterbankInvalid`] for `EIGHT_SHORT_SEQUENCE` — use
+/// [`short_window_n`] per short window instead. The SSR gain-control
 /// filterbank (§4.6.12.1) runs the same window geometry at
 /// `(512, 64)` — one quarter of the standard family — per band.
 pub(crate) fn long_sequence_window_n(
@@ -211,14 +204,6 @@ pub(crate) fn short_window_n(
     }
     w
 }
-
-/// §4.6.11.3.2 c) — offset of short window 0 inside the 2048-sample
-/// frame window region: `(N_l − N_s)/4 = 448`.
-pub(crate) const SHORT_SEQ_START: usize = (N_L - N_S) / 4;
-
-/// §4.6.11.3.2 c) — hop between successive short windows:
-/// `N_s/2 = 128`.
-pub(crate) const SHORT_SEQ_HOP: usize = N_S / 2;
 
 /// Modified Bessel function of the first kind, order 0, via its power
 /// series `I0(x) = Σ_k ((x/2)^k / k!)^2` (§4.6.11.3.2). The series

@@ -46,6 +46,9 @@
 //!   window region. Frame `f` covers input samples
 //!   `[f·1024 − 1024, f·1024 + 1024)`; the leading frame is primed
 //!   with zeros, giving the standard 1024-sample encoder delay.
+//!   Under the 960-line family ([`StreamEncoder::set_frame_family`])
+//!   every length scales: 960-sample hops, `N = 1920 / 240`, a
+//!   960-sample delay.
 //! * **Quantizer** — the exact inverse of §4.6.2:
 //!   `q = round((|x| / 2^(0.25·(sf−100)))^(3/4))`, with
 //!   round-half-away-from-zero (the §1.3 `NINT` convention).
@@ -152,14 +155,10 @@
 //! ceiling), and `aac_frame_length` stays within its 13-bit field.
 
 use crate::adts::{ADTS_HEADER_BYTES_NO_CRC, ADTS_SAMPLE_RATES_HZ, AdtsHeader};
-use crate::encoder_tns::detect_and_apply_tns;
-use crate::filterbank::{
-    SHORT_SEQ_HOP, SHORT_SEQ_START, forward_mdct, long_sequence_window, short_window_j,
-};
+use crate::encoder_tns::detect_and_apply_tns_family;
+use crate::filterbank::{forward_mdct, long_sequence_window_n, short_window_n};
 use crate::ics_body::IcsBody;
-use crate::ics_info::{
-    IcsInfo, NUM_SWB_LONG_WINDOW, NUM_SWB_SHORT_WINDOW, WindowSequence, WindowShape,
-};
+use crate::ics_info::{IcsInfo, NUM_SWB_LONG_WINDOW, WindowSequence, WindowShape};
 use crate::pce::{ElementSelect, Pce};
 use crate::pulse_data::{MAX_PULSES, Pulse, PulseData};
 use crate::raw_data_block::{FrameAssembler, IdSynEle};
@@ -172,7 +171,7 @@ use crate::section_data::{
 use crate::spectral_codebook::MAX_QUANT;
 use crate::spectral_data::SpectralData;
 use crate::swb_offset::{
-    LONG_WINDOW_LEN, SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets,
+    FrameFamily, LONG_WINDOW_LEN, long_window_offsets_family, short_window_offsets_family,
 };
 use crate::tns_data::TnsData;
 use crate::{Error, Result};
@@ -189,8 +188,50 @@ pub use crate::codec_encoder::make_encoder;
 /// family this crate implements).
 pub const FRAME_LEN: usize = LONG_WINDOW_LEN as usize;
 
-/// The long transform length `N = 2048`.
-const LONG_TRANSFORM_LEN: usize = 2 * FRAME_LEN;
+/// The frame geometry one encode runs under: the §4.5.1.1
+/// frame-length family (`Lc1024` or `Lc960`) and the Table 1.18
+/// sampling-frequency index that selects its §4.5.4 band tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Geom {
+    family: FrameFamily,
+    fs: u8,
+}
+
+impl Geom {
+    #[cfg(test)]
+    fn lc(fs: u8) -> Self {
+        Geom {
+            family: FrameFamily::Lc1024,
+            fs,
+        }
+    }
+
+    /// Spectral lines (and PCM samples) per frame: 1024 / 960.
+    fn frame_len(self) -> usize {
+        self.family.frame_len()
+    }
+
+    /// Spectral lines per short window: 128 / 120.
+    fn short_len(self) -> usize {
+        self.family.short_window_len().unwrap_or(128)
+    }
+
+    fn long_offsets(self) -> Result<&'static [u16]> {
+        long_window_offsets_family(self.family, self.fs)
+    }
+
+    fn short_offsets(self) -> Result<&'static [u16]> {
+        short_window_offsets_family(self.family, self.fs)
+    }
+
+    fn num_swb_long(self) -> Result<usize> {
+        Ok(self.long_offsets()?.len() - 1)
+    }
+
+    fn num_swb_short(self) -> Result<usize> {
+        Ok(self.short_offsets()?.len() - 1)
+    }
+}
 
 /// §4.6.2.3.3 `SF_OFFSET` — the scalefactor of unit gain.
 const SF_OFFSET: i32 = 100;
@@ -310,8 +351,8 @@ impl EncoderConfig {
     /// `bitrate · 1024 / sample_rate` bits, minus the 7-byte ADTS
     /// header, floored at a minimum that always allows a syntactically
     /// valid (silent) frame.
-    fn frame_budget_bytes(&self) -> usize {
-        let bits = (self.bitrate as u64 * FRAME_LEN as u64) / self.sample_rate.max(1) as u64;
+    fn frame_budget_bytes(&self, frame_len: usize) -> usize {
+        let bits = (self.bitrate as u64 * frame_len as u64) / self.sample_rate.max(1) as u64;
         let bytes = (bits / 8) as usize;
         bytes.saturating_sub(ADTS_HEADER_BYTES_NO_CRC).max(16)
     }
@@ -575,6 +616,8 @@ pub struct StreamEncoder {
     is_enabled: bool,
     /// Coded bandwidth (`None` = full band); see [`Self::set_bandwidth`].
     bandwidth_hz: Option<f64>,
+    /// §4.5.1.1 frame-length family; see [`Self::set_frame_family`].
+    family: FrameFamily,
 }
 
 impl StreamEncoder {
@@ -672,7 +715,139 @@ impl StreamEncoder {
             tns_enabled: true,
             is_enabled: false,
             bandwidth_hz: Some(config.default_bandwidth_hz()),
+            family: FrameFamily::Lc1024,
         })
+    }
+
+    /// Select the §4.5.1.1 frame-length family: `Lc1024` (the
+    /// default) or `Lc960` — the `frameLengthFlag == 1` 960/120-line
+    /// geometry (the bracketed Table 4.129–4.141 band columns, the
+    /// `N = 1920 / 240` transform pair, 960-sample hops). Select
+    /// before the first frame (it restarts the analysis state).
+    ///
+    /// ADTS cannot signal the 960-line family, so under `Lc960` the
+    /// ADTS entry points ([`Self::encode_frame`], [`Self::finish`],
+    /// [`Self::encode_all`]) return [`Error::EncoderInvalidConfig`];
+    /// use the access-unit entry points ([`Self::encode_access_unit`],
+    /// [`Self::finish_access_unit`], [`Self::encode_all_access_units`])
+    /// with [`Self::audio_specific_config`] (MP4 / Matroska / LATM
+    /// carriage). Any other family is rejected with
+    /// [`Error::EncoderInvalidConfig`].
+    pub fn set_frame_family(&mut self, family: FrameFamily) -> Result<()> {
+        if !matches!(family, FrameFamily::Lc1024 | FrameFamily::Lc960) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        Geom {
+            family,
+            fs: self.fs_index,
+        }
+        .short_offsets()?;
+        self.family = family;
+        let ch = self.config.channels as usize;
+        self.history = vec![vec![0.0; family.frame_len()]; ch];
+        self.prev_seq = WindowSequence::OnlyLong;
+        self.short_pending = false;
+        Ok(())
+    }
+
+    /// The active §4.5.1.1 frame-length family.
+    pub fn frame_family(&self) -> FrameFamily {
+        self.family
+    }
+
+    /// PCM samples per channel per frame (1024 / 960).
+    pub fn frame_len(&self) -> usize {
+        self.family.frame_len()
+    }
+
+    /// The §1.6.2.1 `AudioSpecificConfig` describing this encoder's
+    /// access units: AOT 2 (AAC LC), the sampling-frequency index,
+    /// the `channelConfiguration` (with the `program_config_element()`
+    /// inline for a PCE layout) and `frameLengthFlag` per the family.
+    pub fn audio_specific_config(&self) -> Result<Vec<u8>> {
+        let mut asc = match &self.program_config {
+            Some(pce) => crate::asc_writer::aac_lc_asc_with_pce(self.config.sample_rate, pce)?,
+            None => {
+                crate::asc_writer::aac_lc_asc(self.config.sample_rate, self.channel_configuration)
+            }
+        };
+        if self.family == FrameFamily::Lc960 {
+            // frameLengthFlag: bit 13 (after the 5-bit AOT, 4-bit
+            // sampling-frequency index and 4-bit channelConfiguration).
+            asc[1] |= 0x04;
+        }
+        Ok(asc)
+    }
+
+    fn geom(&self) -> Geom {
+        Geom {
+            family: self.family,
+            fs: self.fs_index,
+        }
+    }
+
+    /// De-interleave one hop onto the ±32768 axis in element order.
+    fn deinterleave(&self, interleaved: &[i16]) -> Result<Vec<Vec<f64>>> {
+        let ch = self.config.channels as usize;
+        let n = self.frame_len();
+        if interleaved.len() > n * ch || !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; n]; ch];
+        for (j, chan) in cur.iter_mut().enumerate() {
+            let src = self.element_src[j];
+            for (k, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
+                *slot = f64::from(interleaved[k * ch + src]);
+            }
+        }
+        Ok(cur)
+    }
+
+    /// Encode one hop (at most [`Self::frame_len`] samples per
+    /// channel, zero-padded) into one bare `raw_data_block()` access
+    /// unit — the MP4 / Matroska / LATM payload, configured by
+    /// [`Self::audio_specific_config`]. Works under both families.
+    pub fn encode_access_unit(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
+        let cur = self.deinterleave(interleaved)?;
+        let au = self.encode_hop_raw(&cur, &[])?;
+        self.history = cur;
+        Ok(au)
+    }
+
+    /// Flush the final analysis overlap as one trailing access unit
+    /// (the access-unit counterpart of [`Self::finish`]).
+    pub fn finish_access_unit(&mut self) -> Result<Vec<u8>> {
+        let zeros = vec![vec![0.0; self.frame_len()]; self.config.channels as usize];
+        let au = self.encode_hop_raw(&zeros, &[])?;
+        self.history = zeros;
+        Ok(au)
+    }
+
+    /// One-shot access-unit encode of a whole interleaved buffer:
+    /// `⌈n / frame_len⌉` content units plus the flush unit.
+    pub fn encode_all_access_units(&mut self, interleaved: &[i16]) -> Result<Vec<Vec<u8>>> {
+        let ch = self.config.channels as usize;
+        if !interleaved.len().is_multiple_of(ch) {
+            return Err(Error::EncoderInvalidConfig);
+        }
+        let mut out = Vec::new();
+        let mut chunks = interleaved.chunks(self.frame_len() * ch);
+        let first = chunks.next().unwrap_or(&[]);
+        out.push(self.encode_access_unit(first)?);
+        for chunk in chunks {
+            out.push(self.encode_access_unit(chunk)?);
+        }
+        out.push(self.finish_access_unit()?);
+        Ok(out)
+    }
+
+    /// ADTS carries only the 1024-line family.
+    fn require_adts_family(&self) -> Result<()> {
+        if self.family == FrameFamily::Lc1024 {
+            Ok(())
+        } else {
+            Err(Error::EncoderInvalidConfig)
+        }
     }
 
     /// The `program_config_element()` of a PCE-described layout
@@ -772,23 +947,14 @@ impl StreamEncoder {
     /// window spans the previous hop and this one, so the emitted
     /// frame carries the overlap-add contribution of both.
     pub fn encode_frame(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
-        let ch = self.config.channels as usize;
-        if interleaved.len() > FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
-            return Err(Error::EncoderInvalidConfig);
-        }
+        self.require_adts_family()?;
         // De-interleave onto the ±32768 axis the §4.6.11 output
         // contract uses (no rescaling — the decoder's PCM stage
         // rounds these values back to i16 directly), permuting the
         // canonical input order into bitstream element order
         // (`element_src` — the inverse of the decoder's Table 1.19
         // output reorder).
-        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
-        for (j, chan) in cur.iter_mut().enumerate() {
-            let src = self.element_src[j];
-            for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
-                *slot = f64::from(interleaved[n * ch + src]);
-            }
-        }
+        let cur = self.deinterleave(interleaved)?;
         let frame = self.encode_hop(&cur, &[])?;
         self.history = cur;
         Ok(frame)
@@ -797,6 +963,7 @@ impl StreamEncoder {
     /// Flush the final analysis overlap: emits one trailing ADTS
     /// frame whose window covers the last real hop and a zero hop.
     pub fn finish(&mut self) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
         let ch = self.config.channels as usize;
         let zeros: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
         let frame = self.encode_hop(&zeros, &[])?;
@@ -816,17 +983,8 @@ impl StreamEncoder {
         interleaved: &[i16],
         fills: &[Vec<u8>],
     ) -> Result<Vec<u8>> {
-        let ch = self.config.channels as usize;
-        if interleaved.len() > FRAME_LEN * ch || !interleaved.len().is_multiple_of(ch) {
-            return Err(Error::EncoderInvalidConfig);
-        }
-        let mut cur: Vec<Vec<f64>> = vec![vec![0.0; FRAME_LEN]; ch];
-        for (j, chan) in cur.iter_mut().enumerate() {
-            let src = self.element_src[j];
-            for (n, slot) in chan.iter_mut().take(interleaved.len() / ch).enumerate() {
-                *slot = f64::from(interleaved[n * ch + src]);
-            }
-        }
+        self.require_adts_family()?;
+        let cur = self.deinterleave(interleaved)?;
         let frame = self.encode_hop(&cur, fills)?;
         self.history = cur;
         Ok(frame)
@@ -836,6 +994,7 @@ impl StreamEncoder {
     /// to a complete ADTS stream (`⌈n/1024⌉ + 1` frames — the `+1`
     /// is the [`StreamEncoder::finish`] flush).
     pub fn encode_all(&mut self, interleaved: &[i16]) -> Result<Vec<u8>> {
+        self.require_adts_family()?;
         let ch = self.config.channels as usize;
         if !interleaved.len().is_multiple_of(ch) {
             return Err(Error::EncoderInvalidConfig);
@@ -857,7 +1016,35 @@ impl StreamEncoder {
     /// Window `[history | cur]`, transform, quantize under the rate
     /// loop, and wrap the raw data block in an ADTS header.
     fn encode_hop(&mut self, cur: &[Vec<f64>], fills: &[Vec<u8>]) -> Result<Vec<u8>> {
+        let raw_block = self.encode_hop_raw(cur, fills)?;
+        // ADTS wrap. aac_frame_length is 13 bits; the budget floor
+        // (16 bytes) and MAX_RATE_ITERATIONS guarantee headroom for
+        // every realistic configuration, but validate regardless.
+        let frame_len = ADTS_HEADER_BYTES_NO_CRC + raw_block.len();
+        if frame_len >= (1 << 13) {
+            return Err(Error::EncoderFrameOverflow);
+        }
+        let header = AdtsHeader {
+            mpeg_version_mpeg2: false,
+            protection_absent: true,
+            profile: 1, // AAC LC: profile_ObjectType = AOT − 1 = 1
+            sampling_frequency_index: self.fs_index,
+            channel_configuration: self.channel_configuration,
+            aac_frame_length: frame_len as u16,
+            adts_buffer_fullness: 0x7FF, // VBR sentinel
+            number_of_raw_data_blocks_in_frame: 1,
+        };
+        let mut out = Vec::with_capacity(frame_len);
+        out.extend_from_slice(&header.write()?);
+        out.extend_from_slice(&raw_block);
+        Ok(out)
+    }
+
+    /// Window `[history | cur]`, transform, and quantize under the
+    /// rate loop into one `raw_data_block()`.
+    fn encode_hop_raw(&mut self, cur: &[Vec<f64>], fills: &[Vec<u8>]) -> Result<Vec<u8>> {
         let ch = self.config.channels as usize;
+        let geom = self.geom();
 
         // §4.6.11.3.2 block-switching state machine. A transient in
         // `cur` means the *next* frame (whose window's left half is
@@ -873,7 +1060,7 @@ impl StreamEncoder {
             .iter()
             .zip(cur.iter())
             .zip(self.lfe_slot.iter())
-            .any(|((h, c), &lfe)| !lfe && detect_transient(h, c));
+            .any(|((h, c), &lfe)| !lfe && detect_transient(h, c, geom.short_len()));
         let seq = if self.short_pending {
             WindowSequence::EightShort
         } else if transient && self.prev_seq != WindowSequence::EightShort {
@@ -901,9 +1088,9 @@ impl StreamEncoder {
             .zip(self.lfe_slot.iter())
         {
             let ch_seq = if lfe { WindowSequence::OnlyLong } else { seq };
-            let mut spec = analyze_channel(hist, chan, ch_seq)?;
+            let mut spec = analyze_channel(hist, chan, ch_seq, geom)?;
             if let (Some(hz), false) = (self.bandwidth_hz, lfe) {
-                cull_bandwidth(&mut spec, ch_seq, hz, self.config.sample_rate);
+                cull_bandwidth(&mut spec, ch_seq, hz, self.config.sample_rate, geom);
             }
             spectra.push(spec);
         }
@@ -917,18 +1104,25 @@ impl StreamEncoder {
         // the spectra once, outside the rate loop (the filter choice
         // is independent of the scalefactor offset).
         let max_sfb = if seq == WindowSequence::EightShort {
-            NUM_SWB_SHORT_WINDOW[self.fs_index as usize]
+            geom.num_swb_short()?
         } else {
-            NUM_SWB_LONG_WINDOW[self.fs_index as usize]
-        };
+            geom.num_swb_long()?
+        } as u8;
         let mut tns: Vec<Option<TnsData>> = vec![None; ch];
         if self.tns_enabled {
             for (j, (spec, slot)) in spectra.iter_mut().zip(tns.iter_mut()).enumerate() {
                 if self.lfe_slot[j] {
                     continue; // §4.5.2.1.3: no TNS on an LFE element
                 }
-                let permit = tns_temporal_permits(&self.history[j], &cur[j], seq);
-                *slot = detect_and_apply_tns(spec, seq, max_sfb, self.fs_index, &permit)?;
+                let permit = tns_temporal_permits(&self.history[j], &cur[j], seq, geom);
+                *slot = detect_and_apply_tns_family(
+                    spec,
+                    seq,
+                    max_sfb,
+                    geom.family,
+                    self.fs_index,
+                    &permit,
+                )?;
             }
         }
 
@@ -952,7 +1146,10 @@ impl StreamEncoder {
             .filter(|f| !f.is_empty())
             .map(|f| f.len() + if f.len() >= 15 { 2 } else { 1 })
             .sum();
-        let budget = self.config.frame_budget_bytes().max(fill_bytes + 16);
+        let budget = self
+            .config
+            .frame_budget_bytes(geom.frame_len())
+            .max(fill_bytes + 16);
         let mut sf_offset = 0i32;
         let mut raw_block = self.assemble_raw_block(seq, &spectra, &tns, sf_offset, fills)?;
         let mut iterations = 0usize;
@@ -987,27 +1184,7 @@ impl StreamEncoder {
             }
         }
 
-        // ADTS wrap. aac_frame_length is 13 bits; the budget floor
-        // (16 bytes) and MAX_RATE_ITERATIONS guarantee headroom for
-        // every realistic configuration, but validate regardless.
-        let frame_len = ADTS_HEADER_BYTES_NO_CRC + raw_block.len();
-        if frame_len >= (1 << 13) {
-            return Err(Error::EncoderFrameOverflow);
-        }
-        let header = AdtsHeader {
-            mpeg_version_mpeg2: false,
-            protection_absent: true,
-            profile: 1, // AAC LC: profile_ObjectType = AOT − 1 = 1
-            sampling_frequency_index: self.fs_index,
-            channel_configuration: self.channel_configuration,
-            aac_frame_length: frame_len as u16,
-            adts_buffer_fullness: 0x7FF, // VBR sentinel
-            number_of_raw_data_blocks_in_frame: 1,
-        };
-        let mut out = Vec::with_capacity(frame_len);
-        out.extend_from_slice(&header.write()?);
-        out.extend_from_slice(&raw_block);
-        Ok(out)
+        Ok(raw_block)
     }
 
     /// Assemble one `raw_data_block()` — the Table 1.19 element plan
@@ -1083,17 +1260,9 @@ impl StreamEncoder {
         is_bands: &[IsBand],
     ) -> Result<QuantizedChannel> {
         if seq == WindowSequence::EightShort {
-            quantize_channel_short(spec, self.fs_index, sf_offset, peak)
+            quantize_channel_short(spec, self.geom(), sf_offset, peak)
         } else {
-            quantize_channel(
-                spec,
-                seq,
-                self.fs_index,
-                sf_offset,
-                peak,
-                pns_bands,
-                is_bands,
-            )
+            quantize_channel(spec, seq, self.geom(), sf_offset, peak, pns_bands, is_bands)
         }
     }
 
@@ -1112,7 +1281,7 @@ impl StreamEncoder {
         // only; a lone channel grants a blanket per-band allowance
         // (the noise-likeness test in quantize_group decides).
         let pns_long = self.pns_enabled && seq != WindowSequence::EightShort;
-        let num_swb_long = NUM_SWB_LONG_WINDOW[self.fs_index as usize] as usize;
+        let num_swb_long = self.geom().num_swb_long()?;
         let peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         let pns_bands = if pns_long {
             vec![true; num_swb_long]
@@ -1180,7 +1349,7 @@ impl StreamEncoder {
         // intensity band signals the §4.6.8.2.3 phase
         // reversal, not an M/S de-matrix).
         let is_bands: Vec<IsBand> = if self.is_enabled && seq != WindowSequence::EightShort {
-            is_decide(l_spec, r_spec, self.fs_index)?
+            is_decide(l_spec, r_spec, self.geom())?
         } else {
             Vec::new()
         };
@@ -1189,7 +1358,7 @@ impl StreamEncoder {
         // mutual exclusion, §4.6.13.5 — and IS wins where the
         // two overlap).
         let pns = if pns_long {
-            pns_decide_pair(l_spec, r_spec, &is_bands, self.fs_index)?
+            pns_decide_pair(l_spec, r_spec, &is_bands, self.geom())?
         } else {
             PairPns::default()
         };
@@ -1213,8 +1382,8 @@ impl StreamEncoder {
                 .zip(r_spec.iter())
                 .map(|(&l, &r)| (l * l + r * r).sqrt())
                 .collect();
-            let offsets = short_window_offsets(self.fs_index)?;
-            let num_swb = NUM_SWB_SHORT_WINDOW[self.fs_index as usize] as usize;
+            let offsets = self.geom().short_offsets()?;
+            let num_swb = self.geom().num_swb_short()?;
             let wgl = decide_short_grouping(&combined, offsets, num_swb);
             let rows = ms_decide_short(l_spec, r_spec, offsets, num_swb, &wgl);
             let (code_l, code_r) = if rows.iter().flatten().any(|&b| b) {
@@ -1228,16 +1397,16 @@ impl StreamEncoder {
                 .fold(0.0f64, |m, &v| m.max(v.abs()));
             left = quantize_channel_short_grouped(
                 &code_l,
-                self.fs_index,
+                self.geom(),
                 sf_offset,
                 pair_peak,
                 wgl.clone(),
             )?;
             right =
-                quantize_channel_short_grouped(&code_r, self.fs_index, sf_offset, pair_peak, wgl)?;
+                quantize_channel_short_grouped(&code_r, self.geom(), sf_offset, pair_peak, wgl)?;
             ms_rows = rows;
         } else {
-            let mut ms_used = ms_decide(l_spec, r_spec, self.fs_index)?;
+            let mut ms_used = ms_decide(l_spec, r_spec, self.geom())?;
             for (sfb, band) in is_bands.iter().enumerate() {
                 if band.is_some()
                     && let Some(m) = ms_used.get_mut(sfb)
@@ -1267,7 +1436,7 @@ impl StreamEncoder {
                 })
                 .collect();
             let (code_l, code_r) = if ms_transform.iter().any(|&b| b) {
-                apply_ms(l_spec, r_spec, &ms_transform, self.fs_index)?
+                apply_ms(l_spec, r_spec, &ms_transform, self.geom())?
             } else {
                 (l_spec.to_vec(), r_spec.to_vec())
             };
@@ -1328,7 +1497,7 @@ fn attach_tns(chan: &mut QuantizedChannel, slot: &Option<TnsData>) {
 /// Subblock length of the transient detector — one short-window hop
 /// (128 samples), so a detected attack aligns with the short-window
 /// grid it triggers.
-const TRANSIENT_SUBBLOCK: usize = SHORT_SEQ_HOP;
+const TRANSIENT_SUBBLOCK: usize = 128;
 
 /// Energy jump (×) a subblock must show over the running average of
 /// the preceding subblocks to count as a transient attack.
@@ -1365,31 +1534,44 @@ const TRANSIENT_ARM: f64 = TRANSIENT_FLOOR / TRANSIENT_RATIO;
 /// Zero the spectral lines above `cutoff_hz` (per window of an
 /// `EIGHT_SHORT` frame): the bandwidth limit the rate loop then
 /// never has to price.
-fn cull_bandwidth(spec: &mut [f64], seq: WindowSequence, cutoff_hz: f64, sample_rate: u32) {
+fn cull_bandwidth(
+    spec: &mut [f64],
+    seq: WindowSequence,
+    cutoff_hz: f64,
+    sample_rate: u32,
+    geom: Geom,
+) {
     let frac = (cutoff_hz / (f64::from(sample_rate) / 2.0)).clamp(0.0, 1.0);
     if seq == WindowSequence::EightShort {
-        let short_len = SHORT_WINDOW_LEN as usize;
+        let short_len = geom.short_len();
         let keep = ((frac * short_len as f64).ceil() as usize).min(short_len);
         for window in spec.chunks_exact_mut(short_len) {
             window[keep..].iter_mut().for_each(|v| *v = 0.0);
         }
     } else {
-        let keep = ((frac * FRAME_LEN as f64).ceil() as usize).min(spec.len());
+        let keep = ((frac * geom.frame_len() as f64).ceil() as usize).min(spec.len());
         spec[keep..].iter_mut().for_each(|v| *v = 0.0);
     }
 }
 
-fn detect_transient(hist: &[f64], cur: &[f64]) -> bool {
+fn detect_transient(hist: &[f64], cur: &[f64], subblock: usize) -> bool {
+    // The thresholds are stated for a [`TRANSIENT_SUBBLOCK`]-sample
+    // subblock; a shorter short-window hop (the 960-line family's
+    // 120) scales the absolute floors with it.
+    let scale = subblock as f64 / TRANSIENT_SUBBLOCK as f64;
     let energies: Vec<f64> = hist
-        .chunks(TRANSIENT_SUBBLOCK)
-        .chain(cur.chunks(TRANSIENT_SUBBLOCK))
+        .chunks(subblock)
+        .chain(cur.chunks(subblock))
         .map(|b| b.iter().map(|&v| v * v).sum())
         .collect();
-    let hist_blocks = hist.len() / TRANSIENT_SUBBLOCK;
+    let hist_blocks = hist.len() / subblock;
     for (j, &e) in energies.iter().enumerate().skip(hist_blocks) {
         let ctx = &energies[j.saturating_sub(hist_blocks.max(1))..j];
         let reference = ctx.iter().fold(0.0f64, |m, &v| m.max(v));
-        if e > TRANSIENT_FLOOR && reference > TRANSIENT_ARM && e > TRANSIENT_RATIO * reference {
+        if e > TRANSIENT_FLOOR * scale
+            && reference > TRANSIENT_ARM * scale
+            && e > TRANSIENT_RATIO * reference
+        {
             return true;
         }
     }
@@ -1414,7 +1596,7 @@ const TNS_TEMPORAL_FLOOR: f64 = 128.0 * 90.0 * 90.0;
 /// strongly non-flat energy envelope.
 ///
 /// The window's time region (2048 samples for a long sequence; the
-/// 256-sample `SHORT_SEQ_START + j·SHORT_SEQ_HOP` slice per short
+/// 256-sample `(N_l − N_s)/4 + j·N_s/2` slice per short
 /// window) is split into 16 subblocks whose energies are reduced to
 /// the `max / mean` flatness ratio; the gate opens above
 /// [`TNS_TEMPORAL_RATIO`] (with a [`TNS_TEMPORAL_FLOOR`] silence
@@ -1425,14 +1607,11 @@ const TNS_TEMPORAL_FLOOR: f64 = 128.0 * 90.0 * 90.0;
 /// directly on the input samples keeps TNS to the transient /
 /// speech-like windows it exists for (§4.6.9.1's duality argument
 /// run forward).
-fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Vec<bool> {
-    let region = |i: usize| -> f64 {
-        if i < FRAME_LEN {
-            hist[i]
-        } else {
-            cur[i - FRAME_LEN]
-        }
-    };
+fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence, geom: Geom) -> Vec<bool> {
+    let n = geom.frame_len();
+    let (n_l, n_s) = (2 * n, 2 * geom.short_len());
+    let (start, hop) = ((n_l - n_s) / 4, n_s / 2);
+    let region = |i: usize| -> f64 { if i < n { hist[i] } else { cur[i - n] } };
     let flatness_permits = |base: usize, len: usize| -> bool {
         let sub = len / 16;
         let energies: Vec<f64> = (0..16)
@@ -1454,54 +1633,47 @@ fn tns_temporal_permits(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Vec<b
     };
     if seq == WindowSequence::EightShort {
         (0..8)
-            .map(|j| {
-                flatness_permits(
-                    SHORT_SEQ_START + j * SHORT_SEQ_HOP,
-                    2 * SHORT_WINDOW_LEN as usize,
-                )
-            })
+            .map(|j| flatness_permits(start + j * hop, n_s))
             .collect()
     } else {
-        vec![flatness_permits(0, LONG_TRANSFORM_LEN)]
+        vec![flatness_permits(0, n_l)]
     }
 }
 
 /// Run the §4.6.11.3.1 analysis transform for one channel under the
-/// chosen `window_sequence`, over the 2048-sample region
-/// `[hist | cur]`.
+/// chosen `window_sequence`, over the `2·frame_len`-sample region
+/// `[hist | cur]` (2048, or 1920 for the 960-line family).
 ///
-/// * Long sequences: one 2048-point MDCT under the
-///   [`long_sequence_window`] (sine shape throughout — this encoder
+/// * Long sequences: one `N_l`-point MDCT under the
+///   [`long_sequence_window_n`] window (sine shape throughout — this encoder
 ///   never switches shapes, so left/right inheritance is trivial).
 /// * `EIGHT_SHORT`: eight 256-point MDCTs at offsets
-///   `448 + j·128` inside the region ([`SHORT_SEQ_START`] /
-///   [`SHORT_SEQ_HOP`]), each under its [`short_window_j`];
+///   `448 + j·128` inside the region (`(N_l − N_s)/4 + j·N_s/2`;
+///   `420 + j·120` for the 960-line family), each under its short
+///   window;
 ///   concatenated window-major (`8 × 128` coefficients).
-fn analyze_channel(hist: &[f64], cur: &[f64], seq: WindowSequence) -> Result<Vec<f64>> {
-    debug_assert_eq!(hist.len(), FRAME_LEN);
-    debug_assert_eq!(cur.len(), FRAME_LEN);
-    let region = |i: usize| -> f64 {
-        if i < FRAME_LEN {
-            hist[i]
-        } else {
-            cur[i - FRAME_LEN]
-        }
-    };
+fn analyze_channel(hist: &[f64], cur: &[f64], seq: WindowSequence, geom: Geom) -> Result<Vec<f64>> {
+    let n = geom.frame_len();
+    debug_assert_eq!(hist.len(), n);
+    debug_assert_eq!(cur.len(), n);
+    let region = |i: usize| -> f64 { if i < n { hist[i] } else { cur[i - n] } };
+    let short_len = geom.short_len(); // 128 / 120
+    let (n_l, n_s) = (2 * n, 2 * short_len); // 2048/256 or 1920/240
     if seq == WindowSequence::EightShort {
-        let short_len = SHORT_WINDOW_LEN as usize; // 128
-        let n_s = 2 * short_len; // 256
+        // §4.6.11.3.2 c): window j at (N_l − N_s)/4 + j·N_s/2.
+        let (start, hop) = ((n_l - n_s) / 4, n_s / 2);
         let mut out = Vec::with_capacity(8 * short_len);
         for j in 0..8 {
-            let w = short_window_j(j, WindowShape::Sine, WindowShape::Sine);
-            let base = SHORT_SEQ_START + j * SHORT_SEQ_HOP;
+            let w = short_window_n(n_s, j, WindowShape::Sine, WindowShape::Sine);
+            let base = start + j * hop;
             let seg: Vec<f64> = (0..n_s).map(|m| region(base + m) * w[m]).collect();
             out.extend_from_slice(&forward_mdct(&seg, n_s));
         }
         Ok(out)
     } else {
-        let w = long_sequence_window(seq, WindowShape::Sine, WindowShape::Sine)?;
-        let z: Vec<f64> = (0..LONG_TRANSFORM_LEN).map(|m| region(m) * w[m]).collect();
-        Ok(forward_mdct(&z, LONG_TRANSFORM_LEN))
+        let w = long_sequence_window_n(n_l, n_s, seq, WindowShape::Sine, WindowShape::Sine)?;
+        let z: Vec<f64> = (0..n_l).map(|m| region(m) * w[m]).collect();
+        Ok(forward_mdct(&z, n_l))
     }
 }
 
@@ -1523,7 +1695,7 @@ type IsBand = Option<(u8, i32)>;
 /// intensity stereo exploits the ear's insensitivity to phase at
 /// high frequencies (§4.6.8.2.1), so the bottom quarter of the
 /// spectrum always keeps discrete coding.
-const IS_MIN_SPECTRAL_LINE: usize = FRAME_LEN / 4;
+const IS_MIN_SPECTRAL_FRACTION: usize = 4;
 
 /// Minimum normalised cross-correlation `|Σ l·r| / sqrt(Σl²·Σr²)`
 /// for a band to qualify for intensity coding. Deliberately strict:
@@ -1556,9 +1728,10 @@ const IS_PEAK_FLOOR_RATIO: f64 = 3e-3;
 /// — and the codebook carries the phase: `INTENSITY_HCB` (15) when
 /// the channels correlate positively, `INTENSITY_HCB2` (14) when
 /// they anti-correlate.
-fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>> {
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+fn is_decide(l_spec: &[f64], r_spec: &[f64], geom: Geom) -> Result<Vec<IsBand>> {
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
+    let min_line = geom.frame_len() / IS_MIN_SPECTRAL_FRACTION;
     let frame_peak = l_spec
         .iter()
         .chain(r_spec.iter())
@@ -1568,7 +1741,7 @@ fn is_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<IsBand>
     for (sfb, slot) in out.iter_mut().enumerate() {
         let start = offsets[sfb] as usize;
         let end = offsets[sfb + 1] as usize;
-        if start < IS_MIN_SPECTRAL_LINE {
+        if start < min_line {
             continue;
         }
         let mut e_l = 0.0f64;
@@ -1642,10 +1815,10 @@ fn pns_decide_pair(
     l_spec: &[f64],
     r_spec: &[f64],
     is_bands: &[IsBand],
-    fs_index: u8,
+    geom: Geom,
 ) -> Result<PairPns> {
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
     let mut out = PairPns {
         l_noise: vec![false; num_swb],
         r_noise: vec![false; num_swb],
@@ -1685,9 +1858,9 @@ fn pns_decide_pair(
 /// energy (≥ ~5 dB below its partner) — it will cull or code
 /// cheaply while the dominant channel carries the band once instead
 /// of twice.
-fn ms_decide(l_spec: &[f64], r_spec: &[f64], fs_index: u8) -> Result<Vec<bool>> {
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+fn ms_decide(l_spec: &[f64], r_spec: &[f64], geom: Geom) -> Result<Vec<bool>> {
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
     let mut used = Vec::with_capacity(num_swb);
     for sfb in 0..num_swb {
         let start = offsets[sfb] as usize;
@@ -1716,9 +1889,9 @@ fn apply_ms(
     l_spec: &[f64],
     r_spec: &[f64],
     ms_used: &[bool],
-    fs_index: u8,
+    geom: Geom,
 ) -> Result<(Vec<f64>, Vec<f64>)> {
-    let offsets = long_window_offsets(fs_index)?;
+    let offsets = geom.long_offsets()?;
     let mut code_l = l_spec.to_vec();
     let mut code_r = r_spec.to_vec();
     for (sfb, &used) in ms_used.iter().enumerate() {
@@ -1750,7 +1923,8 @@ fn ms_decide_short(
     num_swb: usize,
     wgl: &[u8],
 ) -> Vec<Vec<bool>> {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    // The table's sentinel is the short-window length (128 / 120).
+    let short_len = usize::from(offsets[offsets.len() - 1]);
     let mut rows = Vec::with_capacity(wgl.len());
     let mut win_base = 0usize;
     for &len in wgl {
@@ -1787,7 +1961,7 @@ fn apply_ms_short(
     offsets: &[u16],
     wgl: &[u8],
 ) -> (Vec<f64>, Vec<f64>) {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    let short_len = usize::from(offsets[offsets.len() - 1]);
     let mut code_l = l_spec.to_vec();
     let mut code_r = r_spec.to_vec();
     let mut win_base = 0usize;
@@ -2453,16 +2627,17 @@ fn cheapest_band_bits(coeffs: &[i32]) -> Option<u32> {
 fn quantize_channel(
     spec: &[f64],
     seq: WindowSequence,
-    fs_index: u8,
+    geom: Geom,
     sf_offset: i32,
     frame_peak: f64,
     pns_bands: &[bool],
     is_bands: &[IsBand],
 ) -> Result<QuantizedChannel> {
-    debug_assert_eq!(spec.len(), FRAME_LEN);
+    debug_assert_eq!(spec.len(), geom.frame_len());
     debug_assert!(seq != WindowSequence::EightShort);
-    let offsets = long_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_LONG_WINDOW[fs_index as usize] as usize;
+    let fs_index = geom.fs;
+    let offsets = geom.long_offsets()?;
+    let num_swb = geom.num_swb_long()?;
     let mut prev_sf: Option<i32> = None;
     let mut group = quantize_group(
         spec,
@@ -2478,7 +2653,7 @@ fn quantize_channel(
     }
     let pulse_candidate = extract_pulse_candidate(&group.x_quant, &group.sfb_cb, offsets);
     let info = IcsInfo {
-        family: crate::swb_offset::FrameFamily::Lc1024,
+        family: geom.family,
         ics_reserved_bit: false,
         window_sequence: seq,
         window_shape: WindowShape::Sine,
@@ -2561,7 +2736,7 @@ const GROUP_MERGE_EPS: f64 = 1.0;
 /// attack window's jump keeps it in its own group. Returns the
 /// `window_group_length` vector (summing to 8).
 fn decide_short_grouping(spec: &[f64], offsets: &[u16], num_swb: usize) -> Vec<u8> {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    let short_len = usize::from(offsets[offsets.len() - 1]);
     let band_energy = |w: usize, sfb: usize| -> f64 {
         let base = w * short_len;
         spec[base + offsets[sfb] as usize..base + offsets[sfb + 1] as usize]
@@ -2615,14 +2790,14 @@ fn grouping_mask(window_group_length: &[u8]) -> u8 {
 /// `(sfb, window, bin)` transmission order.
 fn quantize_channel_short(
     spec: &[f64],
-    fs_index: u8,
+    geom: Geom,
     sf_offset: i32,
     frame_peak: f64,
 ) -> Result<QuantizedChannel> {
-    let offsets = short_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let offsets = geom.short_offsets()?;
+    let num_swb = geom.num_swb_short()?;
     let window_group_length = decide_short_grouping(spec, offsets, num_swb);
-    quantize_channel_short_grouped(spec, fs_index, sf_offset, frame_peak, window_group_length)
+    quantize_channel_short_grouped(spec, geom, sf_offset, frame_peak, window_group_length)
 }
 
 /// [`quantize_channel_short`] under an *imposed* grouping — the
@@ -2632,15 +2807,16 @@ fn quantize_channel_short(
 /// scalefactor / interleave layouts follow it.
 fn quantize_channel_short_grouped(
     spec: &[f64],
-    fs_index: u8,
+    geom: Geom,
     sf_offset: i32,
     frame_peak: f64,
     window_group_length: Vec<u8>,
 ) -> Result<QuantizedChannel> {
-    let short_len = SHORT_WINDOW_LEN as usize;
+    let short_len = geom.short_len();
     debug_assert_eq!(spec.len(), 8 * short_len);
-    let offsets = short_window_offsets(fs_index)?;
-    let num_swb = NUM_SWB_SHORT_WINDOW[fs_index as usize] as usize;
+    let fs_index = geom.fs;
+    let offsets = geom.short_offsets()?;
+    let num_swb = geom.num_swb_short()?;
     let mask = grouping_mask(&window_group_length);
     let mut prev_sf: Option<i32> = None;
     let mut groups = Vec::with_capacity(window_group_length.len());
@@ -2677,7 +2853,7 @@ fn quantize_channel_short_grouped(
         win_base += wgl;
     }
     let info = IcsInfo {
-        family: crate::swb_offset::FrameFamily::Lc1024,
+        family: geom.family,
         ics_reserved_bit: false,
         window_sequence: WindowSequence::EightShort,
         window_shape: WindowShape::Sine,
@@ -2702,6 +2878,8 @@ fn quantize_channel_short_grouped(
 mod tests {
     use super::*;
     use crate::dequant::{inverse_quantize, scale_factor_gain};
+    use crate::ics_info::NUM_SWB_SHORT_WINDOW;
+    use crate::swb_offset::{SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets};
 
     #[test]
     fn quantize_coef_inverts_dequant_within_rounding() {
@@ -3028,7 +3206,7 @@ mod tests {
             }
         }
         let frame_peak = spec.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-        let chan = quantize_channel_short(&spec, fs_index, 0, frame_peak).unwrap();
+        let chan = quantize_channel_short(&spec, Geom::lc(fs_index), 0, frame_peak).unwrap();
         assert_eq!(chan.info.window_group_length, vec![3, 5]);
 
         let mut bw = BitWriter::new();
@@ -3310,8 +3488,16 @@ mod tests {
                 *slot = 0.0095; // the band floor
             }
         }
-        let chan =
-            quantize_channel(&spec, WindowSequence::OnlyLong, fs_index, 0, 1.0, &[], &[]).unwrap();
+        let chan = quantize_channel(
+            &spec,
+            WindowSequence::OnlyLong,
+            Geom::lc(fs_index),
+            0,
+            1.0,
+            &[],
+            &[],
+        )
+        .unwrap();
         let plain = quantize_group(
             &spec,
             offsets,

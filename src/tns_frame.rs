@@ -192,6 +192,29 @@ pub fn tns_analysis_frame(
     )
 }
 
+/// [`tns_analysis_frame`] under an explicit §4.5.1.1 frame family
+/// (the encoder's 960-line path).
+pub(crate) fn tns_analysis_frame_family(
+    spec: &mut [f64],
+    tns: &TnsData,
+    family: FrameFamily,
+    window_sequence: WindowSequence,
+    max_sfb: u8,
+    aot: u8,
+    fs_index: u8,
+) -> Result<()> {
+    tns_frame_filter(
+        spec,
+        tns,
+        family,
+        window_sequence,
+        max_sfb,
+        aot,
+        fs_index,
+        TnsFilterKind::Analysis,
+    )
+}
+
 /// [`tns_analysis_frame`] driven by a parsed [`IcsInfo`] (see
 /// [`tns_decode_frame_ics`] for the family selection).
 pub fn tns_analysis_frame_ics(

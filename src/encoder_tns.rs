@@ -43,13 +43,11 @@
 
 use crate::Result;
 use crate::ics_info::WindowSequence;
-use crate::swb_offset::{
-    LONG_WINDOW_LEN, SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets,
-};
+use crate::swb_offset::{FrameFamily, long_window_offsets_family, short_window_offsets_family};
 use crate::tns_coef::tns_encode_coef;
 use crate::tns_data::{TnsData, TnsFilter, TnsWindow, num_windows};
-use crate::tns_frame::tns_analysis_frame;
-use crate::tns_max::{AOT_AAC_LC, clamp_tns_band, tns_max_order};
+use crate::tns_frame::tns_analysis_frame_family;
+use crate::tns_max::{AOT_AAC_LC, clamp_tns_band_family, tns_max_order};
 
 /// Encoder-side cap on the TNS filter order. Table 4.102 allows up
 /// to 12 for AAC LC long windows (7 short), but each tap costs 4
@@ -206,17 +204,35 @@ pub fn detect_and_apply_tns(
     fs_index: u8,
     permit: &[bool],
 ) -> Result<Option<TnsData>> {
+    detect_and_apply_tns_family(spec, seq, max_sfb, FrameFamily::Lc1024, fs_index, permit)
+}
+
+/// [`detect_and_apply_tns`] under an explicit §4.5.1.1 frame family
+/// (`Lc1024` or `Lc960`): the window lengths and band tables follow
+/// the family (the 960-line family's bracketed Table 4.129–4.141
+/// columns).
+pub fn detect_and_apply_tns_family(
+    spec: &mut [f64],
+    seq: WindowSequence,
+    max_sfb: u8,
+    family: FrameFamily,
+    fs_index: u8,
+    permit: &[bool],
+) -> Result<Option<TnsData>> {
     let nw = num_windows(seq);
-    let (window_len, offsets) = if seq.is_eight_short() {
-        (SHORT_WINDOW_LEN as usize, short_window_offsets(fs_index)?)
+    let offsets = if seq.is_eight_short() {
+        short_window_offsets_family(family, fs_index)?
     } else {
-        (LONG_WINDOW_LEN as usize, long_window_offsets(fs_index)?)
+        long_window_offsets_family(family, fs_index)?
     };
+    // The tables end on the window length (their sentinel).
+    let window_len = usize::from(*offsets.last().ok_or(crate::Error::TnsDataEncodeInvalid)?);
     let num_swb = offsets.len() - 1;
     // The §4.6.9.3 region for a full-length (length == num_swb,
     // bottom == 0) upward filter: [swb_offset[0],
     // swb_offset[min(num_swb, TNS_MAX_BANDS, max_sfb)]).
-    let top = clamp_tns_band(num_swb as u8, max_sfb, AOT_AAC_LC, seq, fs_index)? as usize;
+    let top =
+        clamp_tns_band_family(num_swb as u8, max_sfb, family, AOT_AAC_LC, seq, fs_index)? as usize;
     let end = offsets[top] as usize;
     let max_order = TNS_ENC_MAX_ORDER.min(tns_max_order(AOT_AAC_LC, seq, fs_index)? as usize);
 
@@ -259,7 +275,7 @@ pub fn detect_and_apply_tns(
         return Ok(None);
     }
     let tns = TnsData { windows };
-    tns_analysis_frame(spec, &tns, seq, max_sfb, AOT_AAC_LC, fs_index)?;
+    tns_analysis_frame_family(spec, &tns, family, seq, max_sfb, AOT_AAC_LC, fs_index)?;
     Ok(Some(tns))
 }
 
@@ -267,6 +283,9 @@ pub fn detect_and_apply_tns(
 mod tests {
     use super::*;
     use crate::ics_info::WindowSequence;
+    use crate::swb_offset::{
+        LONG_WINDOW_LEN, SHORT_WINDOW_LEN, long_window_offsets, short_window_offsets,
+    };
     use crate::tns_frame::tns_decode_frame;
 
     /// Deterministic pseudo-noise in [-1, 1).

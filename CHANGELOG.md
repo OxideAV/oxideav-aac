@@ -20,6 +20,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (err/sig 1.5–2.8 on TNS frames and 5 failed AUs before).
   `tns_data::field_widths_family` now returns the literal widths for
   every family.
+- `pulse_data()` on a 960-line or ER AAC LD long frame was applied
+  through the 1024-line band table and rejected (the frame failed to
+  decode); the §4.6.3.3 fix-up now uses the frame's own family table.
+- The encoders answer a `Frame::StreamParams` input with
+  `Error::Unsupported` (they cannot re-configure mid-stream).
 - A change of `(audioObjectType, samplingFrequencyIndex,
   channelConfiguration)` between blocks (a spliced / concatenated ADTS
   stream) restarts the `StreamDecoder`'s per-stream state; before, an
@@ -33,6 +38,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StreamEncoder::set_frame_family(FrameFamily::Lc960)`: the 960-line
+  AAC-LC encoder core (`frameLengthFlag = 1`; `N = 1920 / 240`, the
+  bracketed Table 4.129–4.141 band columns, block switching on the
+  120-sample grid), with the access-unit entry points
+  `encode_access_unit` / `finish_access_unit` /
+  `encode_all_access_units`, `audio_specific_config`, `frame_len` and
+  `frame_family`. The registry encoder selects it from a
+  `frameLengthFlag` extradata ASC and emits 960-sample bare access
+  units. At equal rate its per-band NMR tracks the 1024-line path
+  within ±0.15 dB on tonal and burst material, and a black-box decoder
+  reads it within 1 LSB of this crate's decode. The 1024-line output is
+  unchanged byte for byte.
+- `encoder_tns::detect_and_apply_tns_family`.
 - The runtime decoder implements `Decoder::output_params` /
   `output_params_generation` and emits one `Frame::StreamParams` event
   immediately before the first frame of each new output shape (sample
