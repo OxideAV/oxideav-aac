@@ -254,7 +254,7 @@ fn roundtrip_snr_db(pcm: &[i16], channels: usize, rate: u32, bitrate: u32) -> Ve
 fn five_one_rate_follows_the_loud_channel() {
     let pcm = film_like_five_one(6);
     let snr = roundtrip_snr_db(&pcm, 6, 48_000, 6 * 96_000);
-    let center_alone: Vec<i16> = pcm.chunks_exact(6).map(|f| f[2]).collect();
+    let center_alone: Vec<i16> = pcm.as_chunks::<6>().0.iter().map(|f| f[2]).collect();
     let mono = roundtrip_snr_db(&center_alone, 1, 48_000, 96_000)[0];
     eprintln!(
         "5.1 film-like per-channel SNR dB = {snr:.1?}; center alone at 96 kbit/s = {mono:.1}"
