@@ -243,10 +243,10 @@ pub fn short_window_offsets(fs_index: u8) -> Result<&'static [u16]> {
 /// * For every GA AOT except AAC SSR and ER AAC LD,
 ///   `frameLengthFlag == 0` selects the 1024/128-line IMDCT family
 ///   and `frameLengthFlag == 1` the 960/120-line family.
-/// * For ER AAC LD (AOT 23), `frameLengthFlag == 0` selects a single
-///   512-line IMDCT and `frameLengthFlag == 1` a single 480-line
-///   IMDCT; there is no block switching (§4.6.17.2.2), hence no
-///   short-window geometry at all.
+/// * For ER AAC LD (AOT 23) and ER AAC ELD (AOT 39),
+///   `frameLengthFlag == 0` selects a single 512-line transform and
+///   `frameLengthFlag == 1` a single 480-line one; there is no block
+///   switching (§4.6.17.2.2), hence no short-window geometry at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FrameFamily {
     /// 1024 spectral lines per long frame, 128 per short window
@@ -268,7 +268,7 @@ impl FrameFamily {
     /// Resolve the family from the stream's `audioObjectType` and
     /// `frameLengthFlag` per §4.5.1.1.
     pub fn from_aot_and_flag(aot: u8, frame_length_flag: bool) -> Self {
-        match (aot == 23, frame_length_flag) {
+        match (aot == 23 || aot == 39, frame_length_flag) {
             (false, false) => FrameFamily::Lc1024,
             (false, true) => FrameFamily::Lc960,
             (true, false) => FrameFamily::Ld512,

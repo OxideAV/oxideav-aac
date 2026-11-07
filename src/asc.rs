@@ -139,14 +139,14 @@ pub const TRAILING_EXTENSION_AOT_BSAC: u8 = 22;
 /// The raw `frameLengthFlag` of `GASpecificConfig` — ISO/IEC 14496-3
 /// §4.5.1.1 semantics. The flag's meaning is AOT-dependent: for every
 /// GA AOT except AAC SSR and ER AAC LD it selects 1024 vs 960 IMDCT
-/// lines; for ER AAC LD (AOT 23) the same flag selects 512 vs 480
+/// lines; for ER AAC LD (AOT 23) and ELD (AOT 39) the same flag selects 512 vs 480
 /// (use [`crate::swb_offset::FrameFamily::from_aot_and_flag`] to
 /// resolve the actual frame geometry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameLength {
-    /// `frameLengthFlag == 0` — 1024 lines (512 for ER AAC LD).
+    /// `frameLengthFlag == 0` — 1024 lines (512 for ER AAC LD / ELD).
     Long1024,
-    /// `frameLengthFlag == 1` — 960 lines (480 for ER AAC LD).
+    /// `frameLengthFlag == 1` — 960 lines (480 for ER AAC LD / ELD).
     Long960,
 }
 
@@ -359,6 +359,108 @@ pub struct AudioSpecificConfig {
     /// [`AudioSpecificConfig::parse_bits`] keeps its no-probe
     /// semantics.
     pub trailing_sbr_probe: Option<SbrExtensionProbe>,
+    /// `ELDSpecificConfig()` for ER AAC ELD (AOT 39). Its frame length
+    /// and resilience flags also fill [`AudioSpecificConfig::ga_body`]
+    /// (an ELD configuration carries no `GASpecificConfig` itself).
+    pub eld: Option<EldSpecificConfig>,
+}
+
+/// AOT of ER AAC ELD.
+pub const ELD_AOT: u8 = 39;
+
+/// `ELDSpecificConfig(channelConfiguration)` (AOT 39).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EldSpecificConfig {
+    /// `frameLengthFlag`: 512 lines ([`FrameLength::Long1024`]) or 480
+    /// ([`FrameLength::Long960`]).
+    pub frame_length: FrameLength,
+    /// The `aacSectionDataResilienceFlag` /
+    /// `aacScalefactorDataResilienceFlag` /
+    /// `aacSpectralDataResilienceFlag` triplet.
+    pub resilience: AacResilienceFlags,
+    /// The low-delay SBR configuration when `ldSbrPresentFlag` is set.
+    pub ld_sbr: Option<LdSbrConfig>,
+    /// The `eldExtType` / payload pairs before `ELDEXT_TERM`.
+    pub extensions: Vec<(u8, Vec<u8>)>,
+}
+
+/// The low-delay SBR fields of `ELDSpecificConfig()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LdSbrConfig {
+    /// `ldSbrSamplingRate`: SBR runs at twice the core rate.
+    pub dual_rate: bool,
+    /// `ldSbrCrcFlag`.
+    pub crc: bool,
+    /// `ld_sbr_header()`: one `sbr_header()` per channel element that
+    /// is not an LFE (configurations 1 and 2: one; 3: two; 4 to 6:
+    /// three; 7: four).
+    pub headers: Vec<crate::sbr_header::SbrHeader>,
+}
+
+/// `ELDSpecificConfig()` after `audioObjectType`, the sampling
+/// frequency and `channelConfiguration`.
+fn parse_eld_specific_config(
+    reader: &mut BitReader<'_>,
+    channel_configuration: u8,
+) -> Result<EldSpecificConfig> {
+    let frame_length = if read_bit(reader)? {
+        FrameLength::Long960
+    } else {
+        FrameLength::Long1024
+    };
+    let resilience = AacResilienceFlags {
+        section_data: read_bit(reader)?,
+        scalefactor_data: read_bit(reader)?,
+        spectral_data: read_bit(reader)?,
+    };
+    let ld_sbr = if read_bit(reader)? {
+        let dual_rate = read_bit(reader)?;
+        let crc = read_bit(reader)?;
+        let count = match channel_configuration {
+            1 | 2 => 1,
+            3 => 2,
+            4..=6 => 3,
+            7 => 4,
+            _ => return Err(Error::ElementDecodeInvalid),
+        };
+        let mut headers = Vec::with_capacity(count);
+        for _ in 0..count {
+            headers.push(crate::sbr_header::SbrHeader::parse(reader)?);
+        }
+        Some(LdSbrConfig {
+            dual_rate,
+            crc,
+            headers,
+        })
+    } else {
+        None
+    };
+    let mut extensions = Vec::new();
+    loop {
+        let kind = read_u8(reader, 4)?;
+        if kind == 0 {
+            break;
+        }
+        let mut length = u32::from(read_u8(reader, 4)?);
+        if length == 15 {
+            let more = u32::from(read_u8(reader, 8)?);
+            length += more;
+            if more == 255 {
+                length += read_u32(reader, 16)?;
+            }
+        }
+        let mut payload = Vec::with_capacity(length as usize);
+        for _ in 0..length {
+            payload.push(read_u8(reader, 8)?);
+        }
+        extensions.push((kind, payload));
+    }
+    Ok(EldSpecificConfig {
+        frame_length,
+        resilience,
+        ld_sbr,
+        extensions,
+    })
 }
 
 impl AudioSpecificConfig {
@@ -487,16 +589,36 @@ impl AudioSpecificConfig {
             }
         }
 
-        // Body dispatch — Phase 1 only handles GA.
-        if !GA_AOTS.contains(&effective_aot) {
-            return Err(Error::UnsupportedAot(effective_aot));
-        }
-        let ga_body = parse_ga_specific_config(
-            reader,
-            channel_configuration,
-            effective_aot,
-            origin_bit_offset,
-        )?;
+        // Body dispatch: GA, or ELD.
+        let mut eld = None;
+        let ga_body = if effective_aot == ELD_AOT && outer_aot == ELD_AOT {
+            let config = parse_eld_specific_config(reader, channel_configuration)?;
+            let body = GaSpecificConfig {
+                frame_length: config.frame_length,
+                depends_on_core_coder: false,
+                core_coder_delay: None,
+                extension_flag: true,
+                pce: None,
+                layer_nr: None,
+                extension_body: Some(GaExtensionBody {
+                    bsac_layer: None,
+                    resilience: Some(config.resilience),
+                    extension_flag3: false,
+                }),
+            };
+            eld = Some(config);
+            body
+        } else {
+            if !GA_AOTS.contains(&effective_aot) {
+                return Err(Error::UnsupportedAot(effective_aot));
+            }
+            parse_ga_specific_config(
+                reader,
+                channel_configuration,
+                effective_aot,
+                origin_bit_offset,
+            )?
+        };
 
         // Table 1.15 outer `switch (audioObjectType)` — `epConfig`
         // for ER object types. `epConfig == 2 || epConfig == 3`
@@ -538,6 +660,7 @@ impl AudioSpecificConfig {
             error_protection,
             direct_mapping,
             trailing_sbr_probe: None,
+            eld,
         })
     }
 
