@@ -77,7 +77,10 @@
 //! * PNS output is RNG-defined per §4.6.13.3 (only the per-band L2 norm
 //!   is spec-determined); the driver uses the default
 //!   [`crate::pns::gen_rand_vector`] LCG, seeded once per decoder so the
-//!   noise is reproducible across a decode run.
+//!   noise is reproducible across a decode run, or restarted at every
+//!   frame from the frame's own bytes ([`ElementDecoder::reseed_pns`],
+//!   the stream decoder's opt-in per-frame seed) so it is reproducible
+//!   wherever a decode run begins.
 
 use crate::cce::CouplingChannelElement;
 use crate::decoded_spectrum::quant_to_spec;
@@ -476,6 +479,12 @@ impl CceDecoder {
         self.fb.set_sine_before_first_block(enabled);
     }
 
+    /// Restart the embedded SCE's PNS generator at `seed` (the stream
+    /// decoder's per-frame seed, [`crate::pns::element_pns_seed`]).
+    pub fn reseed_pns(&mut self, seed: u32) {
+        self.pns_state = seed;
+    }
+
     /// Decode the CCE's embedded `single_channel_element()` to the
     /// §4.6.8.3.3 `cc_spectrum[]` (and, for an independently switched
     /// CCE, on to the time domain through this slot's persistent
@@ -670,6 +679,16 @@ impl ElementDecoder {
     /// default process).
     pub fn set_shared_pns_seed(&mut self, shared: bool) {
         self.shared_pns_seed = shared;
+    }
+
+    /// Restart the PNS generator at `seed` before the next element is
+    /// decoded: both channel slots, so with
+    /// [`Self::set_shared_pns_seed`] each channel again starts from the
+    /// common seed. The stream decoder's per-frame seed
+    /// ([`crate::decode::StreamDecoder::set_pns_frame_seed`]) calls this
+    /// at every frame, so a frame's noise depends on the frame alone.
+    pub fn reseed_pns(&mut self, seed: u32) {
+        self.pns_state = [seed; 2];
     }
 
     /// Decode one single-channel element (SCE) or LFE channel to PCM.

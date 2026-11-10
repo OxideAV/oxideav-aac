@@ -66,6 +66,14 @@
 //! closure so a caller can substitute a different (e.g. bit-exact
 //! reference) source without changing the synthesis maths.
 //!
+//! By default a decoder seeds the generator once and runs it on from
+//! frame to frame, so a frame's noise depends on every frame decoded
+//! before it: a decoder started mid-stream draws other noise than one
+//! that ran from the start. [`frame_pns_seed`] and [`element_pns_seed`]
+//! give each channel element a state drawn from the frame's own bytes
+//! instead (the decoder's opt-in per-frame seed), so a frame decodes
+//! to the same noise wherever decoding began.
+//!
 //! The staged clean-room analysis
 //! (`docs/audio/aac/pns-gen-rand-vector.md`) pins down exactly how
 //! far the standard constrains this tool: the band selection, the
@@ -168,6 +176,46 @@ pub fn gen_rand_vector(out: &mut [f64], state: &mut u32) {
         *v = (*state as i32) as f64 / 2_147_483_648.0;
     }
 }
+
+/// A generator seed drawn from one `raw_data_block()` payload: the
+/// 32-bit FNV-1a hash of its bytes.
+///
+/// With [`crate::decode::StreamDecoder::set_pns_frame_seed`] the
+/// decoder restarts every channel element's generator at each frame
+/// from this value (mixed per element by [`element_pns_seed`]), so a
+/// frame's noise depends on the frame alone, not on how many frames
+/// the decoder saw before it. The bytes differ from frame to frame as
+/// the coded audio does, so successive frames still draw unrelated
+/// vectors; only a byte-identical frame repeats its noise.
+pub fn frame_pns_seed(payload: &[u8]) -> u32 {
+    payload.iter().fold(FNV_OFFSET, |hash, &byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+/// The generator state one channel element starts a frame from, under
+/// [`crate::decode::StreamDecoder::set_pns_frame_seed`]: the frame's
+/// [`frame_pns_seed`] with the element's `raw_data_block()` index
+/// within the frame, its element id and its instance tag folded in,
+/// then mixed (the 32-bit finalizer of MurmurHash3) so elements of one
+/// frame start from unrelated states and their noise bands decorrelate.
+pub fn element_pns_seed(frame_seed: u32, block: u8, element_id: u8, tag: u8) -> u32 {
+    let mut h = [block, element_id, tag]
+        .iter()
+        .fold(frame_seed, |hash, &byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(FNV_PRIME)
+        });
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// FNV-1a 32-bit offset basis.
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+/// FNV-1a 32-bit prime.
+const FNV_PRIME: u32 = 0x0100_0193;
 
 /// Synthesise one PNS band in place from a pre-filled random vector.
 ///
@@ -718,6 +766,70 @@ mod tests {
             "non-noise left band must stay silent"
         );
         assert!((norm(&rspec[start..end]) - noise_target_norm(4)).abs() < 1e-9);
+    }
+
+    /// The per-frame seed changes which vector a band draws, never its
+    /// energy: over many frames' and elements' seeds every noise band
+    /// comes out at exactly its `noise_nrg` target norm.
+    #[test]
+    fn per_frame_seeds_keep_every_band_at_its_target_norm() {
+        let fs = FS_48000;
+        let offsets = long_window_offsets(fs).unwrap();
+        let num_swb = offsets.len() - 1;
+        let ics = long_ics(num_swb as u8);
+        let sfb_cb = vec![vec![NOISE_HCB; num_swb]];
+        let noise_nrg = vec![
+            (0..num_swb as i32)
+                .map(|sfb| sfb * 3 - 20)
+                .collect::<Vec<_>>(),
+        ];
+        for frame in 0u32..64 {
+            let payload: Vec<u8> = (0..32).map(|i| (frame * 31 + i * 7) as u8).collect();
+            for (element_id, tag) in [(0, 0), (1, 0), (1, 1), (3, 0)] {
+                let mut state = element_pns_seed(frame_pns_seed(&payload), 0, element_id, tag);
+                let mut spec = vec![0.0f64; LONG_WINDOW_LEN as usize];
+                let mut chan = PnsChannel {
+                    spec: &mut spec,
+                    sfb_cb: &sfb_cb,
+                    noise_nrg: &noise_nrg,
+                };
+                apply_pns(&mut chan, &ics, fs, |out| gen_rand_vector(out, &mut state)).unwrap();
+                for sfb in 0..num_swb {
+                    let band = &spec[offsets[sfb] as usize..offsets[sfb + 1] as usize];
+                    let target = noise_target_norm(noise_nrg[0][sfb]);
+                    assert!(
+                        (norm(band) / target - 1.0).abs() < 1e-12,
+                        "frame {frame}, element ({element_id}, {tag}), sfb {sfb}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One frame's seed depends on its bytes alone; one byte more or
+    /// changed, another element or another block of the frame start
+    /// the generator elsewhere.
+    #[test]
+    fn per_frame_seeds_follow_the_frame_and_the_element() {
+        let payload = [0x21u8, 0x10, 0x05, 0x40, 0x80, 0x00, 0x1c];
+        let frame = frame_pns_seed(&payload);
+        assert_eq!(frame, frame_pns_seed(&payload.clone()));
+        assert_ne!(frame, frame_pns_seed(&payload[..6]));
+        let mut changed = payload;
+        changed[3] ^= 1;
+        assert_ne!(frame, frame_pns_seed(&changed));
+        let seeds = [
+            element_pns_seed(frame, 0, 0, 0),
+            element_pns_seed(frame, 0, 1, 0),
+            element_pns_seed(frame, 0, 1, 1),
+            element_pns_seed(frame, 0, 3, 0),
+            element_pns_seed(frame, 1, 0, 0),
+        ];
+        for (i, a) in seeds.iter().enumerate() {
+            for b in &seeds[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

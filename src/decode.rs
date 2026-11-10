@@ -56,6 +56,7 @@ use crate::ics_info::IcsInfo;
 use crate::ms_stereo::MsMaskPresent;
 use crate::pce::Pce;
 use crate::pcm::interleave_s16;
+use crate::pns::{element_pns_seed, frame_pns_seed};
 use crate::raw_data_block::{Element, IdSynEle, Walker};
 use crate::sbr_decoder::SbrDecoder;
 use crate::sbr_extension::SbrExtensionData;
@@ -218,6 +219,9 @@ pub struct StreamDecoder {
     /// restart (an overlap tail, LTP history or SBR state of a
     /// different configuration has no meaning for the new one).
     stream_config: Option<(u8, u8, u8)>,
+    /// Restart every element's PNS generator at each frame from the
+    /// frame's bytes ([`Self::set_pns_frame_seed`]).
+    pns_frame_seed: bool,
 }
 
 /// Per-element decoder settings a [`StreamDecoder`] installs on every
@@ -292,6 +296,22 @@ impl StreamDecoder {
     /// for a stream configured as AAC-LC.
     pub fn set_core_only(&mut self, enabled: bool) {
         self.core_only = enabled;
+    }
+
+    /// Restart each channel and coupling element's PNS generator at
+    /// every `raw_data_block()` from a seed drawn from the block's own
+    /// bytes ([`crate::pns::frame_pns_seed`], mixed per element by
+    /// [`crate::pns::element_pns_seed`]); off by default, when one
+    /// generator runs on from frame to frame. A frame's noise bands
+    /// then decode the same wherever decoding began, so a decoder
+    /// started a frame before frame `n` (the transform's overlap) gives
+    /// frame `n` on exactly as one that decoded the stream from its
+    /// start: a stream can be decoded in pieces and joined without a
+    /// change at the joins. The noise energy is untouched (each band is
+    /// normalized to its `noise_nrg` target, §4.6.13.3); only the
+    /// draw changes. Applies from the next block on.
+    pub fn set_pns_frame_seed(&mut self, enabled: bool) {
+        self.pns_frame_seed = enabled;
     }
 
     /// Install the program configuration of a
@@ -451,6 +471,7 @@ impl StreamDecoder {
         let fs = fs_index;
         let family = self.family;
         let element_options = self.element_options;
+        let frame_seed = self.pns_frame_seed.then(|| frame_pns_seed(payload));
         let mut reader = BitReader::new(payload);
 
         // Per channel-element outputs in element order: the decoded
@@ -593,11 +614,15 @@ impl StreamDecoder {
         // independently switched CCE, its time signal), through the
         // per-instance-tag persistent CCE decoder slot.
         let mut decoded_cces: Vec<DecodedCce> = Vec::with_capacity(cces.len());
-        for (_, cce) in &cces {
+        for (block, cce) in &cces {
             let dec = self
                 .cce_decoders
                 .entry(cce.element_instance_tag)
                 .or_insert_with(|| element_options.cce_decoder(family));
+            if let Some(seed) = frame_seed {
+                let id = IdSynEle::Cce as u8;
+                dec.reseed_pns(element_pns_seed(seed, *block, id, cce.element_instance_tag));
+            }
             decoded_cces.push(dec.decode(cce, aot, fs)?);
         }
 
@@ -619,10 +644,14 @@ impl StreamDecoder {
                         ics_info: &sce.ics,
                         spectral: &sce.spectral,
                     };
-                    let dec = self
-                        .decoders
-                        .entry(pe.key)
-                        .or_insert_with(|| element_options.element_decoder(family));
+                    let dec = element_slot(
+                        &mut self.decoders,
+                        pe.key,
+                        element_options,
+                        family,
+                        frame_seed,
+                        pe.block,
+                    );
                     vec![dec.decode_sce_coupled(&ch, aot, fs, &coupling)?]
                 }
                 ParsedChannel::Pair(cpe) => {
@@ -631,10 +660,14 @@ impl StreamDecoder {
                     let right_coupling =
                         coupling_for(&cces, &decoded_cces, pe.block, pe.kind, pe.key.1, 1);
                     let (left, right, joint) = cpe.channel_inputs();
-                    let dec = self
-                        .decoders
-                        .entry(pe.key)
-                        .or_insert_with(|| element_options.element_decoder(family));
+                    let dec = element_slot(
+                        &mut self.decoders,
+                        pe.key,
+                        element_options,
+                        family,
+                        frame_seed,
+                        pe.block,
+                    );
                     let (l, r) = dec.decode_cpe_coupled(
                         &left,
                         &right,
@@ -1048,6 +1081,7 @@ impl StreamDecoder {
         let fs = fs_index;
         let family = self.family;
         let element_options = self.element_options;
+        let frame_seed = self.pns_frame_seed.then(|| frame_pns_seed(payload));
         // Table 4.19: the fixed element sequence per channelConfiguration.
         let sequence: &[IdSynEle] = match channel_configuration {
             1 => &[IdSynEle::Sce],
@@ -1083,10 +1117,14 @@ impl StreamDecoder {
                         ics_info: &ics,
                         spectral: &spectral,
                     };
-                    let dec = self
-                        .decoders
-                        .entry(key)
-                        .or_insert_with(|| element_options.element_decoder(family));
+                    let dec = element_slot(
+                        &mut self.decoders,
+                        key,
+                        element_options,
+                        family,
+                        frame_seed,
+                        0,
+                    );
                     channels.push(dec.decode_sce(&ch, aot, fs)?);
                 }
                 IdSynEle::Cpe => {
@@ -1144,10 +1182,14 @@ impl StreamDecoder {
                             ms_mask_present,
                             ms_used,
                         };
-                        let dec = self
-                            .decoders
-                            .entry(key)
-                            .or_insert_with(|| element_options.element_decoder(family));
+                        let dec = element_slot(
+                            &mut self.decoders,
+                            key,
+                            element_options,
+                            family,
+                            frame_seed,
+                            0,
+                        );
                         dec.decode_cpe(&left, &right, &joint, aot, fs)?
                     } else {
                         let left_body = IcsBody::parse_er_family(
@@ -1200,10 +1242,14 @@ impl StreamDecoder {
                             ics_info: &right_ics,
                             spectral: &right_spectral,
                         };
-                        let dec = self
-                            .decoders
-                            .entry(key)
-                            .or_insert_with(|| element_options.element_decoder(family));
+                        let dec = element_slot(
+                            &mut self.decoders,
+                            key,
+                            element_options,
+                            family,
+                            frame_seed,
+                            0,
+                        );
                         dec.decode_cpe(&left, &right, &CpeJointStereo::default(), aot, fs)?
                     };
                     channels.push(dec_out.0);
@@ -1595,6 +1641,26 @@ fn coupling_for<'a>(
 /// Map a channel-element `id_syn_ele` to the slot key's first component
 /// (the element decoders are keyed independently per syntactic-element
 /// id so an SCE tag 0 and a CPE tag 0 never collide).
+/// The persistent decoder of channel element `key` (created on first
+/// use), its PNS generator restarted at this element's share of the
+/// frame's seed when [`StreamDecoder::set_pns_frame_seed`] is on.
+fn element_slot(
+    decoders: &mut HashMap<(u8, u8), ElementDecoder>,
+    key: (u8, u8),
+    options: ElementOptions,
+    family: FrameFamily,
+    frame_seed: Option<u32>,
+    block: u8,
+) -> &mut ElementDecoder {
+    let dec = decoders
+        .entry(key)
+        .or_insert_with(|| options.element_decoder(family));
+    if let Some(seed) = frame_seed {
+        dec.reseed_pns(element_pns_seed(seed, block, key.0, key.1));
+    }
+    dec
+}
+
 fn kind_id(kind: IdSynEle) -> u8 {
     match kind {
         IdSynEle::Sce => 0,
