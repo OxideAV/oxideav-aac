@@ -59,16 +59,24 @@ fn extension_type_sbr_rejected() {
 }
 
 #[test]
-fn extension_type_reserved_rejected() {
-    // Every 4-bit value except 0/1/0xb/0xd/0xe is reserved.
+fn extension_type_reserved_is_skippable() {
+    // Every 4-bit value except 0/1/0xb/0xd/0xe is reserved (0b0010 is
+    // EXT_DATA_ELEMENT): Table 4.51's default branch skips its body.
     for raw in [
         0b0010u8, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111, 0b1000, 0b1001, 0b1010, 0b1100, 0b1111,
     ] {
+        assert_eq!(ExtensionType::from_bits(raw), Ok(ExtensionType::Other(raw)));
         assert_eq!(
-            ExtensionType::from_bits(raw),
-            Err(Error::UnsupportedExtensionType(raw))
+            ExtensionType::from_bits_allow_sbr(raw),
+            Ok(ExtensionType::Other(raw))
         );
+        assert_eq!(ExtensionType::Other(raw).as_u8(), raw);
     }
+    // A value wider than the 4-bit field is not an extension_type.
+    assert_eq!(
+        ExtensionType::from_bits(0x10),
+        Err(Error::UnsupportedExtensionType(0x10))
+    );
 }
 
 // ---------------------------------------------------------------
@@ -194,25 +202,28 @@ fn ext_fill_data_cnt_eq_1_no_payload() {
 }
 
 #[test]
-fn ext_fill_data_parser_rejects_non_zero_nibble() {
+fn ext_fill_data_parser_skips_non_zero_nibble() {
     // type=0b0001, nibble=0b0001 (illegal) ⇒ first byte 0b0001_0001 = 0x11.
+    // The "must be" patterns bind an encoder; a decoder skips the bytes.
     let bytes = [0x11, FILL_DATA_BYTE, FILL_DATA_BYTE];
     let mut r = BitReader::new(&bytes);
     assert_eq!(
         ExtensionPayload::parse(&mut r, 3),
-        Err(Error::ExtensionPayloadInvalid)
+        Ok(ExtensionPayload::FillData { cnt: 3 })
     );
+    assert_eq!(r.bit_position(), 24);
 }
 
 #[test]
-fn ext_fill_data_parser_rejects_non_a5_byte() {
+fn ext_fill_data_parser_skips_non_a5_byte() {
     // type=1, nibble=0, then one 0xA5 then one 0x00 (illegal).
     let bytes = [0x10, FILL_DATA_BYTE, 0x00];
     let mut r = BitReader::new(&bytes);
     assert_eq!(
         ExtensionPayload::parse(&mut r, 3),
-        Err(Error::ExtensionPayloadInvalid)
+        Ok(ExtensionPayload::FillData { cnt: 3 })
     );
+    assert_eq!(r.bit_position(), 24);
 }
 
 #[test]
@@ -711,14 +722,102 @@ fn parser_dispatch_sbr_crc_extension_type_surfaced() {
 }
 
 #[test]
-fn parser_dispatch_reserved_extension_type_surfaced() {
-    // Byte 0: [type:4=0010, padding:4=0000] = 0x20.
+fn parser_dispatch_reserved_extension_type_skipped() {
+    // Byte 0: [type:4=0010, other_bits:4=0000] = 0x20.
     let bytes = [0x20u8];
     let mut r = BitReader::new(&bytes);
     assert_eq!(
         ExtensionPayload::parse(&mut r, 1),
-        Err(Error::UnsupportedExtensionType(0b0010))
+        Ok(ExtensionPayload::Other {
+            extension_type: 0b0010,
+            cnt: 1,
+            other_bits: vec![0x00],
+        })
     );
+}
+
+#[test]
+fn reserved_extension_type_consumes_exactly_cnt_bytes() {
+    // type 0xa, cnt 3: 4 + 8 * 2 + 4 = 24 bits, all arbitrary.
+    let bytes = [0xa1, 0x23, 0x4f];
+    let mut r = BitReader::new(&bytes);
+    let p = ExtensionPayload::parse(&mut r, 3).unwrap();
+    assert_eq!(r.bit_position(), 24);
+    assert_eq!(p.byte_length(), 3);
+    assert_eq!(
+        p,
+        ExtensionPayload::Other {
+            extension_type: 0xa,
+            cnt: 3,
+            other_bits: vec![0x12, 0x34, 0xf0],
+        }
+    );
+}
+
+#[test]
+fn reserved_extension_type_round_trips_through_write() {
+    for raw in [0b0010u8, 0b0011, 0b1010, 0b1100, 0b1111] {
+        let original = ExtensionPayload::Other {
+            extension_type: raw,
+            cnt: 3,
+            other_bits: vec![0x12, 0x34, 0xf0],
+        };
+        let mut w = BitWriter::new();
+        assert_eq!(original.write(&mut w).unwrap(), 3);
+        let bytes = w.finish();
+        assert_eq!(bytes[0] >> 4, raw);
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(ExtensionPayload::parse(&mut r, 3).unwrap(), original);
+    }
+}
+
+#[test]
+fn reserved_extension_type_writer_rejects_a_wide_type_or_wrong_length() {
+    let wide = ExtensionPayload::Other {
+        extension_type: 0x10,
+        cnt: 1,
+        other_bits: vec![0],
+    };
+    assert_eq!(
+        wide.write(&mut BitWriter::new()),
+        Err(Error::ExtensionPayloadInvalid)
+    );
+    let short = ExtensionPayload::Other {
+        extension_type: 0xa,
+        cnt: 3,
+        other_bits: vec![0],
+    };
+    assert_eq!(
+        short.write(&mut BitWriter::new()),
+        Err(Error::ExtensionPayloadInvalid)
+    );
+}
+
+#[test]
+fn reserved_extension_type_truncated_payload_is_unexpected_end() {
+    // type 0xa claims cnt 4 (32 bits); only 16 are present.
+    let bytes = [0xa1, 0x23];
+    let mut r = BitReader::new(&bytes);
+    assert_eq!(
+        ExtensionPayload::parse(&mut r, 4),
+        Err(Error::UnexpectedEnd)
+    );
+}
+
+#[test]
+fn parse_with_sbr_skips_a_reserved_extension_type() {
+    let bytes = [0xa1, 0x23, 0x4f];
+    let mut r = BitReader::new(&bytes);
+    let out = ExtensionPayload::parse_with_sbr(&mut r, 3, IdSynEle::Sce, FS_SBR, None).unwrap();
+    assert!(matches!(
+        out,
+        ExtensionPayloadOrSbr::Payload(ExtensionPayload::Other {
+            extension_type: 0xa,
+            cnt: 3,
+            ..
+        })
+    ));
+    assert_eq!(r.bit_position(), 24);
 }
 
 // ---------------------------------------------------------------

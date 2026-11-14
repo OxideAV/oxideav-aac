@@ -36,13 +36,15 @@
 //! * `EXT_SBR_DATA` (`0b1101`).
 //! * `EXT_SBR_DATA_CRC` (`0b1110`).
 //!
-//! All other (reserved) values surface as
-//! [`Error::UnsupportedExtensionType`] carrying the literal 4-bit
-//! value as read from the wire.
+//! All other values (`EXT_DATA_ELEMENT` and the reserved ones) are
+//! [`ExtensionType::Other`] and parse to [`ExtensionPayload::Other`]:
+//! Table 4.51's `default` branch skips `8 * (cnt - 1) + 4`
+//! `other_bits`, and so does the decoder. An `EXT_FILL_DATA` whose
+//! nibble or bytes differ from the "must be" patterns is skipped too.
 //!
 //! ## Why a parser / writer pair, and why now
 //!
-//! The Phase 1 `raw_data_block()` walker (round 121) recognises
+//! The Phase 1 `raw_data_block()` walker (round 121) recognizes
 //! FIL but skips its payload bytes opaque. Round 160's
 //! `FrameAssembler::push_fill` accepts an opaque payload byte
 //! slice. Neither side decodes or encodes the structured
@@ -119,6 +121,13 @@ pub enum ExtensionType {
     /// (ISO/IEC 13818-7 Table 40). This crate does not parse the
     /// `sbr_extension_data()` body yet.
     SbrDataCrc,
+    /// Any other 4-bit value: `EXT_DATA_ELEMENT` (`0b0010`, whose
+    /// `ANC_DATA` body is ancillary data a decoder has no use for) and
+    /// every value Table 4.59 marks reserved. Table 4.51's `default`
+    /// branch has a decoder read the remaining `8 * (cnt - 1) + 4` bits
+    /// as `other_bits` and carry on, so these are skipped, not refused.
+    /// Holds the raw 4-bit value.
+    Other(u8),
 }
 
 impl ExtensionType {
@@ -131,18 +140,22 @@ impl ExtensionType {
     ///   (`EXT_SBR_DATA`) and `0b1110` (`EXT_SBR_DATA_CRC`) — the
     ///   bodies are the SBR `sbr_extension_data()` syntax which
     ///   this crate does not parse.
-    /// * [`Error::UnsupportedExtensionType`] carrying the raw
-    ///   4-bit value for any other value not in
+    /// * [`ExtensionType::Other`] for any other value not in
     ///   `{0b0000, 0b0001, 0b1011, 0b1101, 0b1110}`. Table 4.59 /
-    ///   Table 40 list these as "reserved".
+    ///   Table 40 list these as "reserved" (or, for `0b0010`,
+    ///   `EXT_DATA_ELEMENT`), and Table 4.51's `default` branch skips
+    ///   their body.
+    /// * [`Error::UnsupportedExtensionType`] only for a value wider
+    ///   than the 4-bit field.
     pub fn from_bits(value: u8) -> Result<Self> {
         match value {
             0b0000 => Ok(ExtensionType::Fill),
             0b0001 => Ok(ExtensionType::FillData),
             0b1011 => Ok(ExtensionType::DynamicRange),
             0b1101 | 0b1110 => Err(Error::UnsupportedExtensionSbr(value)),
-            other if other <= 0x0f => Err(Error::UnsupportedExtensionType(other)),
-            // unreachable in practice — `read_u32(4)` produces 0..=15
+            other if other <= 0x0f => Ok(ExtensionType::Other(other)),
+            // `read_u32(4)` produces 0..=15; a caller passing a wider
+            // value gets an error.
             _ => Err(Error::UnsupportedExtensionType(value)),
         }
     }
@@ -150,7 +163,8 @@ impl ExtensionType {
     /// Like [`Self::from_bits`] but maps the two SBR wire values to
     /// their [`ExtensionType`] variants instead of an error, so the
     /// [`ExtensionPayload::parse_with_sbr`] entry can dispatch them into
-    /// the SBR side-info walker. Reserved values still error.
+    /// the SBR side-info walker. Reserved values are
+    /// [`ExtensionType::Other`], as in [`Self::from_bits`].
     pub fn from_bits_allow_sbr(value: u8) -> Result<Self> {
         match value {
             0b0000 => Ok(ExtensionType::Fill),
@@ -158,6 +172,7 @@ impl ExtensionType {
             0b1011 => Ok(ExtensionType::DynamicRange),
             0b1101 => Ok(ExtensionType::SbrData),
             0b1110 => Ok(ExtensionType::SbrDataCrc),
+            other if other <= 0x0f => Ok(ExtensionType::Other(other)),
             other => Err(Error::UnsupportedExtensionType(other)),
         }
     }
@@ -170,6 +185,7 @@ impl ExtensionType {
             ExtensionType::DynamicRange => 0b1011,
             ExtensionType::SbrData => 0b1101,
             ExtensionType::SbrDataCrc => 0b1110,
+            ExtensionType::Other(value) => value,
         }
     }
 }
@@ -212,6 +228,18 @@ pub enum ExtensionPayload {
     },
     /// `EXT_DYNAMIC_RANGE` — DRC metadata per Table 4.52.
     DynamicRange(DynamicRangeInfo),
+    /// An extension type this decoder has no body layout for
+    /// (`EXT_DATA_ELEMENT` and the reserved values, see
+    /// [`ExtensionType::Other`]), skipped per Table 4.51's `default`
+    /// branch: `8 * (cnt - 1) + 4` `other_bits`, carried verbatim.
+    Other {
+        /// The raw 4-bit `extension_type`.
+        extension_type: u8,
+        /// Total bytes consumed, including the type nibble.
+        cnt: u32,
+        /// `other_bits` packed MSB-first, as in [`ExtensionPayload::Fill`].
+        other_bits: Vec<u8>,
+    },
 }
 
 /// The result of [`ExtensionPayload::parse_with_sbr`]: either a standard
@@ -324,7 +352,7 @@ pub struct DrcBands {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgRefLevelFields {
     /// `prog_ref_level` — 7 bits. Reference level for downstream
-    /// loudness normalisation.
+    /// loudness normalization.
     pub level: u8,
     /// `prog_ref_level_reserved_bits` — 1 bit.
     pub reserved: bool,
@@ -360,6 +388,7 @@ impl ExtensionPayload {
             ExtensionType::Fill => parse_fill(reader, cnt),
             ExtensionType::FillData => parse_fill_data(reader, cnt),
             ExtensionType::DynamicRange => parse_dynamic_range(reader, cnt),
+            ExtensionType::Other(value) => parse_other(reader, cnt, value),
             // `from_bits` already converted these to errors.
             ExtensionType::SbrData | ExtensionType::SbrDataCrc => unreachable!(),
         }
@@ -409,6 +438,9 @@ impl ExtensionPayload {
             )?)),
             ExtensionType::DynamicRange => Ok(ExtensionPayloadOrSbr::Payload(parse_dynamic_range(
                 reader, cnt,
+            )?)),
+            ExtensionType::Other(value) => Ok(ExtensionPayloadOrSbr::Payload(parse_other(
+                reader, cnt, value,
             )?)),
             ExtensionType::SbrData | ExtensionType::SbrDataCrc => {
                 let crc_flag = ty == ExtensionType::SbrDataCrc;
@@ -475,6 +507,11 @@ impl ExtensionPayload {
             ExtensionPayload::Fill { cnt, other_bits } => write_fill(writer, *cnt, other_bits),
             ExtensionPayload::FillData { cnt } => write_fill_data(writer, *cnt),
             ExtensionPayload::DynamicRange(drc) => write_dynamic_range(writer, drc),
+            ExtensionPayload::Other {
+                extension_type,
+                cnt,
+                other_bits,
+            } => write_other(writer, *extension_type, *cnt, other_bits),
         }
     }
 
@@ -485,6 +522,7 @@ impl ExtensionPayload {
             ExtensionPayload::Fill { cnt, .. } => *cnt,
             ExtensionPayload::FillData { cnt } => *cnt,
             ExtensionPayload::DynamicRange(drc) => drc.byte_length(),
+            ExtensionPayload::Other { cnt, .. } => *cnt,
         }
     }
 }
@@ -548,7 +586,45 @@ fn parse_fill(reader: &mut BitReader<'_>, cnt: u32) -> Result<ExtensionPayload> 
     Ok(ExtensionPayload::Fill { cnt, other_bits })
 }
 
+/// An extension type with no body layout here (`EXT_DATA_ELEMENT`, reserved values): Table 4.51's `default` branch,
+/// `8 * (cnt - 1) + 4` `other_bits`, the same body shape as `EXT_FILL`.
+fn parse_other(
+    reader: &mut BitReader<'_>,
+    cnt: u32,
+    extension_type: u8,
+) -> Result<ExtensionPayload> {
+    match parse_fill(reader, cnt)? {
+        ExtensionPayload::Fill { cnt, other_bits } => Ok(ExtensionPayload::Other {
+            extension_type,
+            cnt,
+            other_bits,
+        }),
+        _ => unreachable!("parse_fill returns Fill"),
+    }
+}
+
+fn write_other(
+    writer: &mut BitWriter,
+    extension_type: u8,
+    cnt: u32,
+    other_bits: &[u8],
+) -> Result<u32> {
+    if extension_type > 0x0f {
+        return Err(Error::ExtensionPayloadInvalid);
+    }
+    write_fill_with_type(writer, extension_type, cnt, other_bits)
+}
+
 fn write_fill(writer: &mut BitWriter, cnt: u32, other_bits: &[u8]) -> Result<u32> {
+    write_fill_with_type(writer, ExtensionType::Fill.as_u8(), cnt, other_bits)
+}
+
+fn write_fill_with_type(
+    writer: &mut BitWriter,
+    extension_type: u8,
+    cnt: u32,
+    other_bits: &[u8],
+) -> Result<u32> {
     if cnt == 0 {
         return Err(Error::ExtensionPayloadInvalid);
     }
@@ -561,7 +637,7 @@ fn write_fill(writer: &mut BitWriter, cnt: u32, other_bits: &[u8]) -> Result<u32
     if other_bits.len() != expected_bytes {
         return Err(Error::ExtensionPayloadInvalid);
     }
-    writer.write_u32(ExtensionType::Fill.as_u8() as u32, EXTENSION_TYPE_BITS);
+    writer.write_u32(extension_type as u32, EXTENSION_TYPE_BITS);
     write_packed_bits(writer, other_bits, body_bits)?;
     Ok(cnt)
 }
@@ -575,16 +651,15 @@ fn parse_fill_data(reader: &mut BitReader<'_>, cnt: u32) -> Result<ExtensionPayl
     //   fill_nibble;                 4 bits  /* must be '0000' */
     //   for (i = 0; i < cnt - 1; i++)
     //       fill_byte[i];            8 bits  /* must be '10100101' */
-    let nibble = read_u8(reader, 4)?;
-    if nibble != FILL_DATA_NIBBLE {
-        return Err(Error::ExtensionPayloadInvalid);
-    }
+    //
+    // The "must be" values bind an encoder. A decoder has nothing to
+    // do with filler, so a nibble or byte that differs is skipped (as
+    // `other_bits` would be), not refused: the payload is still `cnt`
+    // bytes long and the stream is otherwise sound.
+    let _fill_nibble = read_u8(reader, 4)?;
     let body_bytes = cnt.saturating_sub(1) as usize;
     for _ in 0..body_bytes {
-        let b = read_u8(reader, 8)?;
-        if b != FILL_DATA_BYTE {
-            return Err(Error::ExtensionPayloadInvalid);
-        }
+        let _fill_byte = read_u8(reader, 8)?;
     }
     Ok(ExtensionPayload::FillData { cnt })
 }

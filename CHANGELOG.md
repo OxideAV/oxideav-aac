@@ -36,6 +36,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   segment (a 44.1 kHz AAC-LC segment came out at 88.2 kHz, a 48 kHz mono
   one at 96 kHz stereo).
 
+- A fill element whose `extension_payload()` carries an `extension_type` with no
+  body layout here (`EXT_DATA_ELEMENT`, or any value Table 4.59 reserves) no
+  longer fails the whole frame with `UnsupportedExtensionType`. Table 4.51's
+  `default` branch has a decoder read the remaining `8 * (cnt - 1) + 4` bits
+  as `other_bits` and continue, so the payload is skipped
+  (`ExtensionType::Other`, `ExtensionPayload::Other`). A common encoder's
+  5.1 AAC-LC output carries such a payload and would not play at all. An
+  `EXT_FILL_DATA` payload whose fill nibble or fill bytes differ from the
+  patterns an encoder "must" write is skipped likewise, not refused.
+
 ### Changed
 
 - API hygiene (breaking): the configuration records `EncoderConfig`,
@@ -192,7 +202,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   rate / channel count taken from the ASC (explicit or §1.6.5
   backward-compatible SBR → SBR rate, PS → stereo). Without extradata,
   bare AUs are decoded as AAC-LC at the stream's rate / channel count.
-- Implicitly signalled HE-AAC carried as bare access units in a
+- Implicitly signaled HE-AAC carried as bare access units in a
   container that declares the AAC core rate (e.g. Matroska written
   without an SBR `OutputSamplingFrequency`) is emitted at that declared
   rate via the §4.6.18.4.3 downsampled SBR mode, so consumers configured
@@ -221,7 +231,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - HE-AAC v2 (parametric stereo) encoder: `ps_analysis` (Annex 8.C.6.2
   stereo hybrid analysis + band excitations on the Table 8.C.2/8.C.3
   ranges), `ps_encoder` (FIX/VAR parameter positions, IID/ICC/IPD/OPD
-  estimation and Table 8.25/8.26/8.28/8.31 quantisation,
+  estimation and Table 8.25/8.26/8.28/8.31 quantization,
   measured-bit time/frequency differential coding closed-loop over
   `PsData::resolve`), `ps_writer` (forward `ps_data()`, Tables
   8.9–8.14, inverse of the parser), and the `HeAacConfig::parametric_stereo`
@@ -232,7 +242,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   trailer and hierarchical AOT-29 forms) + `asc_bits`;
   `HeAacEncoder::audio_specific_config_bits`
 - `codec_encoder::make_he_aac_v2_encoder`; `make_encoder` dispatches on
-  a PS-signalling extradata ASC
+  a PS-signaling extradata ASC
 - `fuzz/` sub-crate with `ps_data_roundtrip` and `ps_encoder_frame`
   targets + the Fuzz workflow shim
 - `StreamEncoder::with_layout`: PCE-described speaker sets
@@ -282,7 +292,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `EncoderConfig::default_bandwidth_hz` (0.26 Hz per bit/s of
   per-channel rate, clamped 4–20 kHz and Nyquist),
   `StreamEncoder::set_bandwidth` / `bandwidth`; lines above the cutoff
-  are zeroed before quantisation (per window of a short frame) so the
+  are zeroed before quantization (per window of a short frame) so the
   rate loop spends the bits below it; the HE-AAC core runs full band
   (its input is band-limited at the SBR crossover). Measured on the
   new equal-rate harness (`tests/encoder_psy_harness.rs`: black-box
@@ -329,7 +339,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - HE-AAC v1 profile on the registry factory
 - LOAS/LATM writer + black-box reference-decoder validation
 - HE-AAC v1 (AAC-LC + SBR) streaming encoder, ASC writer, delivery-aware noise model
-- Annex 4.B.18 parameter estimation, quantisation and closed-loop delta coding
+- Annex 4.B.18 parameter estimation, quantization and closed-loop delta coding
 - forward SBR bitstream writer (Tables 4.62-4.74) + CRC payload builder
 - Annex 4.B.18.2 64-band encoder analysis QMF bank
 - fix explicit-counter-loop lint in the CCE battery
@@ -395,7 +405,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - §8.5.2.2 PCE-driven speaker mapping — config-0 layouts land canonically
 - 5.1 multichannel PCM validation against the staged MP4 fixture
 - ISO/IEC 14496-3:2001 §4.6.7.3 short-window LTP synthesis — pinned math, explicit origin
-- §4.6.13 CPE PNS — correlated-noise ms_used signalling on channel pairs
+- §4.6.13 CPE PNS — correlated-noise ms_used signaling on channel pairs
 - §4.6.8.2 intensity-stereo emission — correlated high bands as is_pos records
 - §4.6.9 TNS emission — Levinson-Durbin decision + wire-exact analysis filtering
 - add CI / crates.io / docs.rs / MIT-license badges
@@ -429,7 +439,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   measured synthesis loss); and the full-chain `he_aac_encoder`
   (crossover-cut FIR downsampler → half-rate AAC-LC core with the SBR
   fill element charged inside the frame budget, implicit ADTS
-  signalling). Explicit signalling: `asc_writer`
+  signaling). Explicit signaling: `asc_writer`
   (backward-compatible 0x2b7 trailer and hierarchical AOT-5
   `AudioSpecificConfig` forms) and `latm_writer` (LOAS
   `AudioSyncStream` writer at `audioMuxVersion = 1`). Registry:
@@ -547,7 +557,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   out-of-phase `cc_sign` is split off **each transmitted dpcm delta**
   (`1 − 2·(dpcm & 1)`) with the accumulator fed by `dpcm >> 1`, and a
   `common_gain_element` is **never** sign-split (so an independently
-  switched CCE always couples in phase). The previous behaviour — the
+  switched CCE always couples in phase). The previous behavior — the
   14496-3:2009 fragment that splits the *accumulated* value at
   coupling time, an editorial defect of that edition (its own
   surviving second fragment implements the 2001 reading) — changed
@@ -722,7 +732,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   bank so an SBR-active stream is emitted at the *core* sampling rate
   (1024 samples per channel per frame) instead of the doubled rate;
   `StreamDecoder::set_sbr_downsampled`, `LoasDecoder` (with automatic
-  per-layer selection when an explicitly signalled ASC carries
+  per-layer selection when an explicitly signaled ASC carries
   `extensionSamplingFrequency == samplingFrequency`, the §4.6.18.2.6
   in-band declaration of a core-rate SBR output), and the runtime
   `Decoder`'s `sbr_downsampled` codec option /
@@ -743,7 +753,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   reduction (`GLimBoost → GA` with the exact energy-restoring
   normalization), unconditional no-smoothing rule, modified
   real-valued sinusoid injection (the `−0.00815·(−1)^(m+kx)`
-  neighbour correction, first 16 sinusoids per time segment, spill
+  neighbor correction, first 16 sinusoids per time segment, spill
   into subbands `kx − 1` / `kx + M`) and modified `X` assembly.
   `SbrDecoder::set_low_power` / `StreamDecoder::set_sbr_low_power` /
   `LoasDecoder::set_sbr_low_power` / the `sbr_low_power` codec option
@@ -843,14 +853,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   persisting across frames, `gain_control_data()` consumed from the
   channel body — pinned bit-identical to the hand-driven pipeline and
   exercised end to end by an ADTS SSR-profile stream test (encoder
-  output re-labelled to profile 2, mono + stereo)
+  output re-labeled to profile 2, mono + stereo)
 - §4.6.8.3.3 coupling-channel **application**: the stream decoder's
   raw-data-block walk is now two-pass (parse every channel element,
   decode each CCE's embedded `single_channel_element()` through a
   per-instance-tag `CceDecoder` slot, then decode the SCE/CPE targets
   with the coupling injected), so a CCE contributes to its addressed
   targets regardless of element order — dependently switched CCEs are
-  scaled per gain list and added at the signalled `cc_domain` stage
+  scaled per gain list and added at the signaled `cc_domain` stage
   (before/after the target's TNS), independently switched CCEs are
   decoded to the time domain through their own persistent filterbank
   and added on the target PCM; the `decode_coupling_channel()` target
@@ -884,7 +894,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   spectra (SCE, shared-window CPE, VCB section coding) and exercised
   through a LOAS AOT-17 stream end to end
 
-- Table 1.19 config-7 (7.1) default channel mapping: centre + inner
+- Table 1.19 config-7 (7.1) default channel mapping: center + inner
   Lc/Rc + outer L/R + surround pair + LFE rank-sorted to the canonical
   `L, R, C, LFE, Lc, Rc, Ls, Rs` interleave
 - §8.5.2.2 PCE-driven channel mapping for `channelConfiguration 0`:
@@ -901,7 +911,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - encoder §4.6.9 TNS emission (default on): per-window Levinson-Durbin
   prediction-gain decision under a time-domain temporal-envelope gate,
-  PARCOR quantisation on the §4.6.9.3 4-bit arcsine grid, and the
+  PARCOR quantization on the §4.6.9.3 4-bit arcsine grid, and the
   §4.6.7.4.1 all-zero analysis pass derived from the wire coefficients
   (exact inverse of the decoder's synthesis filter); `set_tns` toggle
 - encoder §4.6.8.2 intensity-stereo emission (opt-in
@@ -918,7 +928,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `docs/audio/aac/short-window-ltp-blocked.md` §5)
 - encoder §4.6.13 PNS extended to channel pairs: per-channel noise
   decision on the pre-M/S spectra with the §4.6.13.3 correlated-noise
-  `ms_used` signalling (shared random vector) for both-channels-noise
+  `ms_used` signaling (shared random vector) for both-channels-noise
   bands correlating above 0.5; pns/encoder docs now cite the staged
   `pns-gen-rand-vector.md` clean-room analysis (band energy normative,
   per-bin noise phase implementation-defined)
@@ -933,7 +943,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - ps_decorr + ps_map: §8.6.4.5 de-correlator and §8.6.4.6.1 parameter-band maps
 - §8.6.4.3 hybrid filterbank — 10/20 + 34 band configs, zero-delay Annex 8.A alignment
 - ps_huffman + ps_data: §8.4.2 Parametric Stereo bitstream layer
-- route SBR-signalling ASCs through the §4.6.18 back-end — LATM HE-AAC v1 byte-identical to ADTS
+- route SBR-signaling ASCs through the §4.6.18 back-end — LATM HE-AAC v1 byte-identical to ADTS
 - wire the §4.6.18 SBR back-end into the ADTS stream decoder — HE-AAC v1 99.98% sample-exact
 - §4.6.18.5 SBR frame driver — analysis to 2048-sample dual-rate output
 - sbr_env_adjust + sbr_noise_table: §4.6.18.7 HF adjustment to the output matrix Y
@@ -1043,7 +1053,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   ISO/IEC 14496-3:2009 §8.6.4.5 / §8.6.4.6.1. The three-link complex
   all-pass chain (Table 8.39 coefficients + delays, Table 8.42
   fractional-delay rotations, `q_φ = 0.39`, the Table 8.40/8.41
-  centre-frequency ladders plus their closed-form tails, the
+  center-frequency ladders plus their closed-form tails, the
   `DECAY_SLOPE` frequency taper) behind the z⁻²·φ_fract front, the
   14-slot / 1-slot plain delays above `NR_ALLPASS_BANDS`, and the
   §8.6.4.5.3–5.4 transient duck (peak-decay `α = 0.76592833836465`,
@@ -1095,19 +1105,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `num_env == 0` parameter-hold. New `Error::PsDataInvalid` covers the
   malformed cases.
 - **HE-AAC v1 over LATM/LOAS** (`latm`) — the `LoasDecoder` no longer
-  pre-rejects an SBR-signalling `AudioSpecificConfig` with
+  pre-rejects an SBR-signaling `AudioSpecificConfig` with
   `Error::LatmSbrUnsupported`: both the explicit AOT-5 hierarchical
-  wrapper and implicit AAC-LC-only signalling route through the shared
+  wrapper and implicit AAC-LC-only signaling route through the shared
   `decode_raw_data_block` core, whose §4.6.18 `EXT_SBR_DATA` FIL
   auto-detect doubles the output rate exactly as on the ADTS path (a
-  PS-signalling stream decodes its HE-AAC v1 layer). The error variant
+  PS-signaling stream decodes its HE-AAC v1 layer). The error variant
   is kept (documented as no longer emitted) so existing `match` arms
   stay valid. Pinned by `tests/latm_sbr.rs`: the staged HE-AAC v1 ADTS
   fixture is re-multiplexed access-unit-for-access-unit into a LOAS
   `AudioSyncStream()` (inline `StreamMuxConfig` on the first element,
   `useSameStreamMux` after, `frameLengthType 0` with 255-escape slot
   lengths) and the LATM decode must be **byte-identical** to the ADTS
-  decode under both signalling modes.
+  decode under both signaling modes.
 - **HE-AAC v1 SBR wired into the stream decoder — 99.98% sample-exact**
   (`decode`, `codec_decoder`, `raw_data_block`) — the ADTS
   `StreamDecoder` now walks FIL bodies via a new
@@ -1118,7 +1128,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the doubled rate (2048 samples/channel), sending SBR-less frames
   through the §4.6.18.5 pure-upsampling path so the output rate never
   flaps. The coupled-pair `sbr_invf()` sharing (Table 4.66) is
-  honoured. The runtime `Decoder` trait derives the per-frame sample
+  honored. The runtime `Decoder` trait derives the per-frame sample
   count from the buffer (1024 core / 2048 dual-rate). **Validated
   against the staged HE-AAC v1 fixture: identical sample count at
   zero lag, ≥ 99.9% byte-exact (measured 99.98%), max per-sample
@@ -1166,7 +1176,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   512-entry Table 4.A.91 transcribed from the spec PDF (the staged
   `sbr-random-phase.csv` cross-checks every present value to 1e-9 but
   is missing one scalar, so the spec grid is authoritative).
-  `EnvAdjustState` threads all cross-frame state and honours the
+  `EnvAdjustState` threads all cross-frame state and honors the
   §4.6.18.3.3 reset. Pinned by flat-gain envelope reproduction,
   per-envelope gain switching at `tE` borders, limiter clamping with
   boost compensation, noise-floor synthesis with exact `fIndexNoise`
@@ -1297,7 +1307,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   per-`window_sequence` overlap-add into the band sample data `V_B`,
   threading the cross-frame `PT_B` tail). All four `window_sequence`
   shapes are covered; the `PFMD ≡ 1.0` / `PT ≡ 0.0` spec initial values
-  are honoured. Pinned by table spot-checks, the `Inter` endpoint /
+  are honored. Pinned by table spot-checks, the `Inter` endpoint /
   geometric-midpoint identities, the identity-gain / empty-ladder unit
   cases, and overlap-add property tests.
 - **HCR segmentation / pre-sorting scaffold** (`hcr`) — ISO/IEC
@@ -1392,7 +1402,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `raw_data_block()` element order to the WAVE_FORMAT_EXTENSIBLE / BS.775
   interleaved order (e.g. a 5.1 stream's `C, L, R, Ls, Rs, LFE` element
   order becomes `L, R, C, LFE, Ls, Rs`).
-  `StreamDecoder::decode_raw_data_block` now takes the signalled
+  `StreamDecoder::decode_raw_data_block` now takes the signaled
   `channel_configuration` (from the ADTS fixed header and the LATM
   effective ASC) and applies the reorder before interleaving; mono /
   stereo are identity permutations and configs 0 (PCE-defined) / 7
@@ -1649,7 +1659,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   still must provide).
 - §4.6.11 integer-PCM rendering (`pcm` module) — the final output stage
   that turns the §4.6.11 filterbank's `f64` time signal (already on the
-  `±32768` full-scale amplitude axis from the `2/N` IMDCT normalisation +
+  `±32768` full-scale amplitude axis from the `2/N` IMDCT normalization +
   §4.6.2.3.3 scalefactor gain) into 16-bit signed PCM. `nint` is the
   §1.3 `NINT()` nearest-integer operator (half-integers rounded away from
   zero, per the spec arithmetic-operator definitions); `to_s16` applies
@@ -1703,7 +1713,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   backward-adaptive intra-channel predictor of the AAC Main object type
   (AOT 1). A `PredictorBank` of second-order lattice `Predictor`s (one
   per MDCT line up to the §4.6.6.2 `PRED_SFB_MAX` limit) reconstructs
-  `x_rec = x_est + y_rec` on the signalled bands. Implements the
+  `x_rec = x_est + y_rec` on the signaled bands. Implements the
   §4.6.6.3.2.1 lattice `predict()` + LMS adaptation (`α = 0.90625`,
   `a = b = 0.953125`), the §4.6.6.3.2.3 `flt_round_inf()` 16-bit-float
   rounding applied to every stored state variable and the predicted
@@ -1795,7 +1805,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   fills every `NOISE_HCB` (13) band of a channel in place over a
   `PnsChannel` (the de-interleaved window-major spectrum, the per-band
   `sfb_cb`, and the accumulated `noise_nrg[g][sfb]`) by drawing a
-  random vector and applying the 2009 measured-energy normalisation
+  random vector and applying the 2009 measured-energy normalization
   `scale = 2^(0.25·noise_nrg) / sqrt(Σ spec²)`, so each band's L2 norm
   is exactly `2^(0.25·noise_nrg)` — a deterministic, spec-determined
   invariant (only the per-coefficient phase is generator-dependent,
@@ -1807,7 +1817,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   correlation; independent otherwise; no M/S de-matrix on noise bands,
   §4.6.13.5). Runs prior to TNS in the §4.6 block order. New
   `Error::PnsInvalid`. With PNS landed, all three channel-pair / noise
-  tools (M/S, intensity, PNS) are synthesised.
+  tools (M/S, intensity, PNS) are synthesized.
 - phase 2 (r300): `intensity_stereo` — the §4.6.8.2 intensity stereo
   (IS) synthesis, the second deterministic channel-pair tool.
   `apply_intensity_stereo` derives the right channel from the left in
@@ -1969,14 +1979,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   dequantised MDCT spectrum, consuming the direct-form `lpc[]` array
   produced by [`tns_coef::tns_decode_coef_to_lpc`]. Filter state is
   zero-seeded at every invocation, the output overwrites the input,
-  and the strided walk honours both the upward (`inc = +1`) and the
+  and the strided walk honors both the upward (`inc = +1`) and the
   downward (`inc = −1`, `start = end − 1`) directions that
   §4.6.9.3 `tns_decode_frame` sets from the per-filter `direction`
   flag. An empty `lpc`, an `inc ∉ {−1, +1}`, or a `start`/`size`/`inc`
   triple whose strided walk leaves the spectrum bounds is rejected
   with [`Error::TnsCoefOutOfRange`]; an order-0 filter (`lpc ==
   [1.0]`) and a zero-length region are well-defined no-ops. With the
-  inverse-quantisation + LPC step-up from r263, both TNS building
+  inverse-quantization + LPC step-up from r263, both TNS building
   blocks the §4.6.9 `tns_decode_frame` orchestration chains are now
   in place; only the `swb_offset` / grouping region slicer (which
   needs the per-frame spectral context) remains. 10 new unit tests
@@ -1987,7 +1997,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   rejections, plus an end-to-end wire-`coef` → LPC → filter path.
 
 - phase 2 (r263): `tns_coef` module — ISO/IEC 14496-3 §4.6.9.3
-  `tns_decode_coef` inverse-quantisation and conversion-to-LPC
+  `tns_decode_coef` inverse-quantization and conversion-to-LPC
   step-up procedure, plus the §C.6 encoder-side companion
   `tns_encode_coef`. This is the bridge between the
   [`tns_data`](src/tns_data.rs) wire parser (which surfaces the
@@ -1998,18 +2008,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   spectrum. The decode path follows the §4.6.9.3 pseudocode literally:
   the wire `coef[i]` is sign-extended via the §4.6.9.3 `sgn_mask` /
   `neg_mask` pair (equivalent to a two's-complement extension of the
-  truncated `coef_res2`-bit field), then inverse-quantised via
+  truncated `coef_res2`-bit field), then inverse-quantized via
   `sin(tmp[i] / iqfac_branch)` where the divisor branches on the sign
   of the sign-extended index: `iqfac = ((1 << (coef_res_bits-1)) -
   0.5) / (π/2)` for non-negative indices and `iqfac_m = ((1 <<
   (coef_res_bits-1)) + 0.5) / (π/2)` for negative indices. The
   half-bit offset matches the §C.6 encoder's rounded
-  `NINT(arcsin(r) * iqfac_branch)` quantisation so every legal wire
+  `NINT(arcsin(r) * iqfac_branch)` quantization so every legal wire
   value round-trips through decode → encode bit-exactly (35 wire
   patterns across all four `(coef_res_bits, coef_compress)`
   combinations, enumerated at unit-test time). The §4.6.9.3
   conversion-to-LPC step-up loop is implemented as [`lpc_step_up`]:
-  it takes the inverse-quantised PARCOR array and produces the
+  it takes the inverse-quantized PARCOR array and produces the
   `order + 1` direct-form LPC `a[]` vector with `a[0] = 1.0` and
   `a[order] = parcor[order-1]`, with intermediate slots derived by
   the spec's `b[i] = a[i] + k * a[m-i]` cross-term recurrence
@@ -2022,7 +2032,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   [`iqfac`] / [`iqfac_m`] (the §4.6.9.3 scaling constants),
   [`sign_extend_coef`] / [`pack_coef`] (signed-magnitude wire ↔
   signed integer), [`tns_decode_coef`] / [`tns_encode_coef`] (the
-  full inverse-quantisation surface), [`lpc_step_up`] (the §4.6.9.3
+  full inverse-quantization surface), [`lpc_step_up`] (the §4.6.9.3
   conversion-to-LPC second loop), and [`tns_decode_coef_to_lpc`]
   (the combined wrapper). Argument-validation errors all surface as
   the new [`Error::TnsCoefOutOfRange`] variant: invalid
@@ -2036,7 +2046,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   round-trip across 4 / 3 / 2-bit widths / `pack_coef` rejection
   outside field / decode zero-wire ↔ zero-PARCOR / decode extrema
   match hand-arithmetic / negative branch uses `iqfac_m` / 3-bit
-  `coef_res_bits` decode / decode rejects oversized wire value under
+  `coef_res_bits` decode / decode rejects oversize wire value under
   `coef_compress = 1` / decode rejects invalid `coef_res_bits` /
   decode rejects invalid `coef_compress` / decode empty input /
   encode zero ↔ zero / encode `±1.0` saturates to field extrema /
@@ -2347,9 +2357,9 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Codebook 5 is the first **pair** spectrum book (Table 4.95 row 5:
   `unsigned_cb = 0`, `dim = 2`, `LAV = 4` → `(2 * 4 + 1)^2 = 9^2 = 81`
   entries indexed `0..=80`, each tuple coefficient in `-4..=+4`). The
-  zero-tuple `(0, 0)` lands at index 40 — the centre row — because
+  zero-tuple `(0, 0)` lands at index 40 — the center row — because
   the §4.6.3.3 polynomial `idx = (y + LAV) * 9 + (z + LAV)` puts the
-  origin at the centre of the index range for signed pair books; the
+  origin at the center of the index range for signed pair books; the
   shortest codeword (1 bit `0`) parks there too. The maximum
   codeword length is **13 bits** and exactly four rows occupy the
   ceiling: indices 0 (`0x1fff`), 8 (`0x1ffd`), 72 (`0x1ffc`), and
@@ -2611,7 +2621,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Accessor: `table_4_95(codebook)` (rejects `> 31` with
   `Error::SpectralCodebookOutOfRange`). §4.6.3.3 translation:
   `decode_index_to_tuple(codebook, idx)` returns the
-  `dim`-tuple of quantised spectral coefficients (the spec's
+  `dim`-tuple of quantized spectral coefficients (the spec's
   pseudocode for `dim == 4`: `w = INT(idx/mod^3) - off`, etc.; for
   `dim == 2`: `y, z`). Inverse: `encode_tuple_to_index(codebook,
   tuple)`. Sign-bit handling: `apply_sign_bits(codebook, tuple,
@@ -2811,7 +2821,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `AudioSpecificConfig::extension_channel_configuration` field
   is set. This mirrors the explicit-SBR / PS wrapper path so
   call sites can read SBR / PS state from a single top-level
-  field set whether the signalling was hierarchical-explicit or
+  field set whether the signaling was hierarchical-explicit or
   trailing-implicit.
 - New `Error::UnsupportedTrailingExtensionAot(u8)` variant for
   resolved extension AOTs whose Table 1.15 body is not defined
@@ -3072,7 +3082,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     `section_data` → `scale_factor_data` → optional `pulse_data` /
     `tns_data` → `spectral_data`) is the caller's responsibility — it
     is appended via the next entry point.
-  - `push_channel_body_bits(bits, bit_count)` appends a pre-serialised
+  - `push_channel_body_bits(bits, bit_count)` appends a pre-serialized
     channel-element body as an MSB-first packed bit-slice. This lets
     callers run the existing typed writers (`IcsInfo::write`,
     `SectionData::write`, `ScaleFactorData::write`, `PulseData::write`,
@@ -3113,7 +3123,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   hints, comment field, plus the relative-origin `byte_alignment()`
   per Table 4.2 Note 1). The assembler rejects PCE in
   `push_channel_header` rather than admitting an `Element::ProgramConfig`
-  variant the writer cannot honour.
+  variant the writer cannot honor.
 - 30 new integration tests in `tests/raw_data_block_encode.rs`:
   END-only frame (one-byte `0xE0` wire-layout pin); channel-header
   push for every `(SCE, CPE, CCE, LFE)` × `(tag = 0, 7, 0x0a, 0x0f)`
@@ -3152,7 +3162,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - `scale_factor_data::differentiate(abs, sfb_cb, global_gain) ->
   Result<ScaleFactorData>` — the symmetric encoder-side inverse.
   Takes absolute per-band records (the output of rate-allocation
-  / scalefactor quantisation / PNS noise-energy estimation) and
+  / scalefactor quantization / PNS noise-energy estimation) and
   produces the DPCM record set the bit-exact `ScaleFactorData::write`
   consumes. Validates every spectrum / intensity / PNS-subsequent
   delta against Table 4.150's `-60..=+60`, the first PNS band's
@@ -3186,7 +3196,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 - Module-level documentation calls out the spec ambiguity between
   the §4.6.2.3.2 illustrative pseudocode (single-track, lumps PNS
   into `last_sf`) and the §4.6.8.1.4 + §4.6.13 prose-level "done
-  separately" wording. This crate honours the three-track prose
+  separately" wording. This crate honors the three-track prose
   interpretation; the rationale is that the §4.6.2.3.2 pseudocode
   is identical in 13818-7 §11.3.2 where PNS does not exist, so the
   MPEG-4 prose §4.6.13 supersedes for PNS bands.
@@ -3198,7 +3208,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   PNS first-band PCM seed including 9-bit boundaries (delta 0 and
   511); PNS subsequent-band Huffman delta; frame-scope
   `noise_pcm_flag` invariant across window groups; three-track
-  independence under interleaved bands; `ZERO_HCB` skip behaviour;
+  independence under interleaved bands; `ZERO_HCB` skip behavior;
   cross-window-group accumulator persistence; two hand-pinned
   §4.6.2.3.2 / §4.6.13 spec-pseudocode lockstep tests; every
   `ScaleFactorAccumulatorInvalid` rejection branch (spectrum /
@@ -3225,7 +3235,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the Table 4.A.1 codebook directly for Auditor harnesses and
   fixture cross-checks.
 - Public constants `SF_INDEX_OFFSET = -60` (Table 4.150 DPCM range
-  centre), `NOISE_PCM_BITS = 9` (Table 4.53 first-PNS seed width),
+  center), `NOISE_PCM_BITS = 9` (Table 4.53 first-PNS seed width),
   `HCOD_SF_NUM_ENTRIES = 121`, `HCOD_SF_MAX_LEN = 19` pin the
   §4.6.3 / Table 4.150 dispatch.
 - `ScaleFactorData::parse(reader, sfb_cb)` walks the per-`(g, sfb)`
@@ -3302,7 +3312,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `LENGTH_BITS_{SHORT,LONG}`, `ORDER_BITS_{SHORT,LONG}`,
   `COEF_RES_BITS`, `DIRECTION_BITS`, `COEF_COMPRESS_BITS` pin the
   per-table widths. The §4.6.9.3 `tns_decode_coef` LPC reconstruction
-  (signed conversion, `iqfac` arcsine inverse-quantisation, Levinson-
+  (signed conversion, `iqfac` arcsine inverse-quantization, Levinson-
   style conversion to LPC) and the §4.6.9.3 `tns_ar_filter` all-pole
   pass over the spectrum are **not** performed here — they need the
   spectral context that arrives with the per-AOT IMDCT back-end. The
@@ -3523,14 +3533,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Hierarchical SBR (AOT 5) and PS (AOT 29) outer-wrappers are
   unwrapped and surfaced as `sbr_present` / `ps_present` plus the
   extension sampling-frequency index. `samplingFrequencyIndex` 24-bit
-  escape (`0xf`) is honoured; `GetAudioObjectType` 5/6-bit escape is
-  honoured. Non-GA AOTs return `Error::UnsupportedAot`.
+  escape (`0xf`) is honored; `GetAudioObjectType` 5/6-bit escape is
+  honored. Non-GA AOTs return `Error::UnsupportedAot`.
 - `pce` module: ISO/IEC 14496-3 §4.4.1.1 / ISO/IEC 13818-7 §8.5
   `program_config_element()` parser — every wire field is preserved
   (`front` / `side` / `back` / `lfe` / `assoc` / `cc` element
   lists, mono / stereo / matrix mix-down hints, comment field).
   `byte_alignment()` is configurable via the `origin_bit_offset`
-  parameter to honour Table 4.2 Note 1 (ASC-relative alignment when
+  parameter to honor Table 4.2 Note 1 (ASC-relative alignment when
   the PCE is embedded inside an `AudioSpecificConfig`).
 - `raw_data_block::Element::ProgramConfig(Pce)`: the walker now
   fully parses a PCE element inside a raw_data_block (previously
@@ -3548,7 +3558,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `N − 1`). Reserved `sampling_frequency_index` values are rejected;
   CRC presence is confirmed but the CRC value is not validated yet.
 - `raw_data_block` module: ISO/IEC 14496-3 §4.4.2.1 syntactic walker
-  that iterates `id_syn_ele` and recognises all eight element types
+  that iterates `id_syn_ele` and recognizes all eight element types
   (SCE / CPE / CCE / LFE / DSE / PCE / FIL / END). FIL and DSE bodies
   are fully skipped per §4.4.2.7 / §4.4.2.5; SCE/CPE/CCE/LFE emit
   the element header (`kind`, `element_instance_tag`) without
@@ -3564,7 +3574,7 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   Hat-3 cold enforcement of the workspace clean-room policy
   (`docs/IMPLEMENTOR_ROUND.md`). The retired implementation included
   encoder-source comments describing matching an external reference
-  encoder's behaviour by citing a specific source file of that
+  encoder's behavior by citing a specific source file of that
   implementation. The clean-room policy forbids consulting any
   external implementation's source for any reason, regardless of
   licensing or technical merit.
@@ -3580,5 +3590,5 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Next
 
 - Clean-room re-implementation against the staged ISO/IEC 14496-3 /
-  13818-7 AAC specifications (numeric tables and decode behaviour
+  13818-7 AAC specifications (numeric tables and decode behavior
   read only from the standards) in a future round.
