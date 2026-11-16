@@ -147,8 +147,13 @@ mono — four events for the four real changes).
 - **spectral_data()** (`spectral_data`) — Table 4.56 wire walker and
   bit-exact writer, dispatching onto the Huffman codebooks.
 - **extension_payload()** (`extension_payload`) — §4.4.2.7 / Table 4.51
-  parser + encoder for the `EXT_FILL`, `EXT_FILL_DATA`, and
-  `EXT_DYNAMIC_RANGE` branches. The two SBR-data extension types
+  parser + encoder for every `extension_type`: `EXT_FILL`,
+  `EXT_FILL_DATA` (body discarded, not compared with the fill
+  pattern), `EXT_DATA_ELEMENT` (ancillary data element), `EXT_SAC_DATA`
+  (carried verbatim), `EXT_DYNAMIC_RANGE`, and the reserved values,
+  which take the syntax table's `default` branch (discarded
+  `other_bits`) — a fill element of an uninterpreted type never
+  stops a decode. The two SBR-data extension types
   decode through the `parse_with_sbr` entry (feeding the §4.6.18
   back-end); the plain `parse` entry without an SBR context rejects
   them (`Error::UnsupportedExtensionSbr`).

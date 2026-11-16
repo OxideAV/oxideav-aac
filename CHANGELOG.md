@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A fill element whose `extension_payload()` carries a reserved
+  `extension_type` no longer fails the access unit (a 5.1 AAC-LC track
+  at 48 kHz / 224 kbit/s stopped at its first frame with
+  `extension_type 0xa is reserved (no body layout defined)`). ISO/IEC
+  14496-3:2009 Table 4.57 gives every value a body: reserved values
+  (Table 4.121 — "can be used for a further extension of the syntax in
+  a compatible way") take the `default` branch, `8 * (cnt - 1) + 4`
+  `other_bits` "to be discarded by the decoder" (ISO/IEC 13818-7
+  Table 28 reads the same). They now parse as
+  `ExtensionPayload::Reserved` / `ExtensionType::Reserved(u8)` and
+  `Error::UnsupportedExtensionType` is no longer produced by the
+  parser.
+- `EXT_FILL_DATA` bodies are discarded without comparing them against
+  the `'0000'` / `'10100101'` pattern: those values bind the encoder
+  ("shall be set to"), while for the decoder `fill_byte` is a "byte to
+  be discarded by the decoder" (§4.5.2.9.1; 13818-7 §8.8.2.1). A filler
+  with other values used to fail the frame.
 - ER channel streams (AOTs 17 / 19 / 23) read `tns_data()` at its
   §4.5.2.4.2 error-sensitivity-category position — after the stream's
   category-1 run (`gain_control_data_present` and the HCR length fields
@@ -83,6 +100,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `extension_payload`: `ExtensionPayload::{Reserved, AncillaryData,
+  DataElementReserved, SacData}` with parser, writer and
+  `byte_length`; `ExtensionType::{DataElement, SacData, Reserved}` and
+  `ExtensionType::is_reserved`; `DATA_ELEMENT_VERSION_ANC_DATA`.
+  `EXT_DATA_ELEMENT` (Table 4.57 / 4.122: an ancillary data element
+  returns its own length, a reserved `data_element_version` sets
+  `align = 0` and skips `8 * (cnt - 1)` bits) and `EXT_SAC_DATA`
+  (Table 4.61, carried verbatim) parse instead of being refused. Fuzz
+  target `extension_payload_roundtrip`.
 - `StreamEncoder::set_frame_family(FrameFamily::Lc960)`: the 960-line
   AAC-LC encoder core (`frameLengthFlag = 1`; `N = 1920 / 240`, the
   bracketed Table 4.129–4.141 band columns, block switching on the

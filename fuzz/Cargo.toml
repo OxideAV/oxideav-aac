@@ -38,3 +38,10 @@ path = "fuzz_targets/sbr_encoder_frame.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "extension_payload_roundtrip"
+path = "fuzz_targets/extension_payload_roundtrip.rs"
+test = false
+doc = false
+bench = false

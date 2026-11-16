@@ -8,8 +8,9 @@
 
 use oxideav_aac::Error;
 use oxideav_aac::extension_payload::{
-    DrcBandRecord, DrcBands, DynamicRangeInfo, ExcludedChannels, ExtensionPayload, ExtensionType,
-    FILL_DATA_BYTE, FILL_DATA_NIBBLE, PceTagFields, ProgRefLevelFields, excluded_group_count,
+    DATA_ELEMENT_VERSION_ANC_DATA, DrcBandRecord, DrcBands, DynamicRangeInfo, ExcludedChannels,
+    ExtensionPayload, ExtensionType, FILL_DATA_BYTE, FILL_DATA_NIBBLE, PceTagFields,
+    ProgRefLevelFields, excluded_group_count,
 };
 use oxideav_core::bits::{BitReader, BitWriter};
 
@@ -59,17 +60,40 @@ fn extension_type_sbr_rejected() {
 }
 
 #[test]
-fn extension_type_reserved_rejected() {
-    // Every 4-bit value except 0/1/0xb/0xd/0xe is reserved.
-    for raw in [
-        0b0010u8, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111, 0b1000, 0b1001, 0b1010, 0b1100, 0b1111,
-    ] {
-        assert_eq!(
-            ExtensionType::from_bits(raw),
-            Err(Error::UnsupportedExtensionType(raw))
-        );
+fn extension_type_reserved_values_map_to_reserved() {
+    // ISO/IEC 14496-3:2009 Table 4.121: every 4-bit value except
+    // 0/1/2/0xb/0xc/0xd/0xe is reserved "for a further extension of
+    // the syntax in a compatible way" — a value with a body layout
+    // (the syntax table's default branch), not an error.
+    for raw in RESERVED_TYPES {
+        let ty = ExtensionType::from_bits(raw).unwrap();
+        assert_eq!(ty, ExtensionType::Reserved(raw));
+        assert!(ty.is_reserved());
+        assert_eq!(ty.as_u8(), raw);
+        assert_eq!(ExtensionType::from_bits_allow_sbr(raw).unwrap(), ty);
     }
+    assert_eq!(
+        ExtensionType::from_bits(0b0010).unwrap(),
+        ExtensionType::DataElement
+    );
+    assert_eq!(
+        ExtensionType::from_bits(0b1100).unwrap(),
+        ExtensionType::SacData
+    );
+    assert!(!ExtensionType::DataElement.is_reserved());
+    assert_eq!(ExtensionType::DataElement.as_u8(), 0b0010);
+    assert_eq!(ExtensionType::SacData.as_u8(), 0b1100);
+    // Not a 4-bit value at all.
+    assert_eq!(
+        ExtensionType::from_bits(0x10),
+        Err(Error::UnsupportedExtensionType(0x10))
+    );
 }
+
+/// The `extension_type` values Table 4.121 lists as reserved.
+const RESERVED_TYPES: [u8; 9] = [
+    0b0011, 0b0100, 0b0101, 0b0110, 0b0111, 0b1000, 0b1001, 0b1010, 0b1111,
+];
 
 // ---------------------------------------------------------------
 // EXT_FILL — Table 4.51 default branch
@@ -194,24 +218,40 @@ fn ext_fill_data_cnt_eq_1_no_payload() {
 }
 
 #[test]
-fn ext_fill_data_parser_rejects_non_zero_nibble() {
-    // type=0b0001, nibble=0b0001 (illegal) ⇒ first byte 0b0001_0001 = 0x11.
-    let bytes = [0x11, FILL_DATA_BYTE, FILL_DATA_BYTE];
+fn ext_fill_data_parser_discards_non_zero_nibble() {
+    // type=0b0001, nibble=0b0001 ⇒ first byte 0b0001_0001 = 0x11.
+    // The '0000' value binds the writer; the decoder discards the
+    // field (ISO/IEC 14496-3:2009 §4.5.2.9.1), so the payload parses
+    // and consumes exactly cnt bytes.
+    let bytes = [0x11, FILL_DATA_BYTE, FILL_DATA_BYTE, 0xff];
     let mut r = BitReader::new(&bytes);
     assert_eq!(
         ExtensionPayload::parse(&mut r, 3),
-        Err(Error::ExtensionPayloadInvalid)
+        Ok(ExtensionPayload::FillData { cnt: 3 })
     );
+    assert_eq!(r.bit_position(), 24);
 }
 
 #[test]
-fn ext_fill_data_parser_rejects_non_a5_byte() {
-    // type=1, nibble=0, then one 0xA5 then one 0x00 (illegal).
-    let bytes = [0x10, FILL_DATA_BYTE, 0x00];
+fn ext_fill_data_parser_discards_non_a5_byte() {
+    // type=1, nibble=0, then one 0xA5 then one 0x00: "byte to be
+    // discarded by the decoder".
+    let bytes = [0x10, FILL_DATA_BYTE, 0x00, 0xff];
     let mut r = BitReader::new(&bytes);
     assert_eq!(
         ExtensionPayload::parse(&mut r, 3),
-        Err(Error::ExtensionPayloadInvalid)
+        Ok(ExtensionPayload::FillData { cnt: 3 })
+    );
+    assert_eq!(r.bit_position(), 24);
+}
+
+#[test]
+fn ext_fill_data_truncated_still_errors() {
+    let bytes = [0x10, FILL_DATA_BYTE];
+    let mut r = BitReader::new(&bytes);
+    assert_eq!(
+        ExtensionPayload::parse(&mut r, 3),
+        Err(Error::UnexpectedEnd)
     );
 }
 
@@ -711,14 +751,257 @@ fn parser_dispatch_sbr_crc_extension_type_surfaced() {
 }
 
 #[test]
-fn parser_dispatch_reserved_extension_type_surfaced() {
-    // Byte 0: [type:4=0010, padding:4=0000] = 0x20.
-    let bytes = [0x20u8];
+fn reserved_extension_type_takes_the_default_branch() {
+    // Syntax table default branch: 8*(cnt-1)+4 other_bits, return
+    // cnt — for every reserved type and several cnt, with a trailing
+    // sentinel byte that must stay unread.
+    for ty in RESERVED_TYPES {
+        for cnt in [1u32, 2, 3, 15, 269] {
+            let mut bytes = vec![(ty << 4) | 0x9];
+            bytes.extend((1..cnt).map(|i| (i as u8).wrapping_mul(37) ^ 0x5a));
+            bytes.push(0xee);
+            let mut r = BitReader::new(&bytes);
+            let p = ExtensionPayload::parse(&mut r, cnt).unwrap();
+            assert_eq!(
+                r.bit_position(),
+                u64::from(cnt) * 8,
+                "type {ty:#x} cnt {cnt}"
+            );
+            assert_eq!(p.byte_length(), cnt);
+            let ExtensionPayload::Reserved {
+                extension_type,
+                cnt: got_cnt,
+                other_bits,
+            } = &p
+            else {
+                panic!("expected Reserved, got {p:?}");
+            };
+            assert_eq!((*extension_type, *got_cnt), (ty, cnt));
+            // 8*(cnt-1)+4 bits packed MSB-first.
+            assert_eq!(other_bits.len(), cnt as usize);
+            assert_eq!(other_bits[0] >> 4, 0x9);
+            // Write is the exact inverse.
+            let mut w = BitWriter::new();
+            assert_eq!(p.write(&mut w).unwrap(), cnt);
+            assert_eq!(w.finish(), &bytes[..cnt as usize]);
+        }
+    }
+}
+
+#[test]
+fn reserved_extension_type_truncated_still_errors() {
+    for ty in RESERVED_TYPES {
+        // cnt says 4 bytes, the buffer holds 3.
+        let bytes = [ty << 4, 0x11, 0x22];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            ExtensionPayload::parse(&mut r, 4),
+            Err(Error::UnexpectedEnd)
+        );
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(
+            ExtensionPayload::parse(&mut r, 0),
+            Err(Error::ExtensionPayloadInvalid)
+        );
+    }
+}
+
+#[test]
+fn reserved_writer_refuses_defined_types_and_bad_shapes() {
+    for ty in [0u8, 1, 2, 0xb, 0xc, 0xd, 0xe, 0x10] {
+        let p = ExtensionPayload::Reserved {
+            extension_type: ty,
+            cnt: 1,
+            other_bits: vec![0],
+        };
+        let mut w = BitWriter::new();
+        assert_eq!(p.write(&mut w), Err(Error::ExtensionPayloadInvalid));
+    }
+    let p = ExtensionPayload::Reserved {
+        extension_type: 0xa,
+        cnt: 3,
+        other_bits: vec![0; 2],
+    };
+    let mut w = BitWriter::new();
+    assert_eq!(p.write(&mut w), Err(Error::ExtensionPayloadInvalid));
+}
+
+#[test]
+fn reserved_type_through_the_sbr_entry() {
+    use oxideav_aac::extension_payload::ExtensionPayloadOrSbr;
+    use oxideav_aac::raw_data_block::IdSynEle;
+    let bytes = [0xa3u8, 0x44, 0x55, 0xee];
     let mut r = BitReader::new(&bytes);
+    let out = ExtensionPayload::parse_with_sbr(&mut r, 3, IdSynEle::Cpe, 96_000, None).unwrap();
+    assert_eq!(r.bit_position(), 24);
     assert_eq!(
-        ExtensionPayload::parse(&mut r, 1),
-        Err(Error::UnsupportedExtensionType(0b0010))
+        out,
+        ExtensionPayloadOrSbr::Payload(ExtensionPayload::Reserved {
+            extension_type: 0xa,
+            cnt: 3,
+            other_bits: vec![0x34, 0x45, 0x50],
+        })
     );
+}
+
+// ---------------------------------------------------------------
+// EXT_DATA_ELEMENT — ISO/IEC 14496-3:2009 Table 4.57 / 4.122
+// ---------------------------------------------------------------
+
+fn anc_wire(len: usize) -> (Vec<u8>, Vec<u8>) {
+    let data: Vec<u8> = (0..len)
+        .map(|i| (i as u8).wrapping_mul(13) ^ 0xc3)
+        .collect();
+    let mut wire = vec![0x20 | DATA_ELEMENT_VERSION_ANC_DATA];
+    wire.extend(std::iter::repeat_n(255u8, len / 255));
+    wire.push((len % 255) as u8);
+    wire.extend_from_slice(&data);
+    (wire, data)
+}
+
+#[test]
+fn anc_data_element_round_trips_and_returns_its_own_length() {
+    // Lengths around the 255 escape: 254 → one part; 255 → parts
+    // 255, 0; 256 → 255, 1; 510 → 255, 255, 0.
+    for len in [0usize, 1, 7, 254, 255, 256, 509, 510, 600] {
+        let (wire, data) = anc_wire(len);
+        let n = (1 + len / 255 + 1 + len) as u32;
+        assert_eq!(wire.len() as u32, n);
+        // The fill element may be longer than the data element: the
+        // payload returns its own length, not cnt.
+        for slack in [0u32, 1, 5] {
+            let mut bytes = wire.clone();
+            bytes.extend([0xeeu8; 6]);
+            let mut r = BitReader::new(&bytes);
+            let p = ExtensionPayload::parse(&mut r, n + slack).unwrap();
+            assert_eq!(r.bit_position(), u64::from(n) * 8, "len {len}");
+            assert_eq!(p, ExtensionPayload::AncillaryData { data: data.clone() });
+            assert_eq!(p.byte_length(), n);
+            let mut w = BitWriter::new();
+            assert_eq!(p.write(&mut w).unwrap(), n);
+            assert_eq!(w.finish(), wire);
+        }
+    }
+}
+
+#[test]
+fn anc_data_element_longer_than_the_fill_element_is_refused() {
+    let (wire, _) = anc_wire(20);
+    let n = wire.len() as u32;
+    for cnt in 1..n {
+        let mut r = BitReader::new(&wire);
+        assert_eq!(
+            ExtensionPayload::parse(&mut r, cnt),
+            Err(Error::ExtensionPayloadInvalid),
+            "cnt {cnt}"
+        );
+    }
+    // An unterminated run of 255 length parts.
+    let wire = [0x20u8, 255, 255, 255];
+    let mut r = BitReader::new(&wire);
+    assert_eq!(
+        ExtensionPayload::parse(&mut r, 4),
+        Err(Error::ExtensionPayloadInvalid)
+    );
+}
+
+#[test]
+fn anc_data_element_truncated_still_errors() {
+    let (wire, _) = anc_wire(20);
+    for keep in 1..wire.len() {
+        let mut r = BitReader::new(&wire[..keep]);
+        assert_eq!(
+            ExtensionPayload::parse(&mut r, wire.len() as u32),
+            Err(Error::UnexpectedEnd),
+            "keep {keep}"
+        );
+    }
+}
+
+#[test]
+fn data_element_reserved_version_sets_align_zero() {
+    // data_element_version != ANC_DATA: align = 0, then 8*(cnt-1)
+    // other_bits, return cnt.
+    for version in 1u8..=15 {
+        for cnt in [1u32, 2, 9] {
+            let mut bytes = vec![0x20 | version];
+            bytes.extend((1..cnt).map(|i| i as u8 ^ 0x77));
+            bytes.push(0xee);
+            let mut r = BitReader::new(&bytes);
+            let p = ExtensionPayload::parse(&mut r, cnt).unwrap();
+            assert_eq!(r.bit_position(), u64::from(cnt) * 8);
+            assert_eq!(
+                p,
+                ExtensionPayload::DataElementReserved {
+                    version,
+                    other_bytes: bytes[1..cnt as usize].to_vec(),
+                }
+            );
+            assert_eq!(p.byte_length(), cnt);
+            let mut w = BitWriter::new();
+            assert_eq!(p.write(&mut w).unwrap(), cnt);
+            assert_eq!(w.finish(), &bytes[..cnt as usize]);
+        }
+    }
+    let mut r = BitReader::new(&[0x25u8, 0x01]);
+    assert_eq!(
+        ExtensionPayload::parse(&mut r, 3),
+        Err(Error::UnexpectedEnd)
+    );
+    for version in [0u8, 16] {
+        let p = ExtensionPayload::DataElementReserved {
+            version,
+            other_bytes: vec![],
+        };
+        let mut w = BitWriter::new();
+        assert_eq!(p.write(&mut w), Err(Error::ExtensionPayloadInvalid));
+    }
+}
+
+// ---------------------------------------------------------------
+// EXT_SAC_DATA — ISO/IEC 14496-3:2009 Table 4.61
+// ---------------------------------------------------------------
+
+#[test]
+fn sac_data_round_trips() {
+    for (anc_type, anc_start, anc_stop) in [(0u8, false, false), (1, true, false), (3, true, true)]
+    {
+        for cnt in [1u32, 2, 40] {
+            let head = 0xc0 | (anc_type << 2) | (u8::from(anc_start) << 1) | u8::from(anc_stop);
+            let mut bytes = vec![head];
+            bytes.extend((1..cnt).map(|i| (i as u8).wrapping_mul(29)));
+            bytes.push(0xee);
+            let mut r = BitReader::new(&bytes);
+            let p = ExtensionPayload::parse(&mut r, cnt).unwrap();
+            assert_eq!(r.bit_position(), u64::from(cnt) * 8);
+            assert_eq!(
+                p,
+                ExtensionPayload::SacData {
+                    anc_type,
+                    anc_start,
+                    anc_stop,
+                    data: bytes[1..cnt as usize].to_vec(),
+                }
+            );
+            assert_eq!(p.byte_length(), cnt);
+            let mut w = BitWriter::new();
+            assert_eq!(p.write(&mut w).unwrap(), cnt);
+            assert_eq!(w.finish(), &bytes[..cnt as usize]);
+        }
+    }
+    let mut r = BitReader::new(&[0xc4u8, 0x01]);
+    assert_eq!(
+        ExtensionPayload::parse(&mut r, 3),
+        Err(Error::UnexpectedEnd)
+    );
+    let p = ExtensionPayload::SacData {
+        anc_type: 4,
+        anc_start: false,
+        anc_stop: false,
+        data: vec![],
+    };
+    let mut w = BitWriter::new();
+    assert_eq!(p.write(&mut w), Err(Error::ExtensionPayloadInvalid));
 }
 
 // ---------------------------------------------------------------
