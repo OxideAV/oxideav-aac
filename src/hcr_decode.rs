@@ -732,8 +732,8 @@ mod tests {
                 2 => 1,      // book 1 quads
                 _ => 40,     // book 11
             };
-            for i in a..b {
-                spectral.x_quant[0][i] = prand(&mut state, max);
+            for q in &mut spectral.x_quant[0][a..b] {
+                *q = prand(&mut state, max);
             }
         }
         let (payload, len_bits, longest) =

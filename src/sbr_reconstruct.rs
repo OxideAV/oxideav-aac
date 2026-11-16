@@ -376,8 +376,8 @@ mod tests {
             Some(&prev),
         )
         .unwrap();
-        for k in 0..n {
-            assert_eq!(rec.eq[0][k], 32); // 30 + 2
+        for &e in &rec.eq[0][..n] {
+            assert_eq!(e, 32); // 30 + 2
         }
     }
 
@@ -408,9 +408,9 @@ mod tests {
             NoiseScalefactors::reconstruct(&noise, &grid, &dtdf, nq, false, false, None).unwrap();
         let mut acc = 5;
         assert_eq!(rec.q[0][0], 5);
-        for k in 1..nq {
+        for &q in &rec.q[0][1..nq] {
             acc += 1;
-            assert_eq!(rec.q[0][k], acc);
+            assert_eq!(q, acc);
         }
     }
 }

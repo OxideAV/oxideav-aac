@@ -171,8 +171,8 @@ pub fn sect_sfb_offset(ics_info: &IcsInfo, fs_index: u8) -> Result<Vec<Vec<u32>>
             return Err(Error::SpectralDataInvalid);
         }
         let mut per_group = Vec::with_capacity(ics_info.num_window_groups as usize);
-        for g in 0..ics_info.num_window_groups as usize {
-            let wgl = u32::from(ics_info.window_group_length[g]);
+        for &group_len in &ics_info.window_group_length[..ics_info.num_window_groups as usize] {
+            let wgl = u32::from(group_len);
             let mut offsets = Vec::with_capacity(max_sfb + 1);
             let mut offset = 0u32;
             offsets.push(offset);
@@ -842,8 +842,8 @@ mod tests {
         };
         for (g, group_offsets) in offsets.iter().enumerate() {
             let end = group_offsets[4] as usize;
-            for k in 0..end {
-                data.x_quant[g][k] = match k % 3 {
+            for (k, q) in data.x_quant[g][..end].iter_mut().enumerate() {
+                *q = match k % 3 {
                     0 => 1,
                     1 => -1,
                     _ => 0,

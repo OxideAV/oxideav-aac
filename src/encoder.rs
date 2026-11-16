@@ -1438,7 +1438,6 @@ impl StreamEncoder {
     /// 54 (a reference encoder reads 42) while the room-tone channels
     /// go from 30 to 26-28 dB (the reference reads 27-29). The LFE,
     /// band-limited and independent, keeps its own anchor.
-    #[allow(clippy::too_many_arguments)]
     /// The least scalefactor offset whose raw data block fits
     /// `budget`, with that block. Bits fall as the offset rises (each
     /// step coarsens every quantizer by ¾ dB), so the fit boundary is

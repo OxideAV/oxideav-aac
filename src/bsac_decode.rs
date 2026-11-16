@@ -204,9 +204,7 @@ impl<'a> BlockCtx<'a> {
                 let plane = i32::from(CBAND_SI_MSB_PLANE[si]);
                 let start = cband * 32;
                 let end = (cband * 32 + 32).min(self.geo.group_len[g]);
-                for i in start..end {
-                    self.lines[ch][g].cur_snf[i] = plane;
-                }
+                self.lines[ch][g].cur_snf[start.min(end)..end].fill(plane);
             }
         }
         Ok(())
@@ -289,8 +287,8 @@ impl<'a> BlockCtx<'a> {
         // maxsnf over the region.
         let mut maxsnf = 0i32;
         for &(g, s, e) in regions {
-            for ch in 0..self.nch {
-                let st = &self.lines[ch][g];
+            for ch_lines in &self.lines[..self.nch] {
+                let st = &ch_lines[g];
                 let arr = match kind {
                     SnfKind::Cur => &st.cur_snf,
                     SnfKind::Unc => &st.unc_snf,
@@ -631,8 +629,7 @@ pub fn decode_bsac_raw_data_block(
     // Assemble the signed samples.
     let mut sample = vec![Vec::with_capacity(ngroups); nch];
     for (ch, sample_ch) in sample.iter_mut().enumerate().take(nch) {
-        for g in 0..ngroups {
-            let st = &ctx.lines[ch][g];
+        for st in &ctx.lines[ch][..ngroups] {
             let buf: Vec<i32> = st
                 .mask
                 .iter()

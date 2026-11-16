@@ -285,8 +285,8 @@ impl PsDecorr {
     /// `ps_data()` in the previous frame" full reset).
     pub fn reset_bands(&mut self, kmax: usize) {
         let c = consts(self.config);
-        for k in kmax..c.nr_allpass_bands {
-            self.allpass[k].reset();
+        for band in &mut self.allpass[kmax.min(c.nr_allpass_bands)..c.nr_allpass_bands] {
+            band.reset();
         }
         for k in kmax.max(c.nr_allpass_bands)..c.nr_bands {
             let i = k - c.nr_allpass_bands;
