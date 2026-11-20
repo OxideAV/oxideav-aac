@@ -201,6 +201,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   v2 stream decodes as its AAC-LC core at the core rate (1024 samples
   per channel per block), as Apple's decoder does for a stream
   described as AAC-LC (#28, ropoctl).
+- `StreamDecoder::set_pns_frame_seed` (off by default): every channel
+  and coupling element restarts its PNS generator at each
+  `raw_data_block()` from a seed drawn from the block's own bytes
+  (`pns::frame_pns_seed`, an FNV-1a hash, mixed per element by
+  `pns::element_pns_seed`), so a frame's noise bands decode the same
+  wherever decoding began. A decoder started one frame before frame `n`
+  then gives frame `n` on exactly as one that ran from the start of the
+  stream, noise bands included, and a stream decoded in pieces (after a
+  seek, or in segments converted one at a time) joins without a change
+  at the joins. Every band still comes out at exactly its `noise_nrg`
+  energy (§4.6.13.3); only the draw changes. `ElementDecoder::reseed_pns`
+  and `CceDecoder::reseed_pns` restart one element's generator.
+- `fuzz/fuzz_targets/stream_decode.rs`: the stream decoder under every
+  combination of its PNS seed, shared pair seed, core-only and
+  declaration-order options over arbitrary ADTS-framed input, decoding
+  each frame through its own header or as a raw block under a fuzzed
+  configuration.
 
 ### Fixed
 
