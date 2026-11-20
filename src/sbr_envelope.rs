@@ -152,9 +152,9 @@ impl SbrNoiseData {
         let ((t_huff, t_lav), (f_huff, f_lav)) = noise_tables(ctx);
 
         let mut data = Vec::with_capacity(grid.num_noise);
-        for noise in 0..grid.num_noise {
+        for &delta_in_time in &dtdf.df_noise[..grid.num_noise] {
             let mut row = Vec::with_capacity(num_noise_bands);
-            if !dtdf.df_noise[noise] {
+            if !delta_in_time {
                 // Delta in frequency: band 0 is a 5-bit absolute start
                 // value, bands 1.. are f_huff deltas.
                 let start = read(reader, 5)? as i32;

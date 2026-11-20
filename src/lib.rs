@@ -304,14 +304,16 @@
 //!   filterbank.
 //! * The [`extension_payload`] module — ISO/IEC 14496-3 §4.4.2.7 /
 //!   Table 4.51 *extension_payload()* parser **and** encoder
-//!   primitive (**new in round 187**). Implements the three
-//!   non-SBR `extension_type` branches whose body layouts are
-//!   fully specified by fixed-width fields: `EXT_FILL` (`0b0000`)
+//!   primitive (**new in round 187**). Every `extension_type`
+//!   parses: `EXT_FILL` (`0b0000`) and every reserved value
 //!   — the Table 4.51 default branch surfacing the
 //!   `8 * (cnt - 1) + 4` `other_bits` as a packed byte buffer;
-//!   `EXT_FILL_DATA` (`0b0001`) — the normative-pattern filler
-//!   with `fill_nibble == 0b0000` and `fill_byte ==
-//!   0b1010_0101`; and `EXT_DYNAMIC_RANGE` (`0b1011`) — the
+//!   `EXT_FILL_DATA` (`0b0001`) — the pattern filler, whose
+//!   `fill_nibble` / `fill_byte` the decoder discards unexamined;
+//!   `EXT_DATA_ELEMENT` (`0b0010`) — ancillary data element or a
+//!   reserved `data_element_version`; `EXT_SAC_DATA` (`0b1100`) —
+//!   `sac_extension_data()` carried verbatim; and
+//!   `EXT_DYNAMIC_RANGE` (`0b1011`) — the
 //!   Table 4.52 `dynamic_range_info()` block (optional
 //!   `pce_instance_tag`, optional Table 4.53 `excluded_channels()`
 //!   exclude-mask list, optional per-band partitioning, optional

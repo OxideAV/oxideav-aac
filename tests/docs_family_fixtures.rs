@@ -274,8 +274,8 @@ fn make_channel_fs(
         ((state >> 8) % (2 * max + 1) as u32) as i32 - max
     };
     let mut x_quant = Vec::with_capacity(ics.num_window_groups as usize);
-    for g in 0..ics.num_window_groups as usize {
-        let wgl = ics.window_group_length[g] as usize;
+    for &group_len in &ics.window_group_length[..ics.num_window_groups as usize] {
+        let wgl = group_len as usize;
         let mut coeffs = vec![0i32; wgl * window_len];
         for (sfb, &cb) in sfb_cbs.iter().enumerate() {
             let max = match cb {

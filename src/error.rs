@@ -353,12 +353,13 @@ pub enum Error {
     /// per ISO/IEC 13818-7 Table 40.
     UnsupportedExtensionSbr(u8),
 
-    /// `extension_payload()` dispatched on a reserved
-    /// `extension_type` value (any 4-bit value not in
-    /// `{0b0000, 0b0001, 0b1011, 0b1101, 0b1110}`). ISO/IEC
-    /// 14496-3 Table 4.59 and ISO/IEC 13818-7 Table 40 list these
-    /// values as "reserved"; this crate has no body layout to
-    /// advance the bit-reader by.
+    /// An `extension_type` value above `0x0f` was handed to
+    /// [`crate::extension_payload::ExtensionType::from_bits`] — not
+    /// a value of the 4-bit field. The `extension_payload()` parser
+    /// never returns this: the reserved 4-bit values have a body
+    /// layout (the syntax table's `default` branch — discarded
+    /// `other_bits`) and parse as
+    /// [`crate::extension_payload::ExtensionPayload::Reserved`].
     UnsupportedExtensionType(u8),
 
     /// [`crate::extension_payload::ExtensionPayload`] parse / write
@@ -992,7 +993,7 @@ impl core::fmt::Display for Error {
             Error::UnsupportedExtensionType(value) => {
                 write!(
                     f,
-                    "extension_payload extension_type 0x{:x} is reserved (no body layout defined)",
+                    "extension_type 0x{:x} is not a 4-bit extension_payload type value",
                     value
                 )
             }

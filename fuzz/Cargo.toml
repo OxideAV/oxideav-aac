@@ -45,3 +45,10 @@ path = "fuzz_targets/stream_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "extension_payload_roundtrip"
+path = "fuzz_targets/extension_payload_roundtrip.rs"
+test = false
+doc = false
+bench = false
